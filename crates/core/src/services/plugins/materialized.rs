@@ -39,7 +39,7 @@ fn directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn materialize(context: &ServiceContext, bundle: &Bundle) -> Result<PathBuf> {
+pub(super) fn materialize(context: &ServiceContext<impl PluginCatalog>, bundle: &Bundle) -> Result<PathBuf> {
     bundle.validate()?;
     let files = decoded_files(bundle)?;
     let payload = serde_json::to_vec(bundle)?;
@@ -103,7 +103,7 @@ pub(super) fn materialize(context: &ServiceContext, bundle: &Bundle) -> Result<P
 }
 
 pub fn skill_commands(
-    context: &ServiceContext,
+    context: &ServiceContext<impl PluginCatalog>,
 ) -> Result<BTreeMap<String, crate::skills::discovery::SkillCommand>> {
     let mut skills = BTreeMap::new();
     for installed in list(context)?.into_iter().filter(|p| p.enabled) {
@@ -126,7 +126,7 @@ pub fn skill_commands(
     Ok(skills)
 }
 
-pub fn command_hooks(context: &ServiceContext) -> Result<Vec<(PathBuf, Value)>> {
+pub fn command_hooks(context: &ServiceContext<impl PluginCatalog>) -> Result<Vec<(PathBuf, Value)>> {
     let mut hooks = Vec::new();
     for installed in list(context)?.into_iter().filter(|p| p.enabled) {
         let bundle = enabled_bundle(context, &installed.id)?;
@@ -144,7 +144,7 @@ pub fn command_hooks(context: &ServiceContext) -> Result<Vec<(PathBuf, Value)>> 
 /// Synchronize only names reserved for plugin-owned stdio servers. Changes to
 /// user-managed servers remain untouched. Call at startup and before each turn.
 pub async fn sync_mcp(
-    context: &ServiceContext,
+    context: &ServiceContext<impl PluginCatalog>,
     manager: &crate::mcp::McpServerManager,
 ) -> Result<()> {
     let mut desired = BTreeMap::new();

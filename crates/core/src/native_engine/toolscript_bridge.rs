@@ -665,7 +665,7 @@ impl ToolLoopExecutor {
             queue.push((
                 index,
                 Box::pin(async move {
-                    let run = self.run_builtin(&name, &input, &cwd, approved);
+                    let run = self.run_builtin_inner(&name, &input, &cwd, approved);
                     tokio::select! {
                         // Abandonment is polled first: a body that would finish
                         // synchronously must observe a gone caller before it

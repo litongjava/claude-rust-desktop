@@ -54,6 +54,22 @@ fn names(executor: &ToolLoopExecutor) -> Vec<String> {
         .collect()
 }
 
+/// The loadable-tool reminder this session's first user message carries. The
+/// system prompt no longer holds the list.
+fn loadable_reminder(executor: &ToolLoopExecutor) -> Option<String> {
+    let customization = executor.customization().unwrap();
+    let catalog = customization.described(executor.builtin_catalog());
+    let (builtin, mcp) = crate::native_engine::tool_loop::loadable_tool_lists(
+        &customization,
+        &catalog,
+        &executor.mcp_tools,
+        &executor.mcp_states,
+        executor.allowed_tools.as_deref(),
+    );
+    crate::prompt::loadable_tools_reminder(&builtin, &mcp)
+}
+
+
 /// A fake MCP tool, set on the executor directly: discovery needs a running
 /// server, which these tests do not start.
 fn mcp_tool(name: &str, description: &str) -> crate::tools::ToolDefinition {
@@ -110,8 +126,14 @@ async fn context_search_follows_loading_settings_and_session_scope() {
 
     let temp = tempfile::tempdir().unwrap();
     let no_storage = executor(temp.path());
-    let request = no_storage.prepare_request(0).unwrap();
-    assert!(!request.system_prompt.unwrap().contains("ContextSearch"));
+    let request = no_storage.prepare_request().unwrap();
+    assert!(!request.system_prompt.unwrap_or_default().contains("ContextSearch"));
+    assert!(
+        !loadable_reminder(&no_storage)
+            .unwrap_or_default()
+            .contains("ContextSearch"),
+        "without session storage ContextSearch is not in the catalog"
+    );
 
     let db = RuntimePaths::new(temp.path().join("data"))
         .unwrap()
@@ -123,12 +145,14 @@ async fn context_search_follows_loading_settings_and_session_scope() {
         .append(&session, "user", "old context needle")
         .unwrap();
     let mut executor = no_storage.with_conv_id(session).with_goal_state(db);
-    let request = executor.prepare_request(0).unwrap();
+    let request = executor.prepare_request().unwrap();
     executor.exposed_tools = Some(request.tools.iter().map(|tool| tool.name.clone()).collect());
     assert!(!names(&executor).iter().any(|name| name == "ContextSearch"));
-    let prompt = request.system_prompt.unwrap();
-    assert!(prompt.contains("- `ContextSearch`"));
-    assert!(!prompt.contains("After compaction, load ContextSearch with ToolLoad"));
+    let prompt = request.system_prompt.unwrap_or_default();
+    assert!(!prompt.contains("ContextSearch"), "{prompt}");
+    let listing = loadable_reminder(&executor).unwrap();
+    assert!(listing.contains("- ContextSearch:"), "{listing}");
+    assert!(!listing.contains("After compaction, load ContextSearch"), "{listing}");
 
     let input = json!({"query":"needle"});
     let (_, output, failed) = executor
@@ -154,11 +178,11 @@ async fn context_search_follows_loading_settings_and_session_scope() {
         .execute_tool_call("ContextSearch", &input, "same-request")
         .await;
     assert!(failed && output.contains("next model request"), "{output}");
-    let request = executor.prepare_request(0).unwrap();
+    let request = executor.prepare_request().unwrap();
     executor.exposed_tools = Some(request.tools.iter().map(|tool| tool.name.clone()).collect());
     assert!(!request
         .system_prompt
-        .unwrap()
+        .unwrap_or_default()
         .contains("After compaction, use ContextSearch"));
     let (_, output, failed) = executor
         .execute_tool_call("ContextSearch", &input, "search")
@@ -186,8 +210,8 @@ async fn context_search_follows_loading_settings_and_session_scope() {
     assert!(failed && output.contains("Permission denied"), "{output}");
 
     write_switches(temp.path(), &[("ContextSearch", false, false)]);
-    let request = executor.prepare_request(0).unwrap();
-    assert!(!request.system_prompt.unwrap().contains("ContextSearch"));
+    let request = executor.prepare_request().unwrap();
+    assert!(!request.system_prompt.unwrap_or_default().contains("ContextSearch"));
     let (_, output, failed) = executor
         .execute_tool_call("ContextSearch", &input, "off")
         .await;
@@ -930,8 +954,156 @@ fn a_legacy_entry_outside_the_catalog_still_turns_that_tool_off() {
     assert!(executor.loading_violation("mcp__live__echo").is_none());
 }
 
+#[tokio::test]
+async fn tool_load_loads_a_tool_named_in_the_first_message_reminder() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut executor = executor(temp.path());
+    let reminder = loadable_reminder(&executor).expect("built-in tools are listed");
+    // ListDir is on demand by default, so the reminder names it.
+    assert!(reminder.contains("- ListDir:"), "{reminder}");
+    for absent in ["# Tool directory", "MCP tools available on demand"] {
+        assert!(!reminder.contains(absent), "{reminder}");
+    }
+
+    let (_, output, failed) = executor
+        .execute_tool_call("ToolLoad", &json!({"names":["ListDir"]}), "from-reminder")
+        .await;
+    assert!(!failed, "{output}");
+    let value: Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["loaded_tools"], json!(["ListDir"]), "{output}");
+    assert!(names(&executor).contains(&"ListDir".to_owned()));
+}
+
+/// Loading a tool appends it after the resident tools in load order, so the
+/// cached request prefix never moves. Loading WebFetch then ListDir must not
+/// fall back to the alphabetical ListDir, WebFetch.
+#[tokio::test]
+async fn loaded_tools_are_appended_after_the_resident_prefix_in_load_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut executor = executor(temp.path());
+    let resident = executor.tool_definitions().unwrap();
+    let resident_names: Vec<String> = resident.iter().map(|tool| tool.name.clone()).collect();
+    let resident_prefix = serde_json::to_string(&resident).unwrap();
+    executor.exposed_tools = Some(resident_names.iter().cloned().collect());
+
+    for (name, id) in [("WebFetch", "load-web"), ("ListDir", "load-dir")] {
+        let (_, output, failed) = executor
+            .execute_tool_call("ToolLoad", &json!({"names":[name]}), id)
+            .await;
+        assert!(!failed, "{output}");
+    }
+
+    let after = executor.tool_definitions().unwrap();
+    let after_names: Vec<String> = after.iter().map(|tool| tool.name.clone()).collect();
+    assert_eq!(
+        &after_names[..resident_names.len()],
+        resident_names.as_slice(),
+        "the resident prefix must not move"
+    );
+    assert_eq!(
+        &after_names[resident_names.len()..],
+        ["WebFetch", "ListDir"],
+        "loaded tools follow the order they were loaded: {after_names:?}"
+    );
+    assert_eq!(
+        serde_json::to_string(&after[..resident_names.len()]).unwrap(),
+        resident_prefix,
+        "the resident definitions stay byte-identical"
+    );
+
+    // Every later request rebuilds the same order.
+    assert_eq!(names(&executor), after_names);
+}
+
+/// A user-provided tool has no loading switch and is resident even though its
+/// name is not a built-in. Loading a builtin must not push it behind the
+/// loaded definitions.
+#[tokio::test]
+async fn loading_a_tool_keeps_a_user_tool_in_the_resident_prefix() {
+    use crate::services::customization::{CustomTool, Customization};
+    let temp = tempfile::tempdir().unwrap();
+    crate::services::customization::save(
+        temp.path(),
+        &Customization {
+            custom_tools: vec![CustomTool {
+                name: "zed_user_tool".into(),
+                description: "A user tool.".into(),
+                input_schema: json!({"type":"object","properties":{}}),
+                command: "true".into(),
+                enabled: true,
+                timeout_secs: None,
+            }],
+            ..Default::default()
+        },
+        &[],
+    )
+    .unwrap();
+    let mut executor = executor(temp.path());
+    let resident = names(&executor);
+    assert!(
+        resident.contains(&"zed_user_tool".to_owned()),
+        "{resident:?}"
+    );
+    executor.exposed_tools = Some(resident.iter().cloned().collect());
+    let (_, output, failed) = executor
+        .execute_tool_call("ToolLoad", &json!({"names":["WebFetch"]}), "load")
+        .await;
+    assert!(!failed, "{output}");
+    let after = names(&executor);
+    assert_eq!(&after[..resident.len()], resident.as_slice(), "{after:?}");
+    assert_eq!(after.last().map(String::as_str), Some("WebFetch"), "{after:?}");
+}
+
 #[test]
-fn on_demand_mcp_tools_are_listed_until_loaded() {
+fn resident_tool_order_is_stable_across_builds() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut executor = executor(temp.path());
+    executor.mcp_tools = vec![
+        mcp_tool("mcp__z__second", "Second"),
+        mcp_tool("mcp__a__first", "First"),
+    ];
+    executor.mcp_states = std::collections::BTreeMap::from([
+        ("a".to_owned(), McpState::User),
+        ("z".to_owned(), McpState::User),
+    ]);
+
+    let first = names(&executor);
+    assert_eq!(names(&executor), first, "two builds of one session agree");
+    let mut sorted = first.clone();
+    sorted.sort();
+    assert_eq!(first, sorted, "resident definitions are sorted by name: {first:?}");
+
+    // A reconnecting registry that returns its tools in another order must not
+    // rewrite the resident definitions.
+    executor.mcp_tools.reverse();
+    assert_eq!(names(&executor), first);
+}
+
+#[test]
+fn mcp_descriptions_are_snapshotted_per_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut session = executor(temp.path());
+    session.mcp_tools = vec![mcp_tool("mcp__gh__echo", "Original description")];
+    session.snapshot_mcp_tools().unwrap();
+
+    session.mcp_tools = vec![mcp_tool("mcp__gh__echo", "Reconnected description")];
+    session.snapshot_mcp_tools().unwrap();
+    assert_eq!(
+        session.mcp_tools[0].description, "Original description",
+        "a reconnect cannot change a resident definition mid-session"
+    );
+
+    let mut fresh = executor(temp.path()).with_conv_id("a-new-session".into());
+    fresh.mcp_tools = vec![mcp_tool("mcp__gh__echo", "Reconnected description")];
+    fresh.snapshot_mcp_tools().unwrap();
+    assert_eq!(
+        fresh.mcp_tools[0].description, "Reconnected description",
+        "a new session snapshots the current definition"
+    );
+}
+
+#[test]
+fn on_demand_mcp_tools_are_listed_with_builtins_first() {
     let temp = tempfile::tempdir().unwrap();
     let mut executor = executor(temp.path());
     let noisy = format!("{}\nA second line is never shown", "x".repeat(200));
@@ -953,42 +1125,43 @@ fn on_demand_mcp_tools_are_listed_until_loaded() {
     assert!(!visible.contains(&"mcp__gh__create_issue".to_owned()), "{visible:?}");
     assert!(!visible.contains(&"mcp__gh__noisy".to_owned()), "{visible:?}");
 
-    let prompt = executor.prepare_request(0).unwrap().system_prompt.unwrap();
-    let listing = prompt
-        .split_once("MCP tools available on demand")
-        .map(|(_, section)| section)
-        .expect("on-demand tools are listed");
+    let prompt = loadable_reminder(&executor).expect("on-demand tools are listed");
     assert!(
-        listing.starts_with(" (pass exact names in the ToolLoad `names` array before calling):"),
-        "{listing}"
+        prompt.starts_with(
+            "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n"
+        ),
+        "{prompt}"
     );
     assert!(
-        listing.contains("- mcp__gh__create_issue: Create a new issue in a GitHub repository"),
-        "{listing}"
+        prompt.contains("- mcp__gh__create_issue: Create a new issue in a GitHub repository"),
+        "{prompt}"
     );
-    assert!(!listing.contains("mcp__fs__read_file"), "{listing}");
-    let line = listing
+    assert!(!prompt.contains("mcp__fs__read_file"), "{prompt}");
+    assert!(!prompt.contains("A second line"), "{prompt}");
+    // Built-ins come before the MCP block.
+    let builtin = prompt.find("- ListDir:").unwrap();
+    let mcp = prompt.find("- mcp__gh__create_issue:").unwrap();
+    assert!(builtin < mcp, "{prompt}");
+    let line = prompt
         .lines()
-        .find(|line| line.starts_with("- mcp__gh__noisy"))
+        .find(|line| line.starts_with("- mcp__gh__noisy:"))
         .expect("the second on-demand tool is listed");
     let summary = line.trim_start_matches("- mcp__gh__noisy: ");
-    assert_eq!(summary.chars().count(), 120, "{line}");
+    assert_eq!(summary.chars().count(), 100, "{line}");
     assert!(summary.ends_with('…'), "{line}");
 
     executor.loaded_tools.insert("mcp__gh__create_issue".into());
-    let request = executor.prepare_request(0).unwrap();
+    let request = executor.prepare_request().unwrap();
     assert!(request
         .tools
         .iter()
         .any(|tool| tool.name == "mcp__gh__create_issue"));
-    let prompt = request.system_prompt.unwrap();
-    assert_eq!(
-        prompt.matches("MCP tools available on demand").count(),
-        1,
-        "{prompt}"
-    );
+    // The first message is frozen: loading a tool never rewrites its list.
+    let prompt = request.system_prompt.unwrap_or_default();
     assert!(!prompt.contains("mcp__gh__create_issue"), "{prompt}");
-    assert!(prompt.contains("mcp__gh__noisy"), "{prompt}");
+    let listing = loadable_reminder(&executor).unwrap();
+    assert!(listing.contains("mcp__gh__create_issue"), "{listing}");
+    assert!(listing.contains("mcp__gh__noisy"), "{listing}");
 }
 
 #[tokio::test]
@@ -1024,14 +1197,19 @@ async fn tool_load_loads_on_demand_mcp_tools() {
     );
     assert!(executor.loaded_tools.contains("mcp__gh__create_issue"));
     // A resumed session restores the load from the stored ToolLoad result.
-    let mut restored = std::collections::BTreeSet::new();
+    let mut restored = LoadedTools::default();
     ToolLoopExecutor::absorb_loaded(&output, &mut restored);
     assert!(restored.contains("mcp__gh__create_issue"));
 
     assert!(names(&executor).contains(&"mcp__gh__create_issue".to_owned()));
-    let prompt = executor.prepare_request(0).unwrap().system_prompt.unwrap();
+    let prompt = executor.prepare_request().unwrap().system_prompt.unwrap_or_default();
     assert!(!prompt.contains("mcp__gh__create_issue"), "{prompt}");
-    assert!(prompt.contains("mcp__gh__list_pull_requests"), "{prompt}");
+    assert!(!prompt.contains("mcp__gh__list_pull_requests"), "{prompt}");
+    let listing = loadable_reminder(&executor).unwrap();
+    // The frozen first message keeps listing a tool the model loaded; only
+    // the resident tool list changes.
+    assert!(listing.contains("mcp__gh__create_issue"), "{listing}");
+    assert!(listing.contains("mcp__gh__list_pull_requests"), "{listing}");
 
     // The other tool can be loaded by its exact qualified name.
     let (_, output, failed) = executor
@@ -1062,12 +1240,10 @@ async fn user_only_mcp_tools_are_hidden_and_refused() {
         std::collections::BTreeMap::from([("gh".to_owned(), McpState::UserOnly)]);
 
     assert!(!names(&executor).contains(&"mcp__gh__create_issue".to_owned()));
-    let prompt = executor.prepare_request(0).unwrap().system_prompt.unwrap();
+    let prompt = executor.prepare_request().unwrap().system_prompt.unwrap_or_default();
     assert!(!prompt.contains("mcp__gh__create_issue"), "{prompt}");
-    assert!(
-        !prompt.contains("MCP tools available on demand"),
-        "{prompt}"
-    );
+    let listing = loadable_reminder(&executor).unwrap();
+    assert!(!listing.contains("mcp__gh__create_issue"), "{listing}");
 
     let (_, output, failed) = executor
         .execute_tool_call(
@@ -1221,6 +1397,20 @@ fn request_system_prompt(body: &Value, format: &str) -> String {
     }
 }
 
+/// The first user message a provider actually received, serialized so each
+/// protocol's text-block shape can be searched for the reminder.
+fn request_first_user(body: &Value, format: &str) -> String {
+    let items = if format == "responses" {
+        body["input"].as_array()
+    } else {
+        body["messages"].as_array()
+    };
+    items
+        .and_then(|messages| messages.iter().find(|message| message["role"] == "user"))
+        .map(|message| message["content"].to_string())
+        .unwrap_or_default()
+}
+
 fn write_directory_switches(root: &std::path::Path, websearch_on_demand: bool) {
     use crate::services::customization::{CustomTool, Customization, ToolLoading};
     let mut tool_loading = std::collections::BTreeMap::new();
@@ -1269,6 +1459,35 @@ fn request_tool_names(body: &Value, format: &str) -> Vec<String> {    body["tool
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The tool result texts a provider request actually carries.
+fn request_tool_outputs(body: &Value, format: &str) -> Vec<String> {
+    let text = |value: &Value| value.as_str().map(str::to_owned);
+    match format {
+        "openai" => body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| text(&message["content"]))
+            .collect(),
+        "responses" => body["input"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["type"] == "function_call_output")
+            .filter_map(|item| text(&item["output"]))
+            .collect(),
+        _ => body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .filter(|block| block["type"] == "tool_result")
+            .filter_map(|block| text(&block["content"]))
+            .collect(),
+    }
 }
 
 /// The tools in a sent body, normalized to the `{name, description,
@@ -1534,24 +1753,38 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
             .await
             .unwrap()
             .unwrap();
-        let failed = |rx: &mut mpsc::Receiver<EngineEvent>| {
-            let mut errors = Vec::new();
-            while let Ok(event) = rx.try_recv() {
-                if let EngineEvent::ToolUseDone {
-                    tool_name,
-                    is_error,
-                    output,
-                    ..
-                } = event
-                {
-                    if is_error {
-                        errors.push(format!("{tool_name}: {output}"));
-                    }
+        let mut errors = Vec::new();
+        let mut tool_load_outputs = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let EngineEvent::ToolUseDone {
+                tool_name,
+                is_error,
+                output,
+                ..
+            } = event
+            {
+                if is_error {
+                    errors.push(format!("{tool_name}: {output}"));
+                }
+                if tool_name == "ToolLoad" {
+                    tool_load_outputs.push(output);
                 }
             }
-            errors
-        };
-        assert!(failed(&mut rx).is_empty(), "{format}");
+        }
+        assert!(errors.is_empty(), "{format}: {errors:?}");
+        // Desktop and the SDK keep the structured result while the model sees
+        // only its content line.
+        assert_eq!(tool_load_outputs.len(), 1, "{format}");
+        let structured: Value = serde_json::from_str(&tool_load_outputs[0]).unwrap();
+        assert_eq!(
+            structured["loaded_tools"],
+            json!(["ListDir", "WebFetch"]),
+            "{format}"
+        );
+        assert!(
+            structured["tools"][0]["input_schema"].is_object(),
+            "{format}"
+        );
         assert_eq!(text, "done", "{format}");
         server.abort();
 
@@ -1573,9 +1806,31 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
             second.contains(&"WebFetch".to_owned()),
             "{format}: {second:?}"
         );
+        // The resident tools keep their exact prefix, and the loaded tools
+        // follow in the order the search named them.
+        let first_tools = requests[0]["tools"].as_array().unwrap();
+        let second_tools = requests[1]["tools"].as_array().unwrap();
+        assert_eq!(
+            &second_tools[..first_tools.len()],
+            first_tools.as_slice(),
+            "{format}: loading moved a resident tool"
+        );
+        assert_eq!(
+            &second[first_tools.len()..],
+            ["ListDir", "WebFetch"],
+            "{format}: {second:?}"
+        );
         assert!(
             requests[1]["tools"].to_string().contains("\"path\""),
             "{format}"
+        );
+        // The model-visible result is only the content line: the next request
+        // already carries both definitions in its tools array.
+        let outputs = request_tool_outputs(&requests[1], format);
+        assert_eq!(
+            outputs,
+            ["Loaded ListDir, WebFetch. Available from the next request."],
+            "{format}: {outputs:?}"
         );
         assert!(requests[2].to_string().contains("needle.txt"), "{format}");
     }
@@ -1711,12 +1966,12 @@ async fn a_settings_change_while_a_loaded_tool_is_called_follows_the_current_swi
     }
 }
 
-/// The real request payloads on all three transports carry a directory built
-/// from the current switches, and it changes on the next request after a load
-/// or a settings change. Resident, disabled, removed, MCP and custom tools are
-/// not listed.
+/// The real request payloads on all three transports keep the loadable-tool
+/// list out of the system prompt. The frozen first-message reminder is built
+/// from the initial switches; resident, disabled, custom and MCP tools are not
+/// listed, and loading or disabling a tool never rewrites that prefix.
 #[tokio::test]
-async fn every_transport_sends_a_dynamic_directory_of_loadable_builtins() {
+async fn every_transport_moves_the_loadable_tool_list_to_the_first_message() {
     use axum::{http::header, routing::post, Json, Router};
     let _ = crate::config::OrchestrationConfig::init_global();
     for format in ["anthropic", "openai", "responses"] {
@@ -1771,6 +2026,8 @@ async fn every_transport_sends_a_dynamic_directory_of_loadable_builtins() {
             ReasoningMode::Standard,
         )
         .with_search_config_path(root.path().join("config.json"));
+        let reminder = loadable_reminder(&executor).expect("the initial switches list tools");
+        executor = executor.with_context_reminders(vec![reminder.clone()]);
         let (text, _) = tokio::time::timeout(Duration::from_secs(20), executor.execute())
             .await
             .unwrap()
@@ -1782,52 +2039,48 @@ async fn every_transport_sends_a_dynamic_directory_of_loadable_builtins() {
 
         let first = request_system_prompt(&requests[0], format);
         assert!(first.contains("BASE SYSTEM"), "{format}: {first}");
-        assert_eq!(
-            first.matches("# Tool directory").count(),
-            1,
-            "{format}: {first}"
-        );
+        assert!(!first.contains("# Tool directory"), "{format}: {first}");
+        assert!(!first.contains("Tools you can load with ToolLoad"), "{format}: {first}");
+        assert!(!first.contains("ListDir"), "{format}: {first}");
+        assert!(!first.contains("MCP tools available on demand"), "{format}: {first}");
+
+        let user = request_first_user(&requests[0], format);
+        assert!(user.contains("Tools you can load with ToolLoad"), "{format}: {user}");
         assert!(
-            first.contains("Among built-ins, ToolLoad can load only the names listed below"),
-            "{format}: {first}"
+            user.contains("- ListDir: Directory listing from the shared snapshot"),
+            "{format}: the listing uses the configured override: {user}"
         );
-        assert!(
-            first.contains("exact, case-sensitive names in the `names` array"),
-            "{format}: {first}"
-        );
-        assert!(first.contains("`ListDir`"), "{format}: {first}");
-        assert!(
-            first.contains("`ListDir`: Directory listing from the shared snapshot"),
-            "{format}: the directory uses the configured override: {first}"
-        );
-        assert!(first.contains("`WebSearch`"), "{format}: {first}");
-        assert!(first.contains("`MultiEdit`"), "{format}: {first}");
+        assert!(user.contains("- WebSearch:"), "{format}: {user}");
+        assert!(user.contains("- MultiEdit:"), "{format}: {user}");
         for absent in [
-            "`Bash`",
-            "`WebFetch`",
-            "`computer_use`",
-            "`private_tool`",
-            "`git_status`",
-            "`git_diff`",
+            "- Bash",
+            "- WebFetch",
+            "computer_use",
+            "private_tool",
+            "git_status",
+            "git_diff",
         ] {
-            assert!(!first.contains(absent), "{format}: {absent} in {first}");
+            assert!(!user.contains(absent), "{format}: {absent} in {user}");
         }
         assert!(!request_tool_names(&requests[0], format).contains(&"ListDir".to_owned()));
 
+        // The first message stays exactly as frozen, even though ListDir was
+        // loaded and WebSearch was disabled between the two requests.
+        let frozen_user = request_first_user(&requests[1], format);
+        assert!(frozen_user.contains("- ListDir: Directory listing from the shared snapshot"), "{format}: {frozen_user}");
+        assert!(frozen_user.contains("- WebSearch:"), "{format}: {frozen_user}");
+        assert!(frozen_user.contains("- MultiEdit:"), "{format}: {frozen_user}");
+        assert_eq!(
+            frozen_user.matches("Tools you can load with ToolLoad").count(),
+            1,
+            "{format}: {frozen_user}"
+        );
         let second = request_system_prompt(&requests[1], format);
         assert!(second.contains("BASE SYSTEM"), "{format}: {second}");
-        assert!(
-            !second.contains("`ListDir`"),
-            "{format}: a loaded tool must leave the directory: {second}"
-        );
-        assert!(
-            !second.contains("`WebSearch`"),
-            "{format}: a disabled tool must leave the directory: {second}"
-        );
-        assert!(second.contains("`MultiEdit`"), "{format}: {second}");
+        assert!(!second.contains("ListDir"), "{format}: {second}");
+        assert!(!second.contains("WebSearch"), "{format}: {second}");
         assert!(request_tool_names(&requests[1], format).contains(&"ListDir".to_owned()));
-        // The loaded schema carries the same override the directory used:
-        // both were built from one settings snapshot.
+        // The loaded schema carries the same override the listing used.
         assert!(
             requests[1]["tools"]
                 .to_string()
@@ -1911,6 +2164,16 @@ async fn every_transport_lists_only_loadable_mcp_tools_when_the_loader_is_presen
             executor
                 .mcp_states
                 .insert("fixture".into(), McpState::OnDemand);
+            // The reminder the first user message would carry. Without ToolLoad
+            // there is nothing a model could load, so the engine sends none.
+            let reminder = loadable_reminder(&executor);
+            if loader_enabled {
+                executor = executor.with_context_reminders(vec![reminder
+                    .clone()
+                    .expect("the eligible MCP tool is listed")]);
+            } else {
+                assert!(reminder.is_none(), "{format}: {reminder:?}");
+            }
             let (text, _) = timeout(Duration::from_secs(20), async {
                 if format == "anthropic" {
                     executor.execute_anthropic_loop().await
@@ -1933,6 +2196,11 @@ async fn every_transport_lists_only_loadable_mcp_tools_when_the_loader_is_presen
                 let prompt = request_system_prompt(body, format);
                 let tools = request_tool_names(body, format);
                 assert!(prompt.contains("BASE SYSTEM"), "{format}: {prompt}");
+                assert!(
+                    !prompt.contains("Tools you can load with ToolLoad")
+                        && !prompt.contains("MCP tools available on demand"),
+                    "{format}: the list must stay out of the system prompt: {prompt}"
+                );
                 assert_eq!(
                     tools.iter().any(|name| name == "ToolLoad"),
                     loader_enabled,
@@ -1946,16 +2214,11 @@ async fn every_transport_lists_only_loadable_mcp_tools_when_the_loader_is_presen
                     );
                 }
             }
-            let first = request_system_prompt(&requests[0], format);
-            assert_eq!(
-                first.contains("MCP tools available on demand"),
-                loader_enabled,
-                "{format}: {first}"
-            );
+            let first = request_first_user(&requests[0], format);
             assert_eq!(
                 first.contains(eligible),
                 loader_enabled,
-                "{format}: {first}"
+                "{format}: the first message carries the loadable MCP tool: {first}"
             );
             assert!(
                 !request_tool_names(&requests[0], format)
@@ -1970,30 +2233,24 @@ async fn every_transport_lists_only_loadable_mcp_tools_when_the_loader_is_presen
                         .any(|name| name == eligible),
                     "{format}"
                 );
-                let second = request_system_prompt(&requests[1], format);
+                // The first message is frozen; loading the tool never edits it.
                 assert!(
-                    !second.contains("MCP tools available on demand"),
-                    "{format}: {second}"
+                    request_first_user(&requests[1], format).contains(eligible),
+                    "{format}: {}",
+                    request_first_user(&requests[1], format)
                 );
-                assert!(!second.contains(eligible), "{format}: {second}");
             }
         }
     }
 }
 
-/// An empty searchable set is reported instead of an empty or misleading list,
-/// and a request without ToolLoad says so.
+/// An empty searchable set produces no reminder at all rather than a
+/// misleading empty or loader-less list.
 #[tokio::test]
-async fn an_empty_directory_is_reported_truthfully() {
+async fn an_empty_loadable_set_produces_no_reminder() {
     use axum::{http::header, routing::post, Json, Router};
     let _ = crate::config::OrchestrationConfig::init_global();
-    for (allowed, expected) in [
-        (
-            vec!["Bash", "ToolLoad"],
-            "No built-in tools are available for ToolLoad to load",
-        ),
-        (vec!["Bash"], "ToolLoad is not available in this request"),
-    ] {
+    for allowed in [vec!["Bash", "ToolLoad"], vec!["Bash"]] {
         let root = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -2014,7 +2271,7 @@ async fn an_empty_directory_is_reported_truthfully() {
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let (tx, _rx) = mpsc::channel(64);
-        let mut executor = ToolLoopExecutor::new(
+        let executor = ToolLoopExecutor::new(
             wire_provider(&base, "openai"),
             vec![json!({"role":"user","content":"hello"})],
             Some("BASE SYSTEM".into()),
@@ -2027,6 +2284,11 @@ async fn an_empty_directory_is_reported_truthfully() {
         .with_allowed_tools(Some(
             allowed.iter().map(|name| (*name).to_owned()).collect(),
         ));
+        assert!(
+            loadable_reminder(&executor).is_none(),
+            "{allowed:?} has nothing ToolLoad can load"
+        );
+        let mut executor = executor;
         let (text, _) = tokio::time::timeout(Duration::from_secs(20), executor.execute())
             .await
             .unwrap()
@@ -2035,8 +2297,8 @@ async fn an_empty_directory_is_reported_truthfully() {
         server.abort();
         let requests = captured.lock().await;
         let system = request_system_prompt(&requests[0], "openai");
-        assert!(system.contains(expected), "{system}");
-        assert!(!system.contains("- `"), "{system}");
+        assert!(!system.contains("Tools you can load with ToolLoad"), "{system}");
+        assert!(!system.contains("# Tool directory"), "{system}");
     }
 }
 
@@ -2088,10 +2350,10 @@ async fn a_request_without_callable_tool_load_does_not_promise_loading() {
         assert!(sent.contains(&"Bash".to_owned()), "{label}: {sent:?}");
         let system = request_system_prompt(&requests[0], "openai");
         assert!(
-            system.contains("ToolLoad is not available in this request"),
+            !system.contains("Tools you can load with ToolLoad"),
             "{label}: {system}"
         );
-        assert!(!system.contains("- `"), "{label}: {system}");
+        assert!(!system.contains("ToolLoad is not available"), "{label}: {system}");
     }
 }
 

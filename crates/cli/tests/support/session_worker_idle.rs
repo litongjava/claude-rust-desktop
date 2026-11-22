@@ -1,3 +1,6 @@
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::*;
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -212,18 +215,8 @@ impl Fixture {
             completed(&context.paths.data_dir, &initial).await.status,
             "completed"
         );
-        let records: Vec<String> = store
-            .db
-            .with_conn(|conn| {
-                conn.prepare("SELECT value FROM peripheral_settings WHERE key LIKE 'delegation.%'")?
-                    .query_map([], |row| row.get(0))?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap()
-            .unwrap();
-        let child = records
-            .iter()
-            .map(|raw| serde_json::from_str::<Value>(raw).unwrap())
+        let records: Vec<Value> = context.db.conversations().unwrap().iter().filter_map(|r|context.child_progress(&r.id).unwrap()).collect();
+        let child = records.iter()
             .find(|row| row["parent_session_id"] == owner)
             .unwrap()["session_id"]
             .as_str()
@@ -519,6 +512,16 @@ async fn owned_child_wakes_without_parent_turn_and_preserves_its_original_runtim
     assert!(notices[0].contains(&format!("Source session: {}", fixture.child)));
     assert!(!notices[0].contains("stored its answer directly in this session"));
     assert_no_secret(&fixture.context.paths.data_dir);
+    worker::call(
+        &fixture.host,
+        &worker::Request::Bind { identity: "changed-frontend-transport".into() },
+    )
+    .await
+    .unwrap();
+    fixture.send("Follow-up after provider rotation");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    assert_eq!(fixture.model.requests.lock().unwrap().len(), 5);
+    assert_eq!(session_messages::pending_count(&fixture.context, &fixture.child).unwrap(), 1);
     fixture.stop().await;
 }
 
@@ -530,26 +533,12 @@ async fn inbox_resume_survives_a_briefly_held_writer() {
     let fixture = Fixture::start("bypass", false).await;
     let child = fixture.child.clone();
     let watched = child.clone();
-    let database = fixture
-        .context
-        .paths
-        .data_dir
-        .join(deepseek_code_core::runtime::DATABASE_FILE);
-    // The wake commits its authority, runtime, transcript and consumer rows
-    // before it drains the inbox. Holding the writer from the start would only
-    // delay those writes and release it again before the drain, so the hold is
-    // taken as soon as the consumer row appears: the drain follows it at once.
+    let data=fixture.context.paths.data_dir.clone();
+    let connection=fixture_sql::shard_connection(&data,&child).unwrap();
     let holder = std::thread::spawn(move || {
-        let connection = rusqlite::Connection::open(&database).unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let attached: bool = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_inbox_consumers WHERE session_id=?1)",
-                    [&watched],
-                    |row| row.get(0),
-                )
-                .unwrap();
+            let attached=session_messages::receiver_active(&data,&watched).unwrap();
             if attached {
                 break;
             }
@@ -587,7 +576,7 @@ async fn inbox_resume_survives_a_briefly_held_writer() {
     );
     let saved: Value = fixture
         .context
-        .setting(&format!("delegation.{child}"))
+        .child_progress(&child)
         .unwrap()
         .unwrap();
     assert_ne!(saved["status"], "needs_resume", "{saved}");
@@ -812,15 +801,11 @@ async fn idle_child_budget_is_shared_with_owner_turn_continuations() {
 #[tokio::test]
 async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
     for case in [
-        "policy", "sender", "restart", "failure", "lease", "binding", "foreign",
+        "policy", "sender", "restart", "failure", "lease", "binding", "foreign", "directory_owner",
     ] {
         let mut fixture = Fixture::start("bypass", false).await;
         let lease = if case == "lease" {
-            session_messages::ExecutionLease::acquire(
-                &fixture.context.paths.data_dir,
-                &fixture.child,
-            )
-            .unwrap()
+            Some(fixture.context.db.open_session(&fixture.child).unwrap().acquire_execution().unwrap())
         } else {
             None
         };
@@ -828,7 +813,7 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
             fixture
                 .store
                 .db
-                .with_conn(|conn| {
+                .directory_sql(|conn| {
                     conn.execute(
                         "UPDATE conversations SET model='foreign-model' WHERE id=?1",
                         [&fixture.child],
@@ -838,16 +823,27 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
                 .unwrap();
         }
         if case == "foreign" {
-            let key = format!("delegation.{}", fixture.child);
-            let mut state: Value = fixture.context.setting(&key).unwrap().unwrap();
-            state["parent_session_id"] = json!(fixture.peer);
-            fixture.context.save_setting(&key, &state).unwrap();
+            let child = fixture.context.db.open_session(&fixture.child).unwrap();
+            child.write(|w| {
+                use deepseek_code_core::db::session_store::settings::CHILD_PROGRESS;
+                let mut progress = w.setting(CHILD_PROGRESS)?.unwrap();
+                progress.insert("parent_session_id".into(), json!(fixture.peer));
+                w.set_setting(CHILD_PROGRESS, &progress)
+            }).unwrap();
+        }
+        if case == "directory_owner" {
+            let changed = fixture.context.db.directory_sql(|c| c.execute(
+                "UPDATE session_execution_parents SET parent_id=?1,
+                    parent_incarnation=(SELECT incarnation FROM conversations WHERE id=?1)
+                 WHERE child_id=?2",
+                (&fixture.peer, &fixture.child),
+            )).unwrap().unwrap();
+            assert_eq!(changed, 1);
         }
         if case == "policy" {
             fixture
                 .context
-                .save_setting(
-                    &format!("cli.permissions.{}", fixture.owner),
+                .db.seed_preference(&fixture.owner, deepseek_code_core::db::session_store::settings::PERMISSIONS,
                     &json!({"Write":"Deny"}),
                 )
                 .unwrap();
@@ -876,7 +872,7 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
             fixture
                 .store
                 .db
-                .with_conn(|conn| {
+                .directory_sql(|conn| {
                     conn.execute(
                         "UPDATE conversations SET archived=1 WHERE id=?1",
                         [&fixture.peer],
@@ -902,10 +898,15 @@ async fn idle_child_revalidates_policy_sender_trust_and_process_residency() {
             "{case}"
         );
         assert!(!fixture.workspace.join("idle.txt").exists());
-        if case != "failure" {
+        if case == "sender" {
+            let inbox = session_messages::inbox(&fixture.context, &fixture.child, false).unwrap();
+            let message = inbox.iter().find(|message| message.content == "IDLE_WRITE").unwrap();
+            assert_eq!(message.state, "blocked");
+            assert!(message.blocked_reason.is_some());
+        } else if case != "failure" {
             assert_eq!(
                 session_messages::pending_count(&fixture.context, &fixture.child).unwrap(),
-                1
+                1, "{case}"
             );
         }
         drop(lease);

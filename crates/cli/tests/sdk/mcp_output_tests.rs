@@ -1,3 +1,6 @@
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::*;
 
 const PNG: &str =
@@ -181,7 +184,7 @@ async fn post_mcp_output_reaches_both_providers_display_storage_and_resume() {
         let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let (saved_id, saved) = store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&session, |conn| {
                 conn.query_row(
                     "SELECT t.id,t.output FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.name='mcp__first__echo'",
                     [&session],
@@ -191,7 +194,7 @@ async fn post_mcp_output_reaches_both_providers_display_storage_and_resume() {
             .unwrap()
             .unwrap();
         assert_eq!(saved, output);
-        let metadata=store.db.with_conn(|conn|conn.query_row("SELECT metadata_json FROM mcp_tool_outputs WHERE conversation_id=?1 AND tool_use_id=?2",[&session,&saved_id],|row|row.get::<_,String>(0))).unwrap().unwrap();
+        let metadata=store.db.shard_sql(&session, |conn|conn.query_row("SELECT metadata_json FROM mcp_tool_outputs WHERE conversation_id=?1 AND tool_use_id=?2",[&session,&saved_id],|row|row.get::<_,String>(0))).unwrap().unwrap();
         assert!(
             metadata.contains("HOST_first_RAW_PRIVATE"),
             "transport metadata remains separately preserved"

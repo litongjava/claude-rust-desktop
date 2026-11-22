@@ -139,7 +139,7 @@ impl HistoryView {
     }
     pub(super) fn open_at(&mut self, row: usize) -> io::Result<()> {
         if !self.active() {
-            execute!(io::stderr(), EnterAlternateScreen)?;
+            execute!(crate::terminal_output::stderr(), EnterAlternateScreen)?;
         }
         self.top = Some(row);
         self.previous.clear();
@@ -186,13 +186,13 @@ impl HistoryView {
             return Ok(());
         }
         self.top = Some(next);
-        if !was_active { self.previous.clear(); execute!(io::stderr(), EnterAlternateScreen)?; }
+        if !was_active { self.previous.clear(); execute!(crate::terminal_output::stderr(), EnterAlternateScreen)?; }
         Ok(())
     }
     pub(super) fn show_compact(&mut self, page: usize) -> io::Result<()> {
         if !self.active() {
             self.previous.clear();
-            execute!(io::stderr(), EnterAlternateScreen)?;
+            execute!(crate::terminal_output::stderr(), EnterAlternateScreen)?;
         }
         self.top = Some(self.all.len().saturating_sub(self.content_page(page)));
         Ok(())
@@ -236,9 +236,9 @@ impl HistoryView {
         if !was_active && self.active() {
             self.previous.clear();
             // Keep the main screen's scrollback intact without capturing the mouse.
-            execute!(io::stderr(), EnterAlternateScreen)?;
+            execute!(crate::terminal_output::stderr(), EnterAlternateScreen)?;
         } else if was_active && !self.active() {
-            execute!(io::stderr(), LeaveAlternateScreen)?;
+            execute!(crate::terminal_output::stderr(), LeaveAlternateScreen)?;
         }
         Ok(true)
     }
@@ -264,7 +264,7 @@ impl HistoryView {
 
     pub(super) fn close(&mut self) -> io::Result<()> {
         if self.top.take().is_some() {
-            execute!(io::stderr(), LeaveAlternateScreen)?;
+            execute!(crate::terminal_output::stderr(), LeaveAlternateScreen)?;
         }
         Ok(())
     }
@@ -281,7 +281,7 @@ impl HistoryView {
         if frame == self.previous {
             return Ok(());
         }
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         out.write_all(b"\x1b[?2026h")?;
         out.write_all(&frame)?;
         out.write_all(b"\x1b[?2026l")?;
@@ -353,7 +353,7 @@ fn view_page(lines: &[Line], from_start: bool, footer: &str) -> io::Result<Outco
     let result = run_page(lines, &[], &mut || reader.next(std::time::Duration::from_millis(100)), from_start, footer);
     drop(reader);
     if !raw {
-        execute!(io::stderr(), DisableMouseCapture)?;
+        execute!(crate::terminal_output::stderr(), DisableMouseCapture)?;
         terminal::disable_raw_mode()?;
     }
     result
@@ -381,7 +381,7 @@ fn run_page(
     from_start: bool,
     footer: &str,
 ) -> io::Result<Outcome> {
-    let mut out = io::stderr();
+    let mut out = crate::terminal_output::stderr();
     // Capture scrolling and use the shared retained drag selection.
     execute!(out, EnterAlternateScreen, Hide, EnableMouseCapture)?;
     let result = pager(lines, logged, next_event, &mut out, from_start, footer);

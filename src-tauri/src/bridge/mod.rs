@@ -1,16 +1,17 @@
 pub mod routes;
 pub mod server_mode;
 
+use deepseek_code_core::db::session_store::HostAccess;
 use crate::clipboard::ClipboardManager;
 use crate::config::{AppConfig, ConfigManager};
 use crate::cost_tracker::CostTracker;
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::engine::EnginePool;
 use crate::fs::FileOperations;
 use crate::git::GitIntegration;
 use crate::logger::Logger;
 use crate::mcp::{McpServerManager, McpServerConfig};
-use crate::memory::{MemExClient, MemoryConfig, MemorySearchRequest, MemoryIngestRequest, MemoryItem, MemoryStats, ContextManager};
+use crate::memory::{MemExClient, MemorySearchRequest, MemoryIngestRequest, MemoryItem, MemoryStats, ContextManager};
 use crate::native_engine::NativeEngine;
 use crate::native_engine::provider_manager::ProviderManager;
 use crate::notification::NotificationManager;
@@ -163,7 +164,7 @@ pub type AppStateTuple = (
     Arc<Mutex<HashMap<String, bool>>>,
     Arc<Mutex<Option<ConfigManager>>>,
     Arc<Mutex<SkillsManager>>,
-    Arc<DbManager>,
+    Arc<Stores>,
     Arc<Mutex<Option<TaskExecutor>>>,
     Arc<Mutex<ProcessManager>>,
     Arc<Mutex<PtyManager>>,
@@ -192,7 +193,7 @@ pub struct BridgeServer {
     research_mode: Arc<Mutex<HashMap<String, bool>>>,
     config_manager: Arc<Mutex<Option<ConfigManager>>>,
     skill_manager: Arc<Mutex<SkillsManager>>,
-    db_manager: Arc<DbManager>,
+    db_manager: Arc<Stores>,
     task_executor: Arc<Mutex<Option<TaskExecutor>>>,
     process_manager: Arc<Mutex<ProcessManager>>,
     terminal_manager: Arc<Mutex<PtyManager>>,
@@ -213,27 +214,22 @@ pub struct BridgeServer {
 }
 
 impl BridgeServer {
-    pub fn new(data_dir: PathBuf, db_manager: Arc<DbManager>) -> Self {
+    #[cfg(any(mobile, test))]
+    pub(crate) fn open_mobile(data_dir: PathBuf) -> Result<Self> {
+        let paths = deepseek_code_core::runtime::RuntimePaths::new(data_dir.clone())?;
+        Ok(Self::new(data_dir, paths.open_database()?))
+    }
+
+    pub fn new(data_dir: PathBuf, db_manager: Arc<Stores>) -> Self {
         let skills_dir = data_dir.join("skills");
         let log_dir = data_dir.join("logs");
         let analytics_dir = data_dir.join("analytics");
 
         let skill_manager = SkillsManager::with_path(skills_dir);
-        if let Err(e) = skill_manager.install_bundled_skills() {
+        if let Err(e) = skill_manager.ensure_installed() {
             tracing::error!(module = "Bridge", error = %e);
         }
 
-        tracing::info!(module = "Bridge", "Database initialized at {:?}", data_dir.join(deepseek_code_core::runtime::DATABASE_FILE));
-        tracing::info!(module = "Bridge", "Running migration check...");
-        {
-            let data_dir_ref = &data_dir;
-            db_manager.with_conn(|conn| {
-                if let Err(e) = crate::db::migration::check_and_migrate(data_dir_ref, conn) {
-                    tracing::warn!(module = "Bridge", error = %e);
-                }
-            }).ok();
-        }
-        tracing::info!(module = "Bridge", "Migration check completed");
         let logger = Logger::new(log_dir);
         let file_watcher = FileWatcher::new();
 
@@ -247,7 +243,6 @@ impl BridgeServer {
         )));
         let task_executor = TaskExecutor::new_with_provider_manager(
             provider_manager.clone(),
-            db_manager.clone(),
         );
 
         let audit_logger = Arc::new(AuditLogger::new(1000));
@@ -257,11 +252,7 @@ impl BridgeServer {
         // 注册 always_allow 检查器，使 PermissionManager 能够通过数据库检查始终允许规则
         let db_for_checker = db_manager.clone();
         permission_manager.set_always_allow_checker(Box::new(move |tool_name: &str, action: &str| -> bool {
-            let tool = tool_name.to_string();
-            let act = action.to_string();
-            db_for_checker.with_conn(|conn| {
-                crate::db::permission_repo::check_always_allowed(conn, &tool, &act)
-            }).unwrap_or(false)
+            db_for_checker.always_allowed(tool_name, action)
         }));
 
         let file_cache = Arc::new(FileCache::new());
@@ -579,9 +570,7 @@ async fn system_status() -> Json<SystemStatus> {
 async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
     let db_healthy = {
         let db = &state.db_manager;
-        db.with_conn(|conn| {
-            conn.execute_batch("SELECT 1")
-        }).is_ok()
+        db.directory_healthy()
     };
 
     let active_sse = crate::metrics::ACTIVE_SSE_CONNECTIONS.get();
@@ -2218,6 +2207,7 @@ async fn workflow_execute(
     };
 
     let provider = crate::native_engine::provider_manager::Provider {
+        lease: None,
         id: provider_config.id.clone(),
         builtin_id: provider_config.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
         name: provider_config.name.clone(),
@@ -2306,6 +2296,7 @@ async fn workflow_execute_stream(
     };
 
     let provider = crate::native_engine::provider_manager::Provider {
+        lease: None,
         id: provider_config.id.clone(),
         builtin_id: provider_config.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
         name: provider_config.name.clone(),
@@ -2437,22 +2428,6 @@ async fn memory_stats_handler(
         Ok(stats) => Ok(Json(stats)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))),
     }
-}
-
-async fn memory_get_config_handler(
-    State(state): State<AppState>,
-) -> Json<MemoryConfig> {
-    let memex: Arc<MemExClient> = state.memex_client.clone();
-    Json(memex.get_config().await)
-}
-
-async fn memory_update_config_handler(
-    State(state): State<AppState>,
-    Json(config): Json<MemoryConfig>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let memex: Arc<MemExClient> = state.memex_client.clone();
-    memex.update_config(config).await.map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({"error": error.to_string()}))))?;
-    Ok(Json(json!({"status": "updated"})))
 }
 
 async fn memory_clear_handler(

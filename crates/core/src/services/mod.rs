@@ -49,7 +49,6 @@ pub mod agent_import;
 pub mod diagnostics;
 pub mod runtime_status;
 pub mod doctor;
-pub mod cli_resources;
 pub mod feedback;
 pub mod statusline;
 pub mod statusline_setup;
@@ -84,11 +83,15 @@ impl Credentials for EnvironmentCredentials {
     }
 }
 
-#[derive(Clone)]
-pub struct ServiceContext {
+pub struct ServiceContext<D = crate::db::session_store::Stores> {
     pub paths: RuntimePaths,
-    pub db: Arc<DbManager>,
+    pub db: Arc<D>,
     pub credentials: Arc<dyn Credentials>,
+}
+impl<D> Clone for ServiceContext<D> {
+    fn clone(&self) -> Self {
+        Self { paths:self.paths.clone(), db:self.db.clone(), credentials:self.credentials.clone() }
+    }
 }
 impl ServiceContext {
     pub fn open(paths: RuntimePaths, credentials: Arc<dyn Credentials>) -> Result<Self> {
@@ -99,6 +102,8 @@ impl ServiceContext {
             credentials,
         })
     }
+}
+impl ServiceContext<DbManager> {
     pub fn setting<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
         let value: Option<String> = self.db.with_conn(|c| {
             c.query_row(
@@ -114,14 +119,39 @@ impl ServiceContext {
     }
     pub fn save_setting<T: Serialize>(&self, key: &str, value: &T) -> Result<()> {
         let json = serde_json::to_string(value)?;
-        self.db.with_conn(|c| {
-            c.execute(
-                "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)
+        self.db.with_conn(|c| -> Result<()> {
+            crate::db::write_tx(
+                c,
+                "save setting",
+                crate::db::STARTUP_WRITE_DEADLINE,
+                |tx| {
+                    tx.execute(
+                        "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                [key, &json],
+                        [key, &json],
+                    )?;
+                    Ok(())
+                },
             )
+            .context("Saving session setting")
         })??;
         Ok(())
+    }
+}
+
+impl<D: crate::db::session_store::GlobalPreferences> ServiceContext<D> {
+    pub fn global_setting<T: DeserializeOwned>(&self, key: crate::db::session_store::GlobalSetting<'_>) -> Result<Option<T>> {
+        self.db.global_preference(key)
+    }
+    pub fn save_global_setting<T: Serialize>(&self, key: crate::db::session_store::GlobalSetting<'_>, value: &T) -> Result<()> {
+        self.db.save_global_preference(key, value)
+    }
+}
+
+impl ServiceContext<crate::db::session_store::Stores> {
+    pub fn from_stores(paths:RuntimePaths, credentials:Arc<dyn Credentials>) -> Result<Self> {
+        let db=Arc::new(paths.open_stores()?);
+        Ok(Self{paths,db,credentials})
     }
 }
 
@@ -237,3 +267,33 @@ pub mod context_usage;
 pub mod permission_updates;
 
 pub mod file_changed;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::test_support;
+    use crate::runtime::RuntimePaths;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn save_setting_waits_for_another_writer_instead_of_failing() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+        let context =
+            ServiceContext::open(paths.clone(), Arc::new(EnvironmentCredentials)).unwrap();
+        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join("global.db"));
+        let releaser = test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = Instant::now();
+        context.db.global().set_setting(crate::db::session_store::GlobalSetting::MachinePreference("probe"), &"value").unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "save returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(
+            context.db.global().setting::<String>(crate::db::session_store::GlobalSetting::MachinePreference("probe")).unwrap().as_deref(),
+            Some("value")
+        );
+    }
+}

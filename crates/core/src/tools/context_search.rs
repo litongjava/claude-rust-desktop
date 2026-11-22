@@ -120,6 +120,14 @@ impl Matcher<'_> {
 }
 
 pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<String> {
+    search(session, value, |selection| db.with_conn(|conn| context_search_repo::read(conn, session, selection))?)
+}
+
+pub(crate) fn search(
+    cursor_scope: &str,
+    value: Value,
+    read: impl FnOnce(Selection<'_>) -> Result<context_search_repo::Transcript>,
+) -> Result<String> {
     let input: Input = serde_json::from_value(value).context("Invalid ContextSearch input")?;
     let limit = input.limit.unwrap_or(5);
     ensure!(
@@ -162,7 +170,7 @@ pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<Str
         Role::Tool => "tool",
     });
     let scope: [u8; 32] = Sha256::digest(serde_json::to_vec(&(
-        session,
+        cursor_scope,
         &input.query,
         input.regex,
         role,
@@ -196,19 +204,13 @@ pub(crate) fn execute(db: &DbManager, session: &str, value: Value) -> Result<Str
         (None, Some(id)) => Boundary::Pinned(Some(id)),
         (None, None) => Boundary::Latest,
     };
-    let mut transcript = db.with_conn(|conn| {
-        context_search_repo::read(
-            conn,
-            session,
-            Selection {
-                range: input.range,
-                boundary,
-                role,
-                tool_name: input.tool_name.as_deref(),
-                position: previous.as_ref().map(|cursor| &cursor.position),
-            },
-        )
-    })??;
+    let mut transcript = read(Selection {
+        range: input.range,
+        boundary,
+        role,
+        tool_name: input.tool_name.as_deref(),
+        position: previous.as_ref().map(|cursor| &cursor.position),
+    })?;
 
     transcript.sources.retain_mut(|source| {
         if let Some(name) = &source.location.tool_name {
@@ -381,14 +383,14 @@ fn excerpt(
 mod tests {
     use super::*;
     use crate::{
-        db::{message_repo, turn_repo::TurnTimer},
+        db::message_repo,
         runtime::{RuntimePaths, SessionStore},
         services::compaction,
     };
 
     struct Fixture {
         _temp: tempfile::TempDir,
-        db: std::sync::Arc<DbManager>,
+        db: std::sync::Arc<crate::db::session_store::Stores>,
         store: SessionStore,
         session: String,
     }
@@ -423,7 +425,7 @@ mod tests {
 
         fn tool(&self, message: &str, id: &str, name: &str, text: &str) {
             self.db
-                .with_conn(|c| {
+                .fixture_shard(&self.session, |c| {
                     message_repo::insert_tool_call(
                         c,
                         id,
@@ -440,7 +442,7 @@ mod tests {
         }
 
         fn search(&self, input: Value) -> Value {
-            serde_json::from_str(&execute(&self.db, &self.session, input).unwrap()).unwrap()
+            serde_json::from_str(&self.db.open_session(&self.session).unwrap().context_search(input).unwrap()).unwrap()
         }
     }
 
@@ -455,8 +457,8 @@ mod tests {
             "Bash",
             r#"{"stderr":"needle: file missing","exit_code":1}"#,
         );
-        let turn = TurnTimer::start(f.db.clone(), &f.session).unwrap();
-        f.db.with_conn(|c| {
+        let turn = f.db.start_turn_timer(&f.session).unwrap();
+        f.db.fixture_shard(&f.session, |c| {
             crate::db::turn_repo::link_message(c, &turn.record().turn_id, &assistant)
         })
         .unwrap()
@@ -544,7 +546,7 @@ mod tests {
             r#"{"result":"edited","file_change":"scope-token DIFF"}"#,
         );
         f.tool(&assistant, "repeat", NAME, "scope-token REPEATED SEARCH");
-        f.db.with_conn(|c| {
+        f.db.fixture_shard(&f.session, |c| {
             c.execute(
                 "UPDATE messages SET thinking='scope-token REASONING' WHERE id=?1",
                 [&assistant],
@@ -566,16 +568,10 @@ mod tests {
             f.search(json!({"query":"hidden-hook-input"}))["matches"],
             json!([])
         );
-        assert!(execute(
-            &f.db,
-            &f.session,
-            json!({"query":"scope-token","session_id":other})
+        assert!(f.db.open_session(&f.session).unwrap().context_search(json!({"query":"scope-token","session_id":other})
         )
         .is_err());
-        assert!(execute(
-            &f.db,
-            &f.session,
-            json!({"query":"scope-token","boundary_id":foreign_boundary,"range":"before"})
+        assert!(f.db.open_session(&f.session).unwrap().context_search(json!({"query":"scope-token","boundary_id":foreign_boundary,"range":"before"})
         )
         .is_err());
         assert_eq!(
@@ -592,7 +588,7 @@ mod tests {
         let mut bytes = vec![b'a'; 1_100_000];
         bytes.extend_from_slice(b"\xff needle \xfe");
         bytes.extend(std::iter::repeat_n(b'z', 1_100_000));
-        f.db.with_conn(|c| {
+        f.db.fixture_shard(&f.session, |c| {
             c.execute("UPDATE tool_calls SET output=?1 WHERE id='large'", [bytes])
                 .unwrap();
         })
@@ -656,7 +652,7 @@ mod tests {
     fn context_search_resumes_past_the_metadata_limit_and_binds_the_cursor() {
         let f = Fixture::new();
         let old = f.append("user", "older needle");
-        f.db.with_conn(|c| {
+        f.db.fixture_shard(&f.session, |c| {
             c.execute(
                 "WITH RECURSIVE rows(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n<?2)
              INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
@@ -673,20 +669,14 @@ mod tests {
         let found = f.search(json!({"query":"needle","role":"user","cursor":cursor}));
         assert_eq!(found["matches"][0]["message_id"], old);
         assert!(found.get("next_cursor").is_none());
-        assert!(execute(
-            &f.db,
-            &f.session,
-            json!({"query":"changed","role":"user","cursor":cursor})
+        assert!(f.db.open_session(&f.session).unwrap().context_search(json!({"query":"changed","role":"user","cursor":cursor})
         )
         .is_err());
         let other = f
             .store
             .create(f._temp.path(), "fixture", "fixture")
             .unwrap();
-        assert!(execute(
-            &f.db,
-            &other,
-            json!({"query":"needle","role":"user","cursor":cursor})
+        assert!(f.db.open_session(&other).unwrap().context_search(json!({"query":"needle","role":"user","cursor":cursor})
         )
         .is_err());
     }
@@ -700,7 +690,7 @@ mod tests {
             f.append("user", &text);
         }
         let page =
-            f.db.with_conn(|conn| {
+            f.db.fixture_shard(&f.session, |conn| {
                 context_search_repo::read(
                     conn,
                     &f.session,
@@ -769,7 +759,7 @@ mod tests {
             json!({"query":"x","role":"user","tool_name":"Bash"}),
         ] {
             assert!(
-                execute(&f.db, &f.session, input.clone()).is_err(),
+                f.db.open_session(&f.session).unwrap().context_search(input.clone()).is_err(),
                 "{input}"
             );
         }
@@ -794,7 +784,7 @@ mod tests {
             page = f.search(json!({"query":"xx","cursor":cursor}));
         }
         assert_eq!(delivered.len(), 12);
-        let output = execute(&f.db, &f.session, json!({"query":"xx","limit":10})).unwrap();
+        let output = f.db.open_session(&f.session).unwrap().context_search(json!({"query":"xx","limit":10})).unwrap();
         assert!(output.len() <= RESPONSE_BYTES);
         let output: Value = serde_json::from_str(&output).unwrap();
         assert!(output["matches"].as_array().unwrap().len() < 10);
@@ -808,7 +798,7 @@ mod tests {
         f.append("user", "literal /src/\"你好.RS:14");
         // Prove the bundled build actually exercises the FTS candidate path.
         let transcript =
-            f.db.with_conn(|conn| {
+            f.db.fixture_shard(&f.session, |conn| {
                 context_search_repo::read(
                     conn,
                     &f.session,

@@ -130,7 +130,7 @@ pub async fn handle(argument: &str, session: &Session, input: &mut TerminalInput
         let payload = payload(session).await?;
         command_eprintln!(
             "Statusline setup: generating a proposal with {} (no shell or file-write tools).",
-            session.model
+            session.binding_state().model
         );
         let current_command = crate::display_commands::load(session)?.statusline;
         let request = json!({"request":if request.is_empty() {"Import my shell prompt without its trailing prompt marker"} else {request}, "shell":if cfg!(windows) {"Windows PowerShell"} else {"POSIX sh"}, "profiles":profiles, "current_command_untrusted_reference":current_command, "status_json_example":payload});
@@ -168,10 +168,9 @@ pub async fn payload(session: &Session) -> Result<Value> {
     let usage = crate::display_commands::usage(session)?;
     let selected = session.selected_provider().await?;
     let title = session.store.resume(&session.id)?.title;
-    let (current, added, project_dir) = session.store.db.with_conn(|conn| -> Result<_> {
-        let current = setup::current_usage(conn, &session.id)?;
-        let project =
-            deepseek_code_core::native_engine::workspace::conversation_project(conn, &session.id)?;
+    let history = session.selected_session()?.repository();
+    let current = history.current_usage()?;
+    let project = history.workspace_project()?;
         let project_dir = project
             .as_ref()
             .and_then(|p| p.workspace_path.clone())
@@ -186,8 +185,6 @@ pub async fn payload(session: &Session) -> Result<Value> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        Ok((current, added, project_dir))
-    })??;
     let context_size = selected.model.context_window;
     let used = current.as_ref().and_then(|v| {
         v["input_tokens"].as_u64().map(|input| {
@@ -200,7 +197,7 @@ pub async fn payload(session: &Session) -> Result<Value> {
         .zip(context_size.filter(|size| *size > 0))
         .map(|(used, size)| (used as f64 / size as f64 * 100.0).clamp(0.0, 100.0));
     Ok(
-        json!({"session_id":session.id,"session_name":title,"cwd":session.workspace,"model":{"id":session.model,"display_name":selected.model.name},"workspace":{"current_dir":session.workspace,"project_dir":project_dir,"added_dirs":added},"version":env!("CARGO_PKG_VERSION"),"output_style":{"name":crate::display_commands::load(session)?.output_style},"context_window":{"total_input_tokens":usage["input_tokens"].as_i64().unwrap_or(0),"total_output_tokens":usage["output_tokens"].as_i64().unwrap_or(0),"context_window_size":context_size,"current_usage":current,"used_percentage":percentage,"remaining_percentage":percentage.map(|v|100.0-v)},"usage":usage}),
+        json!({"session_id":session.id,"session_name":title,"cwd":session.workspace,"model":{"id":session.binding_state().model,"display_name":selected.model.name},"workspace":{"current_dir":session.workspace,"project_dir":project_dir,"added_dirs":added},"version":env!("CARGO_PKG_VERSION"),"output_style":{"name":crate::display_commands::load(session)?.output_style},"context_window":{"total_input_tokens":usage["input_tokens"].as_i64().unwrap_or(0),"total_output_tokens":usage["output_tokens"].as_i64().unwrap_or(0),"context_window_size":context_size,"current_usage":current,"used_percentage":percentage,"remaining_percentage":percentage.map(|v|100.0-v)},"usage":usage}),
     )
 }
 

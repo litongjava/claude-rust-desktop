@@ -10,7 +10,7 @@ use std::io::{self, IsTerminal};
 /// onboarding or hook output so that startup diagnostics remain visible.
 pub fn prepare_screen() -> io::Result<()> {
     execute!(
-        io::stderr(),
+        crate::terminal_output::stderr(),
         Clear(ClearType::All),
         Clear(ClearType::Purge),
         MoveTo(0, 0)
@@ -35,13 +35,13 @@ impl ScreenMode {
         }
         if fullscreen {
             execute!(
-                io::stderr(),
+                crate::terminal_output::stderr(),
                 EnterAlternateScreen,
                 Clear(ClearType::All),
                 MoveTo(0, 0)
             )?;
         } else {
-            execute!(io::stderr(), LeaveAlternateScreen)?;
+            execute!(crate::terminal_output::stderr(), LeaveAlternateScreen)?;
         }
         self.fullscreen = fullscreen;
         Ok(fullscreen)
@@ -50,7 +50,7 @@ impl ScreenMode {
 impl Drop for ScreenMode {
     fn drop(&mut self) {
         if self.fullscreen {
-            let _ = execute!(io::stderr(), LeaveAlternateScreen);
+            let _ = execute!(crate::terminal_output::stderr(), LeaveAlternateScreen);
         }
     }
 }
@@ -105,7 +105,7 @@ impl Drop for ExitCleanup {
             style::ResetColor,
         };
         let _ = execute!(
-            io::stderr(),
+            crate::terminal_output::stderr(),
             DisableMouseCapture,
             DisableBracketedPaste,
             ResetColor,
@@ -113,7 +113,7 @@ impl Drop for ExitCleanup {
         );
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = execute!(
-            io::stderr(),
+            crate::terminal_output::stderr(),
             Clear(ClearType::All),
             Clear(ClearType::Purge),
             MoveTo(0, 0)

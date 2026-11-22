@@ -1,3 +1,7 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
+use deepseek_code_core::db::session_store::GlobalSetting;
 use anyhow::{Context, Result};
 use axum::{
     extract::{Multipart, State},
@@ -68,7 +72,7 @@ async fn independent_clients_auth_crud_conflicts_tombstones_and_restart() {
     let beta = context(&dir.path().join("beta"), "test-beta-token-long");
     let bad = context(&dir.path().join("bad"), "invalid-token");
     assert!(auth(&bad, &url, "alpha").await.is_err());
-    assert!(bad.setting::<TeamConfig>("team-sync").unwrap().is_none());
+    assert!(bad.global_setting::<TeamConfig>(GlobalSetting::TeamConfiguration("team-sync")).unwrap().is_none());
     assert!(auth(&beta, &url, "alpha").await.is_err());
     auth(&beta, &url, "beta").await.unwrap();
     auth(&a, &url, "alpha").await.unwrap();
@@ -136,7 +140,7 @@ async fn offline_queue_recovers_and_retry_of_accepted_mutation_is_idempotent() {
     auth(&a, &url, "alpha").await.unwrap();
     let first = team::put(&a, None, "one".into(), "offline content".into(), vec![]).unwrap();
     let mutation =
-        a.db.with_conn(|c| {
+        a.db.directory_sql(|c| {
             c.query_row(
                 "SELECT mutation FROM team_memories WHERE id=?1",
                 [&first.id],
@@ -318,8 +322,7 @@ async fn audio_bytes_are_uploaded_to_audio_api_and_errors_are_real() {
     assert!(voice::transcribe(&c, audio.clone(), "audio/wav")
         .await
         .is_err());
-    c.save_setting(
-        "voice",
+    c.save_global_setting(GlobalSetting::MachinePreference("voice"),
         &VoiceConfig {
             endpoint: format!("http://{addr}/v1/audio/transcriptions"),
             model: "test-stt".into(),
@@ -417,8 +420,7 @@ async fn stopping_host_cancels_a_stalled_request_and_releases_both_leases() {
         axum::serve(listener, router).await.unwrap();
     });
     let a = context(&dir.path().join("a"), "test-alpha-token-long");
-    a.save_setting(
-        "team-sync",
+    a.save_global_setting(GlobalSetting::TeamConfiguration("team-sync"),
         &TeamConfig {
             team: "alpha".into(),
             endpoint: format!("http://{addr}"),

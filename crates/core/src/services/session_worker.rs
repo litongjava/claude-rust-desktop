@@ -66,6 +66,9 @@ pub struct Worker {
 pub enum Request {
     Ping,
     RuntimeStatus,
+    Bind { identity: String },
+    GetBinding { generation: u64 },
+    SetBinding { binding: crate::native_engine::session_binding::BindingSnapshot },
     SetPermissionMode {
         job_id: String,
         mode: String,
@@ -90,6 +93,13 @@ pub enum Request {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Reply {
     pub ok: bool,
+    /// Present on Ping replies from hosts that implement Bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_supported: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<crate::native_engine::session_binding::BindingSnapshot>,
     pub job_id: Option<String>,
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +119,9 @@ impl Reply {
     pub fn ok(id: Option<String>) -> Self {
         Self {
             ok: true,
+            binding_supported: None,
+            generation_supported: None,
+            snapshot: None,
             job_id: id,
             error: None,
             permission_mode: None,
@@ -122,6 +135,9 @@ impl Reply {
     pub fn error(error: impl ToString) -> Self {
         Self {
             ok: false,
+            binding_supported: None,
+            generation_supported: None,
+            snapshot: None,
             job_id: None,
             error: Some(error.to_string()),
             permission_mode: None,
@@ -184,10 +200,7 @@ pub struct SettledSession {
 pub fn settle_session(root: &Path, session: &str) -> Result<SettledSession> {
     let recovered = recover_session(root, session)?;
     let mut active = None;
-    for job in jobs::list(root, None)? {
-        if job.session_id != session {
-            continue;
-        }
+    for job in jobs::executing_in(root, session)? {
         if !matches!(job.status.as_str(), "starting" | "running" | "unresponsive") {
             continue;
         }
@@ -467,12 +480,33 @@ fn socket_endpoint(id: &str, bases: impl IntoIterator<Item = PathBuf>) -> Option
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+pub fn worker_session(worker: &Worker) -> Result<crate::db::session_store::SessionDb> {
+    let address: crate::db::session_store::HistoryAddress = serde_json::from_slice(
+        &fs::read(directory(worker).join("session-owner.json"))
+            .context("Worker lacks a recorded session")?,
+    )?;
+    ensure!(
+        address.session == worker.session_id,
+        "Worker session changed"
+    );
+    crate::db::session_store::Stores::open(&worker.root)?.resume_history(&address)
+}
+
 pub async fn ensure_worker(
     root: &Path,
     executable: &Path,
     session: &str,
     workspace: &Path,
 ) -> Result<Worker> {
+    let selected = if root.join("global.db").try_exists()? {
+        Some(crate::db::session_store::Stores::open(root)?.open_session(session)?)
+    } else {
+        None
+    };
+    let _owner = selected
+        .as_ref()
+        .map(|s| s.hold_incarnation())
+        .transpose()?;
     let base = worker_path(root, session)?;
     fs::create_dir_all(&base)?;
     // Serialize recovery and startup across frontends. OS releases this lock on exit.
@@ -486,7 +520,12 @@ pub async fn ensure_worker(
                 // stopped, start a new worker instead of reporting the old exit.
                 if !worker.child_pid.is_some_and(recovery::exited) {
                     match wait_ready(worker.clone()).await {
-                        Ok(ready) => return Ok(ready),
+                        Ok(ready) => {
+                            if root.join("global.db").try_exists()? {
+                                worker_session(&ready)?;
+                            }
+                            return Ok(ready);
+                        }
                         Err(error) if read_worker(&directory(&worker))?.status != "stopped" => {
                             return Err(error)
                         }
@@ -504,6 +543,9 @@ pub async fn ensure_worker(
     let mut claim = SessionClaim::acquire(root, session, &id)?;
     let dir = worker_path(root, session)?.join(&id);
     fs::create_dir_all(&dir)?;
+    if let Some(owner) = &selected {
+        jobs::save(&dir.join("session-owner.json"), &owner.address())?;
+    }
     let endpoint = worker_endpoint(&id)?;
     let worker = Worker {
         id,
@@ -620,6 +662,16 @@ fn startup_failure(error: Option<&str>, dir: &Path) -> String {
 }
 
 pub fn begin_job(worker: &Worker, id: &str, prompt: &str) -> Result<Job> {
+    begin_job_with_target(worker, id, prompt, None)
+}
+
+pub fn begin_job_with_target(
+    worker: &Worker,
+    id: &str,
+    prompt: &str,
+    child: Option<&crate::db::session_store::SessionDb>,
+) -> Result<Job> {
+    let _publication = jobs::job_publication_fence(&worker.root, false)?;
     let active = directory(worker).join("active.json");
     if active.exists() {
         // A finished job's marker is stale: its owner is only about to remove it.
@@ -653,23 +705,78 @@ pub fn begin_job(worker: &Worker, id: &str, prompt: &str) -> Result<Job> {
         error: None,
         launched: true,
     };
+    jobs::JobOwners::publish(&worker.root, &job)?;
+    if let Some(child) = child {
+        record_job_child(&worker.root, id, child)?;
+    }
     jobs::save(&dir.join("state.json"), &job)?;
     fs::File::create(dir.join("output.jsonl"))?;
     jobs::save(&active, &id)?;
     Ok(job)
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum JobChild {
+    Bound { id: String, incarnation: String },
+    Legacy(String),
+}
+
+pub fn record_job_child(
+    root: &Path,
+    job: &str,
+    child: &crate::db::session_store::SessionDb,
+) -> Result<()> {
+    jobs::save(
+        &jobs::directory(root, job)?.join("owned-child.json"),
+        &JobChild::Bound {
+            id: child.id().to_owned(),
+            incarnation: child.incarnation().to_owned(),
+        },
+    )
+}
+
+pub(crate) fn job_child(root: &Path, job: &Job) -> Result<Option<JobChild>> {
+    job_child_by_id(root, &job.id)
+}
+
+fn job_child_by_id(root: &Path, id: &str) -> Result<Option<JobChild>> {
+    match fs::read(jobs::directory(root, id)?.join("owned-child.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+pub(crate) fn recorded_job_child(root: &Path, id: &str) -> Result<Option<(String, String)>> {
+    match job_child_by_id(root, id)? {
+        Some(JobChild::Bound { id, incarnation }) => Ok(Some((id, incarnation))),
+        Some(JobChild::Legacy(_)) => anyhow::bail!("Child lacks recorded incarnation for job {id}"),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn bound_child_for_job(root: &Path, job: &Job) -> Result<Option<(String, String)>> {
+    match job_child(root, job)? {
+        Some(JobChild::Bound { id, incarnation }) => Ok(Some((id, incarnation))),
+        Some(JobChild::Legacy(_)) => anyhow::bail!("Owned child has no recorded incarnation"),
+        None => Ok(None),
+    }
+}
+
 /// The durable target lets historical task attachments avoid changing the owner UI state.
 pub fn job_execution_session(root: &Path, job: &Job) -> Result<String> {
-    let path = jobs::directory(root, &job.id)?.join("owned-child.json");
-    match fs::read(path) {
-        Ok(bytes) => {
-            let id: String = serde_json::from_slice(&bytes)?;
+    jobs::authorize_attachment(root, job, &job.session_id)?;
+    recorded_job_target(root, job)
+}
+
+pub(crate) fn recorded_job_target(root: &Path, job: &Job) -> Result<String> {
+    match job_child(root, job)? {
+        Some(JobChild::Bound { id, .. } | JobChild::Legacy(id)) => {
             ensure!(uuid::Uuid::parse_str(&id).is_ok(), "Invalid owned child job target");
             Ok(id)
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(job.session_id.clone()),
-        Err(error) => Err(error.into()),
+        }
+        None => Ok(job.session_id.clone()),
     }
 }
 /// Remove the active marker only while it still belongs to `id`, so an old
@@ -701,22 +808,29 @@ pub async fn finish_job(worker: &Worker, id: &str, error: Option<String>) -> Res
 pub async fn shutdown(root: &Path, session: &str) -> Result<()> {
     recover_session(root, session)?;
     if let Some(worker) = current(root, session)? {
-        if worker.status != "stopped" {
-            call(&worker, &Request::Shutdown).await?;
-            tokio::time::timeout(Duration::from_secs(10), async {
-                loop {
-                    if read_worker(&directory(&worker))?.status == "stopped"
-                        && worker.supervisor_pid.is_none_or(recovery::exited)
-                        && worker.child_pid.is_none_or(recovery::exited)
-                    {
-                        return Ok::<_, anyhow::Error>(());
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+        shutdown_worker(&worker).await?;
+    }
+    Ok(())
+}
+
+/// Retire the observed incarnation. A concurrently created successor owns a
+/// different endpoint and directory.
+pub async fn shutdown_worker(worker: &Worker) -> Result<()> {
+    if worker.status != "stopped" {
+        call(worker, &Request::Shutdown).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if read_worker(&directory(worker))?.status == "stopped"
+                    && worker.supervisor_pid.is_none_or(recovery::exited)
+                    && worker.child_pid.is_none_or(recovery::exited)
+                {
+                    return Ok::<_, anyhow::Error>(());
                 }
-            })
-            .await
-            .context("Session worker shutdown timed out")??;
-        }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .context("Session worker shutdown timed out")??;
     }
     Ok(())
 }
@@ -1373,6 +1487,32 @@ mod active_marker_tests {
     }
     fn active(worker: &Worker) -> String {
         serde_json::from_slice(&fs::read(directory(worker).join("active.json")).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn idle_job_records_the_child_selected_before_retirement() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let worker = prepare(root.path());
+        let stores = crate::db::session_store::Stores::open(root.path())?;
+        stores.create(&worker.session_id, Default::default())?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let retained = stores.create(&id, Default::default())?;
+        retained.delete()?;
+        let replacement = stores.create(&id, Default::default())?;
+        let job_id = uuid::Uuid::new_v4().to_string();
+        let job = begin_job_with_target(&worker, &job_id, "wake", Some(&retained))?;
+        let Some(JobChild::Bound {
+            id: target,
+            incarnation,
+        }) = job_child(root.path(), &job)?
+        else {
+            anyhow::bail!("Missing idle child identity");
+        };
+        assert_eq!(target, id);
+        assert_eq!(incarnation, retained.incarnation());
+        assert_ne!(incarnation, replacement.incarnation());
+        assert!(jobs::authorize_attachment(root.path(), &job, &worker.session_id).is_err());
+        Ok(())
     }
 
     #[test]

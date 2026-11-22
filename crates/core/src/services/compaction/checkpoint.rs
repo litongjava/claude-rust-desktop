@@ -1,7 +1,10 @@
 //! Completed summary requests are reusable; only compaction::commit installs history.
-use crate::{db::DbManager, native_engine::provider_manager::ResolvedProvider};
+use crate::{
+    db::session_store::{RecordingPolicies, SessionAccess, SessionRepository},
+    native_engine::provider_manager::ResolvedProvider,
+};
 use anyhow::Result;
-use rusqlite::OptionalExtension;
+
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -18,14 +21,20 @@ fn digest(value: &serde_json::Value) -> String {
         .collect()
 }
 
+pub(crate) fn config_fingerprint(provider: &ResolvedProvider, system: &str) -> String {
+    digest(
+        &json!({"version":3,"provider":provider.provider,"model":provider.model,"effort":provider.model.effort,"system":system}),
+    )
+}
+
 #[derive(Serialize, Deserialize)]
-struct Saved {
-    fingerprint: String,
-    completed: BTreeMap<String, String>,
+pub(crate) struct Saved {
+    pub(crate) fingerprint: String,
+    pub(crate) completed: BTreeMap<String, String>,
 }
 
 pub(crate) struct Checkpoint<'a> {
-    db: &'a DbManager,
+    repo: SessionRepository<'a>,
     pub session: &'a str,
     pub options: crate::native_engine::request_options::RequestOptions,
     saved: Saved,
@@ -33,7 +42,7 @@ pub(crate) struct Checkpoint<'a> {
 
 impl<'a> Checkpoint<'a> {
     pub fn open(
-        db: &'a DbManager,
+        db: &'a (impl SessionAccess + RecordingPolicies),
         session: &'a str,
         provider: &ResolvedProvider,
         system: &str,
@@ -44,26 +53,15 @@ impl<'a> Checkpoint<'a> {
         // completed request is already identified by its own exact request key.
         // Version 3 separates that request key from the configuration domain so
         // unchanged fragments survive a later turn; earlier layouts are dropped.
-        let fingerprint = digest(
-            &json!({"version":3,"provider":provider.provider,"model":provider.model,"effort":provider.model.effort,"system":system}),
-        );
-        let value: Option<String> = db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT value FROM peripheral_settings WHERE key=?1",
-                [key(session)],
-                |r| r.get(0),
-            )
-            .optional()
-        })??;
-        let saved = value
-            .and_then(|v| serde_json::from_str::<Saved>(&v).ok())
-            .filter(|v| v.fingerprint == fingerprint)
-            .unwrap_or_else(|| Saved {
-                fingerprint,
-                completed: BTreeMap::new(),
-            });
+        let fingerprint = config_fingerprint(provider, system);
+        let repo = db.select_session(session)?;
+        let completed = repo.checkpoint_fragments(&fingerprint)?;
+        let saved = Saved {
+            fingerprint,
+            completed,
+        };
         Ok(Self {
-            db,
+            repo,
             session,
             saved,
             options: crate::native_engine::request_options::RequestOptions::from_db(
@@ -87,9 +85,9 @@ impl<'a> Checkpoint<'a> {
     }
 
     pub fn save(&mut self, request: String, summary: String) -> Result<()> {
+        self.repo
+            .save_checkpoint_fragment(&self.saved.fingerprint, &request, &summary)?;
         self.saved.completed.insert(request, summary);
-        let value = serde_json::to_string(&self.saved)?;
-        self.db.with_conn(|conn| conn.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key(self.session), value]))??;
         Ok(())
     }
 }
@@ -104,6 +102,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();
+        db.create("session", Default::default()).unwrap();
+        db.create("other", Default::default()).unwrap();
         let provider = crate::native_engine::provider_manager::ProviderManager::in_memory(vec![serde_json::from_value(json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"secret-fixture-key","api_format":"openai","enabled":true,"models":[{"id":"gpt-6-astra","name":"m","enabled":true,"max_tokens":8192,"supports_web_search":false}]})).unwrap()], dir.path().join("providers.json")).resolve_selected("p", "gpt-6-astra").unwrap();
         let request = Checkpoint::request_key("system", "fragment", 4096);
         Checkpoint::open(&db, "session", &provider, "system")
@@ -138,10 +138,10 @@ mod tests {
             .get(&request)
             .is_none());
         let value: String = db
-            .with_conn(|c| {
+            .fixture_shard("session", |c| {
                 c.query_row(
-                    "SELECT value FROM peripheral_settings WHERE key=?1",
-                    [key("session")],
+                    "SELECT fingerprint || request_key || summary FROM compaction_checkpoint",
+                    [],
                     |r| r.get(0),
                 )
             })
@@ -155,22 +155,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();
+        db.create("session", Default::default()).unwrap();
+        db.create("other", Default::default()).unwrap();
         let provider = crate::native_engine::provider_manager::ProviderManager::in_memory(vec![serde_json::from_value(json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"secret-fixture-key","api_format":"openai","enabled":true,"models":[{"id":"gpt-6-astra","name":"m","enabled":true,"max_tokens":8192,"supports_web_search":false}]})).unwrap()], dir.path().join("providers.json")).resolve_selected("p", "gpt-6-astra").unwrap();
         let request = Checkpoint::request_key("system", "fragment", 4096);
         // A version 1 fingerprint is what the earlier strategy stored.
         let fingerprint = digest(
             &json!({"version":1,"provider":provider.provider,"model":provider.model,"effort":provider.model.effort,"system":"system","input":"history"}),
         );
-        let stale =
-            json!({"fingerprint":fingerprint,"completed":{ request.clone(): "Stale summary" }});
-        db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                [key("session"), stale.to_string()],
-            )
-        })
-        .unwrap()
-        .unwrap();
+        db.fixture_shard("session", |c| c.execute(
+            "INSERT INTO compaction_checkpoint VALUES(?1,?2,'Stale summary')", [&fingerprint,&request]
+        )).unwrap().unwrap();
         assert!(
             Checkpoint::open(&db, "session", &provider, "system")
                 .unwrap()
@@ -208,6 +203,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();
+        db.create("session", Default::default()).unwrap();
+        db.create("other", Default::default()).unwrap();
         let provider = crate::native_engine::provider_manager::ProviderManager::in_memory(vec![serde_json::from_value(json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"fixture","api_format":"openai","enabled":true,"models":[{"id":"gpt-6-astra","name":"m","enabled":true,"max_tokens":8192,"supports_web_search":false}]})).unwrap()], dir.path().join("providers.json")).resolve_selected("p", "gpt-6-astra").unwrap();
         let request = Checkpoint::request_key("system", "fragment", 4096);
         Checkpoint::open(&db, "session", &provider, "system")
@@ -234,9 +231,9 @@ mod tests {
         store.append(&id, "assistant", "Progress").unwrap();
         store
             .db
-            .with_conn(|c| {
+            .fixture_shard(&id, |c| {
                 c.execute(
-                    "INSERT INTO peripheral_settings(key,value) VALUES(?1,'{}')",
+                    "INSERT INTO compaction_checkpoint VALUES(?1,'request','summary')",
                     [key(&id)],
                 )
             })
@@ -246,9 +243,9 @@ mod tests {
         super::super::commit(&store.db, prepared, "Final summary").unwrap();
         let remaining: i64 = store
             .db
-            .with_conn(|c| {
+            .fixture_shard(&id, |c| {
                 c.query_row(
-                    "SELECT COUNT(*) FROM peripheral_settings WHERE key=?1",
+                    "SELECT COUNT(*) FROM compaction_checkpoint WHERE fingerprint=?1",
                     [key(&id)],
                     |r| r.get(0),
                 )

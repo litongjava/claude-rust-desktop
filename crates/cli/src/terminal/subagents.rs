@@ -1,4 +1,6 @@
 //! Read-only session-family browser shared by idle and running terminal views.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use deepseek_code_core::services::ServiceContext;
 use std::{
@@ -9,6 +11,7 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct Entry {
     pub id: String,
+    address: Option<crate::background_commands::HistoryAddress>,
     pub label: String,
     pub current: bool,
 }
@@ -16,27 +19,20 @@ pub(crate) struct Entry {
 pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result<Vec<Entry>> {
     let peers = deepseek_code_core::services::session_messages::session_peers(context, session)?;
     let mut background = std::collections::HashMap::new();
-    context.db.with_conn(|conn| -> anyhow::Result<()> {
-        let mut query = conn
-            .prepare("SELECT value FROM peripheral_settings WHERE key LIKE 'background-agent.%'")?;
-        for raw in query.query_map([], |row| row.get::<_, String>(0))? {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw?) {
-                if let Some(id) = value["session_id"].as_str() {
-                    background.insert(id.to_owned(), value);
-                }
-            }
-        }
-        Ok(())
-    })??;
+    for (_,value) in context.db.background_agents(None,None)? {
+        if let Some(id)=value["session_id"].as_str(){ background.insert(id.to_owned(),value); }
+    }
     let mut entries = Vec::new();
     for peer in peers {
         let Some(id) = peer["id"].as_str() else {
             continue;
         };
+        let child = context.db.open_recorded(id, peer["incarnation"].as_str().ok_or_else(|| anyhow::anyhow!("Missing peer incarnation"))?)?;
+        let _guard = child.hold_incarnation()?;
         let record = context
-            .setting::<serde_json::Value>(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .or_else(|| background.remove(id));
-        let description = context.setting::<String>(&format!("agent-description.{id}"))?;
+        let description = context.child_description(&id)?;
         let kind = record
             .as_ref()
             .and_then(|v| v["agent_type"].as_str())
@@ -59,6 +55,7 @@ pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result
             )
         };
         entries.push(Entry {
+            address: Some(child.address()),
             id: id.into(),
             label: label.chars().filter(|ch| !ch.is_control()).collect(),
             current: id == session,
@@ -72,6 +69,7 @@ pub(crate) fn entries(context: &ServiceContext, session: &str) -> anyhow::Result
     });
     if entries.is_empty() {
         entries.push(Entry {
+            address: None,
             id: session.into(),
             label: "Main [default]".into(),
             current: true,
@@ -86,6 +84,7 @@ pub(crate) struct View {
     entries: Vec<Entry>,
     selected: usize,
     watching: bool,
+    watched: Option<crate::background_commands::HistoryAddress>,
     scroll: usize,
     text: String,
     history: super::scrollback::Scrollback,
@@ -100,6 +99,7 @@ impl View {
     pub(crate) fn new(context: ServiceContext, session: String) -> Self {
         let entries = entries(&context, &session).unwrap_or_else(|error| {
             vec![Entry {
+                address: None,
                 id: session.clone(),
                 label: format!("Main · {error}"),
                 current: true,
@@ -111,6 +111,7 @@ impl View {
             entries,
             selected: 0,
             watching: false,
+            watched: None,
             scroll: 0,
             text: String::new(),
             history: Default::default(),
@@ -123,7 +124,7 @@ impl View {
     }
 
     pub(crate) fn enter(&mut self) -> io::Result<()> {
-        crossterm::execute!(io::stderr(), crossterm::terminal::EnterAlternateScreen)?;
+        crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::EnterAlternateScreen)?;
         self.entered = true;
         Ok(())
     }
@@ -132,6 +133,7 @@ impl View {
         if self.entries[self.selected].current {
             return true;
         }
+        self.watched = self.entries[self.selected].address.clone();
         self.watching = true;
         self.scroll = 0;
         self.text.clear();
@@ -223,10 +225,10 @@ impl View {
                     .unwrap_or(0);
                 self.entries = entries;
             }
-            if self.watching {
+            if let Some(address) = self.watched.as_ref().filter(|_| self.watching) {
                 let history = crate::background_commands::agent_transcript(
                     &self.context,
-                    &self.entries[self.selected].id,
+                    address,
                 );
                 let text = history.all().join("\n");
                 if text != self.text {
@@ -311,7 +313,7 @@ impl View {
             return Ok(());
         }
         self.last_frame.clone_from(&output);
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         out.write_all(output.as_bytes())?;
         out.flush()
     }
@@ -320,7 +322,7 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         if self.entered {
-            let _ = crossterm::execute!(io::stderr(), crossterm::terminal::LeaveAlternateScreen);
+            let _ = crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::LeaveAlternateScreen);
         }
     }
 }
@@ -338,10 +340,11 @@ mod tests {
         let store = SessionStore::new(context.db.clone());
         let parent = store.create(temp.path(), "fixture", "fixture").unwrap();
         let child = store.fork(&parent).unwrap();
+        crate::fixture_sql::register_child(&store.db,&parent,&child);
         let unrelated = store.fork(&parent).unwrap();
-        context.save_setting(&format!("delegation.{child}"), &serde_json::json!({"session_id":child,"parent_session_id":parent,"agent_type":"general","status":"completed","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
+        context.db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"session_id":child,"parent_session_id":parent,"agent_type":"general","status":"completed","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
         context
-            .save_setting(&format!("agent-description.{child}"), &"Inspect child")
+            .db.seed_preference(&child, deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Inspect child")
             .unwrap();
         store.append(&child, "user", "CHILD_USER_SENTINEL").unwrap();
         let assistant = store
@@ -357,7 +360,7 @@ mod tests {
             .join("\n");
         context
             .db
-            .with_conn(|conn| {
+            .shard_sql(&child, |conn| {
                 deepseek_code_core::db::message_repo::insert_tool_call(
                     conn,
                     "child-tool",
@@ -396,7 +399,7 @@ mod tests {
         ))));
         assert!(view.watching);
         assert_eq!(view.entries[view.selected].id, child);
-        let body = crate::background_commands::agent_execution(&context, &child);
+        let body = crate::background_commands::agent_execution(&context, &context.db.open_session(&child).unwrap().address());
         assert!(body.contains(&format!(
             "{} CHILD_USER_SENTINEL",
             crate::terminal::prompt_glyph()
@@ -423,7 +426,7 @@ mod tests {
         display.before_text("MAIN_TRANSCRIPT_SENTINEL\n");
         super::super::title::start();
         let mut notifications = super::super::scrollback::Scrollback::default();
-        super::super::prompt_display::write_recorded(&mut io::stderr(), &mut notifications,
+        super::super::prompt_display::write_recorded(&mut crate::terminal_output::stderr(), &mut notifications,
             "<task-notification>\n<summary>Agent NOTICE_SENTINEL completed</summary>\n</task-notification>", 130, true).unwrap();
         notifications.save();
         display.queued_delivered("<task-notification>\n<summary>Agent INTERNAL_NOTICE completed</summary>\n</task-notification>");
@@ -442,7 +445,7 @@ mod tests {
         editor.set_subagents(context, parent);
         editor.set_agent_rows(Box::new(|| {
             vec![crate::background_commands::Agent {
-                session_id: "fixture-background".into(),
+                address: crate::background_commands::HistoryAddress {session: "fixture-background".into(), store: String::new(), incarnation: String::new()},
                 agent_type: "general".into(),
                 description: "RUNNING_BACKGROUND_SENTINEL".into(),
                 started_ms: chrono::Utc::now().timestamp_millis() as u64,

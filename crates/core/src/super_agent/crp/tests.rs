@@ -7,7 +7,7 @@ use std::sync::Arc;
 struct Fixture {
     _temp: tempfile::TempDir,
     data: PathBuf,
-    db: Arc<DbManager>,
+    db: Arc<crate::db::session_store::Stores>,
     runtime: ToolRuntime,
     router: String,
     coder: String,
@@ -765,4 +765,63 @@ fn finalizing_accepts_only_the_current_final_delivery_review_and_harness() {
     )
     .unwrap();
     assert!(harness["report_id"].is_string(), "{harness}");
+}
+
+#[test]
+fn router_operations_require_the_task_creation_incarnation() -> anyhow::Result<()> {
+    let fixture = Fixture::new();
+    let task = fixture.task();
+    let store = fixture.store();
+    let approval = store.request_approval(
+        "approval",
+        &task.task_id,
+        crate::super_agent::store::ApprovalDraft {
+            source_session_id: fixture.coder.clone(),
+            parent_session_id: fixture.router.clone(),
+            request_type: ApprovalType::Plan,
+            request: json!({}),
+            task_spec_version: 1,
+            permission_policy_version: 1,
+        },
+    )?;
+    store.ingest_event(
+        &task.task_id,
+        NewEvent {
+            session_id: None,
+            run_id: None,
+            event_type: EventType::DiscoveryCompleted,
+            causation_id: None,
+            operation_id: "pending".into(),
+            payload: json!({}),
+        },
+    )?;
+    fixture.db.open_session(&fixture.router)?.delete()?;
+    fixture.db.create(&fixture.router, Default::default())?;
+    role::set(&fixture.db, &fixture.router, Role::Router)?;
+    assert!(store.list_tasks(&fixture.router, None)?.is_empty());
+    assert!(store
+        .process_pending(&fixture.router, &Default::default())?
+        .is_empty());
+    for (name, input) in [
+        ("CrpShow", json!({"task_id":task.task_id})),
+        (
+            "CrpUpdateSpec",
+            json!({"task_id":task.task_id,"spec":fixture.spec()}),
+        ),
+        (
+            "CrpAnswer",
+            json!({"approval_id":approval.approval_id,"decision":"approved"}),
+        ),
+        ("CrpCreate", json!({"spec":fixture.spec()})),
+    ] {
+        assert!(
+            execute(&fixture.runtime, name, input, "create-1").is_err(),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        store.approval(&approval.approval_id)?.unwrap().status,
+        ApprovalStatus::Pending
+    );
+    Ok(())
 }

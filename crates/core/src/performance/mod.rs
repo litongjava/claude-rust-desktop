@@ -1,6 +1,7 @@
 //! Shared transport policy. Retries end before a response stream is exposed.
 mod request_failure;
 
+use crate::db::session_store::GlobalSetting;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -766,32 +767,82 @@ pub fn apply_conversation_cache(body: &mut serde_json::Value) {
 
 /// A UTF-8 byte budget including the omission marker, retaining both ends.
 pub fn head_tail_preview(text: &str, limit: usize) -> String {
+    preview_with_ranges(text, limit).0
+}
+
+pub(crate) mod command_lines;
+pub(crate) mod command_output;
+pub(crate) use command_output::LONG_COMMAND_OUTPUT_BYTES;
+
+/// The source ranges preserved by a head/tail preview, with their positions
+/// in the rendered text. Synthetic presentation markers have no source range.
+#[derive(Clone)]
+pub(crate) struct PreviewRanges {
+    pub(crate) head: std::ops::Range<usize>,
+    pub(crate) tail: std::ops::Range<usize>,
+    pub(crate) tail_offset: usize,
+}
+
+impl PreviewRanges {
+    pub(crate) fn whole(len: usize) -> Self {
+        Self {
+            head: 0..len,
+            tail: len..len,
+            tail_offset: len,
+        }
+    }
+
+    pub(crate) fn parts(&self) -> [(std::ops::Range<usize>, usize); 2] {
+        [
+            (self.head.clone(), 0),
+            (self.tail.clone(), self.tail_offset),
+        ]
+    }
+
+    pub(crate) fn kept(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+}
+
+pub(crate) fn preview_with_ranges(text: &str, limit: usize) -> (String, PreviewRanges) {
     if text.len() <= limit {
-        return text.to_owned();
+        return (text.to_owned(), PreviewRanges::whole(text.len()));
     }
     let marker = format!(
         "\n... (output truncated; {} bytes before preview) ...\n",
         text.len()
     );
     if limit < marker.len() {
-        return "...".chars().take(limit).collect();
+        return ("...".chars().take(limit).collect(), PreviewRanges::whole(0));
     }
     let budget = limit - marker.len();
-    let mut head = budget / 2;
-    while !text.is_char_boundary(head) {
-        head -= 1;
-    }
-    let mut tail = text.len() - (budget - budget / 2);
-    while !text.is_char_boundary(tail) {
-        tail += 1;
-    }
-    format!("{}{}{}", &text[..head], marker, &text[tail..])
+    let head = text.floor_char_boundary(budget / 2);
+    let tail = text.ceil_char_boundary(text.len() - (budget - budget / 2));
+    (
+        format!("{}{}{}", &text[..head], marker, &text[tail..]),
+        PreviewRanges {
+            head: 0..head,
+            tail: tail..text.len(),
+            tail_offset: head + marker.len(),
+        },
+    )
 }
 
+pub(crate) const MODEL_TOOL_OUTPUT_BYTES: usize = 16_000;
+
 pub fn retain_tool_output(root: &std::path::Path, output: &str, preview: &str) -> String {
-    const LIMIT: usize = 16_000;
-    if output == preview && output.len() <= LIMIT {
-        return output.to_string();
+    retain_tool_output_with_ranges(root, output, preview, MODEL_TOOL_OUTPUT_BYTES).0
+}
+
+/// No preview ranges are returned if persisting fails and the full original is used.
+pub(crate) fn retain_tool_output_with_ranges(
+    root: &std::path::Path,
+    output: &str,
+    preview: &str,
+    limit: usize,
+) -> (String, Option<PreviewRanges>) {
+    if output == preview && output.len() <= limit {
+        return (output.to_string(), Some(PreviewRanges::whole(output.len())));
     }
     let persist = || -> std::io::Result<std::path::PathBuf> {
         use std::io::Write;
@@ -824,12 +875,10 @@ pub fn retain_tool_output(root: &std::path::Path, output: &str, preview: &str) -
                 output.len(),
                 path.display()
             );
-            format!(
-                "{}{note}",
-                head_tail_preview(preview, LIMIT.saturating_sub(note.len()))
-            )
+            let (text, ranges) = preview_with_ranges(preview, limit.saturating_sub(note.len()));
+            (format!("{text}{note}"), Some(ranges))
         }
-        Err(_) => output.to_string(), // Never discard the only complete copy.
+        Err(_) => (output.to_string(), None), // Keep the only complete copy.
     }
 }
 
@@ -860,7 +909,7 @@ pub fn configure_router(
     config: &RouterConfig,
 ) -> Result<()> {
     validate_router(ctx, config)?;
-    ctx.save_setting("performance.router", config)
+    ctx.save_global_setting(GlobalSetting::MachinePreference("performance.router"), config)
 }
 pub fn simple_turn(text: &str) -> bool {
     let text = text.trim();
@@ -971,15 +1020,23 @@ mod tests {
         assert!(body["messages"][2]["content"][1].get("cache_control").is_none());
 
         // The per-session tail moves after the first user message where accepted.
-        let composed = crate::prompt::compose_system_prompt_in(None, crate::prompt::PromptProfile::Code, Some(std::path::Path::new("/w")));
+        let composed = crate::prompt::compose_system_prompt_in(Some("custom rule"), crate::prompt::PromptProfile::Code);
         let (fixed, tail) = crate::prompt::split_tail(&composed).unwrap();
-        assert!(tail.starts_with("# Environment") && tail.contains("Primary working directory: /w") && !fixed.contains("Primary working directory"));
+        assert!(tail.starts_with("<additional_instructions>") && tail.contains("custom rule") && !tail.contains("# Working environment"));
+        assert!(!fixed.contains("custom rule"));
         let mut moved = serde_json::json!({"system":composed,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]});
         move_system_tail(&mut moved);
         assert_eq!(moved["system"], fixed.as_str());
         assert_eq!(moved["messages"][1], serde_json::json!({"role":"system","content":tail}));
         apply_conversation_cache(&mut moved);
         assert!(moved["system"].as_array().unwrap().iter().all(|block| block["cache_control"]["type"] == "ephemeral"));
+        // A system prompt with no per-request tail is left where it is.
+        let plain = crate::prompt::compose_system_prompt_in(None, crate::prompt::PromptProfile::Code);
+        assert!(crate::prompt::split_tail(&plain).is_none() && !plain.contains("# Working environment"));
+        let mut untouched = serde_json::json!({"system":plain,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"ok"}]});
+        move_system_tail(&mut untouched);
+        assert_eq!(untouched["system"], plain);
+        assert_eq!(untouched["messages"].as_array().unwrap().len(), 2);
         let mut chat = serde_json::json!({"messages":[{"role":"system","content":composed},{"role":"user","content":"hi"}]});
         move_system_tail_chat(&mut chat);
         assert_eq!(chat["messages"][0]["content"], fixed.as_str());

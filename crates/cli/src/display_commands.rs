@@ -2,57 +2,20 @@
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::runtime::RuntimePaths;
-use serde::{Deserialize, Serialize};
+use deepseek_code_core::db::session_store::settings::DISPLAY;
 use serde_json::{json, Value};
 use std::path::Path;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Settings {
-    pub theme: String,
-    pub color: String,
-    pub focus: bool,
-    pub output_style: String,
-    pub statusline: Option<String>,
-    pub tui: String,
-    pub diff_panel: bool,
-    pub diff_staged: bool,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            theme: "dark".into(),
-            color: "default".into(),
-            focus: false,
-            output_style: "default".into(),
-            tui: "default".into(),
-            statusline: None,
-            diff_panel: false,
-            diff_staged: false,
-        }
-    }
-}
+pub use deepseek_code_core::db::session_store::settings::Display as Settings;
 
 pub fn load(session: &Session) -> Result<Settings> {
-    let mut settings = session.store.db.with_conn(|conn| -> Result<Settings> {
-        let mut stmt = conn.prepare("SELECT value FROM peripheral_settings WHERE key=?1")?;
-        let mut rows = stmt.query([format!("cli.display.{}", session.id)])?;
-        Ok(match rows.next()? {
-            Some(row) => serde_json::from_str(&row.get::<_, String>(0)?)?,
-            None => Settings::default(),
-        })
-    })??;
+    let mut settings = session.selected_session()?.repository().preference(DISPLAY)?.unwrap_or_default();
     if let Some(global) = deepseek_code_core::services::statusline_setup::load(&session.paths.data_dir)? { settings.statusline = global.command; }
     Ok(settings)
 }
 
 fn save(session: &Session, settings: &Settings) -> Result<()> {
-    let value = serde_json::to_string(settings)?;
-    session.store.db.with_conn(|conn| conn.execute(
-        "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        [format!("cli.display.{}", session.id), value],
-    ))??;
+    session.selected_session()?.repository().set_preference(DISPLAY,Some(settings))?;
     crate::terminal::style::configure(&settings.theme, &settings.color);
     Ok(())
 }
@@ -397,11 +360,7 @@ pub async fn handle(
 }
 
 pub fn usage(session: &Session) -> Result<Value> {
-    session.store.db.with_conn(|conn| -> Result<Value> {
-        Ok(conn.query_row("SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(total_duration_ms) FROM model_requests WHERE conversation_id=?1", [&session.id], |row| {
-            Ok(json!({"session_id":session.id,"requests":row.get::<_,i64>(0)?,"input_tokens":row.get::<_,Option<i64>>(1)?,"output_tokens":row.get::<_,Option<i64>>(2)?,"cache_read_tokens":row.get::<_,Option<i64>>(3)?,"cache_write_tokens":row.get::<_,Option<i64>>(4)?,"duration_ms":row.get::<_,Option<i64>>(5)?}))
-        })?)
-    })?
+    Ok(session.selected_session()?.repository().usage_totals(&[])?.0)
 }
 
 /// Quotes group arguments; backslashes remain literal for Windows paths.

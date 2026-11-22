@@ -24,8 +24,6 @@ pub use user_content::{image_block_from_file, image_media_type, normalize_user_c
 
 /// Default data directory under the user's home.
 pub const DATA_DIR_NAME: &str = ".deepseek-code";
-/// SQLite database shared by the CLI and Desktop inside the data directory.
-pub const DATABASE_FILE: &str = "deepseek_code.db";
 /// Explicit data directory override.
 pub const DATA_DIR_ENV: &str = "DEEPSEEK_CODE_DATA_DIR";
 
@@ -57,36 +55,16 @@ impl RuntimePaths {
         resolve_default_data_dir()
     }
 
-    pub fn open_database(&self) -> Result<Arc<DbManager>> {
-        // Keep one initialized pool per data directory while any host owns it.
-        // Status polling must not create pool threads or rerun migrations.
-        static DATABASES: std::sync::OnceLock<
-            std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<std::sync::Mutex<std::sync::Weak<DbManager>>>>>,
-        > = std::sync::OnceLock::new();
-        std::fs::create_dir_all(&self.data_dir)?;
-        let path = self.data_dir.canonicalize()?.join(DATABASE_FILE);
-        let slot = {
-            let mut databases = DATABASES
-                .get_or_init(Default::default)
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // Drop slots nobody else holds whose pool is gone. Checking the Arc count
-            // first means a slot being initialized by another thread is never locked here.
-            databases.retain(|_, slot| {
-                Arc::strong_count(slot) > 1
-                    || slot.lock().map(|db| db.strong_count() > 0).unwrap_or(true)
-            });
-            databases.entry(path.clone()).or_default().clone()
-        };
-        // Only callers of this same directory wait for its creation and migrations.
-        let mut cached = slot.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(db) = cached.upgrade() {
-            return Ok(db);
-        }
-        let db = Arc::new(DbManager::new(path).context("Opening shared database pool")?);
-        db.init().context("Initializing shared database schema")?;
-        *cached = Arc::downgrade(&db);
-        Ok(db)
+    pub fn open_stores(&self) -> Result<crate::db::session_store::Stores> {
+        crate::db::session_store::Stores::open(&self.data_dir)
+    }
+
+    pub fn list_published_sessions(&self) -> Result<Vec<conversation_repo::ConversationRow>> {
+        crate::db::session_store::Stores::list_published(&self.data_dir)
+    }
+
+    pub fn open_database(&self) -> Result<Arc<crate::db::session_store::Stores>> {
+        Ok(self.open_stores()?.host_handle())
     }
 
     /// Read without silently discarding malformed configuration or creating defaults.
@@ -120,6 +98,7 @@ impl RuntimePaths {
 /// One mapping for Desktop's saved configuration and the standalone CLI.
 pub fn provider_from_config(p: &ProviderConfig) -> Provider {
     Provider {
+        lease: None,
         id: p.id.clone(),
         name: p.name.clone(),
         base_url: p.base_url.clone(),
@@ -158,18 +137,31 @@ pub fn provider_from_config(p: &ProviderConfig) -> Provider {
 
 pub fn create_engine(
     paths: &RuntimePaths,
-    db: Arc<DbManager>,
+    db: Arc<crate::db::session_store::Stores>,
     providers: Arc<Mutex<ProviderManager>>,
     permissions: Arc<PermissionManager>,
     cache: Arc<FileCache>,
 ) -> NativeEngine {
-    NativeEngine::new(
+    let engine = NativeEngine::new(
         providers,
         db,
         paths.data_dir.join("workspaces"),
         permissions,
         cache,
-    )
+    );
+    // Old frozen files belong to abandoned sessions. Scan off the request path
+    // so engine startup and the first request are not delayed. A session that is
+    // starting now writes files with the current time, so the age check keeps it.
+    let prune_root = paths.data_dir.clone();
+    let _ = std::thread::Builder::new()
+        .name("session-file-prune".to_owned())
+        .spawn(move || {
+            crate::prompt::prune_session_files(
+                &prune_root,
+                crate::prompt::SESSION_FILE_MAX_AGE,
+            )
+        });
+    engine
 }
 
 pub fn default_permissions() -> Arc<PermissionManager> {
@@ -178,14 +170,22 @@ pub fn default_permissions() -> Arc<PermissionManager> {
 
 /// Whole-transaction retry budget for session writes, matching turn writes.
 ///
-/// The pooled connection keeps its 5 s `busy_timeout`; this deadline only bounds
-/// how long the boundary keeps retrying a typed writer conflict after that.
+/// The contention budget includes SQLite lock acquisition and retry backoff.
 const SESSION_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Sessions use the same project trust, Code prompt and SQLite schema as Desktop.
-pub struct SessionStore {
-    pub db: Arc<DbManager>,
+pub struct SessionStore<D = crate::db::session_store::Stores> {
+    pub db: Arc<D>,
 }
+
+impl<D> SessionStore<D> {
+    pub fn new(db: Arc<D>) -> Self {
+        Self { db }
+    }
+}
+
+#[path = "runtime_sessions.rs"]
+mod sessions;
 
 #[cfg(test)]
 mod identity_tests {
@@ -205,10 +205,69 @@ mod identity_tests {
     }
 }
 
-impl SessionStore {
-    pub fn new(db: Arc<DbManager>) -> Self {
-        Self { db }
+pub(crate) fn replay_history(
+    conn: &rusqlite::Connection,
+    id: &str,
+    format: &ApiFormat,
+    native: impl Fn(&str) -> Result<Option<Value>>,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let mut history = Vec::new();
+    let messages = message_repo::get_messages_by_conversation(conn, id)?;
+    let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
+    let boundary = messages
+        .get(start)
+        .filter(|m| m.is_compact_boundary)
+        .map(|m| m.id.clone());
+    for message in messages.into_iter().skip(start) {
+        if let Some(native) = native(&message.id)? {
+            history.push(json!({"role":message.role,"content":message.content,"provider_content":native}));
+            continue;
+        }
+        let mut calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
+        // Nested ToolScript calls are history, not provider protocol:
+        // the provider never emitted their ids, so replaying them would
+        // fabricate an assistant tool_use with no matching requested
+        // call. Their rows stay visible to transcript/display readers.
+        let nested =
+            crate::services::tool_history::nested_ids_for_message(conn, &message.id)?;
+        calls.retain(|tool| !nested.contains(&tool.id));
+        if message.role == "assistant" && !calls.is_empty() {
+            match format {
+                ApiFormat::OpenAI => {
+                    let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
+                    history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
+                    for tool in &calls { history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)})); }
+                    for tool in &calls {
+                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { history.push(json!({"role":"user","content":note})); }
+                    }
+                }
+                ApiFormat::Anthropic => {
+                    let blocks: Vec<_> = calls.iter().map(|t| json!({"type":"tool_use","id":t.id,"name":t.name,"input":t.input.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!({}))})).collect();
+                    history.push(json!({"role":"assistant","content":blocks}));
+                    let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.output.is_none()})).collect();
+                    // Approval notes follow the results as the user's own text.
+                    for tool in &calls {
+                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
+                    }
+                    history.push(json!({"role":"user","content":results}));
+                }
+            }
+            for tool in &calls {
+                for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
+                    history.push(input.model_message());
+                }
+            }
+        }
+        use rusqlite::OptionalExtension;
+        let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
+        if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
+        else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
     }
+    crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
+    Ok((history, boundary))
+}
+
+impl SessionStore<DbManager> {
 
     pub fn create(&self, workspace: &Path, model: &str, provider: &str) -> Result<String> {
         self.create_with_id(workspace, model, provider, &uuid::Uuid::new_v4().to_string())
@@ -361,15 +420,21 @@ impl SessionStore {
     /// Copy bindings atomically so agent restrictions and worktrees survive clear.
     pub fn clear(&self, id: &str) -> Result<String> {
         self.resume(id)?;
-        self.derive_empty(id, None)
+        self.derive_empty(id, None, uuid::Uuid::new_v4().to_string(), |_, _| Ok(()))
     }
 
     /// Derive a child without converting Desktop modes/private folders into Code projects.
     pub fn derive_owned_child(&self, id: &str, workspaces_root: &Path, expected_cwd: &Path) -> Result<String> {
-        self.derive_empty(id, Some((workspaces_root, expected_cwd)))
+        self.derive_empty(id, Some((workspaces_root, expected_cwd)), uuid::Uuid::new_v4().to_string(), |_, _| Ok(()))
     }
 
-    fn derive_empty(&self, id: &str, owned: Option<(&Path, &Path)>) -> Result<String> {
+    pub fn clear_with(&self, id: &str, new_id: String, initialize: impl FnOnce(&rusqlite::Connection, &str) -> Result<()>) -> Result<String> {
+        self.resume(id)?;
+        self.derive_empty(id, None, new_id, initialize)
+    }
+
+    fn derive_empty(&self, id: &str, owned: Option<(&Path, &Path)>, new_id: String,
+        initialize: impl FnOnce(&rusqlite::Connection, &str) -> Result<()>) -> Result<String> {
         self.db.with_conn(|conn| -> Result<String> {
             let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
             let source = conversation_repo::get_conversation(&tx, id)?.context("Session not found")?;
@@ -379,7 +444,6 @@ impl SessionStore {
                 let actual = crate::native_engine::workspace::resolve_workspace(&tx, root, id, None)?.0;
                 ensure!(actual.canonicalize()? == expected.canonicalize()?, "Parent runtime workspace differs from its persisted binding");
             }
-            let new_id = uuid::Uuid::new_v4().to_string();
             let now = chrono::Utc::now().to_rfc3339();
             conversation_repo::insert_conversation(
                 &tx, &new_id, Some("CLI session"), source.model.as_deref(),
@@ -408,6 +472,7 @@ impl SessionStore {
                 ensure!(actual.canonicalize()? == expected.canonicalize()?, "Child workspace differs from its parent binding");
             }
             if owned.is_some() { crate::services::permission_authority::inherit_conn(&tx, id, &new_id)?; }
+            initialize(&tx, &new_id)?;
             tx.commit()?;
             Ok(new_id)
         })?
@@ -434,62 +499,9 @@ impl SessionStore {
         id: &str,
         format: &ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
-        self.db.with_conn(|conn| -> Result<_> {
-            let mut history = Vec::new();
-            let messages = message_repo::get_messages_by_conversation(conn, id)?;
-            let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
-            let boundary = messages
-                .get(start)
-                .filter(|m| m.is_compact_boundary)
-                .map(|m| m.id.clone());
-            for message in messages.into_iter().skip(start) {
-                if let Some(native) = crate::services::compaction::native::load(conn, &message.id)? {
-                    history.push(json!({"role":message.role,"content":message.content,"provider_content":native}));
-                    continue;
-                }
-                let mut calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
-                // Nested ToolScript calls are history, not provider protocol:
-                // the provider never emitted their ids, so replaying them would
-                // fabricate an assistant tool_use with no matching requested
-                // call. Their rows stay visible to transcript/display readers.
-                let nested =
-                    crate::services::tool_history::nested_ids_for_message(conn, &message.id)?;
-                calls.retain(|tool| !nested.contains(&tool.id));
-                if message.role == "assistant" && !calls.is_empty() {
-                    match format {
-                        ApiFormat::OpenAI => {
-                            let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
-                            history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
-                            for tool in &calls { history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)})); }
-                            for tool in &calls {
-                                if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { history.push(json!({"role":"user","content":note})); }
-                            }
-                        }
-                        ApiFormat::Anthropic => {
-                            let blocks: Vec<_> = calls.iter().map(|t| json!({"type":"tool_use","id":t.id,"name":t.name,"input":t.input.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!({}))})).collect();
-                            history.push(json!({"role":"assistant","content":blocks}));
-                            let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.output.is_none()})).collect();
-                            // Approval notes follow the results as the user's own text.
-                            for tool in &calls {
-                                if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
-                            }
-                            history.push(json!({"role":"user","content":results}));
-                        }
-                    }
-                    for tool in &calls {
-                        for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
-                            history.push(input.model_message());
-                        }
-                    }
-                }
-                use rusqlite::OptionalExtension;
-                let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
-                if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
-                else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
-            }
-            crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
-            Ok((history, boundary))
-        })?
+        self.db.with_conn(|conn| replay_history(conn, id, format, |message| {
+            crate::services::compaction::native::load(conn, message)
+        }))?
     }
 
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {
@@ -608,8 +620,8 @@ mod database_cache_tests {
         let data_a = root.path().join("a");
         std::fs::create_dir_all(&data_a).unwrap();
         // Hold the write lock so opening directory A stays busy for a while.
-        let blocker = rusqlite::Connection::open(data_a.join(DATABASE_FILE)).unwrap();
-        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let blocker=std::fs::File::create(data_a.join(".session-bootstrap")).unwrap();
+        blocker.lock().unwrap();
         let began = Instant::now();
         let slow = {
             let data_a = data_a.clone();
@@ -625,7 +637,7 @@ mod database_cache_tests {
             "opening another directory took {elapsed:?} while A was initializing"
         );
         std::thread::sleep(Duration::from_secs(2).saturating_sub(began.elapsed()));
-        blocker.execute_batch("COMMIT").unwrap();
+        blocker.unlock().unwrap();
         assert!(slow.join().unwrap().is_ok());
     }
 

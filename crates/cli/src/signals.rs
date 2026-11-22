@@ -2,11 +2,10 @@
 //! supervisor asks this process to stop.
 //!
 //! Ctrl-C stays a turn-level interruption, as before, and can interrupt a
-//! later turn again. SIGTERM and SIGHUP take the same cooperative cancellation
-//! path and then end the process with a failure status, so the active turn can
-//! cancel its owned work (process trees, hooks, agent children) before the
-//! runtime shuts down. A signal is never handled by exiting the process
-//! directly: destructors of the running turn must still run.
+//! later turn again. SIGTERM, SIGHUP and terminal loss request cooperative
+//! cancellation and a failure status. The active turn cancels its owned work
+//! (process trees, hooks, agent children) and runs its destructors before the
+//! runtime shuts down.
 //!
 //! Every platform publishes signals through the same generation channel, so
 //! the call sites behave alike: Windows Ctrl-C is delivered exactly like a
@@ -79,8 +78,7 @@ struct SignalState {
     sender: watch::Sender<u64>,
     /// Kept alive so the channel never closes while the process runs.
     _receiver: watch::Receiver<u64>,
-    /// Set by SIGTERM and SIGHUP: these stop the process rather than only the
-    /// current turn.
+    /// SIGTERM, SIGHUP and terminal loss stop the process after turn cleanup.
     terminating: AtomicBool,
 }
 
@@ -333,10 +331,73 @@ pub async fn interrupted() {
     }
 }
 
-/// True after SIGTERM or SIGHUP: the process should exit nonzero once the
-/// active turn has cancelled its owned work.
+/// A one-shot command has no earlier turn whose interrupt can be ignored.
+pub(crate) fn received_signal() -> bool {
+    LISTENER.get().and_then(|listener| listener.as_ref().ok())
+        .is_some_and(|state| state.is_terminating() || *state.sender.borrow() != 0)
+}
+
+/// True once termination is requested. Safe to check from a terminal reader
+/// thread, which must never install the async listener itself.
 pub fn terminating() -> bool {
-    try_listener().is_ok_and(|state| state.is_terminating())
+    LISTENER
+        .get()
+        .and_then(|listener| listener.as_ref().ok())
+        .is_some_and(|state| state.is_terminating())
+}
+
+pub(crate) fn notify_terminal_loss() {
+    if let Some(Ok(state)) = LISTENER.get() {
+        if !state.is_terminating() {
+            state.notify(true);
+        }
+    }
+}
+
+#[cfg(unix)]
+static WATCHING_INPUT: AtomicBool = AtomicBool::new(false);
+
+/// Check exceptional conditions without reading input. A plain prompt can
+/// reach EOF before the periodic watcher runs, so it checks here on exit.
+#[cfg(unix)]
+pub(crate) fn check_terminal_hangup() -> bool {
+    use std::os::fd::AsRawFd;
+    if !WATCHING_INPUT.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut fd = libc::pollfd {
+        fd: std::io::stdin().as_raw_fd(),
+        events: 0,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+    let disconnected =
+        ready > 0 && fd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+    if disconnected {
+        notify_terminal_loss();
+    }
+    disconnected
+}
+
+/// Interactive stdin can disappear without a SIGHUP (for example when it
+/// is a PTY slave that was never made the controlling terminal). Detect
+/// hangup even while the REPL is running work with no active input reader.
+#[cfg(unix)]
+pub(crate) fn watch_terminal() {
+    let Ok(state) = try_listener() else {
+        return;
+    };
+    WATCHING_INPUT.store(true, Ordering::Release);
+    tokio::spawn(async move {
+        let termination = state.termination();
+        tokio::pin!(termination);
+        while !check_terminal_hangup() {
+            tokio::select! {
+                _ = &mut termination => break,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+        }
+    });
 }
 
 /// Resolves only for a signal that ends the process.

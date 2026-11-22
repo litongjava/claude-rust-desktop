@@ -35,6 +35,7 @@ async fn research_start_handler(State(state): State<AppState>, Json(req): Json<C
         if let Some(cm) = cm_guard.as_ref() {
             cm.get_config().providers.iter().map(|p| {
                 crate::native_engine::provider_manager::Provider {
+                    lease: None,
                     id: p.id.clone(),
                     builtin_id: p.settings.get("builtinId").and_then(|v| v.as_str()).map(String::from),
                     name: p.name.clone(),

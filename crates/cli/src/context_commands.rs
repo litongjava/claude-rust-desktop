@@ -125,7 +125,7 @@ fn render(request: Option<deepseek_code_core::services::context_usage::LastReque
 /// What the first request would hold: the base system prompt, the project
 /// instructions, the built-in tool definitions and saved history.
 fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core::services::context_usage::LastRequest> {
-    let system = deepseek_code_core::prompt::compose_system_prompt_in(None, deepseek_code_core::prompt::PromptProfile::Code, Some(&session.workspace));
+    let system = deepseek_code_core::prompt::compose_system_prompt_in(None, deepseek_code_core::prompt::PromptProfile::Code);
     let mut history = session.store.model_history(&session.id, &deepseek_code_core::native_engine::provider_manager::ApiFormat::Anthropic)?;
     // The engine puts instructions at the start of the first user message.
     let reminders = deepseek_code_core::project_instructions::load_all(
@@ -145,7 +145,7 @@ fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core
     let mut usage = deepseek_code_core::native_engine::request_context::ContextUsage::from_body("anthropic-messages", &body, window, 0);
     // The engine's full system prompt and tool list barely change between
     // sessions; a recent measured request estimates them better.
-    let recent = session.store.db.with_conn(|conn| deepseek_code_core::db::conversation_repo::list_conversations(conn))??;
+    let recent = session.store.db.conversations()?;
     for row in recent.iter().filter(|row| row.id != session.id).take(20) {
         if let Some(measured) = deepseek_code_core::services::context_usage::last_request(&session.store.db, &row.id)?.and_then(|request| request.usage) {
             usage.instructions = measured.instructions;
@@ -154,8 +154,8 @@ fn estimate(session: &Session, window: Option<u64>) -> Result<deepseek_code_core
         }
     }
     Ok(deepseek_code_core::services::context_usage::LastRequest {
-        model: session.model.clone(),
-        provider: Some(session.provider_id.clone()),
+        model: session.binding_state().model.clone(),
+        provider: Some(session.binding_state().provider_id.clone()),
         started_at_ms: None,
         status: "estimate".into(),
         usage: Some(usage),

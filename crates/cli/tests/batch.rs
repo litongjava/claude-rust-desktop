@@ -1,4 +1,7 @@
 //! Real detached CLI supervisors and workers against a local model fixture.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{extract::State, routing::post, Router};
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
@@ -73,10 +76,10 @@ async fn exercise(cancel: bool) {
     let denied = r#"{"Bash":"Deny"}"#;
     store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&parent, |conn| {
             conn.execute(
                 "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                [format!("cli.permissions.{parent}"), denied.into()],
+                ["cli.permissions".to_owned(), denied.into()],
             )
         })
         .unwrap()
@@ -92,7 +95,8 @@ async fn exercise(cancel: bool) {
             })
             .collect(),
     };
-    let plan = batch::create(&root, &parent, &repo, "Inspect modules", proposal).unwrap();
+    let owner = store.db.open_session(&parent).unwrap();
+    let plan = batch::create(&root, &owner, &repo, "Inspect modules", proposal).unwrap();
     let fixture = Fixture {
         active: Arc::new(AtomicUsize::new(0)),
         peak: Arc::new(AtomicUsize::new(0)),
@@ -126,6 +130,7 @@ async fn exercise(cancel: bool) {
     batch::start(
         &root,
         &plan.id,
+        &owner,
         launch,
         2,
         false,
@@ -135,16 +140,16 @@ async fn exercise(cancel: bool) {
     let started = Instant::now();
     let mut cancelled = false;
     let result = loop {
-        let state = batch::get(&root, &plan.id).unwrap();
+        let state = batch::get(&root, &plan.id, &owner).unwrap();
         if cancel && !cancelled && fixture.calls.load(Ordering::SeqCst) > 0 {
-            batch::cancel(&root, &plan.id).unwrap();
+            batch::cancel(&root, &plan.id, &owner).unwrap();
             cancelled = true;
         }
         if !matches!(state.status.as_str(), "running" | "unresponsive") {
             break state;
         }
         if started.elapsed() > Duration::from_secs(40) {
-            let _ = batch::cancel(&root, &plan.id);
+            let _ = batch::cancel(&root, &plan.id, &owner);
             panic!("batch timed out: {state:?}");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -185,10 +190,10 @@ async fn exercise(cancel: bool) {
         if let Some(session) = &worker.session_id {
             let value: String = store
                 .db
-                .with_conn(|conn| {
+                .shard_sql(session, |conn| {
                     conn.query_row(
                         "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [format!("cli.permissions.{session}")],
+                        ["cli.permissions".to_owned()],
                         |row| row.get(0),
                     )
                 })
@@ -234,9 +239,10 @@ async fn worker_failures_are_reported_and_the_batch_fails() {
     let paths = RuntimePaths::new(root.clone()).unwrap();
     let store = SessionStore::new(paths.open_database().unwrap());
     let parent = store.create(&repo, "fixture-model", "cli-runtime").unwrap();
+    let owner = store.db.open_session(&parent).unwrap();
     let plan = batch::create(
         &root,
-        &parent,
+        &owner,
         &repo,
         "Fail workers",
         Proposal {
@@ -286,6 +292,7 @@ async fn worker_failures_are_reported_and_the_batch_fails() {
     batch::start(
         &root,
         &plan.id,
+        &owner,
         launch,
         2,
         false,
@@ -294,12 +301,12 @@ async fn worker_failures_are_reported_and_the_batch_fails() {
     .unwrap();
     let started = Instant::now();
     let result = loop {
-        let state = batch::get(&root, &plan.id).unwrap();
+        let state = batch::get(&root, &plan.id, &owner).unwrap();
         if !matches!(state.status.as_str(), "running" | "unresponsive") {
             break state;
         }
         if started.elapsed() > Duration::from_secs(90) {
-            let _ = batch::cancel(&root, &plan.id);
+            let _ = batch::cancel(&root, &plan.id, &owner);
             panic!("batch timed out: {state:?}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -72,27 +72,16 @@ async fn launch(
     paths: &RuntimePaths,
     session: &Session,
 ) -> Result<(WorkerLaunch, Vec<(String, String)>)> {
-    let provider = session.selected_provider().await?;
+    let provider = session.launch_provider().await?;
     let mut arguments = vec![
         "--data-dir".into(),
         paths.data_dir.to_string_lossy().into_owned(),
         "--provider".into(),
-        session.provider_id.clone(),
+        session.binding_state().provider_id.clone(),
         "--model".into(),
-        session.model.clone(),
+        session.binding_state().model.clone(),
     ];
-    if provider.provider.builtin_id.is_none() {
-        arguments.extend([
-            "--base-url".into(),
-            provider.provider.base_url.clone(),
-            "--api-format".into(),
-            match provider.provider.api_format {
-                deepseek_code_core::native_engine::provider_manager::ApiFormat::Anthropic => "anthropic",
-                deepseek_code_core::native_engine::provider_manager::ApiFormat::OpenAI => "openai",
-            }
-            .into(),
-        ]);
-    }
+    arguments.extend(provider.provider.child_transport_arguments());
     let mut environment = Vec::new();
     if !provider.provider.api_key.is_empty() {
         arguments.extend(["--api-key-env".into(), "CLAUDE_BATCH_API_KEY".into()]);
@@ -101,8 +90,15 @@ async fn launch(
             provider.provider.api_key.clone(),
         ));
     }
-    if let Some(effort) = provider.model.effort.as_ref().or(cli.effort.as_ref()) {
-        arguments.extend(["--effort".into(), effort.clone()]);
+    if let Some(effort) = crate::session_commands::effective_effort(session, session.admitted_launch_options(cli).and_then(|args| args.effort.as_deref()).or(provider.model.effort.as_deref()))?
+    {
+        arguments.extend(["--effort".into(), effort]);
+    }
+    if let Some(limit) = session.admitted_launch_options(cli).and_then(|args| args.max_tokens).or(provider.model.max_tokens) {
+        arguments.extend(["--max-tokens".into(), limit.to_string()]);
+    }
+    for rule in &cli.disallowed_tools {
+        arguments.push(format!("--disallowed-tools={rule}"));
     }
     if let Some(turns) = cli.max_turns {
         arguments.extend(["--max-turns".into(), turns.to_string()]);
@@ -115,8 +111,8 @@ async fn launch(
         WorkerLaunch {
             executable: std::env::current_exe()?,
             arguments,
-            model: session.model.clone(),
-            provider: session.provider_id.clone(),
+            model: session.binding_state().model.clone(),
+            provider: session.binding_state().provider_id.clone(),
             permission_mode: session.permission_mode().into(),
         },
         environment,
@@ -133,11 +129,13 @@ pub async fn handle(
     if command != "/batch" {
         return Ok(false);
     }
+    let parent = session.selected_session()?;
+    let _guard = parent.hold_incarnation()?;
     let argument = argument.trim();
     let mut words = argument.split_whitespace();
     match words.next() {
         None | Some("list") => {
-            for batch in batch::list(&paths.data_dir, &session.id)? {
+            for batch in batch::list(&paths.data_dir, &parent)? {
                 display(&batch);
             }
             if argument.is_empty() {
@@ -147,7 +145,7 @@ pub async fn handle(
         Some("show" | "cancel" | "logs") => {
             let action = argument.split_whitespace().next().unwrap();
             let id = words.next().context("A batch ID is required")?;
-            let state = batch::get(&paths.data_dir, id)?;
+            let state = batch::get(&paths.data_dir, id, &parent)?;
             ensure!(
                 state.parent_session_id == session.id,
                 "Resume the batch's originating session to manage it"
@@ -155,7 +153,7 @@ pub async fn handle(
             match action {
                 "cancel" => {
                     ensure!(words.next().is_none(), "Usage: /batch cancel ID");
-                    batch::cancel(&paths.data_dir, id)?;
+                    batch::cancel(&paths.data_dir, id, &parent)?;
                     command_eprintln!("Cancellation requested; inspect /batch show {id} for confirmed completion.");
                 }
                 "logs" => {
@@ -175,6 +173,12 @@ pub async fn handle(
                         .job_id
                         .as_deref()
                         .context("This worker has not started")?;
+                    let record = background_sessions::get(&paths.data_dir, job)?;
+                    let _participants = background_sessions::hold_owned_attachment(
+                        &paths.data_dir,
+                        &record,
+                        &session.selected_session()?,
+                    )?;
                     let (output, error) = background_sessions::output(&paths.data_dir, job)?;
                     command_println!("{output}");
                     command_eprintln!("{error}");
@@ -189,7 +193,7 @@ pub async fn handle(
             let id = words.next().context(
                 "Usage: /batch run ID [--concurrency N] [--permission-mode MODE] [--publish]",
             )?;
-            let state = batch::get(&paths.data_dir, id)?;
+            let state = batch::get(&paths.data_dir, id, &parent)?;
             ensure!(
                 state.parent_session_id == session.id,
                 "Resume the batch's originating session before running it"
@@ -217,6 +221,7 @@ pub async fn handle(
             let batch = batch::start(
                 &paths.data_dir,
                 id,
+                &parent,
                 launch,
                 concurrency,
                 publish,
@@ -232,7 +237,7 @@ pub async fn handle(
             let planner_id =
                 session
                     .store
-                    .create(&workspace, &session.model, &session.provider_id)?;
+                    .create(&workspace, &session.binding_state().model, &session.binding_state().provider_id)?;
             crate::session_commands::copy_settings(&session.store.db, &session.id, &planner_id)?;
             if let Some(agent) =
                 deepseek_code_core::services::agents::for_session(&session.store.db, &session.id)?
@@ -284,7 +289,7 @@ pub async fn handle(
             );
             display(&batch::create(
                 &paths.data_dir,
-                &session.id,
+                &parent,
                 &workspace,
                 instruction,
                 proposal,

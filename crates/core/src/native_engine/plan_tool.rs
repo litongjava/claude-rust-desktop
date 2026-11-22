@@ -509,6 +509,7 @@ mod tests {
         for name in ["EnterPlanMode"] {
             for answer in [Some("yes"), Some("no"), None] {
                 let root = tempfile::tempdir().unwrap();
+                crate::services::session_messages::context(root.path()).unwrap().db.create("child",Default::default()).unwrap();
                 let parent = crate::runtime::default_permissions();
                 parent.set_mode(PermissionMode::AskPermissions);
                 parent.set_session_rules(
@@ -615,7 +616,7 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             let context = crate::services::session_messages::context(root.path()).unwrap();
-            context.db.with_conn(|conn|conn.execute("INSERT INTO conversations(id,created_at,updated_at) VALUES('plan-session','','')",[])).unwrap().unwrap();
+            context.db.create("plan-session", Default::default()).unwrap();
             let manager = crate::runtime::default_permissions();
             manager.set_mode(PermissionMode::BypassPermissions);
             let provider = ResolvedProvider {
@@ -729,7 +730,7 @@ mod tests {
     ) {
         crate::config::OrchestrationConfig::init_global().unwrap();
         let context = crate::services::session_messages::context(root).unwrap();
-        context.db.with_conn(|conn|conn.execute("INSERT INTO conversations(id,created_at,updated_at) VALUES('file-session','','')",[])).unwrap().unwrap();
+        context.db.create("file-session", Default::default()).unwrap();
         let manager = crate::runtime::default_permissions();
         manager.set_mode(PermissionMode::PlanMode);
         let provider = ResolvedProvider {
@@ -845,13 +846,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (executor, _events, manager) = document_executor(root.path());
         let context = crate::services::session_messages::context(root.path()).unwrap();
-        context
-            .save_setting(
-                "delegation.file-session",
-                &json!({"parent_session_id":"old-parent"}),
-            )
-            .unwrap();
-        context.db.with_conn(|conn| conn.execute("INSERT INTO peripheral_settings(key,value) VALUES('cli.permission-mode.old-parent','bypass')", [])).unwrap().unwrap();
+        context.db.open_session("file-session").unwrap().write(|w| {
+            w.set_setting(crate::db::session_store::settings::CHILD_PROGRESS,
+                json!({"parent_session_id":"old-parent"}).as_object().unwrap())
+        }).unwrap();
+        context.db.create("old-parent", Default::default()).unwrap();
+        crate::services::session_permission_mode::set(
+            &context.db, "old-parent", &crate::runtime::default_permissions(), PermissionMode::BypassPermissions
+        ).unwrap();
         executor.sync_parent_permission_mode();
         assert_eq!(manager.get_mode(), PermissionMode::PlanMode);
         assert!(executor.delegated_parent().is_none());
@@ -863,6 +865,7 @@ mod tests {
         for denied in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let context = crate::services::session_messages::context(root.path()).unwrap();
+            context.db.create("parent-session", Default::default()).unwrap();
             let parent = crate::runtime::default_permissions();
             session_permission_mode::set(
                 &context.db,

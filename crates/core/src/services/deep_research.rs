@@ -151,12 +151,12 @@ pub struct Run {
 }
 pub struct RunGuard {
     pub run: Run,
-    context: ServiceContext,
+    history:crate::db::session_store::ExecutorHistory,
 }
 impl RunGuard {
     pub fn start(context: ServiceContext, session: &str, question: &str) -> Result<Self> {
         let value = Self {
-            context,
+            history:context.db.executor_history(session)?,
             run: Run {
                 id: format!("research-{}", uuid::Uuid::new_v4()),
                 parent_session_id: session.into(),
@@ -178,8 +178,7 @@ impl RunGuard {
         Ok(value)
     }
     pub fn save(&self) -> Result<()> {
-        self.context
-            .save_setting(&format!("workflow.{}", self.run.id), &self.run)
+        self.history.save_research_run(&self.run)
     }
     pub fn finish(&mut self, status: RunStatus) -> Result<()> {
         self.run.status = status;

@@ -312,12 +312,13 @@ fn classify_peers_distinguishes_team_subagent_and_session() {
         register_member(&data, &team.name, "lead", "alpha", None, None, "p", &cwd).unwrap();
     bind_member_session(&data, &team.name, &member.agent_id, "child").unwrap();
     register_live("child");
-    context
-        .save_setting(
-            "delegation.sub",
-            &json!({"parent_session_id":"lead","status":"completed"}),
-        )
-        .unwrap();
+    for id in ["lead","child","independent"] {
+        context.db.create(id, Default::default()).unwrap();
+    }
+    context.db.create("sub", Default::default()).unwrap().write(|w|
+        w.set_setting(crate::db::session_store::settings::CHILD_PROGRESS,
+            json!({"parent_session_id":"lead","status":"completed"}).as_object().unwrap())
+    ).unwrap();
     let mut peers = vec![
         json!({"id":"lead"}),
         json!({"id":"child"}),

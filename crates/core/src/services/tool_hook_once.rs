@@ -18,7 +18,7 @@ impl HookRunner {
                 .as_ref()
                 .map(|db| {
                     crate::native_engine::request_options::RequestOptions::from_db(
-                        db,
+                        db.as_ref(),
                         Some(session),
                         "hook",
                     )

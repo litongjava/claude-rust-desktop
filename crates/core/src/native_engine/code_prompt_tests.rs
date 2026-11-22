@@ -340,6 +340,78 @@ async fn project_only_instructions_use_two_responses_parts() {
     assert_eq!(parts[1]["text"], "hello");
 }
 
+/// The first user message opens with the stable context in order, and the
+/// environment travels as its own Responses `input_text` part.
+#[tokio::test]
+async fn environment_is_its_own_responses_part_in_first_message_order() {
+    let user = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(user.path().join("AGENTS.md"), "user marker").unwrap();
+    std::fs::write(project.path().join("AGENTS.md"), "project marker").unwrap();
+    let (user_block, project_block) = crate::project_instructions::reminder_parts(
+        &crate::project_instructions::load_all(Some(user.path()), project.path()).unwrap(),
+    );
+    let workspace = tempfile::tempdir().unwrap();
+    let mut environment = crate::prompt::environment_reminder(Some(workspace.path()));
+    crate::prompt::add_project_to_environment(
+        &mut environment,
+        "Demo",
+        &[workspace.path().to_str().unwrap()],
+    );
+    let reminders = crate::prompt::first_message_reminders(crate::prompt::SessionReminders {
+        user_instructions: user_block,
+        environment: Some(environment),
+        project_instructions: project_block,
+        standalone_frontend: true,
+        loadable_tools: Some(
+            "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
+        ),
+        available_skills: Some(
+            "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
+        ),
+        date: Some(crate::prompt::date_reminder("2026-11-19")),
+        git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
+        skills: None,
+    });
+    assert_eq!(reminders.len(), 8);
+    let body = capture_instruction_request("responses", reminders).await;
+    assert!(body["instructions"]
+        .as_str()
+        .is_none_or(|system| !system.contains("# Working environment")));
+    let first = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("the request carries the user message");
+    let parts = first["content"].as_array().unwrap();
+    assert_eq!(parts.len(), 9, "{parts:?}");
+    assert!(parts.iter().all(|part| part["type"] == "input_text"), "{parts:?}");
+    let text = |index: usize| parts[index]["text"].as_str().unwrap();
+    assert!(text(0).starts_with("<system-reminder>\n") && text(0).contains("user marker"));
+    assert!(!text(0).contains("project marker"));
+    assert!(text(1).starts_with("<system-reminder>\n# Working environment\n"));
+    assert!(text(1).contains(" - Project: Demo\n - Primary working directory: "));
+    assert!(text(1).contains(" - Platform: "));
+    assert!(text(2).starts_with("<system-reminder>\n") && text(2).contains("project marker"));
+    assert_eq!(text(3), crate::prompt::standalone_frontend_reminder());
+    assert!(text(4).starts_with("<system-reminder>\nTools you can load with ToolLoad"));
+    assert!(text(5).starts_with("<system-reminder>\nAvailable skills:"));
+    assert_eq!(text(6), crate::prompt::date_reminder("2026-11-19"));
+    assert!(text(7).starts_with("<system-reminder>\n# gitStatus"));
+    assert_eq!(text(8), "hello");
+    for index in 0..8 {
+        assert_eq!(text(index).matches("<system-reminder>").count(), 1, "{index}");
+        assert!(text(index).ends_with("</system-reminder>"), "{index}");
+    }
+    println!(
+        "first message parts: {:?}",
+        (0..9)
+            .map(|index| text(index).chars().take(150).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test]
 async fn instruction_files_become_separate_anthropic_blocks() {
     let user = tempfile::tempdir().unwrap();
@@ -614,4 +686,126 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
         message
     };
     assert_eq!(strip(&requests[0]["messages"][0]), strip(&last[0]));
+}
+
+/// The first message's tool and skill lists are frozen on the first request.
+/// Later requests and a resume read the same session files, so a changing MCP
+/// catalog or skill set never rewrites the prefix.
+#[test]
+fn first_message_tool_and_skills_lists_stay_frozen_across_requests_and_resume() {
+    use crate::prompt::{
+        date_reminder, first_message_reminders, loadable_tools_for_session,
+        skills_for_session, SessionReminders,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let builtin = vec![("ListDir".to_owned(), "List a directory.".to_owned())];
+    let mcp = vec![("mcp__gh__issue".to_owned(), "Create an issue.".to_owned())];
+    let skills = vec!["- deploy: Ship it (context: fork)".to_owned()];
+    let tools = loadable_tools_for_session(root.path(), "s", &builtin, &mcp);
+    let skill_list = skills_for_session(root.path(), "s", &skills);
+    assert!(tools.is_some() && skill_list.is_some());
+
+    let compose = |tools: Option<String>, skills: Option<String>| {
+        first_message_reminders(SessionReminders {
+            standalone_frontend: true,
+            loadable_tools: tools,
+            available_skills: skills,
+            date: Some(date_reminder("2026-11-19")),
+            git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
+            ..Default::default()
+        })
+    };
+    let first = compose(tools.clone(), skill_list.clone());
+
+    // A later request sees a different catalog and skill set, but the frozen
+    // files win and the first message is byte-for-byte unchanged.
+    let later_tools = loadable_tools_for_session(root.path(), "s", &[], &[]);
+    let later_skills =
+        skills_for_session(root.path(), "s", &["- other: Changed".to_owned()]);
+    assert_eq!(later_tools, tools);
+    assert_eq!(later_skills, skill_list);
+    assert_eq!(compose(later_tools, later_skills), first);
+
+    // A resume asks again with yet another catalog; the same session files still
+    // produce the same reminders.
+    let resumed_tools = loadable_tools_for_session(
+        root.path(),
+        "s",
+        &[("WebSearch".to_owned(), "Search the web.".to_owned())],
+        &[],
+    );
+    let resumed_skills = skills_for_session(root.path(), "s", &[]);
+    assert_eq!(compose(resumed_tools, resumed_skills), first);
+}
+
+/// Enabling a skill mid-session reports only the addition, once, on the latest
+/// user message through turn context; the first message's listing stays frozen.
+#[test]
+fn a_skill_enabled_mid_session_produces_one_change_reminder_on_the_latest_message() {
+    use crate::prompt::{changes_reminder, set_changes, skills_for_session};
+    let root = tempfile::tempdir().unwrap();
+    let first_list =
+        skills_for_session(root.path(), "s", &["- deploy: Ship it".to_owned()]).unwrap();
+    assert_eq!(
+        set_changes(root.path(), "s", "skills", &["deploy".to_owned()]),
+        (Vec::new(), Vec::new()),
+        "the first request only records the set"
+    );
+    let (new, removed) = set_changes(
+        root.path(),
+        "s",
+        "skills",
+        &["deploy".to_owned(), "lint".to_owned()],
+    );
+    assert_eq!(new, vec!["lint".to_owned()]);
+    assert!(removed.is_empty());
+    let change = changes_reminder(Vec::new(), Vec::new(), new, removed).unwrap();
+    assert_eq!(
+        change,
+        "<system-reminder>\nNew skills: lint\n</system-reminder>"
+    );
+    // The same set on the next request reports nothing.
+    let (new, removed) = set_changes(
+        root.path(),
+        "s",
+        "skills",
+        &["deploy".to_owned(), "lint".to_owned()],
+    );
+    assert!(changes_reminder(Vec::new(), Vec::new(), new, removed).is_none());
+    // The first message still carries only the frozen listing.
+    assert_eq!(
+        skills_for_session(
+            root.path(),
+            "s",
+            &["- deploy: Ship it".to_owned(), "- lint: Lint".to_owned()],
+        )
+        .as_deref(),
+        Some(first_list.as_str())
+    );
+
+    // The change reminder follows the latest user message through turn context.
+    let history = vec![
+        json!({"role":"user","content":"first"}),
+        json!({"role":"assistant","content":"ok"}),
+        json!({"role":"user","content":"second"}),
+    ];
+    let entry =
+        crate::services::turn_context::for_last(&history, vec![change.clone()]).unwrap();
+    let (tx, _rx) = mpsc::channel(8);
+    let executor = ToolLoopExecutor::new(
+        provider("http://127.0.0.1:1", "openai"),
+        history,
+        Some("BASE".into()),
+        128,
+        tx,
+        root.path().to_string_lossy().into(),
+        ReasoningMode::Standard,
+    )
+    .with_context_reminders(vec![first_list.clone()])
+    .with_turn_context(vec![entry]);
+    let additions = executor.message_additions();
+    assert_eq!(additions[0].0, vec![first_list]);
+    assert!(additions[0].1.is_empty());
+    assert!(additions[1].0.is_empty() && additions[1].1.is_empty());
+    assert_eq!(additions[2].1, vec![change]);
 }

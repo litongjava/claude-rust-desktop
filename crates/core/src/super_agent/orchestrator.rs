@@ -6,6 +6,7 @@
 //! approval, and resumes the same Coder afterwards. Every step is keyed by a
 //! durable operation or marker, so repeated ticks cannot duplicate sessions,
 //! jobs or approvals.
+use crate::db::session_store::TaskState;
 use crate::native_engine::provider_manager::ResolvedProvider;
 use crate::services::ServiceContext;
 use crate::super_agent::config::{PlanApprovalPolicy, SuperAgentConfig};
@@ -56,6 +57,7 @@ enum DeliveryJobCheck {
     Blocked(TaskRecord),
 }
 
+#[derive(Clone)]
 pub struct Orchestrator {
     pub context: ServiceContext,
     pub config: SuperAgentConfig,
@@ -91,6 +93,21 @@ impl Orchestrator {
         self
     }
 
+    /// Keep non-database effects under the same lifecycle fence as task selection.
+    /// Task stores derived by the watcher, launcher and cleanup inherit this identity.
+    pub(super) fn router_pass(&self, router: &str) -> Result<(Self, impl Drop)> {
+        let selected = self.context.db.open_session(router)?;
+        self.selected_router_pass(&selected)
+    }
+
+    fn selected_router_pass(&self, selected: &crate::db::session_store::SessionDb) -> Result<(Self, impl Drop)> {
+        let selected = self.context.db.resume_history(&selected.address())?;
+        let guard = selected.hold_incarnation()?;
+        let mut pass = self.clone();
+        pass.context.db = std::sync::Arc::new(selected.router_stores());
+        Ok((pass, guard))
+    }
+
     fn policy(&self) -> StatePolicy {
         StatePolicy {
             max_rounds: self.config.review.max_rounds,
@@ -112,15 +129,7 @@ impl Orchestrator {
     /// granted through the supported settings path. A task specification can
     /// only narrow this scope, never widen it.
     fn authorized_roots(&self, router_session: &str) -> Result<Vec<PathBuf>> {
-        let workspace: Option<String> =
-            self.context
-                .db
-                .with_conn(|conn| -> Result<Option<String>> {
-                    Ok(
-                        crate::db::conversation_repo::get_conversation(conn, router_session)?
-                            .and_then(|row| row.workspace_path),
-                    )
-                })??;
+        let workspace=self.context.db.conversation_metadata(router_session)?.and_then(|row|row.workspace_path);
         let workspace = PathBuf::from(
             workspace.context("Router session has no persisted workspace to authorize")?,
         );
@@ -146,6 +155,16 @@ impl Orchestrator {
     /// CLI/other Router hosts opt into one supervision pass before advancement.
     /// The host owns scheduling; this method never starts a resident loop.
     pub async fn tick_watched(&self, router_session: &str) -> Result<TickReport> {
+        let (pass, _guard) = self.router_pass(router_session)?;
+        pass.tick_watched_selected(router_session).await
+    }
+
+    pub async fn tick_watched_session(&self, router: &crate::db::session_store::SessionDb) -> Result<TickReport> {
+        let (pass, _guard) = self.selected_router_pass(router)?;
+        pass.tick_watched_selected(router.id()).await
+    }
+
+    async fn tick_watched_selected(&self, router_session: &str) -> Result<TickReport> {
         let Some(_lock) = crate::super_agent::watcher::lock_router(self, router_session)? else {
             return Ok(TickReport::default());
         };
@@ -171,7 +190,8 @@ impl Orchestrator {
     }
 
     pub async fn tick(&self, router_session: &str) -> Result<TickReport> {
-        self.tick_excluding(router_session, &Default::default())
+        let (pass, _guard) = self.router_pass(router_session)?;
+        pass.tick_excluding(router_session, &Default::default())
             .await
     }
 
@@ -209,8 +229,8 @@ impl Orchestrator {
                         )
                         .map_err(store_error)?;
                     let key = format!("super-agent.cleanup-pending.{}", task.task_id);
-                    if self.context.setting::<String>(&key)?.as_deref() != Some(reason.as_str()) {
-                        self.context.save_setting(&key, &reason)?;
+                    if self.context.db.task_state::<String>(&key)?.as_deref() != Some(reason.as_str()) {
+                        self.context.db.save_task_state(&key, &reason)?;
                         report
                             .warnings
                             .push(format!("{} cleanup PENDING: {reason}", task.task_id));
@@ -1626,10 +1646,10 @@ impl Orchestrator {
             "super-agent.reviewer-resume.{}.{}.{}.final-completion",
             task.task_id, task.spec_version, task.review_round
         );
-        let Some(marker) = self.context.setting::<serde_json::Value>(&key)? else {
+        let Some(marker) = self.context.db.task_state::<serde_json::Value>(&key)? else {
             // No resume was requested yet: ask the same Reviewer exactly once.
             let outcome = self.launcher().resume_finalizing_reviewer(task).await?;
-            self.context.save_setting(
+            self.context.db.save_task_state(
                 &key,
                 &serde_json::json!({
                     "session_id": outcome.session_id,
@@ -1919,14 +1939,14 @@ impl Orchestrator {
             "super-agent.resume.{}.{}.{}",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let outcome = self
             .launcher()
             .resume_coder(task, &coder_implementation_prompt(task), "implementation")
             .await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,
@@ -2018,11 +2038,11 @@ impl Orchestrator {
             "super-agent.reviewer-resume.{}.{}.{}",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let outcome = self.launcher().resume_reviewer(task).await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,
@@ -2280,7 +2300,7 @@ impl Orchestrator {
             "super-agent.resume-changes.{}.{}.{}",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let issues: Vec<String> = changes.body["issues"]
@@ -2312,7 +2332,7 @@ impl Orchestrator {
             .launcher()
             .resume_coder(task, &instruction, "changes")
             .await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,
@@ -2345,13 +2365,13 @@ impl Orchestrator {
             task.task_id, task.spec_version, task.review_round
         );
         let baselines: Vec<crate::super_agent::integration::IntegrationBaseline> =
-            match self.context.setting::<serde_json::Value>(&baseline_key)? {
+            match self.context.db.task_state::<serde_json::Value>(&baseline_key)? {
                 Some(value) => serde_json::from_value(value)
                     .context("The stored integration baseline is invalid")?,
                 None => {
                     let captured = crate::super_agent::integration::capture_baseline(task)?;
                     self.context
-                        .save_setting(&baseline_key, &serde_json::to_value(&captured)?)?;
+                        .db.save_task_state(&baseline_key, &serde_json::to_value(&captured)?)?;
                     captured
                 }
             };
@@ -2362,7 +2382,7 @@ impl Orchestrator {
         );
         if self
             .context
-            .setting::<serde_json::Value>(&resume_key)?
+            .db.task_state::<serde_json::Value>(&resume_key)?
             .is_none()
         {
             let instruction = coder_integration_prompt(task, &baselines);
@@ -2370,7 +2390,7 @@ impl Orchestrator {
                 .launcher()
                 .resume_coder(task, &instruction, "integration")
                 .await?;
-            self.context.save_setting(
+            self.context.db.save_task_state(
                 &resume_key,
                 &serde_json::json!({
                     "session_id": outcome.session_id,
@@ -2519,11 +2539,11 @@ impl Orchestrator {
             "super-agent.reviewer-resume.{}.{}.{}.final-delivery",
             task.task_id, task.spec_version, task.review_round
         );
-        if self.context.setting::<serde_json::Value>(&key)?.is_some() {
+        if self.context.db.task_state::<serde_json::Value>(&key)?.is_some() {
             return Ok(());
         }
         let outcome = self.launcher().resume_final_reviewer(task).await?;
-        self.context.save_setting(
+        self.context.db.save_task_state(
             &key,
             &serde_json::json!({
                 "session_id": outcome.session_id,

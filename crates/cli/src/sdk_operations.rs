@@ -102,10 +102,7 @@ pub fn latest_user_message(
     session: &Session,
     delivered: &std::collections::HashSet<String>,
 ) -> Result<Option<String>> {
-    let messages = session
-        .store
-        .db
-        .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &session.id))??;
+    let messages = session.selected_session()?.repository().messages()?;
     Ok(messages
         .into_iter()
         .rev()

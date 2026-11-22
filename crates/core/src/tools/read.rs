@@ -13,15 +13,16 @@ const PDF_PAGES_REQUIRED_OVER: usize = 10;
 pub fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
         name: "Read".into(),
-        description: "Reads a file from the local filesystem.\n\n- `file_path` must be an absolute path.\n- Reads up to 2000 lines by default.\n- When you already know which part of the file you need, only read that part. This can be important for larger files.\n- Results are returned using cat -n format, with line numbers starting at 1\n- Reads images (PNG, JPG, GIF, WebP) and presents them visually when the selected model accepts images. Reads PDFs as text via the `pages` parameter (e.g. \"1-5\", max 20 pages/request; required for PDFs over 10 pages). Reads Jupyter notebooks (.ipynb) as cells with outputs.\n- Reading a directory, a missing file, or an empty file returns an error or system reminder rather than content.\n- Do NOT re-read a file you just edited to verify — Edit/Write would have errored if the change failed.".into(),
+        description: "Read a file and return its text with 1-based line numbers. Text reads 2000 lines from line 1 by default; offset and limit select another range, and rendered output over 256 KiB is refused unless allow_large is true. PNG, JPEG, GIF and WebP images up to 5 MiB return as image content when the model accepts it; PDFs return page text for the pages range; .ipynb files return cells with outputs. Long base64 runs in text are replaced with a short placeholder; pass raw=true to read them unchanged. A missing path or directory is an error, and an empty file returns only a warning.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
-                "file_path": {"description": "The absolute path to the file to read", "type": "string"},
-                "offset": {"description": "The line number to start reading from. Only provide if the file is too large to read at once", "type": "integer", "minimum": 0},
-                "limit": {"description": "The number of lines to read. Only provide if the file is too large to read at once.", "type": "integer", "exclusiveMinimum": 0},
-                "pages": {"description": "Page range for PDF files (e.g., \"1-5\", \"3\", \"10-20\"). Only applicable to PDF files. Maximum 20 pages per request.", "type": "string"},
-                "allow_large": {"description": "Set to true to read a text file, or a line range of one, that is over the usual size limits, up to what still fits in your context. Only use this when you genuinely need all of it or the user asked for the whole file; otherwise read it in parts with offset and limit, or search it.", "type": "boolean"}
+                "file_path": {"description": "Path to the file; relative paths resolve against the working directory.", "type": "string"},
+                "offset": {"description": "First line to return, 1-based (0 is treated as 1); defaults to 1.", "type": "integer", "minimum": 0},
+                "limit": {"description": "Maximum lines to return; defaults to 2000 and must be greater than 0.", "type": "integer", "exclusiveMinimum": 0},
+                "pages": {"description": "PDF page range such as \"2\" or \"3-7\", at most 20 pages, required when the PDF has more than 10 pages.", "type": "string"},
+                "allow_large": {"description": "Allow text output over the 256 KiB limit; use only when the whole file is really needed.", "type": "boolean"},
+                "raw": {"description": "Return the file text without collapsing long base64 data.", "type": "boolean"}
             },
             "required": ["file_path"],
             "additionalProperties": false
@@ -30,11 +31,18 @@ pub fn definition() -> super::ToolDefinition {
 }
 
 pub fn execute(input: Value, cwd: &str) -> Result<Value> {
+    execute_bound(input, cwd, None)
+}
+pub(crate) fn execute_bound(
+    input: Value,
+    cwd: &str,
+    session: Option<&crate::db::session_store::SessionDb>,
+) -> Result<Value> {
     let file_path = input["file_path"]
         .as_str()
         .ok_or_else(|| anyhow!("file_path required"))?;
     if let Some(bytes) = crate::skills::bundled_resources::read(Path::new(file_path)) {
-        return text(std::str::from_utf8(bytes)?, &input);
+        return text(std::str::from_utf8(&bytes)?, &input);
     }
     let path = if super::screenshot_file::readable(Path::new(file_path)) {
         Path::new(file_path)
@@ -60,24 +68,30 @@ pub fn execute(input: Value, cwd: &str) -> Result<Value> {
         .and_then(|e| e.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if let Some(media_type) = image_media_type(&extension) {
-        return image(path, media_type);
-    }
-    let pages = optional_pages(&input)?;
-    if extension == "pdf" {
-        return pdf(path, pages);
-    }
-    anyhow::ensure!(pages.is_none(), "pages applies only to PDF files; omit pages for text files and use offset/limit for line ranges");
-    let content = std::fs::read_to_string(path)
-        .map_err(|error| anyhow!("Cannot read {} as UTF-8 text: {error}", path.display()))?;
-    if extension == "ipynb" {
-        if let Ok(notebook) = serde_json::from_str::<Value>(&content) {
-            return Ok(
-                json!({"content": notebook_cells(&notebook), "cells": notebook["cells"].as_array().map_or(0, Vec::len)}),
-            );
+    let render = |bytes: Vec<u8>| {
+        if let Some(media_type) = image_media_type(&extension) {
+            return image(path, media_type, &bytes);
         }
+        let pages = optional_pages(&input)?;
+        if extension == "pdf" {
+            return pdf(path, pages, &bytes);
+        }
+        anyhow::ensure!(pages.is_none(),"pages applies only to PDF files; omit pages for text files and use offset/limit for line ranges");
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|error| anyhow!("Cannot read {} as UTF-8 text: {error}", path.display()))?;
+        if extension == "ipynb" {
+            if let Ok(notebook) = serde_json::from_str::<Value>(content) {
+                return Ok(
+                    json!({"content":notebook_cells(&notebook),"cells":notebook["cells"].as_array().map_or(0,Vec::len)}),
+                );
+            }
+        }
+        text(content, &input)
+    };
+    match session {
+        Some(session) => session.render_tracked_file(path, render),
+        None => render(std::fs::read(path)?),
     }
-    text(&content, &input)
 }
 
 // Empty optional strings from model adapters are placeholders, not page ranges.
@@ -107,14 +121,32 @@ fn text(content: &str, input: &Value) -> Result<Value> {
             json!({"content": format!("<system-reminder>Warning: the file has {total_lines} lines; offset {offset} is past the end.</system-reminder>"), "lines": total_lines, "truncated": false}),
         );
     }
-    let selected: Vec<String> = lines
-        .iter()
-        .enumerate()
-        .skip(offset - 1)
-        .take(limit)
-        .map(|(i, line)| format!("{:>6}\t{}", i + 1, line))
-        .collect();
-    let rendered = selected.join("\n");
+    let (selected, collapsed): (Vec<String>, usize) = {
+        let collapse = input["raw"].as_bool() != Some(true);
+        let mut collapsed = 0;
+        let selected = lines
+            .iter()
+            .enumerate()
+            .skip(offset - 1)
+            .take(limit)
+            .map(|(i, line)| {
+                let line = if collapse {
+                    let (line, count) = super::base64_collapse::collapse(line);
+                    collapsed += count;
+                    line
+                } else {
+                    (*line).to_owned()
+                };
+                format!("{:>6}\t{}", i + 1, line)
+            })
+            .collect();
+        (selected, collapsed)
+    };
+    let mut rendered = selected.join("\n");
+    if collapsed > 0 {
+        rendered.push('\n');
+        rendered.push_str(&super::base64_collapse::note(collapsed));
+    }
     if rendered.len() > MAX_TEXT_BYTES && input["allow_large"].as_bool() != Some(true) {
         bail!("File content ({} KB) exceeds the {} KB read limit. Read it in parts with offset and limit, search it with Grep, or pass allow_large=true if you genuinely need all of it.", rendered.len() / 1024, MAX_TEXT_BYTES / 1024);
     }
@@ -134,8 +166,7 @@ fn image_media_type(extension: &str) -> Option<&'static str> {
 }
 
 /// The tool loop turns `image` into model image content when the model accepts it.
-fn image(path: &Path, media_type: &str) -> Result<Value> {
-    let bytes = std::fs::read(path)?;
+fn image(path: &Path, media_type: &str, bytes: &[u8]) -> Result<Value> {
     anyhow::ensure!(
         bytes.len() <= MAX_IMAGE_BYTES,
         "Image is {} MB; the limit is {} MB",
@@ -149,8 +180,7 @@ fn image(path: &Path, media_type: &str) -> Result<Value> {
     }))
 }
 
-fn pdf(path: &Path, pages: Option<&str>) -> Result<Value> {
-    let bytes = std::fs::read(path)?;
+fn pdf(path: &Path, pages: Option<&str>, bytes: &[u8]) -> Result<Value> {
     let texts = pdf_extract::extract_text_from_mem_by_pages(&bytes)
         .map_err(|error| anyhow!("Cannot extract PDF text from {}: {error}", path.display()))?;
     let total = texts.len();
@@ -287,6 +317,52 @@ mod tests {
         assert_eq!(image["image"]["media_type"], "image/png");
         assert_eq!(image["image"]["data"], "iVBORw==");
         assert!(execute(json!({"file_path":"a.txt","pages":"1"}), cwd).is_err());
+    }
+
+    #[test]
+    fn collapses_long_base64_and_keeps_line_numbering() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_str().unwrap();
+        let json = format!("{{\"body\":\"{}\"}}", "x".repeat(5000));
+        let blob = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let source = format!("before\n{blob}\nafter\n");
+        std::fs::write(dir.path().join("page.html"), &source).unwrap();
+        let placeholder = format!(
+            "[base64 data omitted: about {} bytes decoded, looks like JSON]",
+            json.len()
+        );
+
+        let out = execute(json!({"file_path":"page.html"}), cwd).unwrap();
+        let content = out["content"].as_str().unwrap();
+        assert_eq!(content.lines().count(), 4);
+        assert!(content.starts_with(&format!(
+            "     1\tbefore\n     2\t{placeholder}\n     3\tafter"
+        )));
+        assert!(content
+            .ends_with("(1 long base64 blocks were collapsed; read with raw: true to see them.)"));
+        assert!(!content.contains(&blob[..64]));
+        assert_eq!(out["lines"], 3);
+
+        let raw = execute(json!({"file_path":"page.html","raw":true}), cwd).unwrap();
+        assert_eq!(
+            raw["content"],
+            format!("     1\tbefore\n     2\t{blob}\n     3\tafter")
+        );
+
+        let range = execute(json!({"file_path":"page.html","offset":2,"limit":1}), cwd).unwrap();
+        let range_content = range["content"].as_str().unwrap();
+        assert!(range_content.starts_with(&format!("     2\t{placeholder}")));
+        assert!(range_content.contains("read with raw: true"));
+        assert_eq!(range["truncated"], true);
+        assert_eq!(
+            execute(
+                json!({"file_path":"page.html","offset":2,"limit":1,"raw":true}),
+                cwd
+            )
+            .unwrap()["content"],
+            format!("     2\t{blob}")
+        );
     }
 
     #[test]

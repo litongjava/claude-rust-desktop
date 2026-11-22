@@ -12,15 +12,25 @@ pub fn save_request_snapshots(
     message_id: &str,
     snapshots: &serde_json::Value,
 ) -> Result<()> {
-    let stored = store_trajectory_blobs(conn, snapshots)?;
-    conn.execute("INSERT INTO message_trajectory (message_id, requests_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET requests_json = excluded.requests_json",
-        params![message_id, serde_json::to_string(&stored)?])?;
+    let stored = save_request_trajectory(conn, message_id, snapshots)?;
     if let Some(requests) = stored.as_array() {
         for request in requests {
             super::request_repo::save_request(conn, message_id, request)?;
         }
     }
     Ok(())
+}
+
+// Forks copy normalized rows separately, including rows without request IDs.
+pub(super) fn save_request_trajectory(
+    conn: &Connection,
+    message_id: &str,
+    snapshots: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let stored = store_trajectory_blobs(conn, snapshots)?;
+    conn.execute("INSERT INTO message_trajectory (message_id, requests_json) VALUES (?1, ?2) ON CONFLICT(message_id) DO UPDATE SET requests_json = excluded.requests_json",
+        params![message_id, serde_json::to_string(&stored)?])?;
+    Ok(stored)
 }
 
 pub fn get_request_snapshots(conn: &Connection, message_id: &str) -> Result<serde_json::Value> {
@@ -133,16 +143,20 @@ pub fn load_trajectory_blobs(conn: &Connection, snapshot: &mut serde_json::Value
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageRow {
     pub id: String,
+    #[serde(alias = "conversationId")]
     pub conversation_id: String,
     pub role: String,
     pub content: String,
     pub thinking: Option<String>,
+    #[serde(alias = "createdAt")]
     pub created_at: String,
+    #[serde(default, alias = "isCompactBoundary")]
     pub is_compact_boundary: bool,
+    #[serde(alias = "sortOrder")]
     pub sort_order: i64,
 }
 
-fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
+pub(super) fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageRow> {
     Ok(MessageRow {
         id: row.get(0)?,
         conversation_id: row.get(1)?,
@@ -182,15 +196,7 @@ pub fn insert_message(
     Ok(())
 }
 
-/// Save display text and durable multimodal content inside the caller's transaction.
-pub fn save_user_message(
-    conn: &Connection,
-    id: &str,
-    conversation_id: &str,
-    content: &serde_json::Value,
-    created_at: &str,
-    sort_order: i64,
-) -> Result<()> {
+pub(super) fn prepare_user_message(content:&serde_json::Value)->Result<(String,serde_json::Value)> {
     // Keep ordinary text (including historical empty messages) compatible.
     let normalized = if content.is_string() {
         content.clone()
@@ -215,6 +221,19 @@ pub fn save_user_message(
             .collect::<Vec<_>>()
             .join("\n"),
     };
+    Ok((display,normalized))
+}
+
+/// Save display text and durable multimodal content inside the caller's transaction.
+pub fn save_user_message(
+    conn: &Connection,
+    id: &str,
+    conversation_id: &str,
+    content: &serde_json::Value,
+    created_at: &str,
+    sort_order: i64,
+) -> Result<()> {
+    let (display,normalized)=prepare_user_message(content)?;
     let changed = conn.execute(
         "INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order) VALUES (?1, ?2, 'user', ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET content = excluded.content, sort_order = excluded.sort_order WHERE messages.conversation_id = excluded.conversation_id AND messages.role = 'user'",
         params![id, conversation_id, display, created_at, sort_order],
@@ -388,6 +407,33 @@ pub fn insert_tool_call(
     is_error: bool,
     sort_order: i64,
 ) -> Result<()> {
+    upsert_tool_call(conn, id, message_id, name, input, output, is_error, sort_order)?;
+    // Legacy single-file callers save the transport under the raw provider ID.
+    // Bind the typed MCP sidecar to that durable ID in the same save operation.
+    if let Some(original) = id.strip_prefix(&format!("{message_id}:")) {
+        conn.execute(
+            "INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) \
+             SELECT conversation_id,?1,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs \
+             WHERE conversation_id=(SELECT conversation_id FROM messages WHERE id=?2) AND tool_use_id=?3 AND display_text=?4 AND is_error=?5
+             ON CONFLICT(conversation_id,tool_use_id) DO UPDATE SET content_json=excluded.content_json,metadata_json=excluded.metadata_json,
+                display_text=excluded.display_text,is_error=excluded.is_error
+             WHERE mcp_tool_outputs.display_text<>excluded.display_text OR mcp_tool_outputs.is_error<>excluded.is_error",
+            params![id,message_id,original,output,is_error],
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn upsert_tool_call(
+    conn: &Connection,
+    id: &str,
+    message_id: &str,
+    name: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+    is_error: bool,
+    sort_order: i64,
+) -> Result<()> {
     let mut stmt = conn.prepare_cached(
         "INSERT INTO tool_calls (id, message_id, name, input, output, is_error, sort_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id, name=excluded.name, input=excluded.input, output=excluded.output, is_error=excluded.is_error, sort_order=excluded.sort_order"
     )?;
@@ -400,16 +446,6 @@ pub fn insert_tool_call(
         is_error as i64,
         sort_order,
     ])?;
-    // CLI/archive rows qualify provider IDs with their assistant-message ID.
-    // Bind the typed MCP sidecar to that durable ID in the same save operation.
-    if let Some(original) = id.strip_prefix(&format!("{message_id}:")) {
-        conn.execute(
-            "INSERT OR REPLACE INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error) \
-             SELECT conversation_id,?1,content_json,metadata_json,display_text,is_error FROM mcp_tool_outputs \
-             WHERE conversation_id=(SELECT conversation_id FROM messages WHERE id=?2) AND tool_use_id=?3 AND display_text=?4 AND is_error=?5",
-            params![id,message_id,original,output,is_error],
-        )?;
-    }
     Ok(())
 }
 
@@ -512,16 +548,27 @@ pub fn save_nested_tool_row(
     Ok(())
 }
 
+pub(super) fn upsert_stream_message(
+    conn: &Connection,
+    conversation_id: &str,
+    message_id: &str,
+    content: &str,
+) -> Result<()> {
+    conn.execute("INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order)
+        VALUES (?1, ?2, 'assistant', ?3, ?4, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))
+        ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+        params![message_id, conversation_id, content, chrono::Utc::now().to_rfc3339()])?;
+    Ok(())
+}
+
 fn upsert_stream_tool_result(
     conn: &Connection,
     conversation_id: &str,
     message_id: &str,
     content: &str,
     tool: &ToolCallRow,
-) -> Result<()> {    conn.execute("INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order)
-        VALUES (?1, ?2, 'assistant', ?3, ?4, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))
-        ON CONFLICT(id) DO UPDATE SET content = excluded.content",
-        params![message_id, conversation_id, content, chrono::Utc::now().to_rfc3339()])?;
+) -> Result<()> {
+    upsert_stream_message(conn, conversation_id, message_id, content)?;
     insert_tool_call(
         conn,
         &tool.id,

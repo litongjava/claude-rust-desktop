@@ -1,12 +1,20 @@
+#[cfg(test)]
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+#[macro_use]
+mod terminal_output;
 mod request_attempts;
 mod signals;
+mod session_export;
 // Local command output shares the terminal's display-only history.
 macro_rules! command_eprintln {
     ($($arg:tt)*) => {{
         use std::io::IsTerminal as _;
         if std::io::stderr().is_terminal() {
             let _ = crate::terminal::print_recorded(&format!("{}\n", format_args!($($arg)*)));
-        } else { std::eprintln!($($arg)*); }
+        } else {
+            eprintln!($($arg)*);
+        }
     }};
 }
 macro_rules! command_println {
@@ -14,7 +22,7 @@ macro_rules! command_println {
         use std::io::IsTerminal as _;
         if std::io::stdout().is_terminal() && std::io::stderr().is_terminal() {
             let _ = crate::terminal::print_recorded(&format!("{}\n", format_args!($($arg)*)));
-        } else { std::println!($($arg)*); }
+        } else { println!($($arg)*); }
     }};
 }
 mod account_commands;
@@ -99,6 +107,9 @@ mod terminal;
 mod tool_settings;
 mod tools_menu;
 mod voice;
+mod worker_binding;
+use deepseek_code_core::db::session_store::GlobalSetting;
+use deepseek_code_core::native_engine::session_binding::store as binding_store;
 mod worker_frontend;
 mod workflow_commands;
 mod workflow_runner;
@@ -136,11 +147,15 @@ async fn reload_skill_commands(
 
 /// Prints a turn or command error once, after removing an input box a
 /// finished turn left on screen for the prompt.
-fn report_error(error: &anyhow::Error) {
-    if !worker_frontend::already_presented(error) {
+fn report_error(error: anyhow::Error) -> Result<()> {
+    if error.is::<terminal_output::StdoutWriteFailed>() {
+        return Err(error);
+    }
+    if !worker_frontend::already_presented(&error) {
         terminal::release_handoff();
         command_eprintln!("Error: {error:#}");
     }
+    Ok(())
 }
 
 /// Tool calls nest deep futures. Windows gives the main thread a small stack and
@@ -149,6 +164,11 @@ fn report_error(error: &anyhow::Error) {
 const MAIN_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 fn main() -> std::process::ExitCode {
+    cli_main(Cli::parse_with_mode_source)
+}
+
+fn cli_main(parse_cli: fn() -> Cli) -> std::process::ExitCode {
+    terminal_output::capture_terminals();
     // Internal managed-PTY roles are separate execs of this executable and must
     // run before the Tokio runtime, argument parsing or any database handle
     // exists. Nothing is printed for a normal start.
@@ -186,7 +206,7 @@ fn main() -> std::process::ExitCode {
         .name("dcl-main".into())
         .stack_size(MAIN_STACK_SIZE)
         .spawn(move || match build() {
-            Ok(runtime) => runtime.block_on(async_main()),
+            Ok(runtime) => runtime.block_on(async_main(parse_cli)),
             Err(error) => {
                 eprintln!("Starting the runtime: {error}");
                 std::process::ExitCode::FAILURE
@@ -200,7 +220,7 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-async fn async_main() -> std::process::ExitCode {
+async fn async_main(parse_cli: fn() -> Cli) -> std::process::ExitCode {
     #[cfg(windows)]
     let _console_modes = terminal::screen_mode::ConsoleModes::capture();
     // Inside a sandbox with a domain allowlist: carry the proxy, then run the command.
@@ -231,6 +251,11 @@ async fn async_main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     }
+    match worker_binding::retire_from_env().await {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => (),
+        Err(error) => { eprintln!("Worker retirement failed: {error}"); return std::process::ExitCode::FAILURE; }
+    }
     match Box::pin(persistent_worker::run_from_env()).await {
         Ok(true) => return std::process::ExitCode::SUCCESS,
         Ok(false) => {}
@@ -248,16 +273,16 @@ async fn async_main() -> std::process::ExitCode {
         eprintln!("Error: {error}");
         return std::process::ExitCode::FAILURE;
     }
-    let mut cli = Cli::parse_with_mode_source();
+    let mut cli = parse_cli();
     if cli.agent_teams {
         std::env::set_var("DEEPSEEK_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
     }
     cli.normalize();
     terminal::configure_accessibility(cli.ax_screen_reader);
     debug_logging::install(cli.verbose);
-    let result = Box::pin(run(&cli)).await;
+    let result = Box::pin(run(&mut cli)).await;
     terminal::release_handoff();
-    // A termination signal ends the process nonzero even when the interrupted
+    // A termination request ends the process nonzero even when the interrupted
     // command or prompt swallowed the turn's cancellation error.
     if signals::terminating() {
         if result.is_ok() {
@@ -303,7 +328,7 @@ async fn prompt_turn(
     result
 }
 
-async fn run(cli: &Cli) -> Result<()> {
+async fn run(cli: &mut Cli) -> Result<()> {
     if let Some(Commands::Help { topic, command }) = &cli.command {
         return help::show(topic.as_deref(), command);
     }
@@ -313,6 +338,11 @@ async fn run(cli: &Cli) -> Result<()> {
         None => deepseek_code_core::runtime::resolve_default_data_dir()?,
     };
     let paths = RuntimePaths::new(absolute(data_dir)?)?;
+    if let Some(Commands::Sessions {
+        action: SessionCommands::Export { id, output },
+    }) = &cli.command {
+        return session_export::run(&paths.data_dir, id, output.as_deref());
+    }
     // The coordination root resolves against the launch directory, before `-C`,
     // and the same absolute root is exported for every host child later.
     let launch_cwd = std::env::current_dir().ok();
@@ -494,11 +524,9 @@ async fn run(cli: &Cli) -> Result<()> {
             // the root prepared from the pre-`-C` launch directory.
             let prepared = local_coordination::prepare_startup(cli, &paths, launch_cwd.as_deref()).await;
             local_coordination::export_child_root(&prepared);
-            let original =
-                local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?;
-            let args = remote_host::launch_args(&original);
-            let workspace = cli.path.clone().unwrap_or(std::env::current_dir()?);
-            let code = remote_host::run(listening, args, &workspace, &paths.data_dir).await?;
+            let workspace = std::env::current_dir()?;
+            let launch = restart::fresh(cli, &paths.data_dir, &workspace);
+            let code = remote_host::run(listening, launch, &workspace).await?;
             std::process::exit(code);
         }
         Some(Commands::Remote { request, yes }) => {
@@ -553,7 +581,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 language: language.clone(),
             };
             config.validate()?;
-            context.save_setting("voice", &config)?;
+            context.save_global_setting(GlobalSetting::MachinePreference("voice"), &config)?;
             return services::print(&config);
         }
         Some(Commands::Voice {
@@ -602,9 +630,16 @@ async fn run(cli: &Cli) -> Result<()> {
             if let SessionCommands::Compact { id, instructions } = action {
                 return compaction::run(cli, &paths, id, instructions).await;
             }
+            if let SessionCommands::List = action {
+                let rows = paths.list_published_sessions()?;
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
             let db = paths.open_database()?;
             let value = match action {
-                SessionCommands::Live { .. }
+                SessionCommands::List
+                | SessionCommands::Export { .. }
+                | SessionCommands::Live { .. }
                 | SessionCommands::ShutdownWorker { .. }
                 | SessionCommands::StopTask { .. } => unreachable!(),
                 SessionCommands::Trust { id, folders } => serde_json::to_value(
@@ -625,9 +660,6 @@ async fn run(cli: &Cli) -> Result<()> {
                         *preview,
                     )?)?
                 }
-                SessionCommands::List => serde_json::to_value(
-                    db.with_conn(deepseek_code_core::db::conversation_repo::list_conversations)??,
-                )?,
                 SessionCommands::Show { id } => {
                     let store = SessionStore::new(db);
                     serde_json::json!({"session":store.resume(id)?,"messages":store.history(id)?})
@@ -668,7 +700,29 @@ async fn run(cli: &Cli) -> Result<()> {
             match action {
                 SkillsCommands::ImportLegacy { .. } => unreachable!(),
                 SkillsCommands::List => {
-                    println!("{}", serde_json::to_string_pretty(&skills)?);
+                    let states =
+                        deepseek_code_core::skills::states::load(&paths.data_dir);
+                    let listed = skills
+                        .iter()
+                        .map(|skill| {
+                            let bundled = skill.source
+                                == deepseek_code_core::skills::SkillSource::Bundled;
+                            let state = deepseek_code_core::skills::states::effective_in(
+                                &states,
+                                &skill.name,
+                                bundled,
+                            );
+                            let mut value = serde_json::to_value(skill)?;
+                            value["state"] = serde_json::Value::String(state.label().into());
+                            // `enabled` follows the effective state, so a built-in
+                            // that is off by default never reads as enabled.
+                            value["enabled"] = serde_json::Value::Bool(
+                                state != deepseek_code_core::skills::states::SkillState::Off,
+                            );
+                            Ok(value)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    println!("{}", serde_json::to_string_pretty(&listed)?);
                     return Ok(());
                 }
                 SkillsCommands::State { skill, state } => {
@@ -754,6 +808,10 @@ async fn run(cli: &Cli) -> Result<()> {
         single || cli.output_format == OutputFormat::Text,
         "JSON output requires --print or query"
     );
+    #[cfg(unix)]
+    if !single {
+        signals::watch_terminal();
+    }
     let mut prompt = skill_prompt
         .or_else(|| match &cli.command {
             Some(Commands::Repl { prompt }) | Some(Commands::Query { prompt }) => prompt.clone(),
@@ -788,14 +846,7 @@ async fn run(cli: &Cli) -> Result<()> {
     };
     if let Some(resumed) = &resumed {
         let db = paths.open_database()?;
-        let (workspace, _) = db.with_conn(|conn| {
-            deepseek_code_core::native_engine::workspace::resolve_workspace(
-                conn,
-                &paths.data_dir.join("workspaces"),
-                &resumed.id,
-                None,
-            )
-        })??;
+        let workspace = db.open_session(&resumed.id)?.workspace()?;
         if cli.path.is_some() {
             ensure!(
                 std::fs::canonicalize(&workspace)?
@@ -871,12 +922,55 @@ async fn run(cli: &Cli) -> Result<()> {
     } else {
         Some(session::terminal_input())
     };
+    // Observe the selector and its version together, before resolving any configuration.
+    let observed = if let Some(saved) = resumed.as_ref() {
+        Some(paths.open_database()?.observed_binding(&saved.id)?)
+    } else {
+        None
+    };
+    cli.observed_generation = observed.as_ref().map(|row| row.generation);
+    if let Some(carried) = cli.binding_generation {
+        if Some(carried) != cli.observed_generation { eprintln!("Provider binding changed before relaunch; using the current binding."); }
+        std::env::remove_var("API_BASE_URL");
+    }
+    let normal_frontend = match &resumed {
+        Some(saved) => deepseek_code_core::services::background_sessions::worker_directory(&paths.data_dir, &saved.id)?.is_none(),
+        None => true,
+    };
+    if cli.binding_generation.is_some() || (normal_frontend && cli.observes_binding(resumed.is_some())) {
+        cli.discard_binding_options();
+    }
     let selection = config::select(
         cli,
         &paths,
-        resumed.as_ref().and_then(|s| s.model.as_deref()),
-        resumed.as_ref().and_then(|s| s.provider.as_deref()),
+        observed
+            .as_ref()
+            .map(|s| s.model.as_str())
+            .filter(|s| !s.is_empty()),
+        observed
+            .as_ref()
+            .map(|s| s.provider.as_str())
+            .filter(|s| !s.is_empty()),
     );
+    let selection = if selection.is_err() && !cli.changes_binding() {
+        if let (Some(saved), Some(row)) = (&resumed, &observed) {
+            match worker_binding::resident(&paths, &saved.id, row).await? {
+                Some(state) => Ok(config::Selection {
+                    providers: state.providers,
+                    provider_id: state.provider_id,
+                    model: state.model,
+                }),
+                None => selection,
+            }
+        } else {
+            selection
+        }
+    } else {
+        selection
+    };
+
+    // Only a successful startup selection consumed the original provider flags.
+    let startup_selected = selection.is_ok();
     let selection = match selection {
         Ok(selection) => selection,
         Err(error) if !single => {
@@ -895,7 +989,7 @@ async fn run(cli: &Cli) -> Result<()> {
     startup_options::validate(cli, &std::env::current_dir()?)?;
     if !single && !sdk_stream {
         // As in the reference CLI, before project settings and hooks load.
-        let folder = cli.path.clone().unwrap_or(std::env::current_dir()?);
+        let folder = std::env::current_dir()?;
         startup_prompts::confirm(
             &paths.data_dir,
             &folder,
@@ -918,11 +1012,17 @@ async fn run(cli: &Cli) -> Result<()> {
         resumed.as_ref().map(|s| s.id.as_str()),
     )
     .await?;
+    if normal_frontend && resumed.is_some() && session.startup_provider.is_none() {
+        // After observation or a rejected selection, raw startup options have no authority.
+        cli.discard_binding_options();
+    }
+    if !startup_selected { session.startup_provider=None; }
     resource_sampling::session(&session.id);
     let mut screen_mode = terminal::screen_mode::ScreenMode::default();
     // Set by /restart; the replacement starts after this session is closed.
-    let mut restart_args: Option<Vec<String>> = None;
+    let mut restart_launch = None;
     let result = async {
+        session.admit_launch_prompt(&mut prompt, single)?;
         // Applied inside the cleanup scope so a startup failure reaches teardown
         // and publishes no incarnation.
         startup_options::apply(cli, &mut session).await?;
@@ -949,7 +1049,7 @@ async fn run(cli: &Cli) -> Result<()> {
         session.activate_coordination(prepared).await;
         if !single {
             if std::env::var_os(remote_host::HANDOFF_ENV).is_none() {
-                let banner = terminal::banner(&session.model, &session.workspace);
+                let banner = terminal::banner(&session.binding_state().model, &session.workspace);
                 eprintln!("{banner}");
                 if resumed.is_none() {
                     let mut history = terminal::scrollback::Scrollback::take();
@@ -975,13 +1075,13 @@ async fn run(cli: &Cli) -> Result<()> {
                 if io::stderr().is_terminal() && !terminal::screen_reader() {
                     let mut history = terminal::scrollback::Scrollback::take();
                     terminal::prompt_display::write_recorded(
-                        &mut io::stderr(), &mut history, &prompt,
+                        &mut crate::terminal_output::stderr(), &mut history, &prompt,
                         crate::terminal::size().0.saturating_sub(1) as usize, false,
                     )?;
                     history.save();
                 } else {
                     terminal::prompt_display::write_submitted(
-                    &mut io::stderr(), &format!("{} ", terminal::prompt_glyph()), &prompt,
+                    &mut crate::terminal_output::stderr(), &format!("{} ", terminal::prompt_glyph()), &prompt,
                     crate::terminal::size().0.saturating_sub(1) as usize,
                     io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none() && !terminal::screen_reader(), false,
                 )?;
@@ -1020,13 +1120,12 @@ async fn run(cli: &Cli) -> Result<()> {
             if let Err(error) = remote.command("", &paths, &session, &mut input).await { command_eprintln!("Remote Control: {error:#}"); }
         }
         let mut last_config_error = String::new();
+        let mut reported_binding_failures = std::collections::HashMap::new();
         // Read-only view of a turn a direct print/json owner still executes.
         let mut execution_observer = observe::Observer::default();
         terminal::tips::start_session(&paths.data_dir);
         // Lets other sessions see this one is open while it is idle.
         let mut presence: Option<(String, deepseek_code_core::services::session_messages::PresenceLease)> = None;
-        // History length the last suggestion was generated for.
-        let mut suggested_for = session.store.history(&session.id)?.len();
         terminal::STARTED.get_or_init(std::time::Instant::now);
         terminal::title::start();
         if let Some(speed) = std::fs::read_to_string(paths.data_dir.join("scroll-speed")).ok().and_then(|text| text.trim().parse::<usize>().ok()).filter(|speed| (1..=20).contains(speed)) {
@@ -1055,30 +1154,26 @@ async fn run(cli: &Cli) -> Result<()> {
                 match background_commands::wake_for_notifications(cli, &mut session, &mut input).await {
                     Ok(true) => continue 'repl,
                     Ok(false) => {},
-                    Err(error) => report_error(&error),
+                    Err(error) => report_error(error)?,
                 }
             }
             if !session.waiting_for_continue() {
                 if let Some(prompt) = remote.take_deferred() {
-                    if let Err(error) = session.turn(cli, &prompt, &mut input).await { report_error(&error); }
+                    if let Err(error) = session.turn(cli, &prompt, &mut input).await { report_error(error)?; }
                 }
             }
             if let Err(error) = remote.sync(&session) { command_eprintln!("Remote Control: {error:#}"); }
             if presence.as_ref().is_none_or(|(id, _)| *id != session.id) {
                 drop(presence.take());
-                presence = deepseek_code_core::services::session_messages::PresenceLease::acquire(&paths.data_dir, &session.id)
+                presence = session.store.db.acquire_presence(&session.id)
                     .ok()
                     .map(|lease| (session.id.clone(), lease));
             }
-            if !session.waiting_for_continue() && prompt_suggestion::enabled(&paths.data_dir) {
-                let history = session.store.history(&session.id)?;
-                if history.len() != suggested_for {
-                    suggested_for = history.len();
-                    if let (Some(text), Ok(provider)) = (prompt_suggestion::context(&history), session.selected_provider().await) {
-                        prompt_suggestion::spawn(session.id.clone(), provider, text, input.as_ref().unwrap().suggestion_sender());
-                    }
-                }
-            }
+            let suggestions_enabled = prompt_suggestion::enabled(&paths.data_dir);
+            let reader = input.as_ref().expect("interactive reader");
+            let ghost = suggestions_enabled.then(|| prompt_suggestion::Ghost::load(&session)).flatten();
+            let mut shown_suggestion = ghost.as_ref().map(|ghost| ghost.saved.clone());
+            reader.set_suggestion(ghost);
             skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
             if let Err(error) = input.as_mut().unwrap().set_keybindings(&paths.data_dir.join("keybindings.json")) {
                 command_eprintln!("Keybindings: {error:#}");
@@ -1093,7 +1188,7 @@ async fn run(cli: &Cli) -> Result<()> {
             terminal::style::configure(&display.theme, &display.color);
             let mut catalog = skill_commands::catalog(&skills);
             if let Some((_, description)) = catalog.iter_mut().find(|(name, _)| name == "/model") {
-                *description = format!("Set the AI model (currently {} · {})", session.model, session.provider_id);
+                *description = format!("Set the AI model (currently {} · {})", session.binding_state().model, session.binding_state().provider_id);
             }
             input.as_mut().unwrap().set_commands(catalog);
             input
@@ -1114,7 +1209,7 @@ async fn run(cli: &Cli) -> Result<()> {
             input.as_ref().unwrap().set_effort(Some(session_commands::model_label(&session).await));
             let (agent_paths, agent_db, agent_session) = (paths.clone(), session.store.db.clone(), session.id.clone());
             input.as_ref().unwrap().set_agent_rows(Box::new(move || background_commands::running_agents(&agent_paths, &agent_db, &agent_session)));
-            let agent_context = services::context(&paths)?;
+            let agent_context = session.hook_service_context();
             input.as_ref().unwrap().set_subagents(agent_context.clone(), session.id.clone());
             input.as_ref().unwrap().set_agent_details(Box::new(move |id| background_commands::agent_execution(&agent_context, id)));
             let (todo_paths, todo_session) = (paths.clone(), session.id.clone());
@@ -1151,6 +1246,7 @@ async fn run(cli: &Cli) -> Result<()> {
                         if let Err(error) = session.cycle_permission_mode().await { command_eprintln!("Permission mode: {error:#}"); }
                         continue 'repl;
                     },
+                    Err(_) if signals::terminating() => break 'repl,
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {
                         if composer.is_pending() {
                             composer.cancel();
@@ -1161,11 +1257,36 @@ async fn run(cli: &Cli) -> Result<()> {
                     },
                     Err(error) => return Err(error.into()),
                     Ok(None) => {
+                        #[cfg(unix)]
+                        signals::check_terminal_hangup();
                         if composer.is_pending() { command_eprintln!("Unfinished prompt discarded."); }
                         break 'repl;
                     }
                 },
                 _ = background_refresh.tick() => {
+                    let failure = session.store.db.binding_notice(&session.id,&session.binding_requester)?;
+                    if let Some((generation, requested, restored, needs_ack)) = failure {
+                        let seen = reported_binding_failures.entry(session.id.clone()).or_insert(0);
+                        if generation > *seen {
+                            let reader = input.as_ref().expect("interactive reader");
+                            reader.notice(format!("Provider switch to {requested} did not apply: activation failed. Restored {restored}."));
+                            match session.refresh_binding().await {
+                                Ok(()) => reader.set_effort(Some(session_commands::model_label(&session).await)),
+                                Err(error) => reader.notice(format!("Could not refresh the restored binding: {error:#}")),
+                            }
+                            *seen = generation;
+                        }
+                        if needs_ack {
+                            session.store.db.acknowledge_binding(&session.id,&session.binding_requester,generation)?;
+                        }
+                    }
+                    if suggestions_enabled {
+                        let ghost = prompt_suggestion::Ghost::load(&session);
+                        if ghost.as_ref().map(|ghost| &ghost.saved) != shown_suggestion.as_ref() {
+                            shown_suggestion = ghost.as_ref().map(|ghost| ghost.saved.clone());
+                            input.as_ref().expect("interactive reader").set_suggestion(ghost);
+                        }
+                    }
                     // While a resumed session is owned elsewhere, show the public
                     // text/tool progress that owner publishes. The observer never
                     // takes the lease, submits input or runs a tool.
@@ -1191,14 +1312,17 @@ async fn run(cli: &Cli) -> Result<()> {
                         idle_notified = true;
                         if let Err(error) = deepseek_code_core::services::lifecycle_events::run(&session.hook_service_context(), &session.workspace, &session.id,
                             deepseek_code_core::services::tool_hooks::HookEvent::Notification,
-                            serde_json::json!({"message":"Claude is waiting for your input","notification_type":"idle_prompt"})).await {
+                            serde_json::json!({"message":"DeepSeek Code is waiting for your input","notification_type":"idle_prompt"})).await {
                             input.as_ref().expect("interactive reader").notice(format!("Notification hook: {error:#}"));
                         }
                     }
                     if !session.waiting_for_continue() && !composer.is_pending()
                         && deepseek_code_core::services::async_hooks::has_pending_wake(&paths.data_dir, &session.id)
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
-                        if let Err(error) = session.wake_hooks(cli, &mut input).await { command_eprintln!("Hook wake: {error:#}"); }
+                        if let Err(error) = session.wake_hooks(cli, &mut input).await {
+                            if error.is::<terminal_output::StdoutWriteFailed>() { return Err(error); }
+                            command_eprintln!("Hook wake: {error:#}");
+                        }
                         continue 'repl;
                     }
                     if let Err(error) = session.sync_workspace() { command_eprintln!("Worktree: {error:#}"); }
@@ -1214,7 +1338,7 @@ async fn run(cli: &Cli) -> Result<()> {
                                     }
                                     continue 'repl;
                                 }
-                                for prompt in due { deepseek_code_core::services::input_queue::push(&session.store.db, &session.id, &prompt)?; }
+                                for prompt in due { session.selected_session()?.enqueue_cli_notification(&prompt)?; }
                             }
                             Ok(_) => {}
                             Err(error) => command_eprintln!("Scheduled jobs: {error:#}"),
@@ -1242,7 +1366,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     // A background agent waiting for approval asks here, as in the
                     // reference CLI, once the input is empty.
                     if !session.waiting_for_continue() && !composer.is_pending()
-                        && background_commands::agent_question(&paths, &session.id).is_some()
+                        && background_commands::agent_question(&paths, &session).is_some()
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         if let Err(error) = background_commands::answer_agent_question(&paths, &session) { command_eprintln!("Agent question: {error:#}"); }
                         continue 'repl;
@@ -1251,7 +1375,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     // A finished background command starts a turn; its line is
                     // printed first, above that turn.
                     if !session.waiting_for_continue() && !composer.is_pending()
-                        && deepseek_code_core::services::input_queue::any(&session.store.db, &session.id, background_commands::is_notification).unwrap_or(false)
+                        && session.store.db.next_desktop_input(&session.id).ok().flatten().is_some()
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         for notice in notices { command_eprintln!("{notice}"); }
                         continue 'repl;
@@ -1286,7 +1410,7 @@ async fn run(cli: &Cli) -> Result<()> {
                     input.as_ref().expect("interactive reader").set_permission_mode(session.permission_mode());
                 },
                 // Idle Ctrl-C discards a draft and otherwise ends the prompt;
-                // SIGTERM/SIGHUP always stop the prompt after cleanup.
+                // Termination, including terminal loss, also stops the prompt.
                 _ = tokio::signal::ctrl_c() => {
                     if composer.is_pending() {
                         composer.cancel();
@@ -1302,7 +1426,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 terminal::prompt::Input::Cancelled => { command_eprintln!("Prompt discarded."); continue; },
                 terminal::prompt::Input::Prompt(prompt) => {
                     if !prompt.trim().is_empty() {
-                        if let Err(error) = prompt_turn(cli, &mut session, &prompt, &mut input).await { report_error(&error); }
+                        if let Err(error) = prompt_turn(cli, &mut session, &prompt, &mut input).await { report_error(error)?; }
                     }
                     continue;
                 },
@@ -1405,7 +1529,7 @@ async fn run(cli: &Cli) -> Result<()> {
             match background_commands::handle(cli, command, argument, &paths, &mut session, &mut input).await {
                 Ok(background_commands::Outcome::Handled) => continue,
                 Ok(background_commands::Outcome::Exit) => break,
-                Err(error) => { report_error(&error); continue; },
+                Err(error) => { report_error(error)?; continue; },
                 Ok(background_commands::Outcome::NotHandled) => {},
             }
             if command == "/scroll-speed" {
@@ -1427,7 +1551,7 @@ async fn run(cli: &Cli) -> Result<()> {
             if command.starts_with("/mcp__") {
                 match mcp_prompts::expand(&session, command, argument).await {
                     Ok(Some(prompt)) => if let Err(error) = session.turn(cli, &prompt, &mut input).await {
-                        report_error(&error);
+                        report_error(error)?;
                     },
                     Ok(None) => {}
                     Err(error) => command_eprintln!("Error: {error:#}"),
@@ -1438,7 +1562,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 match repl_loop::run(argument, &mut loops) {
                     Ok(repl_loop::Outcome::Message(message)) => command_eprintln!("{message}"),
                     Ok(repl_loop::Outcome::Run(prompt)) => if let Err(error) = session.turn(cli, &prompt, &mut input).await {
-                        report_error(&error);
+                        report_error(error)?;
                     },
                     Err(error) => command_eprintln!("Error: {error:#}"),
                 }
@@ -1447,21 +1571,21 @@ async fn run(cli: &Cli) -> Result<()> {
             if matches!(command, "/remote-control" | "/rc") {
                 if let Err(error) = remote.command(argument, &paths, &session, &mut input).await { command_eprintln!("Error: {error:#}"); }
                 if let Some(listening) = remote.take_handoff() {
+                    if let Err(error) = worker_binding::retain_for_transfer(&session).await {
+                        command_eprintln!("Handoff did not apply: {error:#}");
+                        continue;
+                    }
+                    let launch = restart::resume(cli, &session)?;
                     // The session continues in a child dcl that local and remote terminals share.
                     drop(presence.take());
                     // The old OS input reader must be gone before the host owns stdin.
                     drop(input.take());
-                    // The child inherits the exported native root, so the original
-                    // override is dropped before any non-UTF-8 value is decoded.
-                    let original =
-                        local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?;
-                    let args = remote_host::child_args(&original, cli.prompt.as_deref(), &session.id, &session.workspace);
                     // The relay child inherits this session's current native root.
                     local_coordination::export_session_child_root(session.coordination_child_root());
                     // The child resumes the session; this owner is deliberately
                     // handing it off, so its row closes before the transfer.
                     session.close_coordination().await;
-                    let code = remote_host::run(listening, args, &session.workspace, &paths.data_dir).await?;
+                    let code = remote_host::run(listening, launch, &session.workspace).await?;
                     std::process::exit(code);
                 }
                 continue;
@@ -1469,7 +1593,7 @@ async fn run(cli: &Cli) -> Result<()> {
             if command == "/plan" {
                 match extended_commands::plan_task(argument, &paths, &mut session).await {
                     Ok(Some(task)) => if let Err(error) = session.turn(cli, &task, &mut input).await {
-                        report_error(&error);
+                        report_error(error)?;
                     },
                     Err(error) => command_eprintln!("Error: {error:#}"),
                     Ok(None) => {},
@@ -1480,7 +1604,7 @@ async fn run(cli: &Cli) -> Result<()> {
                 match session_commands::handle(command, argument, &paths, &mut session).await {
                     Ok(_) if !argument.trim().is_empty() && !session_commands::is_goal_clear(argument) => {
                         if let Err(error) = session.turn(cli, argument.trim(), &mut input).await {
-                            report_error(&error);
+                            report_error(error)?;
                         }
                     },
                     Err(error) => command_eprintln!("Error: {error:#}"),
@@ -1515,13 +1639,9 @@ async fn run(cli: &Cli) -> Result<()> {
                     command_eprintln!("Usage: /restart");
                     continue;
                 }
-                restart_args = Some(restart::args(
-                    &local_coordination::child_argv_without_coordination(std::env::args_os().skip(1))?,
-                    cli.prompt.as_deref(),
-                    &session.id,
-                    &session.workspace,
-                ));
-                session_trust::quit_worker(&session.paths, &session.id).await?;
+                if let Err(error) = worker_binding::retain_for_transfer(&session).await { command_eprintln!("Relaunch did not apply: {error:#}"); continue; }
+                let launch = restart::resume(cli, &session)?;
+                restart_launch = Some(launch);
                 break;
             }
             match line.trim() {
@@ -1551,10 +1671,10 @@ async fn run(cli: &Cli) -> Result<()> {
                     if let Err(error) = result { command_eprintln!("Tools: {error:#}"); }
                 },
                 command if skills.contains_key(command.split_whitespace().next().unwrap_or(command)) => {
-                    if let Err(error) = session.turn(cli, &line, &mut input).await { report_error(&error); }
+                    if let Err(error) = session.turn(cli, &line, &mut input).await { report_error(error)?; }
                 },
                 command if command.starts_with('/') => command_eprintln!("Unknown command: {}. Use /help; use /multiline to send text starting with /.", command.split_whitespace().next().unwrap_or(command)),
-                _ => if let Err(error) = prompt_turn(cli, &mut session, &line, &mut input).await { report_error(&error); },
+                _ => if let Err(error) = prompt_turn(cli, &mut session, &line, &mut input).await { report_error(error)?; },
             }
         }
         if remote.is_connected() {
@@ -1566,13 +1686,13 @@ async fn run(cli: &Cli) -> Result<()> {
         terminal::title::clear();
     }
     session
-        .end_hooks(if result.is_ok() && !single {
+        .end_hooks(if result.is_ok() && !single && !signals::terminating() {
             "prompt_input_exit"
         } else {
             "other"
         })
         .await;
-    let resume_hint = restart_args.is_none()
+    let resume_hint = restart_launch.is_none()
         && !single
         && !sdk_stream
         && session
@@ -1585,16 +1705,19 @@ async fn run(cli: &Cli) -> Result<()> {
     drop(screen_mode);
     drop(_exit_cleanup);
     if resume_hint {
-        eprintln!("\nResume this session with:\ndcl --resume {}", session.id);
+        eprintln!(
+            "\nResume this session with:\ndcl --resume {}",
+            session.id
+        );
     }
-    if let Some(args) = restart_args.take() {
+    if let Some(launch) = restart_launch.take() {
         // The replacement inherits the session's current native root.
         local_coordination::export_session_child_root(session.coordination_child_root());
         // Release the session and its database before the replacement opens it.
         shutdown?;
         drop(session);
         eprintln!("Restarting dcl in this conversation\u{2026}");
-        return restart::relaunch(&args);
+        return restart::relaunch(launch);
     }
     // A completed single turn already wrote its terminal result. Shutdown may
     // still fail, but stdout must not acquire a second result record.
@@ -1603,6 +1726,17 @@ async fn run(cli: &Cli) -> Result<()> {
             return Err(
                 output::ReportedError(format!("Session shutdown failed: {error:#}")).into(),
             );
+        }
+        let pending = session.pending_suggestion.lock().unwrap().take();
+        if let Some(pending) = pending {
+            if deepseek_code_core::services::background_sessions::finish_before_suggestion(
+                &session.paths.data_dir,
+                &session.id,
+            )
+            .is_ok()
+            {
+                let _ = pending.generate().await;
+            }
         }
         return result;
     }

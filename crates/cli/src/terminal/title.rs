@@ -34,8 +34,8 @@ static CURRENT: Mutex<TitleState> = Mutex::new(TitleState {
 });
 
 fn emit(text: &str) {
-    let mut out = std::io::stdout();
-    if out.is_terminal() && !crate::terminal::screen_reader() {
+    let mut out = crate::terminal_output::stdout();
+    if std::io::stdout().is_terminal() && !crate::terminal::screen_reader() {
         let clean: String = text.chars().filter(|ch| !ch.is_control()).collect();
         let _ = write!(out, "\x1b]0;{clean}\x07");
         let _ = out.flush();
@@ -123,11 +123,12 @@ pub fn name_topic(session: &crate::session::Session, prompt: &str) {
         named.push(session.id.clone());
     }
     let engine = session.side_engine();
-    let db = session.store.db.clone();
+    let Ok(shard) = session.selected_session() else { return; };
+    let history = deepseek_code_core::db::session_store::ExecutorHistory::Session(shard);
     let (id, provider, model) = (
         session.id.clone(),
-        session.provider_id.clone(),
-        session.model.clone(),
+        session.binding_state().provider_id.clone(),
+        session.binding_state().model.clone(),
     );
     let prompt: String = prompt.chars().take(2000).collect();
     tokio::spawn(async move {
@@ -136,7 +137,7 @@ pub fn name_topic(session: &crate::session::Session, prompt: &str) {
             .await
             .map(|reply| tidy(&reply))
         {
-            let _ = db.with_conn(|conn| deepseek_code_core::db::conversation_repo::update_title_if_empty(conn, &id, &title));
+            if !matches!(history.publish_title(&title), Ok(true)) { return; }
             *TOPIC.lock().unwrap_or_else(|error| error.into_inner()) = Some((id, title));
         }
     });

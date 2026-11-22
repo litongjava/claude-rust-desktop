@@ -1,6 +1,5 @@
 use super::*;
 use crate::{
-    db::conversation_repo,
     native_engine::{engine_core::ReasoningMode, provider_manager::ResolvedProvider},
     services::teams,
 };
@@ -33,35 +32,9 @@ async fn executor(
         Arc::new(EnvironmentCredentials),
     )
     .unwrap();
-    context
-        .db
-        .with_conn(|conn| -> Result<()> {
-            conversation_repo::insert_conversation(
-                conn,
-                parent,
-                None,
-                Some("fixture"),
-                Some("fixture"),
-                root.to_str(),
-                None,
-                false,
-                false,
-                false,
-                "now",
-                "now",
-                0,
-            )?;
-            Ok(())
-        })
-        .unwrap()
-        .unwrap();
-    let private_root = root.join("private-root");
-    let cwd = context
-        .db
-        .with_conn(|conn| {
-            crate::native_engine::workspace::resolve_workspace(conn, &private_root, parent, None)
-        })
-        .unwrap()
+    context.db.create(parent, crate::db::session_store::CreateOptions { model: Some("fixture".into()), provider: Some("fixture".into()), ..Default::default() }).unwrap();
+    let private_root = context.paths.data_dir.join("workspaces");
+    let cwd = context.db.engine_workspace(&private_root, parent, None)
         .unwrap()
         .0;
     std::fs::create_dir_all(&cwd).unwrap();
@@ -375,7 +348,15 @@ async fn context_search_scopes_parent_agent_teammate_and_owned_resume() {
                 let loaded = body["tools"].as_array().unwrap().iter()
                     .any(|tool| tool["function"]["name"] == "ContextSearch");
                 let searches: Vec<_> = outputs.iter().copied()
-                    .filter(|output| !output.contains("\"loaded_tools\""))
+                    // ToolLoad now reaches the model as its content line rather
+                    // than a JSON marker, so exclude that line by shape and
+                    // keep every other result, including search errors.
+                    .filter(|output| {
+                        !(output.starts_with("Loaded ")
+                            || output.starts_with("Already available: ")
+                            || output.starts_with("Unknown tools: ")
+                            || output.starts_with("Unavailable tools: "))
+                    })
                     .collect();
                 let call = match searches.len() {
                     0 if !loaded && outputs.is_empty() => Some(("load", "ToolLoad", json!({"names":["ContextSearch"]}))),

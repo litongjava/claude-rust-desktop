@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use deepseek_desktop_tauri_lib::db::DbManager;
+use deepseek_desktop_tauri_lib::db::session_store::Stores;
 use deepseek_desktop_tauri_lib::cost_tracker::CostTracker;
 use deepseek_desktop_tauri_lib::preview_engine::PreviewEngine;
 use deepseek_desktop_tauri_lib::analytics::AnalyticsStore;
@@ -19,47 +19,22 @@ use deepseek_desktop_tauri_lib::memory::MemExClient;
 #[tokio::test]
 async fn test_db_manager_creation() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let db_path = temp_dir.path().join("test.db");
-
-    let db = DbManager::new(db_path).expect("Failed to create DB");
-
-    db.with_conn(|conn| {
-        let result = conn.execute(
-            "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT)",
-            [],
-        );
-        assert!(result.is_ok());
-    }).unwrap();
+    let stores=Stores::open(temp_dir.path()).unwrap();
+    assert!(temp_dir.path().join("global.db").is_file());
+    assert!(stores.conversations().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn test_db_manager_persistent_data() {
-    let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let db_path = temp_dir.path().join("test_persist.db");
-
-    let db = DbManager::new(db_path.clone()).expect("Failed to create DB");
-
-    db.with_conn(|conn| {
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, name TEXT)",
-            [],
-        ).unwrap();
-
-        conn.execute(
-            "INSERT INTO test (name) VALUES (?)",
-            ["test_value"],
-        ).unwrap();
-    }).unwrap();
-
-    let db2 = DbManager::new(db_path).expect("Failed to reopen DB");
-    db2.with_conn(|conn| {
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM test",
-            [],
-            |row| row.get(0),
-        ).unwrap();
-        assert_eq!(count, 1);
-    }).unwrap();
+async fn test_session_history_survives_a_reopen() {
+    let root=tempfile::tempdir().unwrap();
+    let id={
+        let stores=Stores::open(root.path()).unwrap();
+        let shard=stores.create("persistent",Default::default()).unwrap();
+        shard.write(|w|w.append("user","test_value")).unwrap()
+    };
+    let stores=Stores::open(root.path()).unwrap();
+    let messages=stores.open_session("persistent").unwrap().read(|r|r.messages()).unwrap();
+    assert_eq!((messages[0].id.as_str(),messages[0].content.as_str()),(id.as_str(),"test_value"));
 }
 
 #[test]
@@ -163,14 +138,12 @@ async fn test_bridge_server_api_key_uniqueness() {
     use deepseek_desktop_tauri_lib::bridge::BridgeServer;
 
     let temp_dir1 = tempfile::tempdir().expect("Failed to create temp dir");
-    let db_path1 = temp_dir1.path().join("test1.db");
-    let db1 = Arc::new(DbManager::new(db_path1).expect("Failed to create DB"));
+    let db1 = Arc::new(Stores::open(temp_dir1.path()).expect("Failed to create DB"));
     let server1 = BridgeServer::new(temp_dir1.path().to_path_buf(), db1);
     let key1 = server1.get_api_key().to_string();
 
     let temp_dir2 = tempfile::tempdir().expect("Failed to create temp dir");
-    let db_path2 = temp_dir2.path().join("test2.db");
-    let db2 = Arc::new(DbManager::new(db_path2).expect("Failed to create DB"));
+    let db2 = Arc::new(Stores::open(temp_dir2.path()).expect("Failed to create DB"));
     let server2 = BridgeServer::new(temp_dir2.path().to_path_buf(), db2);
     let key2 = server2.get_api_key().to_string();
 

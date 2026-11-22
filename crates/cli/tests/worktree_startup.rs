@@ -1,4 +1,7 @@
 //! Actual Git + CLI processes exercise source isolation and durable resume.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 #[path = "support/tool_loading.rs"]
 mod tool_loading;
 
@@ -48,6 +51,7 @@ async fn cli(root: &Path, data: &Path, endpoint: &str, options: &[&str]) -> std:
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
         .current_dir(root)
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .args([
             "--data-dir",
@@ -242,7 +246,7 @@ async fn named_and_generated_worktrees_isolate_dirty_sources_and_resume_after_pr
     assert!(workspace.exists(), "exit must retain edits for resume");
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             let project = deepseek_code_core::native_engine::workspace::conversation_project(conn, &id)
                 .unwrap()
                 .unwrap();
@@ -282,7 +286,7 @@ async fn named_and_generated_worktrees_isolate_dirty_sources_and_resume_after_pr
     );
     store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             assert_eq!(
                 deepseek_code_core::native_engine::workspace::conversation_project(conn, &id)
                     .unwrap()
@@ -414,4 +418,96 @@ async fn non_git_hook_worktree_uses_real_cli_tools_and_resumes_without_recreatin
         "hook"
     );
     server.abort();
+}
+
+#[tokio::test]
+async fn git_worktree_binding_waits_for_writer_after_init() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    git(
+        &source,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    let common = source.join(".git");
+    let hook = common.join("hooks/post-checkout");
+    std::fs::write(
+        &hook,
+        r#"#!/bin/sh
+common=$(git rev-parse --path-format=absolute --git-common-dir) || exit 1
+touch "$common/checkout-entered" || exit 1
+for i in $(seq 1 200); do
+    test -f "$common/writer-held" && exit 0
+    sleep 0.05
+done
+exit 1
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+    let store = SessionStore::new(paths.open_database().unwrap());
+    let id = uuid::Uuid::new_v4().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let app = Router::new().route("/v1/chat/completions", post(|| async {
+            ([("content-type", "text/event-stream")],
+             "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+        }));
+        axum::serve(listener, app).await.unwrap()
+    });
+    let options = ["--session-id", &id, "--worktree", "busy"];
+    let (output, ()) = tokio::join!(cli(&source, &paths.data_dir, &endpoint, &options), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !common.join("checkout-entered").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Git did not reach post-checkout");
+        let holder = rusqlite::Connection::open_with_flags(paths.data_dir.join("global.db"),rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::fs::write(common.join("writer-held"), "").unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        holder.execute_batch("ROLLBACK").unwrap();
+    });
+    server.abort();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workspace = store.resume(&id).unwrap().workspace_path.unwrap();
+    let binding = store
+        .db
+        .directory_sql(|conn| {
+            conn.query_row(
+                "SELECT path, branch FROM conversation_worktrees WHERE conversation_id=?1",
+                [&id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding, (workspace.clone(), "worktree/busy".into()));
+    assert_eq!(
+        git(Path::new(&workspace), &["branch", "--show-current"]),
+        "worktree/busy"
+    );
 }

@@ -1,14 +1,13 @@
 //! Health check endpoints — no auth required.
 
+use deepseek_code_core::db::session_store::HostAccess;
 use crate::api::error::ApiError;
 use crate::api::state::AppState;
 use axum::{Router, routing::get, extract::State, response::IntoResponse, Json};
 use serde_json::json;
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let db_healthy = state.db_manager.with_conn(|conn| {
-        conn.execute_batch("SELECT 1")
-    }).is_ok();
+    let db_healthy = state.db_manager.directory_healthy();
 
     let active_sse = crate::metrics::ACTIVE_SSE_CONNECTIONS.get();
 

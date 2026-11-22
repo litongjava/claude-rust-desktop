@@ -75,6 +75,25 @@ async fn explicit_review_injects_snapshot_preserves_worktree_and_honors_custom_o
         }
         let status = git(&workspace, &["status", "--porcelain"]);
         let count = requests.lock().unwrap().len();
+        let data_dir = temp.path().join(format!("data-{index}"));
+        // `code-review` is a built-in that is off by default, so enable it the
+        // way a user would before invoking the slash command.
+        let enabled = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"))
+            .current_dir(&workspace)
+            .env("CLAUDE_CONFIG_DIR", temp.path().join("user-config"))
+            .args([
+                "--data-dir",
+                data_dir.to_str().unwrap(),
+                "skills",
+                "state",
+                "code-review",
+                "user",
+            ])
+            .kill_on_drop(true)
+            .status()
+            .await
+            .unwrap();
+        assert!(enabled.success(), "code-review must be enabled");
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
         command
             .current_dir(&workspace)
@@ -82,7 +101,7 @@ async fn explicit_review_injects_snapshot_preserves_worktree_and_honors_custom_o
             .env("REVIEW_FIXTURE_KEY", "fixture-not-secret")
             .args([
                 "--data-dir",
-                temp.path().join(format!("data-{index}")).to_str().unwrap(),
+                data_dir.to_str().unwrap(),
                 "--base-url",
                 &endpoint,
                 "--api-format",

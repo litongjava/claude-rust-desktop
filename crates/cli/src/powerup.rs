@@ -1,4 +1,5 @@
 //! Interactive lessons use the prompt's input owner and incremental inline renderer.
+use deepseek_code_core::db::session_store::GlobalSetting;
 use crate::{
     resource_commands::LESSONS,
     terminal::input::editor::{clipped, DisplayLine, Screen, TextStyle},
@@ -207,7 +208,7 @@ struct Modal {
 impl Drop for Modal {
     fn drop(&mut self) {
         let _ = self.screen.suspend();
-        let _ = execute!(io::stderr(), Show, ResetColor);
+        let _ = execute!(crate::terminal_output::stderr(), Show, ResetColor);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -215,7 +216,7 @@ impl Drop for Modal {
 pub fn run(paths: &RuntimePaths, argument: &str) -> Result<()> {
     let context = crate::services::context(paths)?;
     let completed = context
-        .setting::<BTreeSet<String>>("cli.powerup.completed")?
+        .global_setting::<BTreeSet<String>>(GlobalSetting::MachinePreference("cli.powerup.completed"))?
         .unwrap_or_default()
         .into_iter()
         .filter(|id| LESSONS.iter().any(|lesson| lesson.0 == id))
@@ -231,7 +232,7 @@ pub fn run(paths: &RuntimePaths, argument: &str) -> Result<()> {
     let mut modal = Modal {
         screen: Screen::default(),
     };
-    execute!(io::stderr(), Hide)?;
+    execute!(crate::terminal_output::stderr(), Hide)?;
     let mut reader = crate::terminal::paste_input::Reader::new()?;
     loop {
         let (columns, rows) = crate::terminal::size();
@@ -262,10 +263,10 @@ pub fn run(paths: &RuntimePaths, argument: &str) -> Result<()> {
                         if let Some(id) = tour.enter() {
                             // Publish progress only after saving succeeds.
                             let mut completed = context
-                                .setting::<BTreeSet<String>>("cli.powerup.completed")?
+                                .global_setting::<BTreeSet<String>>(GlobalSetting::MachinePreference("cli.powerup.completed"))?
                                 .unwrap_or_default();
                             completed.insert(id.into());
-                            context.save_setting("cli.powerup.completed", &completed)?;
+                            context.save_global_setting(GlobalSetting::MachinePreference("cli.powerup.completed"), &completed)?;
                             tour.completed.insert(id.into());
                         }
                     }

@@ -1107,19 +1107,11 @@ fn write_settings(data: &Path, enabled: bool) {
 }
 
 #[cfg(target_os = "linux")]
-fn write_provider(data: &Path, endpoint: &str) {
-    std::fs::write(
-        data.join("providers.json"),
-        serde_json::json!([{
-            "id":"fixture","name":"Fixture","base_url":format!("{endpoint}/v1"),
-            "api_key":"fixture-only","api_format":"openai","enabled":true,
-            "models":[{"id":"fixture-model","name":"Fixture","enabled":true,
-                "supports_vision":false,"supports_web_search":false}]
-        }])
-        .to_string(),
-    )
-    .unwrap();
-}
+#[path = "support/linux_terminal.rs"]
+mod linux_terminal;
+
+#[cfg(target_os = "linux")]
+use linux_terminal::write_provider;
 
 #[cfg(target_os = "linux")]
 fn rows_in(root: &Path) -> Vec<Registration> {
@@ -1547,7 +1539,7 @@ async fn registry_failure_does_not_break_session() {
     .unwrap()
     .expect("the turn created a session");
     assert!(
-        deepseek_code_core::services::session_messages::ExecutionLease::acquire(&data, &session.id)
+        deepseek_code_core::db::session_store::Stores::open(&data).unwrap().open_session(&session.id).unwrap().acquire_execution()
             .is_err(),
         "the failed registration must not bypass the execution lease"
     );
@@ -1751,10 +1743,7 @@ async fn registry_worker_survives_frontend_exit() {
 
     // The running turn still owns the execution lease; no one bypassed it.
     assert!(
-        deepseek_code_core::services::session_messages::ExecutionLease::acquire(
-            &fixture.join("data"),
-            &session
-        )
+        deepseek_code_core::db::session_store::Stores::open(&fixture.join("data")).unwrap().open_session(&session).unwrap().acquire_execution()
         .is_err(),
         "the executor's execution lease stays active"
     );
@@ -2508,10 +2497,7 @@ async fn registry_host_owned_turn_refreshes_branch_without_duplicate_row() {
         "the workspace bytes are unchanged"
     );
     assert!(
-        deepseek_code_core::services::session_messages::ExecutionLease::acquire(
-            &fixture.join("data"),
-            &session
-        )
+        deepseek_code_core::db::session_store::Stores::open(&fixture.join("data")).unwrap().open_session(&session).unwrap().acquire_execution()
         .is_err(),
         "the running turn still holds its execution lease"
     );
@@ -2909,9 +2895,13 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     impl Drop for ClearGuard<'_> {
         fn drop(&mut self) {
             let _ = std::fs::write(self.release, b"");
-            if matches!(self.child.try_wait(), Ok(None)) {
+            if !matches!(self.child.try_wait(), Ok(Some(_))) {
                 let _ = self.child.kill();
-                let _ = self.child.wait();
+                while let Err(error) = self.child.wait() {
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -3024,7 +3014,7 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     writer.flush().unwrap();
     let hook_deadline = Instant::now() + Duration::from_secs(120);
     while !entered.exists() {
-        assert!(Instant::now() < hook_deadline, "the clear hook never ran");
+        assert!(Instant::now() < hook_deadline, "the clear hook never ran: {}",std::fs::read_to_string(&log_path).unwrap_or_default());
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // The switch is already committed while its hook is still held.
@@ -3111,3 +3101,7 @@ async fn registry_clear_sigint_after_commit_returns_success() {
     let _ = reader_thread.join();
     server.abort();
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/terminal_hangup.rs"]
+mod terminal_hangup;

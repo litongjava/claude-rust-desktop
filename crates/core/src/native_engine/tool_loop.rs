@@ -1,3 +1,4 @@
+use crate::db::session_store::ExecutorHistory;
 #[cfg(test)]
 #[path = "auto_permission_tests.rs"]
 mod auto_permission_tests;
@@ -121,6 +122,8 @@ mod tool_loading_restore_tests;
 
 #[path = "multimodal.rs"]
 mod multimodal;
+#[path = "provider_transcript.rs"]
+mod provider_transcript;
 #[cfg(test)]
 #[path = "multimodal_tests.rs"]
 mod multimodal_tests;
@@ -134,9 +137,11 @@ pub enum EngineEvent {
     ContextReset {
         session_id: String,
         boundary_id: String,
+        assistant_id: Option<String>,
     },
     /// Delegated task state without exposing the child's private model output.
     AgentProgress {
+        address: Option<crate::db::session_store::HistoryAddress>,
         session_id: String,
         agent_type: String,
         status: String,
@@ -214,7 +219,62 @@ pub enum EngineEvent {
     },
 }
 
+/// Tools the model loaded with ToolLoad, in the order they were first loaded.
+/// Membership is a set so a repeated load neither moves a tool nor advertises
+/// it twice; iteration follows the first load, which is also the order their
+/// definitions are appended to the next request.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LoadedTools {
+    order: Vec<String>,
+    names: std::collections::BTreeSet<String>,
+}
+
+impl LoadedTools {
+    fn insert(&mut self, name: String) -> bool {
+        if self.names.insert(name.clone()) {
+            self.order.push(name);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, String> {
+        self.order.iter()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    fn extend<I: IntoIterator<Item = String>>(&mut self, names: I) {
+        for name in names {
+            self.insert(name);
+        }
+    }
+}
+
+// The membership set is what the loading policy consults; order never widens it.
+impl std::ops::Deref for LoadedTools {
+    type Target = std::collections::BTreeSet<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.names
+    }
+}
+
 pub struct ToolLoopExecutor {
+    /// Selected model including a virtual context suffix omitted from the wire ID.
+    pub(super) model_selector: String,
+    pub(super) suggestion: Option<super::suggestion::SuggestionCapture>,
     provider: ResolvedProvider,
     auto_manual_interactive: bool,
     permission_host_available: bool,
@@ -255,6 +315,7 @@ pub struct ToolLoopExecutor {
     /// persists them. A ToolScript job uses it to write nested history
     /// records independently of the parent's ended turn.
     parent_message_id: Option<String>,
+    executor_history: Option<ExecutorHistory>,
     answer_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     permission_mailbox: crate::native_engine::permission_response::Mailbox,
     permission_interrupted: Arc<std::sync::Mutex<Option<String>>>,
@@ -262,6 +323,7 @@ pub struct ToolLoopExecutor {
     approval_notes: Arc<std::sync::Mutex<Vec<String>>>,
     approved_call: Option<tool_approval::ExactApproval>,
     runtime_agents: super::runtime_agents::Catalog,
+    provider_manager: Option<Arc<tokio::sync::Mutex<super::provider_manager::ProviderManager>>>,
     permission_manager: Option<Arc<PermissionManager>>,
     file_memory: Option<crate::services::memory_files::FileMemory>,
     prompt_profile: PromptProfile,
@@ -287,8 +349,7 @@ pub struct ToolLoopExecutor {
     hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
     stop_hook_active: bool,
     stop_hook_blocks: u64,
-    goal_db: Option<Arc<crate::db::DbManager>>,
-    transcript_db: Option<Arc<crate::db::DbManager>>,
+    goal_db: Option<Arc<crate::db::session_store::Stores>>,
     skill_shell_active: bool,
     /// Deep-research children read pages as text: their quotes are checked
     /// against the fetched source, not against a model's answer about it.
@@ -296,7 +357,7 @@ pub struct ToolLoopExecutor {
     pending_user_skill: Option<Value>,
     manual_skill_active: bool,
     durable_user_input: bool,
-    message_inbox: Option<crate::services::session_messages::Target>,
+    turn_delivery: std::sync::Weak<std::sync::Mutex<crate::db::session_store::DeliveryOwner>>,
     require_pending_peer_message: bool,
     require_hook_wake: bool,
     /// Session ownership for this attempt. The executor retains the token for
@@ -308,8 +369,9 @@ pub struct ToolLoopExecutor {
     message_deliveries: usize,
     pending_plan_reset: Option<(String, String)>,
     allowed_directories: Vec<std::path::PathBuf>,
-    /// Built-in tools the model loaded with ToolLoad in this session.
-    loaded_tools: std::collections::BTreeSet<String>,
+    /// Built-in tools the model loaded with ToolLoad in this session, in load
+    /// order.
+    loaded_tools: LoadedTools,
     /// The names of the request the model is answering, or `None` before the
     /// first one, so a tool loaded in a batch is callable only from the next.
     exposed_tools: Option<std::collections::HashSet<String>>,
@@ -346,8 +408,14 @@ struct PendingToolCall {
     concurrent: bool,
 }
 
-/// Everything one request sends: the tool definitions and the system prompt,
-/// both built from the same settings and catalog snapshot.
+struct Continuation<M> {
+    messages: Vec<M>,
+    iteration: usize,
+    text: String,
+    after_tools: bool,
+}
+
+/// Tools and system prompt for a single provider request.
 struct PreparedRequest {
     tools: Vec<crate::tools::ToolDefinition>,
     system_prompt: Option<String>,
@@ -1196,26 +1264,125 @@ pub fn builtin_tool_catalog() -> Vec<crate::tools::ToolDefinition> {
     tools
 }
 
-/// The first sentence of a tool description, whitespace collapsed and bounded,
-/// for the runtime tool directory.
-fn one_sentence_purpose(description: &str) -> String {
-    let line = description
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default();
-    let sentence = line
-        .split(". ")
-        .next()
-        .unwrap_or(line)
-        .trim_end_matches('.')
-        .trim();
-    let mut text = sentence.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.chars().count() > 180 {
-        text = text.chars().take(180).collect::<String>().trim_end().to_owned();
-        text.push('…');
+/// The built-in catalog with the session-dependent tools included only when
+/// this session can offer them. The first-message tool list uses it so it never
+/// advertises a tool the executor would not load.
+pub(crate) fn builtin_catalog_for_session(
+    profile: crate::prompt::PromptProfile,
+    session_search: bool,
+    goal_proposals: bool,
+    compaction_requests: bool,
+    delegation: bool,
+    workflow: bool,
+) -> Vec<crate::tools::ToolDefinition> {
+    let mut tools = get_tool_definitions();
+    if !session_search {
+        tools.retain(|tool| tool.name != crate::tools::context_search::NAME);
     }
-    text
+    if !goal_proposals {
+        tools.retain(|tool| tool.name != "ProposeGoal");
+    }
+    if !compaction_requests {
+        tools.retain(|tool| tool.name != "CompactContext");
+    }
+    if delegation {
+        tools.extend(delegation::definitions());
+    }
+    if workflow {
+        tools.push(script_workflow::definition());
+    }
+    let mut tools = adapt_tools(tools, profile);
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools.dedup_by(|a, b| a.name == b.name);
+    tools
+}
+
+/// The MCP definitions discovered for this environment and the names the
+/// registry marks read-only. The executor and the first-message listing share
+/// it so both see the same catalog.
+pub(crate) async fn discover_mcp_tools(
+    registry: &crate::mcp::McpToolRegistry,
+) -> Result<(
+    Vec<crate::tools::ToolDefinition>,
+    std::collections::HashSet<String>,
+)> {
+    let mut builtin = get_tool_definitions();
+    builtin.extend(delegation::definitions());
+    builtin.push(script_workflow::definition());
+    let builtin = builtin
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect::<std::collections::HashSet<_>>();
+    let discovered = registry.get_all_tools().await?;
+    let read_only = discovered
+        .iter()
+        .filter(|tool| tool.is_read_only())
+        .map(|tool| tool.name.clone())
+        .collect();
+    let tools = discovered
+        .into_iter()
+        .map(|tool| {
+            anyhow::ensure!(
+                !builtin.contains(&tool.name),
+                "MCP tool conflicts with native tool: {}",
+                tool.name
+            );
+            Ok(crate::tools::ToolDefinition {
+                name: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok((tools, read_only))
+}
+
+/// The on-demand catalog a session's first message lists: built-ins with the
+/// on-demand switch first, then MCP tools whose server is on demand. Both
+/// groups are sorted so a registry reordering never changes the text.
+pub(crate) fn loadable_tool_lists(
+    customization: &crate::services::customization::Customization,
+    catalog: &[crate::tools::ToolDefinition],
+    mcp_tools: &[crate::tools::ToolDefinition],
+    mcp_states: &std::collections::BTreeMap<String, McpState>,
+    allowed_tools: Option<&[String]>,
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let allowed = |name: &str| {
+        allowed_tools.is_none_or(|names| names.iter().any(|granted| granted == name))
+    };
+    // Without a callable loader nothing in the list could be loaded, so the
+    // first message must not promise one.
+    if !(customization.loading("ToolLoad").enabled && allowed("ToolLoad")) {
+        return (Vec::new(), Vec::new());
+    }
+    let mut builtin: Vec<(String, String)> = catalog
+        .iter()
+        .filter(|tool| allowed(&tool.name))
+        .filter(|tool| {
+            let loading = customization.loading(&tool.name);
+            loading.on_demand && !loading.enabled
+        })
+        .map(|tool| (tool.name.clone(), tool.description.clone()))
+        .collect();
+    let mut mcp: Vec<(String, String)> = mcp_tools
+        .iter()
+        .filter(|tool| allowed(&tool.name) && !customization.is_disabled(&tool.name))
+        .filter(|tool| {
+            crate::mcp::states::server_of(&tool.name)
+                .is_some_and(|server| {
+                    crate::mcp::states::effective(mcp_states, server) == McpState::OnDemand
+                })
+        })
+        .map(|tool| (tool.name.clone(), tool.description.clone()))
+        .collect();
+    let by_name = |a: &(String, String), b: &(String, String)| {
+        a.0.to_ascii_lowercase()
+            .cmp(&b.0.to_ascii_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    };
+    builtin.sort_by(by_name);
+    mcp.sort_by(by_name);
+    (builtin, mcp)
 }
 
 async fn execute_builtin_tool(
@@ -1227,7 +1394,12 @@ async fn execute_builtin_tool(
     search_config_path: Option<&std::path::Path>,
     skill_shell_active: bool,
     options: super::request_options::RequestOptions,
+    session:Option<crate::db::session_store::SessionDb>,
 ) -> Result<Value> {
+    let provider = &provider.current()?;
+    if name == "DeepSeekCode" {
+        return crate::tools::external_agents::execute_bound(name, input, cwd, provider.binding_snapshot().as_deref()).await;
+    }
     if name == "Bash" && skill_shell_active {
         let input = crate::skills::invocation::shell_input(
             input["command"]
@@ -1290,6 +1462,9 @@ async fn execute_builtin_tool(
         let mut result = if matches!(name, "Read" | "Glob" | "Grep" | "ListDir") {
             let (name, cwd) = (name.to_owned(), cwd.to_owned());
             tokio::task::spawn_blocking(crate::tools::path_scope::carry(move || {
+                if name=="Read" {
+                    return crate::tools::read::execute_bound(input,&cwd,session.as_ref());
+                }
                 crate::tools::execute_tool(&name, input, &cwd)
             }))
             .await??
@@ -1431,7 +1606,9 @@ impl ToolLoopExecutor {
             toolscript_hosts: Vec::new(),
             local_goal_frontend: false,
             context_usage: None,
+            suggestion: None,
             auto_history: messages.clone(),
+            model_selector: provider.model.id.clone(),
             provider,
             messages,
             context_boundary_id: None,
@@ -1453,12 +1630,14 @@ impl ToolLoopExecutor {
             streaming_tool_args: HashMap::new(),
             conv_id: None,
             parent_message_id: None,
+            executor_history: None,
             answer_waiters: Arc::new(Mutex::new(HashMap::new())),
             permission_mailbox: Default::default(),
             permission_interrupted: Arc::new(std::sync::Mutex::new(None)),
             approval_notes: Arc::new(std::sync::Mutex::new(Vec::new())),
             approved_call: None,
             runtime_agents: Default::default(),
+            provider_manager: None,
             permission_manager: None,
             file_memory: None,
             prompt_profile: PromptProfile::Desktop,
@@ -1481,13 +1660,12 @@ impl ToolLoopExecutor {
             stop_hook_active: false,
             stop_hook_blocks: 0,
             goal_db: None,
-            transcript_db: None,
             skill_shell_active: false,
             raw_web_fetch: false,
             pending_user_skill: None,
             manual_skill_active: false,
             durable_user_input: false,
-            message_inbox: None,
+            turn_delivery: Default::default(),
             require_pending_peer_message: false,
             require_hook_wake: false,
             execution_lease: None,
@@ -1531,22 +1709,17 @@ impl ToolLoopExecutor {
         self
     }
 
-    pub fn with_hooks(mut self, hooks: crate::services::tool_hooks::HookRunner) -> Self {
+    pub fn with_hooks(mut self, mut hooks: crate::services::tool_hooks::HookRunner) -> Self {
         if hooks.has_hooks() {
+            hooks.transcript_history = self.executor_history.clone();
             self.hooks = Some(Arc::new(hooks));
         }
         self
     }
 
-    pub fn with_goal_state(mut self, db: Arc<crate::db::DbManager>) -> Self {
+    pub fn with_goal_state(mut self, db: Arc<crate::db::session_store::Stores>) -> Self {
         self.goal_db = Some(db);
         // Session-backed tools enter the catalog once storage is bound.
-        self.builtin_names.take();
-        self
-    }
-
-    fn with_transcript_db(mut self, db: Arc<crate::db::DbManager>) -> Self {
-        self.transcript_db = Some(db);
         self.builtin_names.take();
         self
     }
@@ -1717,7 +1890,10 @@ impl ToolLoopExecutor {
         for (call, prepared) in calls.iter().zip(&prepared) {
             pending.push(match &prepared.step {
                 CallStep::Builtin(input, approved) => Box::pin(async {
-                    Some(self.run_builtin(&call.name, input, &cwd, *approved).await)
+                    Some(
+                        self.run_builtin(&call.name, input, &call.id, &cwd, *approved)
+                            .await,
+                    )
                 }),
                 CallStep::Finished(_) => Box::pin(async { None }),
             });
@@ -1753,7 +1929,7 @@ impl ToolLoopExecutor {
         approved: bool,
     ) -> (Value, String, bool) {
         let cwd = self.get_workspace_cwd().to_owned();
-        let result = self.run_builtin(name, input, &cwd, approved).await;
+        let result = self.run_builtin(name, input, id, &cwd, approved).await;
         let (output, failed) = self.finish_builtin(name, input, id, result);
         (input.clone(), output, failed)
     }
@@ -1790,6 +1966,7 @@ impl ToolLoopExecutor {
             .map(|manager| manager.get_mode())
             .unwrap_or(crate::permissions::PermissionMode::AskPermissions);
         let spec = crate::native_engine::toolscript_job::JobSpec {
+            history:self.executor_history.as_ref().and_then(ExecutorHistory::address),
             id: String::new(),
             session: session.clone(),
             workspace: self.workspace_cwd.clone(),
@@ -1821,7 +1998,7 @@ impl ToolLoopExecutor {
             // Foreground and background jobs share this owning frontend.
             interactive: self.permission_host_available,
         };
-        let mut start = match crate::native_engine::toolscript_job::start_job(&root, spec).await {
+        let mut start = match crate::native_engine::toolscript_job::start_bound_job(&root, spec, Some(&self.provider)).await {
             Ok(start) => start,
             Err(error) => return failed(format!("ToolScript could not start: {error:#}")),
         };
@@ -1932,7 +2109,7 @@ impl ToolLoopExecutor {
             Some(is_search)
         }
 
-        let mut loaded = std::collections::BTreeSet::new();
+        let mut loaded = LoadedTools::default();
         let mut calls: HashMap<String, Call> = HashMap::new();
         for message in &self.messages {
             match message["role"].as_str().unwrap_or_default() {
@@ -2006,43 +2183,30 @@ impl ToolLoopExecutor {
         }
         // Added, not replaced: a later turn on this same executor keeps what it
         // already learned, and the settings still decide what is reachable.
-        self.loaded_tools.extend(loaded);
+        self.loaded_tools.extend(loaded.order);
     }
 
     /// Desktop may submit display-only history. The durable tool row binds an
     /// assistant call to its result, independently of that display history.
     fn restore_persisted_loaded_tools(&mut self) -> Result<()> {
-        let (Some(db), Some(session)) = (&self.goal_db, self.conv_id.as_deref()) else {
+        let Some(history) = self.session_search_storage() else {
             return Ok(());
         };
         let started = std::time::Instant::now();
-        let loaded = db
-            .with_conn(|conn| -> Result<_> {
-                let mut query = conn.prepare(
-                    "SELECT t.output FROM tool_calls t JOIN messages m ON m.id=t.message_id
-                 WHERE m.conversation_id=?1 AND m.role='assistant'
-                   AND t.name='ToolLoad' AND t.is_error=0 AND t.output IS NOT NULL
-                   AND m.sort_order >= COALESCE((SELECT MAX(sort_order) FROM messages
-                       WHERE conversation_id=?1 AND is_compact_boundary=1), -1)",
-                )?;
-                let results = query.query_map([session], |row| row.get::<_, String>(0))?;
-                let mut loaded = std::collections::BTreeSet::new();
-                for result in results {
-                    Self::absorb_loaded(&result?, &mut loaded);
-                }
-                Ok(loaded)
-            })
-            .and_then(|result| result)
-            .map_err(|error| {
-                crate::db::write_boundary_context("restore loaded tools", session, started, error)
-            })?;
-        self.loaded_tools.extend(loaded);
+        let results = history.loaded_tool_results().map_err(|error| {
+            crate::db::write_boundary_context("restore loaded tools",history.id(),started,error)
+        })?;
+        let mut loaded = LoadedTools::default();
+        for output in results {
+            Self::absorb_loaded(&output, &mut loaded);
+        }
+        self.loaded_tools.extend(loaded.order);
         Ok(())
     }
 
     /// Reads a stored ToolLoad result. Only the structured marker of a
     /// successful search is accepted.
-    fn absorb_loaded(text: &str, loaded: &mut std::collections::BTreeSet<String>) {
+    fn absorb_loaded(text: &str, loaded: &mut LoadedTools) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             return;
         };
@@ -2235,95 +2399,13 @@ impl ToolLoopExecutor {
         }
     }
 
-    /// The directory the model reads for one request. It is built from the same
-    /// catalog, settings and prepared definitions as the tool list sent with
-    /// that request, so a hot settings change cannot make the two disagree.
-    fn tool_directory(
-        &self,
-        customization: &crate::services::customization::Customization,
-        catalog: &[crate::tools::ToolDefinition],
-        prepared: &[crate::tools::ToolDefinition],
-    ) -> String {
-        let exposed: std::collections::HashSet<String> =
-            prepared.iter().map(|tool| tool.name.clone()).collect();
-        let mut lines = vec!["# Tool directory".to_string()];
-        let context_search = crate::tools::context_search::NAME;
-        let compacted = self.applied_compaction;
-        if compacted && exposed.contains(context_search) && self.session_search_storage().is_some() {
-            lines.push("After compaction, use ContextSearch to recover exact details omitted from the summary.".into());
-        }
-        // Whether discovery is actually callable comes from the definitions
-        // sent with this request, not from the user's switches.
-        if !exposed.contains(TOOL_LOAD_NAME) {
-            lines.push(
-                "ToolLoad is not available in this request, so no tools can be loaded through it."
-                    .to_string(),
-            );
-            return lines.join("\n");
-        }
-        let mut tools: Vec<_> = catalog
-            .iter()
-            .filter(|tool| self.tool_is_loadable(tool, customization, &exposed))
-            .collect();
-        if compacted && tools.iter().any(|tool| tool.name == context_search) {
-            lines.push("After compaction, load ContextSearch with ToolLoad to recover exact details omitted from the summary.".into());
-        }
-        tools.sort_by(|a, b| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-                .then_with(|| a.name.cmp(&b.name))
-        });
-        if let Some(first) = tools.first() {
-            let example = json!({"names":[&first.name]});
-            lines.push(format!(
-                "Among built-ins, ToolLoad can load only the names listed below. Pass exact, case-sensitive names in the `names` array, e.g. {example}."
-            ));
-            lines.extend(tools.into_iter().map(|tool| {
-                format!(
-                    "- `{}`: {}",
-                    tool.name,
-                    one_sentence_purpose(&tool.description)
-                )
-            }));
-        } else {
-            lines.push(
-                "No built-in tools are available for ToolLoad to load in this request.".to_owned(),
-            );
-        }
-
-        let mcp_tools: Vec<_> = self
-            .mcp_tools
-            .iter()
-            .filter(|tool| crate::mcp::states::server_of(&tool.name).is_some())
-            .filter(|tool| self.tool_is_loadable(tool, customization, &exposed))
-            .cloned()
-            .collect();
-        if !mcp_tools.is_empty() {
-            lines.push(String::new());
-            lines.push("MCP tools available on demand (pass exact names in the ToolLoad `names` array before calling):".to_owned());
-            lines.extend(customization.described(mcp_tools).iter().map(|tool| {
-                format!(
-                    "- {}: {}",
-                    tool.name,
-                    crate::mcp::states::description_summary(&tool.description)
-                )
-            }));
-        }
-        lines.join("\n")
-    }
-
-    /// The system prompt actually sent with this request: the configured prompt
-    /// followed by the directory built for the same request.
-    fn request_system_prompt(&self, directory: &str) -> Option<String> {
-        let base = self
-            .system_prompt
+    /// The system prompt sent with this request. The loadable-tool and skill
+    /// lists travel in the first user message, not here.
+    fn request_system_prompt(&self) -> Option<String> {
+        self.system_prompt
             .as_deref()
-            .filter(|text| !text.trim().is_empty());
-        Some(match base {
-            Some(base) => format!("{base}\n\n{directory}"),
-            None => directory.to_owned(),
-        })
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
     }
 
     /// Validate the full list before granting any definitions to the next request.
@@ -2391,7 +2473,7 @@ impl ToolLoopExecutor {
         let mut content = Vec::new();
         if !names.is_empty() {
             content.push(format!(
-                "Loaded {}. Call these tools starting with the next model request.",
+                "Loaded {}. Available from the next request.",
                 names.join(", ")
             ));
         }
@@ -2678,34 +2760,67 @@ impl ToolLoopExecutor {
         }
     }
 
+    #[cfg(test)]
     fn retained_tool_output(&self, tool_name: &str, output: &str) -> String {
+        self.retained_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn retained_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
         self.record_tool_usage(tool_name);
-        self.preview_tool_output(tool_name, output)
+        self.preview_tool_output_for_id(tool_name, output, id)
     }
 
     fn preview_tool_output(&self, tool_name: &str, output: &str) -> String {
-        let original = output;
+        self.preview_tool_output_for_id(tool_name, output, None)
+    }
+
+    fn summary_enabled(&self, root: Option<&std::path::Path>) -> bool {
+        crate::config::command_output::enabled(root, std::path::Path::new(self.get_workspace_cwd()))
+    }
+
+    fn preview_tool_output_for_id(
+        &self,
+        tool_name: &str,
+        output: &str,
+        id: Option<&str>,
+    ) -> String {
+        let root = self.search_config_path.as_deref().and_then(|p| p.parent());
+        if model_output::is_shell_result(tool_name) {
+            let enabled = self.summary_enabled(root);
+            let metadata = if enabled {
+                root.zip(id)
+                    .and_then(|(root, id)| {
+                        std::fs::read(model_output::metadata_path(root, id)).ok()
+                    })
+                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            } else {
+                None
+            };
+            return model_output::command_preview(
+                tool_name,
+                output,
+                root,
+                metadata.as_ref(),
+                enabled,
+            );
+        }
         let cleaned = model_tool_output(tool_name, output);
-        let output = cleaned.as_str();
-        // Read already selects the requested line range. This is the fresh
-        // result sent to the model, not a summary of old conversation history.
-        // Spilling it would also truncate any subsequent Read of the spill file.
-        if tool_name == "Read" {
-            return output.to_string();
-        }
-        let preview = if tool_name == "Bash" {
-            model_output::render(tool_name, original, Some(12_000))
+        // Read already selects the requested line range.
+        if let Some(root) = root.filter(|_| tool_name != "Read") {
+            let preview = compact_tool_output(tool_name, &cleaned);
+            crate::performance::retain_tool_output(root, &cleaned, &preview)
         } else {
-            compact_tool_output(tool_name, output)
-        };
-        if let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) {
-            return crate::performance::retain_tool_output(root, output, &preview);
+            cleaned
         }
-        output.to_string()
     }
 
     fn finish_mcp_output(
-        &self,
+        &mut self,
         id: &str,
         name: &str,
         display: &str,
@@ -2715,18 +2830,17 @@ impl ToolLoopExecutor {
         let Some(mut content) = content else {
             return Ok(None);
         };
-        if let (Some(db), Some(session)) = (&self.goal_db, &self.conv_id) {
+        if let Some(history) = self.session_search_storage() {
             let started = std::time::Instant::now();
-            db.with_conn(|conn| content.save(conn, session, id, display, failed))
-                .and_then(|result| result)
-                .map_err(|error| {
-                    crate::db::write_boundary_context(
-                        "save MCP tool output",
-                        session,
-                        started,
-                        error,
-                    )
-                })?;
+            if self.parent_message_id.is_none() {
+                if let ExecutorHistory::Session(session) = &history {
+                    self.parent_message_id = Some(session.write(|w| w.append("assistant", ""))?);
+                }
+            }
+            history.save_mcp(self.parent_message_id.as_deref(), id, &content, display, failed)
+                .map_err(|error| crate::db::write_boundary_context(
+                    "save MCP tool output", history.id(), started, error,
+                ))?;
         }
         // Images and structured blocks must remain real provider content. Only
         // plain text can use the existing spill/preview representation.
@@ -2751,6 +2865,10 @@ impl ToolLoopExecutor {
     }
 
     pub fn with_conv_id(mut self, conv_id: String) -> Self {
+        if self.executor_history.as_ref().is_some_and(|h| h.id() != conv_id) {
+            self.executor_history = None;
+            self.file_state=Default::default();
+        }
         self.conv_id = Some(conv_id);
         self.builtin_names.take();
         self
@@ -2777,10 +2895,19 @@ impl ToolLoopExecutor {
         self,
         runtime: crate::super_agent::crp::ToolRuntime,
     ) -> anyhow::Result<Self> {
+        let mut runtime = runtime;
+        if let Some(ExecutorHistory::Session(session)) = &self.executor_history {
+            anyhow::ensure!(session.id() == runtime.session_id, "Role session changed");
+            runtime.db = Arc::new(session.scoped_stores());
+        }
         let role = crate::super_agent::role::load(&runtime.db, &runtime.session_id)?;
         let member = crate::super_agent::role::membership(&runtime.db, &runtime.session_id)?
             .map(|(_, role)| role);
         Ok(self.with_super_agent(role, member, runtime))
+    }
+
+    pub(super) fn assistant_message_id(&self) -> Option<&str> {
+        self.parent_message_id.as_deref()
     }
 
     pub fn with_parent_message_id(mut self, message_id: String) -> Self {
@@ -2794,9 +2921,10 @@ impl ToolLoopExecutor {
     }
 
     /// Treat these built-ins as already loaded, as a resumed session or a
-    /// durable job must. The loading gate is never widened beyond this set.
-    pub(super) fn with_loaded_tools(mut self, loaded: std::collections::BTreeSet<String>) -> Self {
-        self.loaded_tools = loaded;
+    /// durable job must. The loading gate is never widened beyond this set, and
+    /// the given order is the order their definitions are sent in.
+    pub(super) fn with_loaded_tools(mut self, loaded: impl IntoIterator<Item = String>) -> Self {
+        self.loaded_tools.extend(loaded);
         self
     }
 
@@ -2888,10 +3016,47 @@ impl ToolLoopExecutor {
         self
     }
 
+    async fn run_builtin(
+        &self,
+        tool_name: &str,
+        tool_input: &Value,
+        id: &str,
+        cwd: &str,
+        approved: bool,
+    ) -> Result<Value> {
+        let run = self.run_builtin_inner(tool_name, tool_input, cwd, approved);
+        self.retain_command_metadata(tool_name, id, run).await
+    }
+
+    async fn retain_command_metadata(
+        &self,
+        tool_name: &str,
+        id: &str,
+        run: impl std::future::Future<Output = Result<Value>>,
+    ) -> Result<Value> {
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(std::path::Path::parent);
+        if let Some(root) = root.filter(|root| {
+            model_output::is_shell_result(tool_name) && self.summary_enabled(Some(root))
+        }) {
+            let (result, metadata) = crate::tools::bash_process::with_capture(run).await;
+            if let Some(metadata) = metadata {
+                if let Err(error) = model_output::save_metadata(root, id, &metadata) {
+                    tracing::debug!(%error, "Could not retain shell capture metadata");
+                }
+            }
+            result
+        } else {
+            run.await
+        }
+    }
+
     /// Runs a built-in tool. While a sandboxed command with a domain
     /// allowlist runs, hosts outside the list are put to the user, as in the
     /// reference CLI; "don't ask again" saves a SandboxNetwork(domain:) rule.
-    async fn run_builtin(
+    async fn run_builtin_inner(
         &self,
         tool_name: &str,
         tool_input: &Value,
@@ -2935,6 +3100,7 @@ impl ToolLoopExecutor {
                         self.search_config_path.as_deref(),
                         self.skill_shell_active,
                         self.openai_client.request_options.clone(),
+                        self.file_state.session.clone(),
                     ),
                 ),
             ),
@@ -3093,6 +3259,14 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub(crate) fn with_provider_manager(
+        mut self,
+        manager: Option<Arc<tokio::sync::Mutex<super::provider_manager::ProviderManager>>>,
+    ) -> Self {
+        self.provider_manager = manager;
+        self
+    }
+
     pub(crate) fn with_runtime_agents(mut self, agents: super::runtime_agents::Catalog) -> Self {
         self.runtime_agents = agents;
         self
@@ -3196,43 +3370,11 @@ impl ToolLoopExecutor {
     /// settings and catalog snapshot, so the schemas the model receives and the
     /// directory it reads describe the same state. Execution still re-reads the
     /// settings and rechecks permission when a tool is actually called.
-    fn prepare_request(&self, message_bytes: usize) -> Result<PreparedRequest> {
+    fn prepare_request(&self) -> Result<PreparedRequest> {
         let customization = self.customization()?;
         let catalog = customization.described(self.builtin_catalog());
-        let tools = self.prepare_tool_definitions(&customization, catalog.clone())?;
-        let directory = self.tool_directory(&customization, &catalog, &tools);
-        let mut system_prompt = self.request_system_prompt(&directory);
-        if let Some(memory) = self.file_memory.as_ref().filter(|m| m.active()) {
-            let window = self
-                .provider
-                .model
-                .context_window
-                .map(|n| n as usize)
-                .unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id));
-            let used = message_bytes
-                .saturating_add(system_prompt.as_ref().map_or(0, String::len))
-                .saturating_add(serde_json::to_vec(&tools)?.len());
-            let latest = crate::services::turn_context::for_last(&self.messages, Vec::new());
-            let recall_bytes = latest.as_ref().map_or(0, |target| {
-                self.turn_context
-                    .iter()
-                    .filter(|entry| {
-                        entry.key == target.key && entry.occurrence == target.occurrence
-                    })
-                    .flat_map(|entry| &entry.blocks)
-                    .filter(|block| block.contains(crate::memory::RECALL_LEAD_IN))
-                    .map(String::len)
-                    .sum::<usize>()
-            });
-            let budget = self
-                .memory_budget()
-                .saturating_sub(recall_bytes)
-                .min((window * 85 / 100).saturating_sub(used));
-            let (block, _) = memory.context_with_budget("", self.memory_read_only(), budget)?;
-            system_prompt
-                .get_or_insert_with(String::new)
-                .push_str(&block);
-        }
+        let tools = self.prepare_tool_definitions(&customization, catalog)?;
+        let system_prompt = self.request_system_prompt();
         Ok(PreparedRequest {
             tools,
             system_prompt,
@@ -3331,7 +3473,51 @@ impl ToolLoopExecutor {
                 }
             }
         }
-        Ok(tools)
+        // The resident tools keep one alphabetical order that a rediscovery or
+        // registry reordering cannot rewrite. Tools that exist only because
+        // ToolLoad loaded them follow in load order, so loading one never moves
+        // a resident tool or rewrites the request prefix the provider cached.
+        let mut resident = Vec::with_capacity(tools.len());
+        let mut deferred = Vec::new();
+        for tool in tools {
+            let resident_without_loading = match crate::mcp::states::server_of(&tool.name) {
+                Some(server) => {
+                    crate::mcp::states::effective(&self.mcp_states, server) != McpState::OnDemand
+                }
+                // The user's own tools and the Super Agent tools never go
+                // through ToolLoad, so they count as resident whenever they
+                // reached this list.
+                None if !self.builtin_names().contains(&tool.name) => true,
+                None => {
+                    let loading = customization.loading(&tool.name);
+                    loading.enabled || (restricted && loading.on_demand && allowed(&tool.name))
+                }
+            };
+            if resident_without_loading {
+                resident.push(tool);
+            } else {
+                deferred.push(tool);
+            }
+        }
+        resident.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.description.cmp(&b.description))
+        });
+        for name in self.loaded_tools.iter() {
+            if let Some(index) = deferred.iter().position(|tool| &tool.name == name) {
+                resident.push(deferred.remove(index));
+            }
+        }
+        // A host can mark a tool loaded without a load order (a durable job or
+        // a test); those definitions stay deterministic after the ordered ones.
+        deferred.sort_by(|a, b| {
+            a.name
+                .cmp(&b.name)
+                .then_with(|| a.description.cmp(&b.description))
+        });
+        resident.extend(deferred);
+        Ok(resident)
     }
 
     pub fn with_prefetch_engine(mut self, engine: Arc<PrefetchEngine>) -> Self {
@@ -3385,12 +3571,38 @@ impl ToolLoopExecutor {
         self.context_usage.is_some()
             && self.delegation_depth == 0
             && self.subagent_hook_context.is_none()
-            && self.goal_db.is_some()
+            && self.session_search_storage().is_some()
             && self.conv_id.is_some()
     }
 
-    fn session_search_storage(&self) -> Option<(&Arc<crate::db::DbManager>, &str)> {
-        self.transcript_db.as_ref().or(self.goal_db.as_ref()).zip(self.conv_id.as_deref())
+    async fn publish_context_reset(&mut self, boundary_id: String) -> Result<()> {
+        let sender = self.event_tx.clone();
+        let event = sender.reserve().await.map_err(|_| anyhow!("Planning event receiver closed"))?;
+        let next = match (self.session_search_storage(), self.parent_message_id.as_deref()) {
+            (Some(history), Some(previous)) => Some(history.rollover_segment(previous, &boundary_id)?),
+            _ => None,
+        };
+        self.parent_message_id = next.clone();
+        event.send(EngineEvent::ContextReset {
+            session_id: self.conv_id.clone().unwrap_or_default(), boundary_id, assistant_id: next,
+        });
+        Ok(())
+    }
+
+    fn session_search_storage(&self) -> Option<ExecutorHistory> {
+        self.executor_history.clone().or_else(|| {
+            let db = self.goal_db.as_ref()?;
+            db.executor_history(self.conv_id.as_deref()?).ok()
+        })
+    }
+
+    pub fn with_executor_history(mut self, history: ExecutorHistory) -> Result<Self> {
+        anyhow::ensure!(self.conv_id.as_deref() == Some(history.id()), "Executor transcript belongs to another session");
+        self.file_state.session=match &history {ExecutorHistory::Session(s)=>Some(s.clone()),ExecutorHistory::Shared(..)=>None};
+        if let Some(hooks) = self.hooks.as_mut() { Arc::make_mut(hooks).transcript_history = Some(history.clone()); }
+        self.executor_history = Some(history);
+        self.builtin_names.take();
+        Ok(self)
     }
 
     pub fn with_auto_manual_interactive(mut self, interactive: bool) -> Self {
@@ -3541,88 +3753,16 @@ impl ToolLoopExecutor {
         &self,
         after_tool_results: bool,
     ) -> Vec<crate::services::input_queue::DeliveredInput> {
-        let (Some(db), Some(id)) = (&self.goal_db, &self.conv_id) else {
-            return Vec::new();
-        };
-        if !after_tool_results {
-            return Vec::new();
+        if !after_tool_results { return Vec::new(); }
+        if let Some(owner) = self.turn_delivery.upgrade() {
+            let inputs = owner.lock().unwrap_or_else(|e|e.into_inner()).poll_turn(false, 8).unwrap_or_else(|error| {
+                tracing::warn!("Steer handoff retained for recovery: {error:#}");
+                Vec::new()
+            });
+            for input in &inputs { let _ = self.event_tx.send(EngineEvent::QueuedInput(input.clone())).await; }
+            return inputs;
         }
-        let inputs = crate::services::input_queue::take(db, id).unwrap_or_else(|error| {
-            tracing::warn!("Queued input unavailable: {error:#}");
-            Vec::new()
-        });
-        let data_dir = self
-            .search_config_path
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .map(std::path::Path::to_path_buf)
-            .or_else(|| crate::runtime::resolve_default_data_dir().ok());
-        let mut inputs: Vec<_> = inputs
-            .into_iter()
-            .map(|text| {
-                crate::services::input_queue::DeliveredInput::resolve(data_dir.as_deref(), id, text)
-            })
-            .collect();
-        // Next-turn input never crosses a running model's tool-result boundary.
-        use crate::services::input_queue::{self as queue, QueueMode, QueueState};
-        if !queue::is_paused(db, id).unwrap_or(true) {
-            let pending = queue::list(db, id).unwrap_or_default();
-            for item in pending.into_iter().filter(|item| {
-                item.mode == QueueMode::Steer
-                    && matches!(item.state, QueueState::Queued | QueueState::Claimed)
-            }) {
-                let result = (|| -> anyhow::Result<_> {
-                    let item = if item.state == QueueState::Queued {
-                        queue::claim(db, id, item.id, item.revision)?
-                    } else {
-                        item
-                    };
-                    queue::handoff(db, id, item.id, item.revision, |tx, item, message_id| {
-                        let paused: bool = tx.query_row("SELECT COALESCE((SELECT paused FROM session_input_queue_control WHERE session_id=?1),0)", [id], |row| row.get(0))?;
-                        anyhow::ensure!(!paused, queue::QueueError::Paused);
-                        let order: i64 = tx.query_row("SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?1", [id], |row| row.get(0))?;
-                        crate::db::message_repo::save_user_message(
-                            tx,
-                            message_id,
-                            id,
-                            &item.content,
-                            &chrono::Utc::now().to_rfc3339(),
-                            order,
-                        )?;
-                        Ok(())
-                    })
-                })();
-                match result {
-                    Ok(item) => {
-                        let text = item.content.as_str().map(str::to_owned).unwrap_or_else(|| {
-                            item.content
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|block| block["text"].as_str())
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        });
-                        inputs.push(queue::DeliveredInput {
-                            text,
-                            content: item.content,
-                            origin: item.handoff_id.unwrap_or_default(),
-                        });
-                    }
-                    Err(error) => {
-                        tracing::warn!("Steer handoff retained for recovery: {error:#}");
-                        break;
-                    }
-                }
-            }
-        }
-        for input in &inputs {
-            let _ = self
-                .event_tx
-                .send(EngineEvent::QueuedInput(input.clone()))
-                .await;
-        }
-        inputs
+        Vec::new()
     }
 
     fn drain_approval_notes(&self) -> Vec<String> {
@@ -3635,10 +3775,11 @@ impl ToolLoopExecutor {
     }
 
     fn drain_peer_messages(&mut self) -> Result<Vec<String>> {
-        let messages = match self.message_inbox.as_ref() {
-            Some(inbox) => inbox.drain(32usize.saturating_sub(self.message_deliveries))?,
-            None => Vec::new(),
-        };
+        let limit = 32usize.saturating_sub(self.message_deliveries);
+        let messages = if let Some(owner) = self.turn_delivery.upgrade() {
+            owner.lock().unwrap_or_else(|e| e.into_inner()).poll_turn(true, limit)?
+                .into_iter().map(|input| input.text).collect()
+        } else { Vec::new() };
         self.message_deliveries += messages.len();
         Ok(messages)
     }
@@ -3685,16 +3826,14 @@ impl ToolLoopExecutor {
         // work. The field is intentionally never taken, so cancellation of
         // this future or the outer task still releases it by dropping the
         // executor.
+        if self.executor_history.is_none() {
+            if let (Some(db),Some(id))=(&self.goal_db,self.conv_id.as_deref()) {
+                self.executor_history=db.listed_history(id)?;
+            }
+        }
         if self.execution_lease.is_none() {
-            if let (Some(root), Some(session)) = (
-                self.search_config_path
-                    .as_deref()
-                    .and_then(std::path::Path::parent),
-                self.conv_id.as_deref(),
-            ) {
-                self.execution_lease =
-                    crate::services::session_messages::ExecutionLease::acquire(root, session)?
-                        .map(std::sync::Arc::new);
+            if let Some(history)=&self.executor_history {
+                self.execution_lease=history.execution_lease()?.map(std::sync::Arc::new);
             }
         }
         let mut async_hook_guard = crate::services::async_hooks::TurnGuard(self.conv_id.clone());
@@ -3729,27 +3868,28 @@ impl ToolLoopExecutor {
             self.context_boundary_id = Some(boundary_id.clone());
             self.applied_compaction = true;
             self.stop_hook_active = false;
-            let _ = self
-                .event_tx
-                .send(EngineEvent::ContextReset {
-                    session_id: self.conv_id.clone().unwrap_or_default(),
-                    boundary_id,
-                })
-                .await;
+            self.publish_context_reset(boundary_id).await?;
         }
         // The OS lock is scoped to this future: cancellation/crash releases it.
-        let inbox_owner = match (
-            self.search_config_path
-                .as_deref()
-                .and_then(std::path::Path::parent),
-            self.conv_id.as_deref(),
-        ) {
-            (Some(root), Some(session)) => {
-                crate::services::session_messages::Consumer::attach(root, session)?
-            }
-            _ => None,
-        };
-        self.message_inbox = inbox_owner.as_ref().map(|owner| owner.target.clone());
+        let (_turn_wal, turn_delivery) =
+            if let Some(ExecutorHistory::Session(shard)) = &self.executor_history {
+                let lease = self
+                    .execution_lease
+                    .clone()
+                    .context("Turn delivery requires execution ownership")?;
+                let wal = shard.hold_turn_wal(lease.clone())?;
+                let delivery = shard.delivery_under_lease(lease)?;
+                (
+                    wal,
+                    Some(std::sync::Arc::new(std::sync::Mutex::new(delivery))),
+                )
+            } else {
+                (None, None)
+            };
+        self.turn_delivery = turn_delivery
+            .as_ref()
+            .map(std::sync::Arc::downgrade)
+            .unwrap_or_default();
         self.message_deliveries = 0;
         self.child_resumes.store(0, Ordering::Relaxed);
         if self.require_pending_peer_message {
@@ -3804,16 +3944,16 @@ impl ToolLoopExecutor {
         }
         // MCP discovery is a live external exchange, so execution ownership and
         // authority checks must succeed before any SDK/stdio server is contacted.
-        if let (Some(db), Some(session)) = (&self.goal_db, &self.conv_id) {
-            db.with_conn(|conn| {
-                super::mcp_output::restore_history(&mut self.messages, conn, session)
-            })??;
+        if let Some(history) = self.session_search_storage() {
+            history.restore(&mut self.messages)?;
         }
         Box::pin(self.refresh_mcp_tools()).await?;
         // A tool loaded earlier in this session stays available; the current
-        // settings still decide whether it may come back.
-        self.restore_loaded_tools();
+        // settings still decide whether it may come back. The durable rows are
+        // read first so their load order wins over a display-only message
+        // window that may start in the middle of the session.
         self.restore_persisted_loaded_tools()?;
+        self.restore_loaded_tools();
         self.exposed_tools = None;
         let mut directories = self.allowed_directories.clone();
         if let (Some(manager), Some(conv)) = (&self.permission_manager, self.conv_id.as_deref()) {
@@ -3824,29 +3964,22 @@ impl ToolLoopExecutor {
             .as_deref()
             .and_then(|p| p.parent())
             .map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
-        let mut options = self
-            .goal_db
-            .as_ref()
-            .map(|db| {
-                super::request_options::RequestOptions::from_db(
-                    db,
-                    self.conv_id.as_deref(),
-                    if self.delegation_depth > 0 {
-                        "subagent"
-                    } else {
-                        "main"
-                    },
-                )
-            })
-            .unwrap_or_else(|| {
-                super::request_options::RequestOptions::for_session(self.conv_id.as_deref())
-            });
-        if let Some(recording) = &mut options.recording {
-            recording.parent_session_id = self.request_parent_session();
-        }
+        let history = self.session_search_storage();
+        let (options, recorded_parent) = match &history {
+            Some(storage) => super::request_options::RequestOptions::with_recording_parent(
+                storage, self.conv_id.as_deref(), if self.delegation_depth>0 { "subagent" } else { "main" }),
+            None => (super::request_options::RequestOptions::for_session(self.conv_id.as_deref()),None)
+        };
+        let parent_session = recorded_parent.or_else(|| {
+            if matches!(history, Some(ExecutorHistory::Session(_))) {return None;}
+            let session=self.conv_id.as_deref()?;
+            let root=self.search_config_path.as_deref()?.parent()?;
+            let dir=crate::services::background_sessions::worker_directory(root,session).ok()??;
+            let job=crate::services::background_sessions::read_job(&dir).ok()?;
+            (job.parent_session_id != session).then_some(job.parent_session_id)
+        });
         self.openai_client.request_options = options.clone();
         self.anthropic_client.request_options = options;
-        let parent_session = self.request_parent_session();
         let identity =
             super::request_identity::TurnIdentity::new(self.conv_id.clone(), parent_session);
         let result = identity
@@ -3865,35 +3998,6 @@ impl ToolLoopExecutor {
             async_hook_guard.0 = None;
         }
         result
-    }
-
-    fn request_parent_session(&self) -> Option<String> {
-        let session = self.conv_id.as_deref()?;
-        if let Some(parent) = self
-            .goal_db
-            .as_ref()
-            .and_then(|db| {
-                db.with_conn(|conn| {
-                    conn.query_row(
-                        "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [format!("delegation.{session}")],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .ok()
-                })
-                .ok()
-                .flatten()
-            })
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .and_then(|value| value["parent_session_id"].as_str().map(str::to_owned))
-        {
-            return Some(parent);
-        }
-        let root = self.search_config_path.as_deref()?.parent()?;
-        let directory =
-            crate::services::background_sessions::worker_directory(root, session).ok()??;
-        let job = crate::services::background_sessions::read_job(&directory).ok()?;
-        (job.parent_session_id != session).then_some(job.parent_session_id)
     }
 
     fn drain_async_hook_messages(&self) -> Vec<String> {
@@ -3921,36 +4025,54 @@ impl ToolLoopExecutor {
         self.mcp_tools.clear();
         self.mcp_read_only_tools.clear();
         if let Some(registry) = &self.mcp_registry {
-            let mut builtin = get_tool_definitions();
-            builtin.extend(delegation::definitions());
-            builtin.push(script_workflow::definition());
-            let builtin = builtin
-                .into_iter()
-                .map(|tool| tool.name)
-                .collect::<std::collections::HashSet<_>>();
-            let discovered = registry.get_all_tools().await?;
-            let read_only = discovered
-                .iter()
-                .filter(|tool| tool.is_read_only())
-                .map(|tool| tool.name.clone())
-                .collect();
-            self.mcp_tools = discovered
-                .into_iter()
-                .map(|tool| {
-                    anyhow::ensure!(
-                        !builtin.contains(&tool.name),
-                        "MCP tool conflicts with native tool: {}",
-                        tool.name
-                    );
-                    Ok(crate::tools::ToolDefinition {
-                        name: tool.name,
-                        description: tool.description,
-                        input_schema: tool.input_schema,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let (tools, read_only) = discover_mcp_tools(registry).await?;
+            self.mcp_tools = tools;
             self.mcp_read_only_tools = read_only;
+            self.snapshot_mcp_tools()?;
         }
+        Ok(())
+    }
+
+    /// Freeze each MCP tool definition the first time this session sees it, so
+    /// a reconnecting server cannot rewrite a resident definition mid-session.
+    fn snapshot_mcp_tools(&mut self) -> Result<()> {
+        let (Some(root), Some(session)) = (
+            self.search_config_path
+                .as_deref()
+                .and_then(std::path::Path::parent),
+            self.conv_id.as_deref(),
+        ) else {
+            return Ok(());
+        };
+        let path = crate::session_files::mcp_snapshot_file(root, session);
+        let mut saved: std::collections::BTreeMap<String, crate::tools::ToolDefinition> =
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or_default();
+        let mut changed = false;
+        for tool in &mut self.mcp_tools {
+            if let Some(snapshot) = saved.get(&tool.name) {
+                tool.description = snapshot.description.clone();
+                tool.input_schema = snapshot.input_schema.clone();
+            } else {
+                saved.insert(tool.name.clone(), tool.clone());
+                changed = true;
+            }
+        }
+        if changed {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, serde_json::to_vec_pretty(&saved)?)?;
+        }
+        Ok(())
+    }
+
+    fn refresh_provider(&mut self) -> Result<()> {
+        let (provider, selector) = self.provider.current_selection()?;
+        self.provider = provider;
+        if let Some(selector) = selector { self.model_selector = selector; }
         Ok(())
     }
 
@@ -4222,6 +4344,7 @@ impl ToolLoopExecutor {
         _tool_use_id: &str,
         provider_id: &str,
     ) -> CallStep {
+        if let Err(error) = self.refresh_provider() { return CallStep::Finished((tool_input.clone(), error.to_string(), true)); }
         // Hard denials are enforced before any permission prompt. A pending
         // Super Agent plan approval, a Router edit, or an agent tool allowlist
         // must not become a user-confirmable prompt that could authorize it.
@@ -4568,7 +4691,7 @@ impl ToolLoopExecutor {
                 anyhow::ensure!(self.compaction_requests_available(), "CompactContext is only available in an interactive terminal session");
                 let keep = tool_input["keep"].as_str().context("CompactContext requires keep")?;
                 let (used, window) = self.context_usage.context("CompactContext is only available in an interactive terminal session")?;
-                crate::services::compaction_requests::request(self.goal_db.as_ref().unwrap(), self.conv_id.as_deref().unwrap(), keep, used, window)
+                crate::services::compaction_requests::request(&self.session_search_storage().context("Compaction history unavailable")?, self.conv_id.as_deref().unwrap(), keep, used, window)
             })();
             let failed = result.is_err();
             return CallStep::Finished((tool_input.clone(), result.unwrap_or_else(|error| error.to_string()), failed));
@@ -4637,11 +4760,9 @@ impl ToolLoopExecutor {
 
         if tool_name == crate::tools::context_search::NAME {
             let result = match self.session_search_storage() {
-                Some((db, session)) => {
-                    let (db, session, input) = (db.clone(), session.to_owned(), tool_input.clone());
-                    tokio::task::spawn_blocking(move || {
-                        crate::tools::context_search::execute(&db, &session, input)
-                    })
+                Some(history) => {
+                    let input = tool_input.clone();
+                    tokio::task::spawn_blocking(move || history.search(input))
                     .await
                     .context("ContextSearch could not finish")
                     .and_then(|result| result)
@@ -4785,7 +4906,10 @@ impl ToolLoopExecutor {
                         }
                     }
                 }
-                crate::tools::tasks::execute_for_session_async(tool_name, tool_input.clone(), root, session).await
+                let run = crate::tools::tasks::execute_for_session_async(
+                    tool_name, tool_input.clone(), root, session,
+                );
+                self.retain_command_metadata(tool_name, _tool_use_id, run).await
             }.await;
             return CallStep::Finished((
                 tool_input.clone(),
@@ -5017,7 +5141,9 @@ impl ToolLoopExecutor {
                 .as_str()
                 .or_else(|| tool_input["notebook_path"].as_str())
             {
-                self.record_seen_file(file_path);
+                if tool_name!="Read" || self.file_state.session.is_none() {
+                    self.record_seen_file(file_path);
+                }
             }
         }
         match take_read_image(tool_name, &mut value) {
@@ -5156,19 +5282,13 @@ impl ToolLoopExecutor {
     }
 
     async fn execute_anthropic_loop(&mut self) -> Result<(String, Option<String>)> {
-        tracing::info!(
-            module = "AnthropicLoop",
-            "ENTRY: building messages, msg_count={}",
-            self.messages.len()
-        );
-        let mut conversation_messages: Vec<AnthropicMessage> = self.build_anthropic_messages()?;
-        tracing::info!(
-            module = "AnthropicLoop",
-            "Messages built, count={}",
-            conversation_messages.len()
-        );
+        let messages = self.build_anthropic_messages()?;
+        self.continue_anthropic(Continuation { messages, iteration: 0, text: String::new(), after_tools: false }).await
+    }
 
-        if matches!(self.reasoning_mode, ReasoningMode::Deep) {
+    async fn continue_anthropic(&mut self, cursor: Continuation<AnthropicMessage>) -> Result<(String, Option<String>)> {
+        let mut conversation_messages = cursor.messages;
+        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
             if let Some(ref sp) = self.system_prompt {
                 self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
             } else {
@@ -5176,17 +5296,23 @@ impl ToolLoopExecutor {
             }
         }
 
-        let mut full_text = String::new();
+        let mut full_text = cursor.text;
         let mut stop_reason = None;
-        let base_url = self.provider.provider.base_url.clone();
-        let model_id = self.provider.model.id.clone();
-        let api_key_len = self.provider.provider.api_key.len();
+
 
         let enable_thinking = matches!(self.reasoning_mode, ReasoningMode::Deep);
         let mut output_recoveries = 0;
 
-        let mut after_tool_results = false;
-        for iteration in 0usize.. {
+        let mut after_tool_results = cursor.after_tools;
+        for iteration in cursor.iteration.. {
+            self.refresh_provider()?;
+            if self.provider.provider.api_format != ApiFormat::Anthropic {
+                let messages = provider_transcript::openai(conversation_messages)?;
+                return Box::pin(self.continue_openai(Continuation { messages, iteration, text: full_text, after_tools: after_tool_results })).await;
+            }
+            let base_url = self.provider.provider.base_url.clone();
+            let model_id = self.provider.model.id.clone();
+            let api_key_len = self.provider.provider.api_key.len();
             for context in self.drain_async_hook_messages() {
                 conversation_messages.push(AnthropicMessage {
                     role: "user".into(),
@@ -5297,7 +5423,7 @@ impl ToolLoopExecutor {
             let PreparedRequest {
                 tools,
                 system_prompt,
-            } = self.prepare_request(serde_json::to_vec(&conversation_messages)?.len())?;
+            } = self.prepare_request()?;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
             self.streaming_tool_args.clear();
             let mut request_trace = RequestTrace::new(json!({
@@ -5325,7 +5451,8 @@ impl ToolLoopExecutor {
             // Real HTTP attempts observed by the send layer, so a clean
             // end-of-stream still reports a count instead of "unknown".
             let http_attempts: crate::performance::AttemptCounter;
-            let context_capture = request_trace.capture_context(self.event_tx.clone());
+            let mut context_capture = request_trace.capture_context(self.event_tx.clone());
+            context_capture.suggestion = self.suggestion.clone();
             let stream = self
                 .anthropic_client
                 .send_message_stream_with_thinking_counted(
@@ -5687,6 +5814,13 @@ impl ToolLoopExecutor {
                 snapshot["failure"] = failure.as_json();
                 snapshot["error"] = json!(failure.diagnostic());
             }
+            if let Some(capture) = &self.suggestion {
+                capture.finish(
+                    &snapshot,
+                    &self.provider,
+                    &self.anthropic_client.request_options,
+                );
+            }
             let response_status = snapshot["status"]
                 .as_str()
                 .unwrap_or("interrupted")
@@ -5791,7 +5925,11 @@ impl ToolLoopExecutor {
                             })
                             .await;
                         let content = mcp.map(|value| value.content).unwrap_or_else(|| {
-                            json!(self.retained_tool_output(&tc.name, &output_str))
+                            json!(self.retained_tool_output_for_id(
+                                &tc.name,
+                                &output_str,
+                                Some(&tc.id)
+                            ))
                         });
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: tc.provider_id.clone(),
@@ -5825,13 +5963,7 @@ impl ToolLoopExecutor {
                     full_text.clear();
                     self.messages.clear();
                     self.stop_hook_active = false;
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::ContextReset {
-                            session_id: self.conv_id.clone().unwrap_or_default(),
-                            boundary_id,
-                        })
-                        .await;
+                    self.publish_context_reset(boundary_id).await?;
                 }
             } else {
                 let incoming = if self
@@ -5900,19 +6032,13 @@ impl ToolLoopExecutor {
     }
 
     async fn execute_openai_loop(&mut self) -> Result<(String, Option<String>)> {
-        tracing::info!(
-            module = "OpenAILoop",
-            "ENTRY: building messages, msg_count={}",
-            self.messages.len()
-        );
-        let mut conversation_messages: Vec<OpenAIMessage> = self.build_openai_messages()?;
-        tracing::info!(
-            module = "OpenAILoop",
-            "Messages built, count={}",
-            conversation_messages.len()
-        );
+        let messages = self.build_openai_messages()?;
+        self.continue_openai(Continuation { messages, iteration: 0, text: String::new(), after_tools: false }).await
+    }
 
-        if matches!(self.reasoning_mode, ReasoningMode::Deep) {
+    async fn continue_openai(&mut self, cursor: Continuation<OpenAIMessage>) -> Result<(String, Option<String>)> {
+        let mut conversation_messages = cursor.messages;
+        if cursor.iteration == 0 && matches!(self.reasoning_mode, ReasoningMode::Deep) {
             if let Some(ref sp) = self.system_prompt {
                 self.system_prompt = Some(format!("{}\n\nYou are in deep reasoning mode. For any destructive operations, you MUST ask for user confirmation before proceeding.", sp));
             } else {
@@ -5920,11 +6046,9 @@ impl ToolLoopExecutor {
             }
         }
 
-        let mut full_text = String::new();
+        let mut full_text = cursor.text;
         let mut stop_reason = None;
-        let base_url = self.provider.provider.base_url.clone();
-        let model_id = self.provider.model.id.clone();
-        let api_key_len = self.provider.provider.api_key.len();
+
         let mut output_recoveries = 0;
 
         // Read once per turn. The opt-in replay covers the Chat Completions
@@ -5943,8 +6067,16 @@ impl ToolLoopExecutor {
         };
         let mut recovery_used = false;
 
-        let mut after_tool_results = false;
-        for iteration in 0usize.. {
+        let mut after_tool_results = cursor.after_tools;
+        for iteration in cursor.iteration.. {
+            self.refresh_provider()?;
+            if self.provider.provider.api_format != ApiFormat::OpenAI {
+                let messages = provider_transcript::anthropic(conversation_messages)?;
+                return Box::pin(self.continue_anthropic(Continuation { messages, iteration, text: full_text, after_tools: after_tool_results })).await;
+            }
+            let base_url = self.provider.provider.base_url.clone();
+            let model_id = self.provider.model.id.clone();
+            let api_key_len = self.provider.provider.api_key.len();
             for context in self.drain_async_hook_messages() {
                 conversation_messages.push(OpenAIMessage {
                     role: "user".into(),
@@ -6035,6 +6167,7 @@ impl ToolLoopExecutor {
                                 options,
                                 conversation_messages.clone(),
                                 self.system_prompt.as_deref().unwrap_or(""),
+                                self.conv_id.as_deref(),
                             )
                             .await?;
                         if let Some(record) = &mut record {
@@ -6096,7 +6229,7 @@ impl ToolLoopExecutor {
             let PreparedRequest {
                 tools,
                 system_prompt,
-            } = self.prepare_request(serde_json::to_vec(&conversation_messages)?.len())?;
+            } = self.prepare_request()?;
             self.exposed_tools = Some(tools.iter().map(|tool| tool.name.clone()).collect());
             // One attempt of this model step. A stalled attempt that is replaced
             // must leave nothing behind, so the parser state belongs to the
@@ -6164,7 +6297,8 @@ impl ToolLoopExecutor {
                 // Real HTTP attempts observed by the send layer, so a clean
                 // end-of-stream still reports a count instead of "unknown".
                 let http_attempts: crate::performance::AttemptCounter;
-                let context_capture = request_trace.capture_context(self.event_tx.clone());
+                let mut context_capture = request_trace.capture_context(self.event_tx.clone());
+                context_capture.suggestion = self.suggestion.clone();
                 // The replacement is one authorized POST through a client without
                 // redirects or internal retries; the first leg keeps the ordinary
                 // budgeted entry point.
@@ -6567,6 +6701,13 @@ impl ToolLoopExecutor {
                     snapshot["failure"] = failure.as_json();
                     snapshot["error"] = json!(failure.diagnostic());
                 }
+                if let Some(capture) = &self.suggestion {
+                    capture.finish(
+                        &snapshot,
+                        &self.provider,
+                        &self.openai_client.request_options,
+                    );
+                }
                 let response_status = snapshot["status"]
                     .as_str()
                     .unwrap_or("interrupted")
@@ -6727,9 +6868,9 @@ impl ToolLoopExecutor {
                         if let Some(content) = &mcp {
                             tool_images.extend(content.openai_images(&tc.id));
                         }
-                        let compacted = mcp
-                            .map(|value| value.openai_text())
-                            .unwrap_or_else(|| self.retained_tool_output(&tc.name, &output_str));
+                        let compacted = mcp.map(|value| value.openai_text()).unwrap_or_else(|| {
+                            self.retained_tool_output_for_id(&tc.name, &output_str, Some(&tc.id))
+                        });
                         tool_results.push(OpenAIMessage {
                             role: "tool".to_string(),
                             content: OpenAIContent::Text(compacted),
@@ -6781,13 +6922,7 @@ impl ToolLoopExecutor {
                     full_text.clear();
                     self.messages.clear();
                     self.stop_hook_active = false;
-                    let _ = self
-                        .event_tx
-                        .send(EngineEvent::ContextReset {
-                            session_id: self.conv_id.clone().unwrap_or_default(),
-                            boundary_id,
-                        })
-                        .await;
+                    self.publish_context_reset(boundary_id).await?;
                 }
             } else {
                 let incoming = if self

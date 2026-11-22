@@ -90,7 +90,7 @@ async fn bypass_plan_requires_origin_and_explicit_approval_and_survives_worker_h
         worker.set_plan_launch_permissions(false, false);
         assert!(!modes::plan_returns_to_bypass(&context.db, &session, &worker).unwrap());
         if answer == "db_failure" {
-            context.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER fail_bypass BEFORE UPDATE ON peripheral_settings WHEN NEW.value='bypass' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;")).unwrap().unwrap();
+            context.db.fixture_shard(&session, |conn| conn.execute_batch("CREATE TRIGGER fail_bypass BEFORE UPDATE ON peripheral_settings WHEN NEW.value='bypass' BEGIN SELECT RAISE(ABORT,'fixture failure'); END;")).unwrap().unwrap();
         }
         let waiters = executor.answer_waiters.clone();
         let input = json!({"plan":"# Return to bypass after approval"});
@@ -188,7 +188,7 @@ async fn approval_choices_preserve_rules_cancel_waiters_and_rollback_failed_boun
             )]),
         );
         if choice == "db_failure" {
-            context.db.with_conn(|c|c.execute_batch("CREATE TRIGGER fail_boundary BEFORE INSERT ON messages WHEN NEW.is_compact_boundary=1 BEGIN SELECT RAISE(ABORT,'fixture write failed'); END;")).unwrap().unwrap();
+            context.db.fixture_shard(&session, |c|c.execute_batch("CREATE TRIGGER fail_boundary BEFORE INSERT ON approved_plan_boundaries BEGIN SELECT RAISE(ABORT,'fixture write failed'); END;")).unwrap().unwrap();
         }
         let waiters = executor.answer_waiters.clone();
         let input = json!({"plan":"# approved fixture plan"});

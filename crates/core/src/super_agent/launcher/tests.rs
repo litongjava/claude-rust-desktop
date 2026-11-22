@@ -8,6 +8,7 @@
 //! rather than inferred from in-memory state.
 #![cfg(unix)]
 
+use crate::db::session_store::TaskState as _;
 use super::*;
 use crate::runtime::{RuntimePaths, SessionStore};
 use crate::services::background_sessions;
@@ -237,7 +238,7 @@ impl Fixture {
     fn child_sessions(&self) -> Vec<String> {
         self.context
             .db
-            .with_conn(|conn| -> anyhow::Result<Vec<String>> {
+            .fixture_directory(|conn| -> anyhow::Result<Vec<String>> {
                 let mut statement =
                     conn.prepare("SELECT id FROM conversations WHERE id <> ?1 ORDER BY id")?;
                 let rows = statement.query_map([&self.router], |row| row.get::<_, String>(0))?;
@@ -746,8 +747,7 @@ fn review_and_integration_operations_are_identified_by_evidence_stage() {
     // A reservation recorded under one stage is never returned for another
     // stage's key, so a final review cannot adopt an implementation review.
     launcher
-        .context
-        .save_setting(
+        .context.db.save_task_state(
             &implementation,
             &json!({
                 "operation_id": "task-001:reviewer:resume",
@@ -1182,7 +1182,7 @@ async fn a_tampered_cached_handle_is_never_returned() {
         LaunchKind::Resume,
         &identity.purpose_key(),
     );
-    let stored: serde_json::Value = fixture.launcher().context.setting(&key).unwrap().unwrap();
+    let stored: serde_json::Value = fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
     assert!(stored["handle"].is_object());
 
     let mutations: Vec<fn(&mut serde_json::Value)> = vec![
@@ -1198,8 +1198,7 @@ async fn a_tampered_cached_handle_is_never_returned() {
         mutate(&mut changed);
         fixture
             .launcher()
-            .context
-            .save_setting(&key, &changed)
+            .context.db.save_task_state(&key, &changed)
             .unwrap();
         let error = fixture
             .reopen()
@@ -1214,13 +1213,12 @@ async fn a_tampered_cached_handle_is_never_returned() {
         // A rejected adoption is not an observation: no status, timestamp or
         // state may be persisted. The contradictory record is byte-equivalent.
         let preserved: serde_json::Value =
-            fixture.launcher().context.setting(&key).unwrap().unwrap();
+            fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
         assert_eq!(preserved, changed);
     }
     fixture
         .launcher()
-        .context
-        .save_setting(&key, &stored)
+        .context.db.save_task_state(&key, &stored)
         .unwrap();
     let cached = fixture
         .reopen()
@@ -1310,7 +1308,7 @@ async fn a_cached_typed_delivery_with_a_swapped_job_owner_is_never_returned() {
         LaunchKind::Resume,
         &identity.purpose_key(),
     );
-    let stored: serde_json::Value = fixture.launcher().context.setting(&key).unwrap().unwrap();
+    let stored: serde_json::Value = fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
     let job_id = stored["job_id"].as_str().unwrap().to_owned();
     // Let the real supervisor and worker settle first, so the fixture cannot
     // rewrite the durable state after the mutation below.
@@ -1332,7 +1330,7 @@ async fn a_cached_typed_delivery_with_a_swapped_job_owner_is_never_returned() {
         assert_eq!(fixture.child_runs(), 2);
         // The rejected adoption persists nothing.
         let preserved: serde_json::Value =
-            fixture.launcher().context.setting(&key).unwrap().unwrap();
+            fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
         assert_eq!(preserved, stored);
         std::fs::write(&state_path, &original_state).unwrap();
     }
@@ -1359,7 +1357,7 @@ async fn a_cached_typed_delivery_without_its_actual_job_is_never_returned() {
         LaunchKind::Resume,
         &identity.purpose_key(),
     );
-    let stored: serde_json::Value = fixture.launcher().context.setting(&key).unwrap().unwrap();
+    let stored: serde_json::Value = fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
     let job_id = stored["job_id"].as_str().unwrap().to_owned();
     assert_eq!(fixture.child_runs(), 2);
     std::fs::remove_dir_all(background_sessions::directory(&fixture.data, &job_id).unwrap())
@@ -1375,7 +1373,7 @@ async fn a_cached_typed_delivery_without_its_actual_job_is_never_returned() {
         "{error:#}"
     );
     assert_eq!(fixture.child_runs(), 2);
-    let preserved: serde_json::Value = fixture.launcher().context.setting(&key).unwrap().unwrap();
+    let preserved: serde_json::Value = fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
     assert_eq!(preserved, stored);
 }
 
@@ -1400,7 +1398,7 @@ async fn a_typed_record_without_its_required_version_blocks() {
         LaunchKind::Resume,
         &identity.purpose_key(),
     );
-    let stored: serde_json::Value = fixture.launcher().context.setting(&key).unwrap().unwrap();
+    let stored: serde_json::Value = fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
     let job_id = stored["job_id"].as_str().unwrap().to_owned();
 
     // The operation's nested identity lost its mandatory version. It must not
@@ -1412,8 +1410,7 @@ async fn a_typed_record_without_its_required_version_blocks() {
         .remove("version");
     fixture
         .launcher()
-        .context
-        .save_setting(&key, &without_version)
+        .context.db.save_task_state(&key, &without_version)
         .unwrap();
     let error = fixture
         .reopen()
@@ -1422,14 +1419,13 @@ async fn a_typed_record_without_its_required_version_blocks() {
         .unwrap_err();
     assert!(format!("{error:#}").contains("version"), "{error:#}");
     assert_eq!(fixture.child_runs(), 2);
-    let preserved: serde_json::Value = fixture.launcher().context.setting(&key).unwrap().unwrap();
+    let preserved: serde_json::Value = fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
     assert_eq!(preserved, without_version);
 
     // The sidecar's mandatory version is required as well.
     fixture
         .launcher()
-        .context
-        .save_setting(&key, &stored)
+        .context.db.save_task_state(&key, &stored)
         .unwrap();
     let path = binding_path(&fixture, &job_id);
     let bytes = std::fs::read(&path).unwrap();
@@ -1443,7 +1439,7 @@ async fn a_typed_record_without_its_required_version_blocks() {
         .unwrap_err();
     assert!(format!("{error:#}").contains("version"), "{error:#}");
     assert_eq!(fixture.child_runs(), 2);
-    let preserved: serde_json::Value = fixture.launcher().context.setting(&key).unwrap().unwrap();
+    let preserved: serde_json::Value = fixture.launcher().context.db.task_state(&key).unwrap().unwrap();
     assert_eq!(preserved, stored);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),

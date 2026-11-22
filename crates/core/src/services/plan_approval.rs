@@ -1,5 +1,6 @@
 //! User-selected plan acceptance, independent of model arguments and permission parsing.
 use super::ServiceContext;
+use crate::db::session_store::SessionAccess;
 use anyhow::{bail, Context, Result};
 
 pub const OPTIONS: [&str; 4] = [
@@ -176,11 +177,11 @@ pub fn parse_for_mode(answer: &str, bypass: bool) -> Result<Choice> {
     })
 }
 
-pub fn commit_boundary(context: &ServiceContext, session: &str, content: &str) -> Result<String> {
+pub fn commit_boundary(context: &ServiceContext<impl SessionAccess>, session: &str, content: &str) -> Result<String> {
     commit_boundary_inner(context, session, content, None)
 }
 pub fn commit_approved_boundary(
-    context: &ServiceContext,
+    context: &ServiceContext<impl SessionAccess>,
     session: &str,
     content: &str,
     manager: &crate::permissions::PermissionManager,
@@ -196,7 +197,7 @@ pub fn commit_approved_boundary(
     )
 }
 pub fn commit_approved_boundary_mode(
-    context: &ServiceContext,
+    context: &ServiceContext<impl SessionAccess>,
     session: &str,
     content: &str,
     manager: &crate::permissions::PermissionManager,
@@ -206,22 +207,18 @@ pub fn commit_approved_boundary_mode(
     commit_boundary_inner(context, session, content, Some((manager, expected, mode)))
 }
 pub fn commit_approved_mode(
-    context: &ServiceContext,
+    context: &ServiceContext<impl SessionAccess>,
     session: &str,
     manager: &crate::permissions::PermissionManager,
     expected: crate::permissions::manager::ModeSnapshot,
     mode: crate::permissions::PermissionMode,
     approved_plan: &str,
 ) -> Result<()> {
-    context.db.with_conn(|conn| -> Result<()> {
-        let tx=crate::db::write_transaction(&conn)?;
-        tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![format!("cli.permission-mode.{session}"),super::session_permission_mode::name(mode)])?;
-        super::permission_authority::record_conn(&tx,session,super::permission_authority::Source::ApprovedPlan,&serde_json::json!(approved_plan))?;
-        manager.commit_mode_transition(expected,mode,||{tx.commit()?;Ok(())})
-    })?
+    context.db.select_session(session)?.accept_plan(approved_plan, false, Some((manager, expected, mode)))?;
+    Ok(())
 }
 fn commit_boundary_inner(
-    context: &ServiceContext,
+    context: &ServiceContext<impl SessionAccess>,
     session: &str,
     content: &str,
     transition: Option<(
@@ -230,40 +227,10 @@ fn commit_boundary_inner(
         crate::permissions::PermissionMode,
     )>,
 ) -> Result<String> {
-    context.db.with_conn(|conn| -> Result<String> {
-        let tx = crate::db::write_transaction(&conn)?;
-        crate::db::conversation_repo::get_conversation(&tx, session)?
-            .context("Plan session not found")?;
-        let order: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?1",
-            [session],
-            |r| r.get(0),
-        )?;
-        let id = uuid::Uuid::new_v4().to_string();
-        crate::db::message_repo::insert_message(
-            &tx,
-            &id,
-            session,
-            "user",
-            content,
-            None,
-            &chrono::Utc::now().to_rfc3339(),
-            true,
-            order,
-        )?;
-        crate::db::conversation_repo::increment_message_count(&tx, session)?;
-        tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",rusqlite::params![format!("plan.context_boundary.{session}"),serde_json::json!({"boundary_id":id}).to_string()])?;
-        if let Some((manager, expected, mode)) = transition {
-            super::permission_authority::record_conn(&tx,session,super::permission_authority::Source::ApprovedPlan,&serde_json::json!(content))?;
-            tx.execute("INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[format!("cli.permission-mode.{session}"), super::session_permission_mode::name(mode).into()])?;
-            manager.commit_mode_transition(expected, mode, || { tx.commit()?; Ok(()) })?;
-        } else { tx.commit()?; }
-        Ok(id)
-    })?
+    context.db.select_session(session)?.accept_plan(content,true,transition)?.context("Missing approved boundary")
 }
-
-pub fn latest_boundary(db: &crate::db::DbManager, session: &str) -> Result<Option<String>> {
-    db.with_conn(|conn| latest_boundary_conn(conn, session))?
+pub fn latest_boundary(db: &impl SessionAccess, session: &str) -> Result<Option<String>> {
+    db.select_session(session)?.plan_boundary()
 }
 pub fn latest_boundary_conn(conn: &rusqlite::Connection, session: &str) -> Result<Option<String>> {
     use rusqlite::OptionalExtension;
@@ -364,29 +331,13 @@ mod tests {
             if boundary_first {
                 commit_boundary(&context, &id, "approved plan").unwrap();
             }
-            // Same transaction/order helper as Desktop final save, without a reset event.
-            context
-                .db
-                .with_conn(|conn| -> Result<()> {
-                    let tx = crate::db::write_transaction(conn)?;
-                    let (order, archive) = final_response_order(&tx, &id, None)?;
-                    assert_eq!(archive, boundary_first);
-                    crate::db::message_repo::insert_message(
-                        &tx,
-                        "old-response",
-                        &id,
-                        "assistant",
-                        "OLD_DESKTOP_SECRET",
-                        None,
-                        "now",
-                        false,
-                        order,
-                    )?;
-                    tx.commit()?;
-                    Ok(())
-                })
-                .unwrap()
-                .unwrap();
+            let assistant=sessions.append(&id,"assistant","").unwrap();
+            let save = || context.db.executor_history(&id).unwrap().save_segment(&assistant, crate::db::session_store::SegmentUpdate {
+                placement:crate::db::session_store::SegmentPlacement::Final { observed_boundary:None },
+                text:Some("OLD_DESKTOP_SECRET"),
+                ..Default::default()
+            });
+            save().unwrap();
             if !boundary_first {
                 commit_boundary(&context, &id, "approved plan").unwrap();
             }
@@ -399,21 +350,8 @@ mod tests {
             assert!(!serde_json::to_string(&history)
                 .unwrap()
                 .contains("OLD_DESKTOP_SECRET"));
-            context
-                .db
-                .with_conn(|conn| {
-                    conn.execute(
-                        "UPDATE peripheral_settings SET value='invalid metadata' WHERE key=?1",
-                        [format!("plan.context_boundary.{id}")],
-                    )
-                })
-                .unwrap()
-                .unwrap();
-            assert!(context
-                .db
-                .with_conn(|conn| final_response_order(conn, &id, None))
-                .unwrap()
-                .is_err());
+            context.db.fixture_shard(&id, |c|c.execute("UPDATE messages SET is_compact_boundary=0 WHERE id IN (SELECT message_id FROM approved_plan_boundaries)", [])).unwrap().unwrap();
+            assert!(save().is_err());
         }
     }
     #[test]
@@ -430,7 +368,7 @@ mod tests {
         manager.set_mode(crate::permissions::PermissionMode::PlanMode);
         assert!(commit_approved_boundary(&context, &id, "plan", &manager, stale).is_err());
         assert!(latest_boundary(&context.db, &id).unwrap().is_none());
-        context.db.with_conn(|conn|conn.execute_batch("CREATE TABLE plan_parent(id INTEGER PRIMARY KEY); CREATE TABLE plan_guard(id INTEGER REFERENCES plan_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_plan_commit AFTER INSERT ON messages WHEN NEW.is_compact_boundary=1 BEGIN INSERT INTO plan_guard VALUES(99); END;")).unwrap().unwrap();
+        context.db.fixture_shard(&id, |conn|conn.execute_batch("CREATE TABLE plan_parent(id INTEGER PRIMARY KEY); CREATE TABLE plan_guard(id INTEGER REFERENCES plan_parent(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_plan_commit AFTER INSERT ON approved_plan_boundaries BEGIN INSERT INTO plan_guard VALUES(99); END;")).unwrap().unwrap();
         assert!(
             commit_approved_boundary(&context, &id, "plan", &manager, manager.mode_snapshot())
                 .is_err()
@@ -484,17 +422,12 @@ mod tests {
             is_error: true,
             sort_order: 0,
         };
-        archive_segment(
-            &context.db,
-            &id,
-            &boundary,
-            None,
-            "OLD_SECRET",
-            "OLD_THINKING",
-            &[tool],
-            &[],
-        )
-        .unwrap();
+        let segment = sessions.append(&id, "assistant","").unwrap();
+        use crate::db::session_store::{ExecutorHistory,SegmentPlacement,SegmentUpdate};
+        ExecutorHistory::Session(context.db.open_session(&id).unwrap()).save_segment(&segment,SegmentUpdate {
+            placement:SegmentPlacement::Before(&boundary),text:Some("OLD_SECRET"),thinking:Some("OLD_THINKING"),
+            tools:&[tool],..Default::default()
+        }).unwrap();
         sessions.append(&id, "assistant", "new answer").unwrap();
         let history = sessions
             .model_history(

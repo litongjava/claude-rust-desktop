@@ -1,8 +1,8 @@
 //! Definitions only: all execution remains in NativeEngine and its existing tool loop.
 use super::ServiceContext;
-use crate::db::DbManager;
+use crate::db::session_store::{AgentCatalog,SessionAccess};
+#[cfg(test)] use crate::db::DbManager;
 use anyhow::{ensure, Context, Result};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -142,16 +142,12 @@ impl Definition {
         Ok(())
     }
 }
-pub fn list(context: &ServiceContext) -> Result<Vec<Definition>> {
+pub fn list(context: &ServiceContext<impl AgentCatalog>) -> Result<Vec<Definition>> {
     let mut definitions = builtins();
-    definitions.extend(
-        context
-            .setting::<Vec<Definition>>("agent-definitions")?
-            .unwrap_or_default(),
-    );
+    definitions.extend(context.db.definitions()?);
     Ok(definitions)
 }
-pub fn resolve(context: &ServiceContext, id: &str) -> Result<Definition> {
+pub fn resolve(context: &ServiceContext<impl AgentCatalog>, id: &str) -> Result<Definition> {
     let definitions = list(context)?;
     if let Some(definition) = definitions.iter().find(|d| d.id == id) {
         return Ok(definition.clone());
@@ -171,35 +167,17 @@ pub fn validate_custom(definition: &Definition) -> Result<()> {
     );
     Ok(())
 }
-pub fn install(context: &ServiceContext, definition: Definition) -> Result<()> {
+pub fn install(context: &ServiceContext<impl AgentCatalog>, definition: Definition) -> Result<()> {
     validate_custom(&definition)?;
-    context.db.with_conn(|c| -> Result<()> {
-        let tx = rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)?;
-        let raw: Option<String> = tx.query_row("SELECT value FROM peripheral_settings WHERE key='agent-definitions'",[],|r|r.get(0)).optional()?;
-        let mut definitions: Vec<Definition> = raw.map(|v|serde_json::from_str(&v)).transpose()?.unwrap_or_default();
-        definitions.retain(|d|d.id!=definition.id); definitions.push(definition);
-        tx.execute("INSERT INTO peripheral_settings(key,value) VALUES('agent-definitions',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&definitions)?])?;
-        tx.commit()?; Ok(())
-    })?
-}
-pub fn bind(db: &DbManager, session: &str, definition: &Definition) -> Result<()> {
-    definition.validate()?;
-    let payload = serde_json::to_string(definition)?;
-    db.with_conn(|c|c.execute("INSERT INTO session_agents(conversation_id,definition) VALUES(?1,?2) ON CONFLICT(conversation_id) DO UPDATE SET definition=excluded.definition", rusqlite::params![session,payload]))??;
+    context.db.save_definition(&definition,true,false)?;
     Ok(())
 }
-pub fn for_session(db: &DbManager, session: &str) -> Result<Option<Definition>> {
-    let value: Option<String> = db.with_conn(|c| {
-        c.query_row(
-            "SELECT definition FROM session_agents WHERE conversation_id=?1",
-            [session],
-            |r| r.get(0),
-        )
-        .optional()
-    })??;
-    value
-        .map(|v| serde_json::from_str(&v).map_err(Into::into))
-        .transpose()
+pub fn bind(db:&impl SessionAccess,session:&str,definition:&Definition)->Result<()> {
+    definition.validate()?;
+    db.select_session(session)?.bind_agent(definition).context("Binding session agent")
+}
+pub fn for_session(db:&impl SessionAccess,session:&str)->Result<Option<Definition>> {
+    db.select_session(session)?.bound_agent()
 }
 
 const MODELS_FILE: &str = "agent-models.json";
@@ -380,5 +358,36 @@ mod tests {
         std::fs::write(dir.path().join(MODELS_FILE), "not json").unwrap();
         assert!(load_models(dir.path()).is_empty());
         assert!(default_model(dir.path(), "explore").is_none());
+    }
+
+    #[test]
+    fn bind_waits_for_another_writer_instead_of_failing() {
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agents.sqlite");
+        let db = std::sync::Arc::new(DbManager::new(path.clone()).unwrap());
+        db.init().unwrap();
+        let store = crate::runtime::SessionStore::new(db.clone());
+        let session = store.create(dir.path(), "model", "provider").unwrap();
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let definition = Definition {
+            id: "explore".into(),
+            description: "Explore".into(),
+            system_prompt: "Search".into(),
+            tools: Some(vec!["Read".into()]),
+            read_only_shell: true,
+            legacy: None,
+        };
+        let started = Instant::now();
+        bind(&db, &session, &definition).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "bind returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(for_session(&db, &session).unwrap(), Some(definition));
     }
 }

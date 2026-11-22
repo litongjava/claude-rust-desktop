@@ -2,6 +2,8 @@
 //! No session/assistant/tool row is manufactured by the fixture.
 #![cfg(unix)]
 
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
 use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
 use serde_json::{json, Value};
 use std::{
@@ -51,10 +53,7 @@ async fn respond(
         requests.push(body);
         requests.len() - 1
     };
-    let conn = rusqlite::Connection::open_with_flags(
-        fixture.data.join("deepseek_code.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
+    let conn = fixture_sql::shard_connection(&fixture.data,&fixture.session)
     .unwrap();
     let assistants: usize = conn
         .query_row(
@@ -94,10 +93,7 @@ async fn respond(
 }
 
 fn snapshot(data: &Path, session: &str) -> Vec<Value> {
-    let conn = rusqlite::Connection::open_with_flags(
-        data.join("deepseek_code.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
+    let conn = fixture_sql::shard_connection(data,session)
     .unwrap();
     conn.busy_timeout(Duration::from_secs(5)).unwrap();
     let mut stmt = conn.prepare(
@@ -227,10 +223,27 @@ async fn cli_toolscript_repeated_calls_keep_history_across_model_rounds_and_reop
         .unwrap()
         .iter()
         .filter(|m| m["role"] == "tool")
-        .map(|m| serde_json::from_str(m["content"].as_str().unwrap()).unwrap())
+        .map(|m| {
+            // ToolLoad now reaches the model as one text line; keep it in the
+            // ordered results so the first entry still marks the load.
+            let content = m["content"].as_str().unwrap();
+            serde_json::from_str(content).unwrap_or_else(|_| Value::String(content.to_owned()))
+        })
         .collect();
     assert_eq!(results.len(), 3);
-    assert_eq!(results[0]["loaded_tools"], json!(["ToolScript"]));
+    assert_eq!(
+        results[0],
+        json!("Loaded ToolScript. Available from the next request.")
+    );
+    // The schema the line refers to is advertised by the request after the load.
+    assert!(
+        requests[1]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["function"]["name"] == "ToolScript"),
+        "ToolScript schema missing from the request after ToolLoad"
+    );
     assert_eq!(jobs.len(), 2, "both model ToolScript calls must run");
     for result in &results[1..] {
         assert_eq!(result["status"], "completed", "{result}");

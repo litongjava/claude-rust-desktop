@@ -125,6 +125,19 @@ pub fn update_approval_status(
     Ok(())
 }
 
+pub fn decide_for_session(
+    conn: &Connection, conversation: Option<&str>, approval: &str, status: &str,
+    reason: Option<&str>, decided_at: &str,
+) -> Result<()> {
+    let count = conn.execute(
+        "UPDATE permission_approvals SET status=?1,user_decision=?1,decision_reason=?2,decided_at=?3
+         WHERE id=?4 AND (?5 IS NULL OR conversation_id=?5)",
+        params![status, reason, decided_at, approval, conversation],
+    )?;
+    anyhow::ensure!(count == 1, "Approval not found");
+    Ok(())
+}
+
 pub fn insert_always_allow_rule(
     conn: &Connection,
     id: &str,

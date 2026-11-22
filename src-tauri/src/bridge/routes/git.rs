@@ -20,26 +20,18 @@ where
     F: FnOnce(&std::path::Path) -> anyhow::Result<Value> + Send + 'static,
 {
     let result = tokio::task::spawn_blocking(move || {
-        state.db_manager.with_conn(|conn| {
-            let project = crate::native_engine::workspace::conversation_project(conn, &id)?
-                .ok_or_else(|| anyhow::anyhow!("Select a project first"))?;
-            let source = std::path::PathBuf::from(
-                project
-                    .workspace_path
-                    .ok_or_else(|| anyhow::anyhow!("Project folder is unavailable"))?,
-            );
-            let cwd = crate::worktree::session::resolve(conn, &id, &project.id, &source)?
-                .unwrap_or(source);
-            operation(&cwd)
-        })
+        use deepseek_code_core::db::session_store::SessionAccess;
+        let shard=state.db_manager.open_session(&id)?;
+        anyhow::ensure!(shard.select_session(&id)?.workspace_project()?.is_some(),"Select a project first");
+        operation(&shard.workspace()?)
     })
     .await;
     match result {
-        Ok(Ok(Ok(value))) => Ok(Json(value)),
+        Ok(Ok(value)) => Ok(Json(value)),
         error => Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": match error {
-                Ok(Ok(Err(e))) => e.to_string(), Ok(Err(e)) => e.to_string(), Err(e) => e.to_string(), _ => unreachable!()
+                Ok(Err(e)) => e.to_string(), Err(e) => e.to_string(), _ => unreachable!()
             }})),
         )),
     }

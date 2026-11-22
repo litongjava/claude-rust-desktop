@@ -2,6 +2,7 @@
 //! No inferred ownership from absence: a durable removal intent is required.
 //! External Git writers do not honor our lock; every destructive step therefore
 //! rechecks the assets, and Git itself must accept a non-forced removal.
+use crate::db::session_store::TaskState;
 use super::{
     delivery::{self, DeliveryPlan},
     launcher::Launcher,
@@ -71,6 +72,17 @@ pub fn cleanup_completed(launcher: &Launcher, task_id: &str, policy: &StatePolic
 
 // The hook is only used by local tests to fail precisely between durable steps.
 pub(crate) fn run(
+    launcher: &Launcher,
+    task_id: &str,
+    policy: &StatePolicy,
+    hook: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    crate::db::session_store::without_lifecycle_wait(|| {
+        run_cleanup(launcher, task_id, policy, hook)
+    })
+}
+
+fn run_cleanup(
     launcher: &Launcher,
     task_id: &str,
     policy: &StatePolicy,
@@ -147,7 +159,11 @@ pub(crate) fn run(
             observation.describe()
         );
     }
-    descendants_stopped(launcher, &task)?;
+    let _publication = background_sessions::job_publication_fence(&context.paths.data_dir, true)?;
+    let _workspace = context
+        .db
+        .hold_worktree_removal(&task.repositories[0].worktree_path)?;
+    let _execution_leases = descendants_stopped(launcher, &task)?;
     let verification = delivery::verify_delivery_for_cleanup(&task, &plan)?;
     ensure!(
         verification.complete,
@@ -175,7 +191,7 @@ pub(crate) fn run(
         ]))?)
     );
     let key = format!("super-agent.{operation_id}");
-    let mut operation = if let Some(saved) = context.setting::<Operation>(&key)? {
+    let mut operation = if let Some(saved) = context.db.task_state::<Operation>(&key)? {
         ensure!(
             saved.identity == identity && saved.operation_id == operation_id,
             "Cleanup operation identity changed; refusing to adopt assets"
@@ -222,7 +238,7 @@ pub(crate) fn run(
             branch_intent: false,
             branch_removed: false,
         };
-        context.save_setting(&key, &saved)?;
+        context.db.save_task_state(&key, &saved)?;
         saved
     };
     for (archive, suffix) in [
@@ -253,7 +269,7 @@ pub(crate) fn run(
         validate_worktree(repo)?;
         validate_branch(repo)?;
         operation.worktree_intent = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
         hook("before-worktree-remove")?;
         git(
             &repo.repo_root,
@@ -266,14 +282,14 @@ pub(crate) fn run(
         )?;
         hook("after-worktree-remove")?;
         operation.worktree_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     } else {
         ensure!(
             operation.worktree_intent,
             "Worktree missing without persisted removal intent"
         );
         operation.worktree_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     }
     let branch = branch_oid(repo)?;
     if operation.branch_removed {
@@ -291,7 +307,7 @@ pub(crate) fn run(
             "Task branch is checked out elsewhere"
         );
         operation.branch_intent = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
         hook("before-branch-delete")?;
         // -d normally compares against repo_root's HEAD, which need not be the
         // delivered target. Select the already verified target as the command's
@@ -314,14 +330,14 @@ pub(crate) fn run(
         )?;
         hook("after-branch-delete")?;
         operation.branch_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     } else {
         ensure!(
             operation.branch_intent,
             "Task branch missing without persisted removal intent"
         );
         operation.branch_removed = true;
-        context.save_setting(&key, &operation)?;
+        context.db.save_task_state(&key, &operation)?;
     }
     ensure!(
         !repo.worktree_path.try_exists()?
@@ -567,14 +583,21 @@ fn validate_worktree(repo: &RepoTarget) -> Result<()> {
     Ok(())
 }
 
-fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
-    use crate::native_engine::child_session::{ChildOwnership, OWNER_KEY_PREFIX};
+fn descendants_stopped(
+    launcher: &Launcher,
+    task: &TaskRecord,
+) -> Result<Vec<crate::services::session_messages::ExecutionLease>> {
     let context = &launcher.context;
-    let mut sessions = BTreeSet::new();
-    sessions.extend(task.coder.session_id.clone());
-    sessions.extend(task.reviewer.session_id.clone());
-    sessions.extend(task.coder.previous_session_ids.clone());
-    sessions.extend(task.reviewer.previous_session_ids.clone());
+    let mut participants: BTreeSet<_> = context.db.cleanup_members(task)?.into_iter().collect();
+    let mut unresolved = BTreeSet::new();
+    let mut historical_coders = Vec::new();
+    historical_coders.extend(
+        task.coder
+            .previous_session_ids
+            .iter()
+            .map(|id| (&task.task_id, id)),
+    );
+    unresolved.extend(task.reviewer.previous_session_ids.clone());
     // Child tasks can have their own Coder/Reviewer and durable launch receipts.
     // A terminal task flag alone is not proof those processes have stopped.
     let store = TaskStore::from_context(context);
@@ -618,10 +641,15 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
                 for observation in members.unknown().chain(members.active()) {
                     anyhow::bail!("Child task {}: {}", child.task_id, observation.describe());
                 }
-                sessions.extend(child.coder.session_id.clone());
-                sessions.extend(child.reviewer.session_id.clone());
-                sessions.extend(child.coder.previous_session_ids.clone());
-                sessions.extend(child.reviewer.previous_session_ids.clone());
+                participants.extend(context.db.cleanup_members(child)?);
+                historical_coders.extend(
+                    child
+                        .coder
+                        .previous_session_ids
+                        .iter()
+                        .map(|id| (&child.task_id, id)),
+                );
+                unresolved.extend(child.reviewer.previous_session_ids.clone());
                 task_ids.insert(child.task_id.clone());
                 changed = true;
             }
@@ -630,78 +658,31 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
             break;
         }
     }
-    let owners = context
-        .db
-        .with_conn(|conn| -> Result<Vec<(String, ChildOwnership)>> {
-            let mut statement = conn.prepare(
-                "SELECT key,value FROM peripheral_settings WHERE key LIKE 'child-owner.%'",
-            )?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            rows.into_iter()
-                .map(|(key, value)| {
-                    Ok((
-                        key.strip_prefix(OWNER_KEY_PREFIX)
-                            .context("Invalid child owner key")?
-                            .into(),
-                        serde_json::from_str(&value)?,
-                    ))
-                })
-                .collect()
-        })??;
-    loop {
-        let mut changed = false;
-        for (session, owner) in &owners {
-            if sessions.contains(&owner.parent_session_id) && !sessions.contains(session) {
-                let id = owner
-                    .job_id
-                    .as_deref()
-                    .context("Descendant has no proven job identity")?;
-                require_stopped(
-                    &context.paths.data_dir,
-                    id,
-                    session,
-                    Some(&owner.parent_session_id),
-                )?;
-                sessions.insert(session.clone());
-                changed = true;
-            }
+    for (task_id, id) in historical_coders {
+        let recorded = context.db.former_coder_incarnations(task_id, id)?;
+        if recorded.is_empty() {
+            // Recover older history from durable job markers below.
+            unresolved.insert(id.clone());
         }
-        if !changed {
-            break;
-        }
+        participants.extend(recorded.into_iter().map(|inc| (id.clone(), inc)));
     }
-    // Also cover unrelated sessions explicitly using this worktree and jobs
-    // absent from a launch receipt. Discovery must never silently skip damage.
+    // Worktree occupancy independently includes unrelated current incarnations.
     let worktree = &task.repositories[0].worktree_path;
-    let workspaces = context
-        .db
-        .with_conn(|conn| -> Result<Vec<(String, String)>> {
-            let mut statement = conn.prepare(
-                "SELECT id,workspace_path FROM conversations WHERE workspace_path IS NOT NULL",
-            )?;
-            let rows = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })??;
-    for (session, workspace) in workspaces {
-        if Path::new(&workspace).starts_with(worktree) {
-            sessions.insert(session);
+    for (id, incarnation, workspace) in context.db.workspace_sessions()? {
+        let path = Path::new(&workspace);
+        if path.starts_with(worktree) || path.canonicalize().is_ok_and(|p| p.starts_with(worktree))
+        {
+            participants.insert((id, incarnation));
         }
     }
-    for session in &sessions {
-        ensure!(
-            !crate::services::session_messages::execution_active(&context.paths.data_dir, session)?,
-            "Session {session} still owns an active execution"
-        );
-    }
+    // Completed launches retain both endpoints even after G retires an intermediate
+    // session. Index all edges before traversal so filesystem ordering is irrelevant.
+    let mut descendants = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut idle_children = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut records = Vec::new();
     let jobs = context.paths.data_dir.join("background-tasks");
     if jobs.try_exists()? {
-        for entry in fs::read_dir(jobs)? {
+        for entry in fs::read_dir(&jobs)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -710,41 +691,114 @@ fn descendants_stopped(launcher: &Launcher, task: &TaskRecord) -> Result<()> {
                 .file_name()
                 .into_string()
                 .map_err(|_| anyhow::anyhow!("Invalid job directory"))?;
-            match background_sessions::inspect(&context.paths.data_dir, &id) {
-                Ok(JobSnapshot::Present(job)) => {
-                    let identity = BackgroundIdentity {
-                        id: job.id.clone(),
-                        session_id: job.session_id.clone(),
-                        parent_session_id: job.parent_session_id.clone(),
-                    };
-                    if identity.is_related(&id, &sessions)? {
-                        require_stopped(&context.paths.data_dir, &id, &job.session_id, None)?;
-                    }
+            let identity: BackgroundIdentity = (|| -> Result<_> {
+                Ok(serde_json::from_slice(&fs::read(
+                    entry.path().join("state.json"),
+                )?)?)
+            })()
+            .with_context(|| {
+                format!("Job {id}: cannot read identity to exclude a worktree occupant")
+            })?;
+            identity.validate(&id)?;
+            let owners = background_sessions::JobOwners::load_for_id(&context.paths.data_dir, &id);
+            if let Ok(Some(marker)) = &owners {
+                let parent = (identity.parent_session_id.clone(), marker.parent.clone());
+                let execution = (identity.session_id.clone(), marker.execution.clone());
+                if unresolved.contains(&parent.0) {
+                    participants.insert(parent.clone());
                 }
-                snapshot => {
-                    let detail = match snapshot {
-                        Ok(JobSnapshot::Missing) => "missing state".to_owned(),
-                        Ok(JobSnapshot::Unreadable(reason)) => {
-                            format!("unreadable state: {reason}")
-                        }
-                        Err(error) => format!("inspection failure: {error:#}"),
-                        Ok(JobSnapshot::Present(_)) => unreachable!(),
-                    };
-                    // Lifecycle damage need not destroy identity. Read only
-                    // these required fields; never infer stopped from this view.
-                    let identity = (|| -> Result<BackgroundIdentity> {
-                        Ok(serde_json::from_slice(&fs::read(entry.path().join("state.json"))?)?)
-                    })()
-                    .with_context(|| format!("Job {id} has {detail}; cannot read identity to exclude a worktree occupant"))?;
-                    ensure!(
-                        !identity.is_related(&id, &sessions)?,
-                        "Related job {id} has {detail}; cannot prove it stopped"
-                    );
+                if unresolved.contains(&execution.0) {
+                    participants.insert(execution.clone());
+                }
+                descendants
+                    .entry(parent)
+                    .or_default()
+                    .push(execution.clone());
+                idle_children.entry(execution).or_default().push(id.clone());
+            }
+            records.push((identity, owners));
+        }
+    }
+    for id in unresolved {
+        ensure!(
+            participants.iter().any(|(known, _)| known == &id),
+            "Missing historical participant incarnation for {id}"
+        );
+    }
+    let mut parents: Vec<_> = participants.iter().cloned().collect();
+    while let Some((parent, incarnation)) = parents.pop() {
+        for job in idle_children
+            .remove(&(parent.clone(), incarnation.clone()))
+            .unwrap_or_default()
+        {
+            if let Some(child) =
+                crate::services::session_worker::recorded_job_child(&context.paths.data_dir, &job)?
+            {
+                if participants.insert(child.clone()) {
+                    parents.push(child);
                 }
             }
         }
+        for child in descendants
+            .remove(&(parent.clone(), incarnation.clone()))
+            .unwrap_or_default()
+        {
+            if participants.insert(child.clone()) {
+                parents.push(child);
+            }
+        }
+        for (id, inc, owner) in context.db.recorded_child_jobs(&parent, &incarnation)? {
+            let job = owner
+                .job_id
+                .as_deref()
+                .context("Descendant has no proven job identity")?;
+            require_stopped(&context.paths.data_dir, job, &id, Some(&parent))?;
+            let child = (id, inc);
+            if participants.insert(child.clone()) {
+                parents.push(child);
+            }
+        }
     }
-    Ok(())
+    for (identity, owners) in records {
+        if !participants
+            .iter()
+            .any(|(id, _)| id == &identity.parent_session_id || id == &identity.session_id)
+        {
+            continue;
+        }
+        let related = match owners? {
+            Some(marker) => {
+                participants.contains(&(identity.parent_session_id.clone(), marker.parent))
+                    || participants.contains(&(identity.session_id.clone(), marker.execution))
+            }
+            None => {
+                // A legacy marker cannot distinguish a retired endpoint from its replacement.
+                anyhow::ensure!(
+                    !participants
+                        .iter()
+                        .any(|(id, _)| id == &identity.parent_session_id)
+                        || participants
+                            .iter()
+                            .any(|(id, _)| id == &identity.session_id),
+                    "Cannot establish descendant identity for job {}",
+                    identity.id
+                );
+                true
+            }
+        };
+        if related {
+            require_stopped(
+                &context.paths.data_dir,
+                &identity.id,
+                &identity.session_id,
+                Some(&identity.parent_session_id),
+            )?;
+        }
+    }
+    participants
+        .into_iter()
+        .map(|(id, incarnation)| context.db.hold_stopped_execution(&id, &incarnation))
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -755,14 +809,14 @@ struct BackgroundIdentity {
 }
 
 impl BackgroundIdentity {
-    fn is_related(&self, directory_id: &str, sessions: &BTreeSet<String>) -> Result<bool> {
+    fn validate(&self, directory_id: &str) -> Result<()> {
         ensure!(
             self.id == directory_id
                 && !self.session_id.trim().is_empty()
                 && !self.parent_session_id.trim().is_empty(),
             "Job {directory_id} has missing/conflicting identity; cannot exclude a worktree occupant"
         );
-        Ok(sessions.contains(&self.session_id) || sessions.contains(&self.parent_session_id))
+        Ok(())
     }
 }
 

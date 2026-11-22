@@ -1,3 +1,6 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 // A request snapshot must describe the body it actually sent. These tests drive
 // the real executor and HTTP request, then read the emitted snapshot, so the
 // binding cannot be faked by writing metadata by hand.
@@ -344,11 +347,7 @@ async fn restored_and_reset_histories_bind_the_requests_they_send() {
         assert!(boundary_ids(&snapshots)
             .iter()
             .all(|b| *b == boundary.as_deref()));
-        restored
-            .db
-            .with_conn(|conn| conn.execute("DELETE FROM messages WHERE conversation_id=?1", [&id]))
-            .unwrap()
-            .unwrap();
+        restored.db.open_session(&id).unwrap().write(|w|w.replace_messages(&[])).unwrap();
         restored.append(&id, "user", "RESET_CONTEXT").unwrap();
         let (messages, boundary) = restored
             .model_history_with_boundary(&id, &ApiFormat::OpenAI)

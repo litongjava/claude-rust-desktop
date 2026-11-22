@@ -32,7 +32,7 @@ fn read(conn: &Connection, session: &str) -> Result<Option<Request>> {
         .transpose()
 }
 
-fn save(conn: &Connection, session: &str, keep: &str) -> Result<()> {
+pub(crate) fn save(conn: &Connection, session: &str, keep: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [key(session), serde_json::to_string(&Request { keep: keep.into() })?],
@@ -52,12 +52,23 @@ pub fn definition() -> ToolDefinition {
 /// is under 30% of the window or directly after a compaction, so a model cannot
 /// repeatedly summarize a conversation that has nothing to drop.
 pub fn request(
-    db: &DbManager,
+    db: &impl crate::db::session_store::SessionAccess,
     session: &str,
     keep: &str,
     used_tokens: u64,
     window: u64,
 ) -> Result<String> {
+    db.select_session(session)?.request_compaction(keep,used_tokens,window)?;
+    Ok("Compaction queued. It runs before the next user message, using your `keep` text as the summary instructions. Continue or finish the current turn normally.".into())
+}
+
+pub(crate) fn validate(
+    conn: &Connection,
+    session: &str,
+    keep: &str,
+    used_tokens: u64,
+    window: u64,
+) -> Result<()> {
     ensure!(
         !keep.trim().is_empty() && keep.chars().count() <= 2000,
         "keep must contain 1 to 2000 characters"
@@ -71,21 +82,19 @@ pub fn request(
         window > 0 && pct >= 30,
         "Compaction not needed: the context is {pct}% of the window (at least 30% is required)."
     );
-    db.with_conn(|conn| -> Result<()> {
-        let rows = message_repo::get_messages_by_conversation(conn, session)?;
-        if let Some(index) = rows.iter().rposition(|row| row.is_compact_boundary) {
-            let after = rows[index + 1..]
-                .iter()
-                .filter(|row| row.role == "user")
-                .count();
-            ensure!(
-                after >= 2,
-                "Compaction not needed: the conversation was compacted recently."
-            );
-        }
-        save(conn, session, keep)
-    })??;
-    Ok("Compaction queued. It runs before the next user message, using your `keep` text as the summary instructions. Continue or finish the current turn normally.".into())
+
+    let rows = message_repo::get_messages_by_conversation(conn, session)?;
+    if let Some(index) = rows.iter().rposition(|row| row.is_compact_boundary) {
+        let after = rows[index + 1..]
+            .iter()
+            .filter(|row| row.role == "user")
+            .count();
+        ensure!(
+            after >= 2,
+            "Compaction not needed: the conversation was compacted recently."
+        );
+    }
+    Ok(())
 }
 
 /// Consume the queued request exactly once. The next turn owns it.
@@ -134,12 +143,19 @@ mod tests {
         (temp, store, id)
     }
 
+    fn finish_request(store: &SessionStore, id: &str) -> Result<Option<String>> {
+        let worker = store.db.open_session(id)?.delivery_owner()?;
+        let Some(claim) = worker.claim_compaction()? else { return Ok(None); };
+        worker.finish_compaction(&claim, &super::super::compaction::GeneratedSummary {text:"Summary".into(),native:None})?;
+        Ok(Some(claim.keep))
+    }
+
     #[test]
     fn a_request_below_thirty_percent_is_refused() {
         let (_temp, store, id) = fixture();
         let error = request(&store.db, &id, "Keep the pending tests", 20, 100).unwrap_err();
-        assert!(error.to_string().contains("at least 30%"), "{error}");
-        assert!(take(&store.db, &id).unwrap().is_none());
+        assert!(format!("{error:#}").contains("at least 30%"), "{error}");
+        assert!(finish_request(&store, &id).unwrap().is_none());
     }
 
     #[test]
@@ -148,10 +164,10 @@ mod tests {
         let message = request(&store.db, &id, "Keep the pending tests", 50, 100).unwrap();
         assert!(message.starts_with("Compaction queued"), "{message}");
         assert_eq!(
-            take(&store.db, &id).unwrap().as_deref(),
+            finish_request(&store, &id).unwrap().as_deref(),
             Some("Keep the pending tests")
         );
-        assert!(take(&store.db, &id).unwrap().is_none());
+        assert!(finish_request(&store, &id).unwrap().is_none());
     }
 
     #[test]
@@ -163,9 +179,11 @@ mod tests {
             "Task: run remaining tests",
         )
         .unwrap();
-        store.append(&id, "user", "First message after compaction").unwrap();
+        store
+            .append(&id, "user", "First message after compaction")
+            .unwrap();
         let error = request(&store.db, &id, "Keep the next task", 50, 100).unwrap_err();
-        assert!(error.to_string().contains("compacted recently"), "{error}");
+        assert!(format!("{error:#}").contains("compacted recently"), "{error}");
         store
             .append(&id, "user", "Second message after compaction")
             .unwrap();
@@ -178,7 +196,7 @@ mod tests {
         request(&store.db, &id, "Earlier keep text", 50, 100).unwrap();
         request(&store.db, &id, "Later keep text", 60, 100).unwrap();
         assert_eq!(
-            take(&store.db, &id).unwrap().as_deref(),
+            finish_request(&store, &id).unwrap().as_deref(),
             Some("Later keep text")
         );
     }

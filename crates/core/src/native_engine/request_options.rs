@@ -4,6 +4,10 @@ use reqwest::header::{HeaderMap, HeaderValue};
 
 #[derive(Clone, Debug, Default)]
 pub struct RequestOptions {
+    pub(crate) suggestion_guard: Option<(
+        std::sync::Arc<crate::session_files::suggestion::SuggestionGuard>,
+        std::time::Instant,
+    )>,
     pub session_id: Option<String>,
     pub compact: bool,
     pub recording: Option<super::request_recording::RecordingContext>,
@@ -37,35 +41,22 @@ impl RequestOptions {
         options
     }
 
-    pub fn from_db(db: &crate::db::DbManager, session: Option<&str>, purpose: &str) -> Self {
+    pub fn from_db(db: &(impl crate::db::session_store::RecordingPolicies + ?Sized), session: Option<&str>, purpose: &str) -> Self {
+        Self::with_recording_parent(db, session, purpose).0
+    }
+
+    pub(super) fn with_recording_parent(db: &(impl crate::db::session_store::RecordingPolicies + ?Sized), session: Option<&str>, purpose: &str) -> (Self, Option<String>) {
         let mut options = Self::for_session(session).with_purpose(purpose);
-        if let Some(session) = session {
-            let parent = recording_parent(db, session);
-            let mut policy = db.request_recording_policy(session);
-            let mut ancestor = parent.clone();
-            let mut visited = std::collections::HashSet::from([session.to_owned()]);
-            while policy.is_none() {
-                let Some(id) = ancestor else {
-                    break;
-                };
-                if !visited.insert(id.clone()) {
-                    break;
-                }
-                policy = db.request_recording_policy(&id);
-                ancestor = recording_parent(db, &id);
-            }
-            let policy = policy.unwrap_or_default();
-            if policy.enabled_at(db.data_dir()) {
-                if purpose == "main" && parent.is_some() {
-                    options.purpose = "subagent".into();
-                }
-                options.recording = Some(super::request_recording::RecordingContext {
-                    root: db.data_dir().into(),
-                    parent_session_id: parent,
-                });
-            }
+        let Some(session) = session else { return (options,None) };
+        let (policy, parent) = db.recording_policy_and_parent(session);
+        if policy.unwrap_or_default().enabled_at(db.recording_root()) {
+            if purpose=="main" && parent.is_some() {options.purpose="subagent".into();}
+            options.recording = Some(super::request_recording::RecordingContext {
+                root:db.recording_root().into(),
+                parent_session_id:parent.clone(),
+            });
         }
-        options
+        (options,parent)
     }
 
     pub fn with_purpose(mut self, purpose: &str) -> Self {
@@ -113,6 +104,9 @@ impl RequestOptions {
 
     pub(crate) fn headers(&self, provider: &ResolvedProvider) -> anyhow::Result<HeaderMap> {
         let mut headers = HeaderMap::new();
+        if self.purpose == "suggestion" {
+            headers.insert("x-dcl-request-kind", HeaderValue::from_static("suggestion"));
+        }
         if is_deepseek(provider) {
             if let Some(session) = &self.session_id {
                 // Never normalize or silently replace an external session ID.
@@ -127,29 +121,6 @@ impl RequestOptions {
         }
         Ok(headers)
     }
-}
-
-fn recording_parent(db: &crate::db::DbManager, session: &str) -> Option<String> {
-    db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT value FROM peripheral_settings WHERE key=?1",
-            [format!("delegation.{session}")],
-            |r| r.get::<_, String>(0),
-        )
-        .ok()
-    })
-    .ok()
-    .flatten()
-    .and_then(|v| serde_json::from_str::<serde_json::Value>(&v).ok())
-    .and_then(|v| v["parent_session_id"].as_str().map(str::to_owned))
-    .or_else(|| {
-        crate::services::background_sessions::worker_directory(db.data_dir(), session)
-            .ok()
-            .flatten()
-            .and_then(|dir| crate::services::background_sessions::read_job(&dir).ok())
-            .map(|job| job.parent_session_id)
-    })
-    .filter(|p| p != session)
 }
 
 /// Provider identity or an exact DNS suffix, never a model-name substring.

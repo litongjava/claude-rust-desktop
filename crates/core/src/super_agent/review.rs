@@ -113,44 +113,24 @@ pub fn reviewer_task(runtime: &crate::super_agent::crp::ToolRuntime) -> Result<T
         .with_context(|| format!("Task not found: {task_id}"))
 }
 
-fn coder_sessions(store: &TaskStore, task: &TaskRecord) -> Result<BTreeSet<String>> {
-    let mut sessions = BTreeSet::new();
-    if let Some(session) = &task.coder.session_id {
-        sessions.insert(session.clone());
+fn coder_sessions(store:&TaskStore,task:&TaskRecord)->Result<std::collections::BTreeMap<String,crate::db::session_store::ExecutorHistory>>{
+    let mut sessions=std::collections::BTreeMap::new();
+    let mut queue=VecDeque::new();
+    for id in task.coder.session_id.iter().chain(&task.coder.previous_session_ids) {
+        if let Some(history)=store.db().review_coder(&task.task_id,id)? { queue.push_back(history); }
     }
-    sessions.extend(task.coder.previous_session_ids.iter().cloned());
-    let db = store.db();
-    let mut queue: VecDeque<String> = sessions.iter().cloned().collect();
-    let mut seen = BTreeSet::new();
-    while let Some(parent) = queue.pop_front() {
-        if !seen.insert(parent.clone()) {
-            continue;
-        }
-        let invocations =
-            db.with_conn(|conn| -> Result<Vec<subagents::Invocation>> {
-                subagents::list_invocations(conn, &parent, None)
-            })??;
-        for invocation in invocations {
-            if sessions.insert(invocation.child_session_id.clone()) {
-                queue.push_back(invocation.child_session_id);
-            }
-        }
+    while let Some(history)=queue.pop_front() {
+        if sessions.contains_key(history.id()) {continue;}
+        for (_,child) in history.review_children()? {if let Some(child)=child {queue.push_back(child);}}
+        sessions.insert(history.id().to_owned(),history);
     }
     Ok(sessions)
 }
 
-fn authorize_session(store: &TaskStore, task: &TaskRecord, session: &str) -> Result<()> {
-    ensure!(
-        session.len() <= 128 && !session.is_empty(),
-        "A session ID is required"
-    );
-    ensure!(
-        coder_sessions(store, task)?.contains(session),
-        "Session {session} is not part of this task's Coder session tree"
-    );
-    Ok(())
+fn authorize_session(store:&TaskStore,task:&TaskRecord,session:&str)->Result<crate::db::session_store::ExecutorHistory>{
+    ensure!(session.len()<=128 && !session.is_empty(),"A session ID is required");
+    coder_sessions(store,task)?.remove(session).with_context(||format!("Session {session} is not part of this task's Coder session tree"))
 }
-
 fn limit(input: &Value) -> Result<usize> {
     let limit = input["limit"].as_u64().unwrap_or(DEFAULT_LIMIT as u64) as usize;
     ensure!(
@@ -195,26 +175,9 @@ fn redact_value(value: &mut Value) {
 }
 
 fn session_metadata(store: &TaskStore, task: &TaskRecord, session: &str) -> Result<Value> {
-    authorize_session(store, task, session)?;
-    let row = store
-        .db()
-        .with_conn(|conn| -> Result<Option<conversation_repo::ConversationRow>> {
-            conversation_repo::get_conversation(conn, session)
-        })??
-        .with_context(|| format!("Session {session} not found"))?;
-    let counts = store.db().with_conn(|conn| -> Result<(i64, i64)> {
-        let messages = conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-            [session],
-            |row| row.get(0),
-        )?;
-        let calls = conn.query_row(
-            "SELECT COUNT(*) FROM tool_calls c JOIN messages m ON m.id=c.message_id WHERE m.conversation_id=?1",
-            [session],
-            |row| row.get(0),
-        )?;
-        Ok((messages, calls))
-    })??;
+    let history=authorize_session(store,task,session)?;
+    let row=history.review_metadata()?;
+    let counts=history.review_counts()?;
     Ok(json!({
         "session_id": session,
         "title": row.title,
@@ -238,42 +201,15 @@ fn session_messages(
     let session = input["session_id"]
         .as_str()
         .context("session_id is required")?;
-    authorize_session(store, task, session)?;
-    let cursor = cursor(input)?;
-    let limit = limit(input)?;
-    let messages = store.db().with_conn(|conn| -> Result<Vec<message_repo::MessageRow>> {
-        let mut statement = conn.prepare(
-            "SELECT id,conversation_id,role,content,thinking,created_at,is_compact_boundary,sort_order \
-             FROM messages WHERE conversation_id=?1 AND sort_order>=?2 ORDER BY sort_order, rowid LIMIT ?3",
-        )?;
-        let rows = statement.query_map(
-            rusqlite::params![session, cursor as i64, (limit + 1) as i64],
-            |row| {
-                Ok(message_repo::MessageRow {
-                    id: row.get(0)?,
-                    conversation_id: row.get(1)?,
-                    role: row.get(2)?,
-                    content: row.get(3)?,
-                    thinking: row.get(4)?,
-                    created_at: row.get(5)?,
-                    is_compact_boundary: row.get::<_, i64>(6)? != 0,
-                    sort_order: row.get(7)?,
-                })
-            },
-        )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    })??;
+    let history=authorize_session(store,task,session)?;
+    let cursor=cursor(input)?;
+    let limit=limit(input)?;
+    let messages=history.review_messages(cursor,limit+1)?;
     let has_more = messages.len() > limit;
     let selected: Vec<Value> = messages
         .into_iter()
         .take(limit)
-        .map(|message| {
-            let calls = store
-                .db()
-                .with_conn(|conn| message_repo::get_tool_calls_for_message(conn, &message.id))
-                .ok()
-                .and_then(std::result::Result::ok)
-                .unwrap_or_default();
+        .map(|(message,calls)| {
             json!({
                 "id": message.id,
                 "role": message.role,
@@ -370,15 +306,8 @@ fn session_children(store: &TaskStore, task: &TaskRecord, input: &Value) -> Resu
     let session = input["session_id"]
         .as_str()
         .context("session_id is required")?;
-    authorize_session(store, task, session)?;
-    let invocations = store
-        .db()
-        .with_conn(|conn| -> Result<Vec<subagents::Invocation>> {
-            subagents::list_invocations(conn, session, None)
-        })??;
-    let children: Vec<Value> = invocations
-        .into_iter()
-        .map(|invocation| {
+    let history=authorize_session(store,task,session)?;
+    let children:Vec<Value>=history.review_children()?.into_iter().map(|(invocation,_)|{
             json!({
                 "session_id": invocation.child_session_id,
                 "parent_session_id": invocation.parent_session_id,
@@ -555,7 +484,7 @@ pub fn build_review_request(store: &TaskStore, task: &TaskRecord) -> Result<Valu
         })
         .collect();
     let child_session_ids: Vec<String> = coder_sessions(store, task)?
-        .into_iter()
+        .into_keys()
         .filter(|session| Some(session) != task.coder.session_id.as_ref())
         .collect();
     let start_sequence = events.first().map(|event| event.sequence).unwrap_or(0);

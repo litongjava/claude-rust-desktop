@@ -8,9 +8,9 @@ use axum::{
     Json, Router,
 };
 use deepseek_code_core::{
-    db::DbManager,
+    db::session_store::Stores,
     native_engine::engine_core::ChatRequest,
-    services::input_queue::{self as queue, QueueError, QueueItem, QueueMode, QueueState},
+    services::input_queue::{self as queue, QueueError, QueueMode},
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -43,38 +43,31 @@ fn error(error: anyhow::Error) -> Response {
     };
     (status, Json(json!({"error":error.to_string()}))).into_response()
 }
-fn exists(db: &DbManager, id: &str) -> anyhow::Result<()> {
+fn exists(db: &Stores, id: &str) -> anyhow::Result<()> {
     if db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, id))??
+        .conversation_metadata(id)?
         .is_none()
     {
         return Err(QueueError::NotFound.into());
     }
     Ok(())
 }
-fn snapshot(db: &DbManager, id: &str) -> anyhow::Result<Value> {
+fn snapshot(db: &Stores, id: &str) -> anyhow::Result<Value> {
     exists(db, id)?;
     Ok(json!({"items":queue::list(db,id)?,"paused":queue::is_paused(db,id)?}))
 }
 
 pub(super) fn execution_lease(
-    db: &DbManager,
+    db: &Stores,
     id: &str,
 ) -> anyhow::Result<deepseek_code_core::services::session_messages::ExecutionLease> {
-    let path: String =
-        db.with_conn(|conn| conn.query_row("PRAGMA database_list", [], |row| row.get(2)))??;
-    let path = std::path::Path::new(&path);
-    let root = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Queue needs a file-backed database"))?;
-    deepseek_code_core::services::session_messages::ExecutionLease::acquire(root, id)?
-        .ok_or_else(|| anyhow::anyhow!("Session is executing in another process"))
+    db.existing_chat_lease(id)
 }
 
 /// The turn that queued this dispatch can still hold the execution lease for a
 /// moment (its engine tail drops the last clone). Wait, bounded, until it is free.
 pub(super) async fn wait_for_release(
-    db: &DbManager,
+    db: &Stores,
     id: &str,
     limit: std::time::Duration,
 ) -> bool {
@@ -89,39 +82,6 @@ pub(super) async fn wait_for_release(
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-}
-
-pub(super) fn remember(state: &AppState, req: &ChatRequest) -> anyhow::Result<()> {
-    let mut context = req.clone();
-    context.messages.clear();
-    state.db_manager.with_conn(|conn| -> anyhow::Result<()> {
-        conn.execute_batch("CREATE TABLE IF NOT EXISTS desktop_queue_context(session_id TEXT PRIMARY KEY,request_json TEXT NOT NULL)")?;
-        conn.execute("INSERT INTO desktop_queue_context VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET request_json=excluded.request_json",
-            rusqlite::params![req.conversation_id,serde_json::to_string(&context)?])?;
-        Ok(())
-    })?
-}
-
-pub(super) fn handoff(db: &DbManager, id: &str, item: &QueueItem) -> anyhow::Result<QueueItem> {
-    queue::handoff(db, id, item.id, item.revision, |tx, item, message_id| {
-        let paused: bool = tx.query_row("SELECT COALESCE((SELECT paused FROM session_input_queue_control WHERE session_id=?1),0)",[id],|r|r.get(0))?;
-        anyhow::ensure!(!paused, QueueError::Paused);
-        let order: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?1",
-            [id],
-            |r| r.get(0),
-        )?;
-        crate::db::message_repo::save_user_message(
-            tx,
-            message_id,
-            id,
-            &item.content,
-            &chrono::Utc::now().to_rfc3339(),
-            order,
-        )?;
-        tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1",[id])?;
-        Ok(())
-    })
 }
 
 // A plain spawning function breaks the recursive future type between collector and dispatch.
@@ -142,21 +102,10 @@ async fn dispatch(state: AppState, id: &str) -> anyhow::Result<()> {
     if queue::is_paused(&state.db_manager, id)? {
         return Ok(());
     }
-    let items = queue::list(&state.db_manager, id)?;
-    let Some(item) = items
-        .into_iter()
-        .find(|i| matches!(i.state, QueueState::Queued | QueueState::Claimed))
-    else {
+    let Some(item) = state.db_manager.next_desktop_input(id)? else {
         return Ok(());
     };
-    let raw: String = state.db_manager.with_conn(|conn| {
-        conn.query_row(
-            "SELECT request_json FROM desktop_queue_context WHERE session_id=?1",
-            [id],
-            |r| r.get(0),
-        )
-    })??;
-    let mut req: ChatRequest = serde_json::from_str(&raw)?;
+    let req = state.db_manager.desktop_context(id)?;
     let format = {
         let config = state.config_manager.lock().await;
         let config = config
@@ -175,13 +124,9 @@ async fn dispatch(state: AppState, id: &str) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow::anyhow!("Queued turn provider unavailable"))?;
         crate::runtime::provider_from_config(provider).api_format
     };
-    req.messages =
-        crate::runtime::SessionStore::new(state.db_manager.clone()).model_history(id, &format)?;
-    req.messages
-        .push(json!({"role":"user","content":item.content}));
     // chat owns the same collector/persistence path as an interactive turn. Its body
     // is disposable: collection is detached from any HTTP consumer.
-    let response = super::chat::start_chat(state, req, Some(item)).await;
+    let response = super::chat::start_chat(state, req, Some((item,format))).await;
     anyhow::ensure!(
         response.status().is_success(),
         "Queued turn failed admission: {}",
@@ -302,8 +247,14 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
 }
 pub(super) async fn stop(state: AppState, id: String) -> Response {
     let _gate = gate(&state, &id).await;
-    if let Err(e) = queue::set_paused(&state.db_manager, &id, true) {
-        return error(e);
+    match state.db_manager.global().conversation(&id) {
+        Ok(Some(_)) => {
+            if let Err(error_value) = queue::set_paused(&state.db_manager, &id, true) {
+                return error(error_value);
+            }
+        }
+        Ok(None) => {}
+        Err(error_value) => return error(error_value),
     }
     let outcome = state
         .generation_runs
@@ -326,14 +277,13 @@ pub fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepseek_code_core::services::session_messages::ExecutionLease;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn waits_for_the_finished_turn_to_drop_its_lease() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DbManager::new(dir.path().join("accept.db")).unwrap();
+        let db = Stores::open(dir.path()).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let lease = ExecutionLease::acquire(dir.path(), &id).unwrap().unwrap();
+        let lease = db.create(&id,Default::default()).unwrap().acquire_execution().unwrap();
         let released = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             drop(lease);
@@ -345,9 +295,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lease_that_stays_held_reports_no_release() {
         let dir = tempfile::tempdir().unwrap();
-        let db = DbManager::new(dir.path().join("accept.db")).unwrap();
+        let db = Stores::open(dir.path()).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let lease = ExecutionLease::acquire(dir.path(), &id).unwrap().unwrap();
+        let lease = db.create(&id,Default::default()).unwrap().acquire_execution().unwrap();
         assert!(!wait_for_release(&db, &id, std::time::Duration::from_millis(300)).await);
         drop(lease);
     }

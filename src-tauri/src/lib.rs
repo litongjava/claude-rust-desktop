@@ -80,14 +80,10 @@ fn start_mobile_bridge(data_dir: std::path::PathBuf) {
     }
     prepare_linux_environment(&data_dir);
     tauri::async_runtime::spawn(async move {
-        let db = match db::DbManager::new(data_dir.join(deepseek_code_core::runtime::DATABASE_FILE)) {
-            Ok(db) => std::sync::Arc::new(db),
+        let bridge = match bridge::BridgeServer::open_mobile(data_dir) {
+            Ok(bridge) => bridge,
             Err(error) => return tracing::error!(module = "Bridge", "Cannot open database: {error}"),
         };
-        if let Err(error) = db.init() {
-            return tracing::error!(module = "Bridge", "Cannot initialize database: {error}");
-        }
-        let bridge = bridge::BridgeServer::new(data_dir, db);
         if let Err(error) = bridge.start(30085).await {
             tracing::error!(module = "Bridge", "Server failed to start: {error}");
         }

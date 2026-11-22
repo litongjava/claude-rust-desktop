@@ -1,4 +1,6 @@
 //! Local REPL commands use the same stores as Desktop and never call a model.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::session::Session;
 use anyhow::{ensure, Result};
 use deepseek_code_core::{
@@ -35,7 +37,7 @@ pub fn show_resumed(session: &Session, clear: bool) -> Result<()> {
     let mut out = String::new();
     if clear {
         out.push_str("\x1b[2J\x1b[H");
-        out.push_str(&crate::terminal::banner(&session.model, &session.workspace));
+        out.push_str(&crate::terminal::banner(&session.binding_state().model, &session.workspace));
         out.push('\n');
     }
     let mut recorded = crate::terminal::scrollback::Scrollback::default();
@@ -90,9 +92,7 @@ pub fn save_completion(session: &Session) -> Result<()> {
     let Some(status) = status else {
         return Ok(());
     };
-    let messages = session.store.db.with_conn(|conn| {
-        deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session.id)
-    })??;
+    let messages = session.selected_session()?.repository().messages()?;
     if let Some(message) = messages.last().filter(|m| m.role == "assistant") {
         let directory = session.paths.data_dir.join("turn-completions");
         std::fs::create_dir_all(&directory)?;
@@ -164,8 +164,8 @@ fn conversation(
 ) -> Result<Vec<crate::terminal::change_view::Line>> {
     use crate::terminal::{change_view, tool_view};
     let width = crate::terminal::size().0.saturating_sub(1) as usize;
-    session.store.db.with_conn(|conn| {
-        let rows = deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, id)?;
+    session.store.db.open_session(id)?.read(|history| {
+        let rows = history.messages()?;
         let mut lines = Vec::new();
         let mut tool_number = 0;
         for message in &rows {
@@ -216,7 +216,7 @@ fn conversation(
                             .to_string()
                     })
                     .unwrap_or_default();
-                let header = format!("{time} {}", session.model);
+                let header = format!("{time} {}", session.binding_state().model);
                 lines.push(change_view::muted(&format!("{header:>width$}")));
             }
             if let (Some(recorded), Some(thinking)) = (
@@ -255,7 +255,7 @@ fn conversation(
                 record_lines(recorded, &lines[message_start..], width);
             }
             for tool in
-                deepseek_code_core::db::message_repo::get_tool_calls_for_message(conn, &message.id)?
+                history.tools(&message.id)?
             {
                 tool_number += 1;
                 let number = Some(tool_number);
@@ -288,7 +288,7 @@ fn conversation(
                         (short, full)
                     } else {
                         let elapsed =
-                            deepseek_code_core::db::message_repo::tool_duration(conn, &tool.id)?
+                            history.tool_duration(&tool.id)?
                                 .map(std::time::Duration::from_millis);
                         (
                             tool_view::finished(
@@ -388,7 +388,7 @@ fn conversation(
             // Only the final legacy message has a fallback; intermediate tool
             // messages must not be presented as completed turns.
             if saved.is_file() || rows.last().is_some_and(|last| last.id == message.id) {
-                let turn = deepseek_code_core::db::turn_repo::get_message_turn(conn, &message.id)
+                let turn = history.message_turn(&message.id)
                     .ok()
                     .flatten();
                 if let Some(status) =
@@ -413,7 +413,7 @@ fn conversation(
             }
         }
         Ok(lines)
-    })?
+    })
 }
 
 #[cfg(test)]
@@ -473,7 +473,7 @@ async fn all_tools_keep_numbers_in_resume_and_detailed_transcript() {
     session
         .store
         .db
-        .with_conn(|conn| -> Result<()> {
+        .shard_sql(&id, |conn| -> Result<()> {
             message_repo::insert_message(
                 conn,
                 "answer",
@@ -497,7 +497,8 @@ async fn all_tools_keep_numbers_in_resume_and_detailed_transcript() {
                     index as i64,
                 )?;
             }
-            Ok(())
+            conn.execute("UPDATE manifest SET message_count=(SELECT count(*) FROM messages),content_revision=content_revision+1",[])?;
+                Ok(())
         })
         .unwrap()
         .unwrap();
@@ -528,7 +529,7 @@ async fn all_tools_keep_numbers_in_resume_and_detailed_transcript() {
     session
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&id, |conn| {
             message_repo::save_request_snapshots(conn, "answer", &serde_json::json!([snapshot]))
         })
         .unwrap()
@@ -580,6 +581,7 @@ pub async fn compact(
     use deepseek_code_core::services::compaction::CompactionTracker;
     let context = crate::services::context(paths)?;
     let tracker = CompactionTracker::default();
+    let state = session.binding_state();
     let compacted = {
         let future = crate::hook_progress::during(
             &session.id,
@@ -589,8 +591,8 @@ pub async fn compact(
                 &context,
                 &session.workspace,
                 &session.id,
-                &session.provider_id,
-                &session.model,
+                &state.provider_id,
+                &state.model,
                 instructions.trim(),
                 "manual",
                 Some(&tracker),
@@ -614,7 +616,6 @@ pub async fn compact(
         // and stops the post-compaction hooks instead of waiting for them.
     };
     // A manual compaction supersedes any request the model queued.
-    deepseek_code_core::services::compaction_requests::clear(&session.store.db, &session.id)?;
     for warning in &compacted.report.warnings {
         command_eprintln!("Hook: {warning}");
     }
@@ -749,12 +750,7 @@ pub async fn handle(
         }
         "/context" => {
             ensure!(argument.trim().is_empty(), "Usage: /context");
-            let rows = session.store.db.with_conn(|conn| {
-                deepseek_code_core::db::message_repo::get_messages_by_conversation(
-                    conn,
-                    &session.id,
-                )
-            })??;
+            let rows = session.selected_session()?.read(|r| r.messages())?;
             let start = rows
                 .iter()
                 .rposition(|row| row.is_compact_boundary)
@@ -768,7 +764,7 @@ pub async fn handle(
         "/role" => {
             use deepseek_code_core::super_agent::Role;
             let current =
-                deepseek_code_core::super_agent::role::load(&session.store.db, &session.id)?;
+                deepseek_code_core::super_agent::role::load(&session.selected_session()?, &session.id)?;
             let wanted = argument.trim();
             if wanted.is_empty() {
                 command_eprintln!(
@@ -798,7 +794,7 @@ pub async fn handle(
             let sessions = session
                 .store
                 .db
-                .with_conn(conversation_repo::list_conversations)??;
+                .conversations()?;
             command_println!("{}", serde_json::to_string_pretty(&sessions)?);
         }
         "/skills" => {
@@ -882,9 +878,7 @@ fn rename(store: &SessionStore, id: &str, title: &str) -> Result<()> {
         title.chars().count() <= 200,
         "Session titles must be at most 200 characters"
     );
-    store
-        .db
-        .with_conn(|conn| conversation_repo::update_conversation_title(conn, id, title))??;
+    store.db.rename_session(id, title)?;
     Ok(())
 }
 
@@ -932,7 +926,7 @@ mod tests {
         store.append(&id, "user", "Next turn").unwrap();
         let messages = store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&id, |conn| {
                 deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &id)
             })
             .unwrap()

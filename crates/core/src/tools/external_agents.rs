@@ -319,6 +319,7 @@ fn read_final_message(path: &Path) -> Result<Option<String>> {
 /// Starts the agent with the arguments the tool exposes and waits for it.
 /// Tests call this with a controlled fake executable; production resolves the
 /// executable from PATH first.
+#[cfg(test)]
 async fn run_agent(
     agent: &Agent,
     program: &Path,
@@ -326,12 +327,20 @@ async fn run_agent(
     cwd: &str,
     timeout: Duration,
 ) -> Result<Value> {
+    run_bound_agent(agent, program, input, cwd, timeout, None).await
+}
+
+async fn run_bound_agent(agent: &Agent, program: &Path, input: &Value, cwd: &str, timeout: Duration,
+    binding: Option<&crate::native_engine::session_binding::BindingSnapshot>) -> Result<Value> {
     let prompt = prompt(input)?;
     let session_requested = requested_session(agent, input)?;
     let answer_dir = tempfile::tempdir()?;
     let answer_file = answer_dir.path().join("answer.txt");
     let mut command = tokio::process::Command::new(program);
+    use crate::services::background_sessions::{strip_internal_env, CHILD_API_KEY_ENV};
+    strip_internal_env(&mut command);
     command
+        .env_remove(CHILD_API_KEY_ENV)
         .args(arguments(agent, input, prompt, cwd, &answer_file)?)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -339,7 +348,13 @@ async fn run_agent(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if agent.command == "dcl" {
-        command.env(NESTED_ENV, "1");
+        if let Some(binding) = binding {
+            for (name, value) in &binding.environment {
+                match value { Some(value) => command.env(name, value), None => command.env_remove(name) };
+            }
+        }
+        strip_internal_env(&mut command);
+        command.env_remove(CHILD_API_KEY_ENV).env(NESTED_ENV, "1");
     }
     #[cfg(unix)]
     command.process_group(0);
@@ -465,6 +480,10 @@ async fn run_agent(
 }
 
 pub(super) async fn execute(tool: &str, input: Value, cwd: &str) -> Result<Value> {
+    execute_bound(tool, input, cwd, None).await
+}
+
+pub(crate) async fn execute_bound(tool: &str, input: Value, cwd: &str, binding: Option<&crate::native_engine::session_binding::BindingSnapshot>) -> Result<Value> {
     let agent = agent(tool).context("Unknown external agent")?;
     // Report a missing prompt before looking for the executable.
     prompt(&input)?;
@@ -478,7 +497,7 @@ pub(super) async fn execute(tool: &str, input: Value, cwd: &str) -> Result<Value
         .as_u64()
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(10, MAX_TIMEOUT_SECS);
-    run_agent(agent, &program, &input, cwd, Duration::from_secs(timeout)).await
+    run_bound_agent(agent, &program, &input, cwd, Duration::from_secs(timeout), binding).await
 }
 
 #[cfg(test)]

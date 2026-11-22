@@ -1,3 +1,6 @@
+#[path = "../../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use super::*;
 use deepseek_code_core::runtime::{RuntimePaths, SessionStore};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -144,7 +147,7 @@ async fn sdk_interrupt_during_recovery_preserves_usage_and_committed_summary() {
                 "cancelled recovery must not retry"
             );
             assert_eq!(state.summaries.load(Ordering::SeqCst) > 0, committed);
-            let boundaries = store.db.with_conn(|conn| conn.query_row("SELECT count(*) FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1", [&id], |row| row.get::<_, u64>(0))).unwrap().unwrap();
+            let boundaries = store.db.shard_sql(&id, |conn| conn.query_row("SELECT count(*) FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1", [&id], |row| row.get::<_, u64>(0))).unwrap().unwrap();
             assert_eq!(boundaries, u64::from(committed));
             assert_eq!(
                 deepseek_code_core::services::compaction::count(&store.db, &id)

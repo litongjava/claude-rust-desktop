@@ -142,14 +142,20 @@ pub async fn run(
             format!("Unknown local workflow: {name}. Run /workflows list to see discovered files")
         })?;
     let prompt = compose(&workflow, arguments)?;
-    let child_id = session.store.fork(&session.id)?;
+    let _parent = session
+        .binding
+        .selected_session(&session.id)?
+        .hold_incarnation()?;
+    let child = session.store.fork_session(&session.id)?;
+    let _target = child.hold_incarnation()?;
+    let child_id = child.id().to_owned();
     crate::session_commands::copy_settings(&session.store.db, &session.id, &child_id)?;
     permission_authority::record_user(
         &session.store.db,
         &child_id,
         &serde_json::json!(prompt),
     )?;
-    let provider = session.selected_provider().await?;
+    let provider = session.launch_provider().await?;
     let arguments = crate::background_commands::arguments(
         cli,
         paths,

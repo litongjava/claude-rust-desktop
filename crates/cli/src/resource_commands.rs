@@ -1,6 +1,7 @@
-//! Terminal adapters for public resources and persistent feature lessons.
-use anyhow::{ensure, Context, Result};
-use deepseek_code_core::{runtime::RuntimePaths, services::cli_resources};
+//! Terminal adapters for persistent feature lessons.
+use deepseek_code_core::db::session_store::GlobalSetting;
+use anyhow::{Context, Result};
+use deepseek_code_core::runtime::RuntimePaths;
 use std::collections::BTreeSet;
 
 pub(crate) const LESSONS: &[(&str, &str, &str)] = &[
@@ -19,66 +20,10 @@ pub(crate) const LESSONS: &[(&str, &str, &str)] = &[
 pub async fn handle(command: &str, argument: &str, paths: &RuntimePaths) -> Result<bool> {
     let argument = argument.trim();
     match command {
-        "/radio" | "/stickers" => {
-            ensure!(argument.is_empty(), "This command takes no arguments");
-            let url = if command == "/radio" {
-                cli_resources::RADIO
-            } else {
-                cli_resources::STICKERS
-            };
-            command_eprintln!("Opening {url}");
-            cli_resources::open_link(url)?;
-        }
-        "/mobile" => {
-            ensure!(
-                ["", "ios", "android"].contains(&argument),
-                "Usage: /mobile [ios|android]"
-            );
-            for android in [false, true]
-                .into_iter()
-                .filter(|android| argument.is_empty() || *android == (argument == "android"))
-            {
-                let (platform, url) = if android {
-                    ("Android", cli_resources::ANDROID)
-                } else {
-                    ("iOS", cli_resources::IOS)
-                };
-                command_eprintln!("{platform}: {url}\n{}", cli_resources::mobile_qr(android)?);
-            }
-        }
-        "/release-notes" => {
-            ensure!(
-                ["", "refresh", "all"].contains(&argument),
-                "Usage: /release-notes [refresh|all]"
-            );
-            let notes = tokio::select! {
-                notes = cli_resources::release_notes(&paths.data_dir, argument == "refresh") => notes?,
-                _ = crate::signals::interrupted() => anyhow::bail!("Release notes request cancelled"),
-            };
-            command_eprintln!(
-                "Official Claude Code release notes · {} · fetched {}\n{}",
-                if notes.cached { "cached" } else { "live" },
-                notes.fetched_at,
-                cli_resources::CHANGELOG
-            );
-            let limit = if argument == "all" { usize::MAX } else { 100 };
-            for line in notes.text.lines().take(limit) {
-                // Remote Markdown may contain terminal escape sequences.
-                command_println!(
-                    "{}",
-                    line.chars()
-                        .filter(|ch| !ch.is_control() || *ch == '\t')
-                        .collect::<String>()
-                );
-            }
-            if notes.text.lines().count() > limit {
-                command_eprintln!("Use /release-notes all to show the complete changelog.");
-            }
-        }
         "/powerup" => {
             let context = crate::services::context(paths)?;
             let mut completed = context
-                .setting::<BTreeSet<String>>("cli.powerup.completed")?
+                .global_setting::<BTreeSet<String>>(GlobalSetting::MachinePreference("cli.powerup.completed"))?
                 .unwrap_or_default();
             let words = argument.split_whitespace().collect::<Vec<_>>();
             match words.as_slice() {
@@ -102,7 +47,7 @@ pub async fn handle(command: &str, argument: &str, paths: &RuntimePaths) -> Resu
                 }
                 ["reset"] => {
                     completed.clear();
-                    context.save_setting("cli.powerup.completed", &completed)?;
+                    context.save_global_setting(GlobalSetting::MachinePreference("cli.powerup.completed"), &completed)?;
                     command_eprintln!("Lesson progress reset.");
                 }
                 [id] | ["read", id] | ["done", id] => {
@@ -112,7 +57,7 @@ pub async fn handle(command: &str, argument: &str, paths: &RuntimePaths) -> Resu
                         .context("Unknown lesson; use /powerup to list topics")?;
                     if words.first() == Some(&"done") {
                         completed.insert((*id).into());
-                        context.save_setting("cli.powerup.completed", &completed)?;
+                        context.save_global_setting(GlobalSetting::MachinePreference("cli.powerup.completed"), &completed)?;
                         command_eprintln!("Completed: {title}");
                     } else {
                         command_eprintln!("{title}\n\n{text}\n\nWhen finished: /powerup done {id}");

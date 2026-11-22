@@ -41,6 +41,8 @@ pub struct Worker {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Batch {
+    #[serde(default)]
+    owner: Option<crate::db::session_store::HistoryAddress>,
     pub id: String,
     pub parent_session_id: String,
     pub workspace: PathBuf,
@@ -241,11 +243,12 @@ pub fn schema() -> Value {
 
 pub fn create(
     root: &Path,
-    parent: &str,
+    parent: &crate::db::session_store::SessionDb,
     workspace: &Path,
     instruction: &str,
     proposal: Proposal,
 ) -> Result<Batch> {
+    let _parent = parent.hold_incarnation()?;
     validate(&proposal)?;
     let (workspace, base_commit) = repository(workspace)?;
     let id = uuid::Uuid::new_v4().to_string();
@@ -269,7 +272,8 @@ pub fn create(
         .collect();
     let batch = Batch {
         id,
-        parent_session_id: parent.into(),
+        owner: Some(parent.address()),
+        parent_session_id: parent.id().into(),
         workspace,
         base_commit,
         instruction: instruction.into(),
@@ -285,7 +289,7 @@ pub fn create(
     save(&dir.join("state.json"), &batch)?;
     Ok(batch)
 }
-pub fn get(root: &Path, id: &str) -> Result<Batch> {
+fn read(root: &Path, id: &str) -> Result<Batch> {
     let mut batch: Batch =
         serde_json::from_slice(&fs::read(directory(root, id)?.join("state.json"))?)?;
     if batch.status == "running" && now().saturating_sub(batch.heartbeat_ms) > 15_000 {
@@ -295,7 +299,21 @@ pub fn get(root: &Path, id: &str) -> Result<Batch> {
     }
     Ok(batch)
 }
-pub fn list(root: &Path, parent: &str) -> Result<Vec<Batch>> {
+pub fn get(root: &Path, id: &str, parent: &crate::db::session_store::SessionDb) -> Result<Batch> {
+    let batch = read(root, id)?;
+    ensure!(batch.parent_session_id == parent.id() && batch.owner.as_ref() == Some(&parent.address()), "Resume the batch's originating session to manage it");
+    let _guard = parent.hold_incarnation()?;
+    for worker in &batch.workers {
+        if let Some(id) = &worker.job_id {
+            let job = background_sessions::get(root, id)?;
+            ensure!(worker.session_id.as_deref() == Some(&job.session_id), "Batch worker session changed");
+            background_sessions::owned_execution(root, parent, &job)?;
+        }
+    }
+    Ok(batch)
+}
+
+pub fn list(root: &Path, parent: &crate::db::session_store::SessionDb) -> Result<Vec<Batch>> {
     let mut batches = Vec::new();
     let path = root.join("batches");
     if !path.exists() {
@@ -304,10 +322,8 @@ pub fn list(root: &Path, parent: &str) -> Result<Vec<Batch>> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if let Some(id) = entry.file_name().to_str() {
-            if let Ok(batch) = get(root, id) {
-                if batch.parent_session_id == parent {
-                    batches.push(batch);
-                }
+            if let Ok(batch) = get(root, id, parent) {
+                batches.push(batch);
             }
         }
     }
@@ -333,6 +349,7 @@ fn supervisor_command(executable: &Path, dir: &Path, environment: &[(String, Str
 pub fn start(
     root: &Path,
     id: &str,
+    parent: &crate::db::session_store::SessionDb,
     launch: WorkerLaunch,
     concurrency: usize,
     publish: bool,
@@ -349,7 +366,8 @@ pub fn start(
         ),
         "Invalid batch permission mode"
     );
-    let mut batch = get(root, id)?;
+    let _parent = parent.hold_incarnation()?;
+    let mut batch = get(root, id, parent)?;
     ensure!(batch.status == "planned", "Only a planned batch can start");
     let (_, head) = repository(&batch.workspace)?;
     ensure!(
@@ -396,8 +414,9 @@ pub fn start(
     }
     Ok(batch)
 }
-pub fn cancel(root: &Path, id: &str) -> Result<Batch> {
-    let batch = get(root, id)?;
+pub fn cancel(root: &Path, id: &str, parent: &crate::db::session_store::SessionDb) -> Result<Batch> {
+    let _parent = parent.hold_incarnation()?;
+    let batch = get(root, id, parent)?;
     ensure!(
         matches!(batch.status.as_str(), "running" | "unresponsive"),
         "Batch is not running"
@@ -405,7 +424,7 @@ pub fn cancel(root: &Path, id: &str) -> Result<Batch> {
     fs::write(directory(root, id)?.join("cancel"), b"cancel")?;
     for worker in &batch.workers {
         if let Some(job) = &worker.job_id {
-            let _ = background_sessions::cancel(root, job);
+            cancel_worker(root, &batch, worker, job)?;
         }
     }
     Ok(batch)
@@ -514,7 +533,9 @@ pub fn run_worker_from_env() -> Result<bool> {
         batch.error = Some(format!("{error:#}"));
         for worker in &batch.workers {
             if let Some(job) = &worker.job_id {
-                let _ = background_sessions::cancel(root, job);
+                if let Err(error) = cancel_worker(root, &batch, worker, job) {
+                    tracing::warn!(%error, "Could not cancel batch worker");
+                }
             }
         }
     }
@@ -522,10 +543,26 @@ pub fn run_worker_from_env() -> Result<bool> {
     save(&dir.join("state.json"), &batch)?;
     Ok(true)
 }
+fn cancel_worker(root: &Path, batch: &Batch, worker: &Worker, id: &str) -> Result<()> {
+    let stores = crate::db::session_store::Stores::open(root)?;
+    let parent = stores.resume_history(batch.owner.as_ref().context("Batch lacks a recorded owner")?)?;
+    let _parent = parent.hold_incarnation()?;
+    let job = background_sessions::get(root, id)?;
+    ensure!(worker.session_id.as_deref() == Some(&job.session_id), "Batch worker session changed");
+    let child = background_sessions::owned_execution(root, &parent, &job)?;
+    let _child = child.hold_incarnation()?;
+    if matches!(job.status.as_str(), "running" | "starting") {
+        background_sessions::cancel(root, id)?;
+    }
+    Ok(())
+}
+
 fn supervise(root: &Path, dir: &Path, batch: &mut Batch) -> Result<()> {
     let launch: WorkerLaunch = serde_json::from_slice(&fs::read(dir.join("launch.json"))?)?;
     let paths = crate::runtime::RuntimePaths::new(root.into())?;
     let store = crate::runtime::SessionStore::new(paths.open_database()?);
+    let selected = store.db.resume_history(batch.owner.as_ref().context("Batch lacks a recorded owner")?)?;
+    let _parent = selected.hold_incarnation()?;
     loop {
         let cancelling = dir.join("cancel").exists();
         for index in 0..batch.workers.len() {
@@ -537,7 +574,7 @@ fn supervise(root: &Path, dir: &Path, batch: &mut Batch) -> Result<()> {
                 }
                 let job = background_sessions::get(root, id)?;
                 if cancelling {
-                    let _ = background_sessions::cancel(root, id);
+                    cancel_worker(root, batch, &batch.workers[index], id)?;
                 }
                 match job.status.as_str() {
                     "starting" | "running" => {}
@@ -612,17 +649,26 @@ fn supervise(root: &Path, dir: &Path, batch: &mut Batch) -> Result<()> {
                         &batch.base_commit,
                     ],
                 )?;
-                let session = store.create(&worker.worktree, &launch.model, &launch.provider)?;
+                let _parent = selected.hold_incarnation()?;
+                let session = uuid::Uuid::new_v4().to_string();
+                let target = store.db.create_code_session(
+                    &worker.worktree,
+                    &launch.model,
+                    &launch.provider,
+                    &session,
+                )?;
+                let _target = target.hold_incarnation()?;
                 // A stronger explicitly selected mode never erases existing deny
                 // rules or agent tool restrictions from the originating session.
-                store.db.with_conn(|conn| conn.execute(
-                    "INSERT INTO peripheral_settings(key,value) SELECT ?1,value FROM peripheral_settings WHERE key=?2 ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    [format!("cli.permissions.{session}"),format!("cli.permissions.{}",batch.parent_session_id)]
-                ))??;
+                use crate::db::session_store::settings::PERMISSIONS;
+                let parent=selected.repository();
+                if let Some(rules)=parent.preference(PERMISSIONS)? {
+                    target.repository().set_preference(PERMISSIONS,Some(&rules))?;
+                }
                 if let Some(agent) =
-                    super::agents::for_session(&store.db, &batch.parent_session_id)?
+                    super::agents::for_session(&selected, selected.id())?
                 {
-                    super::agents::bind(&store.db, &session, &agent)?;
+                    super::agents::bind(&target, &session, &agent)?;
                 }
                 let mut arguments = launch.arguments.clone();
                 arguments.extend([
@@ -751,14 +797,16 @@ mod tests {
         )
         .unwrap();
         let data = dir.path().join("data");
-        let batch = create(&data, "parent", &repo, "Stale", proposal()).unwrap();
+        let stores = crate::db::session_store::Stores::open(&data).unwrap();
+        let parent = stores.create("parent", Default::default()).unwrap();
+        let batch = create(&data, &parent, &repo, "Stale", proposal()).unwrap();
         let directory = directory(&data, &batch.id).unwrap();
         let mut state: Batch =
             serde_json::from_slice(&fs::read(directory.join("state.json")).unwrap()).unwrap();
         state.status = "running".into();
         state.heartbeat_ms = 0;
         save(&directory.join("state.json"), &state).unwrap();
-        let read = get(&data, &batch.id).unwrap();
+        let read = get(&data, &batch.id, &parent).unwrap();
         assert_eq!(read.status, "unresponsive");
         assert!(read.error.unwrap().contains("heartbeat"));
         assert!(read.workers.iter().all(|worker| worker.status == "queued"));
@@ -786,9 +834,11 @@ mod tests {
         )
         .unwrap();
         let data = dir.path().join("data");
-        let batch = create(&data, "parent", &repo, "Change modules", proposal()).unwrap();
-        assert_eq!(get(&data, &batch.id).unwrap().status, "planned");
-        assert_eq!(list(&data, "other").unwrap().len(), 0);
+        let stores = crate::db::session_store::Stores::open(&data).unwrap();
+        let parent = stores.create("parent", Default::default()).unwrap();
+        let batch = create(&data, &parent, &repo, "Change modules", proposal()).unwrap();
+        assert_eq!(get(&data, &batch.id, &parent).unwrap().status, "planned");
+        assert_eq!(list(&data, &stores.create("other", Default::default()).unwrap()).unwrap().len(), 0);
         let worker = &batch.workers[0];
         fs::create_dir_all(worker.worktree.parent().unwrap()).unwrap();
         git(

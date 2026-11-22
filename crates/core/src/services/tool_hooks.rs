@@ -263,7 +263,8 @@ fn default_timeout() -> u64 {
 
 #[derive(Default, Clone)]
 pub struct HookRunner {
-    recording_db: Option<std::sync::Arc<crate::db::DbManager>>,
+    pub(crate) transcript_history: Option<crate::db::session_store::ExecutorHistory>,
+    recording_db: Option<std::sync::Arc<dyn crate::db::session_store::HookSessions>>,
     workspace: PathBuf,
     once_directory: PathBuf,
     hooks: Vec<ActiveHook>,
@@ -278,7 +279,7 @@ impl HookRunner {
         Self::load_with_configs(data_dir, workspace, Vec::new())
     }
 
-    pub fn load_with_plugins(context: &super::ServiceContext, workspace: &Path) -> Result<Self> {
+    pub fn load_with_plugins(context: &super::ServiceContext<impl crate::db::session_store::PluginCatalog + crate::db::session_store::HookSessions + 'static>, workspace: &Path) -> Result<Self> {
         Self::load_with_configs(
             &context.paths.data_dir,
             workspace,
@@ -477,6 +478,7 @@ impl HookRunner {
             force_sync: false,
             callbacks: None,
             prompt_provider: None,
+            transcript_history: None,
             recording_db: None,
         })
     }
@@ -587,12 +589,22 @@ impl HookRunner {
     ) -> Value {
         let path = cache.get_or_init(|| {
             let root = self.once_directory.parent().unwrap_or(&self.workspace);
-            let path = super::lifecycle_events::transcript_path(root, session);
-            if let Err(error) = super::lifecycle_events::transcript(root, session) {
-                tracing::warn!(session_id = session, transcript_path = %path.display(),
-                    "Hook transcript snapshot unavailable; dispatch continues: {error:#}");
+            let fallback = if self.transcript_history.is_none() { self.recording_db.as_ref().and_then(|db| db.clone().hook_history(session).ok().flatten()) } else { None };
+            let history = self.transcript_history.as_ref().or(fallback.as_ref());
+            match super::lifecycle_events::snapshot(root,session,history) {
+                Ok(path) => path,
+                Err(error) => {
+                    // An unavailable split snapshot must never expose an older incarnation's file.
+                    let path = if history.is_none() && root.join("global.db").exists() {
+                        root.join("hook-transcripts").join(format!("unavailable-{}",uuid::Uuid::new_v4()))
+                    } else {
+                        super::lifecycle_events::snapshot_path(root, session, history)
+                    };
+                    tracing::warn!(session_id = session, transcript_path = %path.display(),
+                        "Hook transcript snapshot unavailable; dispatch continues: {error:#}");
+                    path
+                }
             }
-            path
         });
         input["transcript_path"] = json!(path);
         input

@@ -1,4 +1,4 @@
-use deepseek_code_core::{db::project_repo, runtime::RuntimePaths};
+use deepseek_code_core::{db::session_store::{ProjectEdit,Projects}, runtime::RuntimePaths};
 use deepseek_desktop_tauri_lib::bridge::BridgeServer;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -20,14 +20,7 @@ async fn workspace_files_require_auth_trust_and_project_relative_paths() {
         folder.to_string_lossy().into_owned(),
         extra.to_string_lossy().into_owned(),
     ];
-    db.with_conn(|conn| {
-        project_repo::insert_project(
-            conn, "project", "Fixture", None, None, None, false, "now", "now",
-        )
-        .unwrap();
-        project_repo::set_folders(conn, "project", &folders).unwrap();
-    })
-    .unwrap();
+    db.create_project("project",&ProjectEdit {name:Some("Fixture".into()),folders:Some(folders.clone()),..Default::default()}).unwrap();
     let bridge = BridgeServer::new(dir.path().into(), db.clone());
     let key = bridge.get_api_key().to_string();
     let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -69,9 +62,7 @@ async fn workspace_files_require_auth_trust_and_project_relative_paths() {
             .status(),
         reqwest::StatusCode::BAD_REQUEST
     );
-    db.with_conn(|conn| project_repo::trust_folders(conn, "project", &folders))
-        .unwrap()
-        .unwrap();
+    db.trust_project("project",&folders).unwrap();
     let roots: Value = client
         .post(format!("{url}/roots"))
         .header("x-api-key", &key)

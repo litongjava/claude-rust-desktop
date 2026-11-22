@@ -112,8 +112,7 @@ pub fn routes(https: bool) -> Router<AppState> {
         .route("/api/github/materialize", post(|State(state): State<AppState>, Json(body): Json<MaterializeBody>| async move {
             let conversation = state
                 .db_manager
-                .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, &body.conversation_id))
-                .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
+                .conversation_metadata(&body.conversation_id)
                 .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?
                 .ok_or_else(|| fail(StatusCode::NOT_FOUND, "Conversation not found"))?;
             let workspace = conversation

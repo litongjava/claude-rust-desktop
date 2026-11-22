@@ -1,4 +1,7 @@
 //! Real dcl processes, isolated SQLite, and a builtin DeepSeek local HTTP endpoint.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::post, Json, Router};
 use deepseek_code_core::runtime::{RuntimePaths, SessionStore};
 use serde_json::{json, Value};
@@ -117,7 +120,7 @@ async fn scenario(api: &'static str) {
         .unwrap();
     let database_id: String = store
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             conn.query_row("SELECT id FROM conversations WHERE id=?1", [&id], |row| {
                 row.get(0)
             })
@@ -195,7 +198,7 @@ async fn scenario(api: &'static str) {
             .expect("main request trace ID");
         let found: i64 = store
             .db
-            .with_conn(|c| {
+            .shard_sql(&id, |c| {
                 c.query_row(
                     "SELECT COUNT(*) FROM model_requests WHERE id=?1",
                     [trace],
@@ -220,7 +223,7 @@ async fn scenario(api: &'static str) {
     let boundary = compact["after_boundary"].as_str().unwrap();
     let found: i64 = store
         .db
-        .with_conn(|c| {
+        .shard_sql(&id, |c| {
             c.query_row(
                 "SELECT COUNT(*) FROM messages WHERE id=?1 AND is_compact_boundary=1",
                 [boundary],
@@ -232,7 +235,7 @@ async fn scenario(api: &'static str) {
     assert_eq!(found, 1);
     let boundaries: i64 = store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&id, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1",
                 [&id],

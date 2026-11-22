@@ -1,6 +1,9 @@
 //! A real `dcl` child must run in the prepared workspace, persist it, and
 //! resume there. The model is a local HTTP mock that makes the child report its
 //! own working directory through the Bash tool.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     native_engine::{
         child_session::{
@@ -220,10 +223,7 @@ async fn real_child_runs_in_the_prepared_workspace_and_resumes_there() {
     );
     let stored = sessions
         .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::get_conversation(conn, &first.session_id)
-        })
-        .unwrap()
+        .conversation_metadata(&first.session_id)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -304,7 +304,7 @@ async fn real_child_runs_in_the_prepared_workspace_and_resumes_there() {
     assert_eq!(live, 0);
     let conversations: i64 = sessions
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM conversations WHERE id <> ?1",
                 [&parent],
@@ -319,7 +319,7 @@ async fn real_child_runs_in_the_prepared_workspace_and_resumes_there() {
     let database_snapshot = || {
         sessions
             .db
-            .with_conn(|conn| -> anyhow::Result<Vec<(String, Vec<String>)>> {
+            .directory_sql(|conn| -> anyhow::Result<Vec<(String, Vec<String>)>> {
                 let mut names = conn
                     .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
                 let names = names

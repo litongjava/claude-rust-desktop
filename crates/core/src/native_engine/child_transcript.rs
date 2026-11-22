@@ -1,5 +1,5 @@
 use super::{ChildState, EngineEvent};
-use crate::db::message_repo::{self, ToolCallRow};
+use crate::db::message_repo::ToolCallRow;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -10,7 +10,7 @@ pub(super) struct ChildTranscript {
     pub state: ChildState,
     pub receiver: tokio::sync::mpsc::Receiver<EngineEvent>,
     pub web_evidence: Vec<Value>,
-    assistant_id: String,
+    pub(super) assistant_id: String,
     text: String,
     thinking: String,
     saw_text: bool,
@@ -27,12 +27,13 @@ impl ChildTranscript {
         receiver: tokio::sync::mpsc::Receiver<EngineEvent>,
         collect_web_evidence: bool,
     ) -> Result<Self> {
+        let assistant_id = state.history.new_message_id();
         let transcript = Self {
             state,
             receiver,
             collect_web_evidence,
             web_evidence: Vec::new(),
-            assistant_id: uuid::Uuid::new_v4().to_string(),
+            assistant_id,
             text: String::new(),
             thinking: String::new(),
             saw_text: false,
@@ -46,25 +47,15 @@ impl ChildTranscript {
     }
 
     fn persist(&self) -> Result<()> {
-        self.state.context.db.with_conn(|conn| -> Result<()> {
-            conn.execute("INSERT INTO messages(id,conversation_id,role,content,thinking,created_at,sort_order) VALUES(?1,?2,'assistant',?3,?4,?5,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?2)) ON CONFLICT(id) DO UPDATE SET content=excluded.content,thinking=excluded.thinking",
-                rusqlite::params![self.assistant_id, self.state.value["session_id"].as_str().unwrap_or_default(), self.text, self.thinking, chrono::Utc::now().to_rfc3339()])?;
-            Ok(())
-        })??;
-        Ok(())
+        self.state
+            .history
+            .child_segment(&self.assistant_id, &self.text, &self.thinking)
     }
 
     fn save_tool(&self, row: &ToolCallRow) -> Result<()> {
-        self.state.context.db.with_conn(|conn| {
-            message_repo::save_stream_tool_result(
-                conn,
-                self.state.value["session_id"].as_str().unwrap_or_default(),
-                &self.assistant_id,
-                &self.text,
-                row,
-            )
-        })??;
-        Ok(())
+        self.state
+            .history
+            .child_stream_tool(&self.assistant_id, &self.text, row)
     }
 
     fn tool(&self, id: &str, name: &str) -> ToolCallRow {
@@ -106,8 +97,8 @@ impl ChildTranscript {
     fn reduce(&mut self, event: EngineEvent) -> Result<Option<EngineEvent>> {
         let mut progress = None;
         match event {
-            EngineEvent::ContextReset { .. } => {
-                self.assistant_id = uuid::Uuid::new_v4().to_string();
+            EngineEvent::ContextReset { assistant_id, .. } => {
+                self.assistant_id = assistant_id.unwrap_or_else(|| self.state.history.new_message_id());
                 self.text.clear();
                 self.thinking.clear();
                 self.tools.clear();
@@ -119,9 +110,7 @@ impl ChildTranscript {
             | EngineEvent::AgentProgress { .. }) => return Ok(Some(event)),
             EngineEvent::Usage(usage) => {
                 self.state.usage(&usage);
-                self.state
-                    .context
-                    .save_setting(&self.state.key, &self.state.value)?;
+                self.state.history.save_child_state(&self.state.value)?;
             }
             EngineEvent::RequestSnapshot(snapshot) => {
                 self.state.snapshot(&snapshot, &self.assistant_id)?
@@ -232,9 +221,7 @@ impl ChildTranscript {
             _ => {}
         }
         if progress.is_some() || self.last_preview.elapsed().as_millis() >= 250 {
-            self.state
-                .context
-                .save_setting(&self.state.key, &self.state.value)?;
+            self.state.history.save_child_state(&self.state.value)?;
             self.last_preview = Instant::now();
         }
         Ok(progress)
@@ -251,14 +238,14 @@ mod tests {
         tokio::sync::mpsc::Sender<EngineEvent>,
     ) {
         let temp = tempfile::tempdir().unwrap();
-        let context = crate::services::session_messages::context(temp.path()).unwrap();
-        let id = crate::runtime::SessionStore::new(context.db.clone())
+        let stores =
+            std::sync::Arc::new(crate::db::session_store::Stores::open(temp.path()).unwrap());
+        let id = crate::runtime::SessionStore::new(stores.clone())
             .create(temp.path(), "fixture", "fixture")
             .unwrap();
         let (event_tx, _) = tokio::sync::mpsc::channel(64);
         let state = ChildState {
-            context,
-            key: format!("delegation.{id}"),
+            history: stores.executor_history(&id).unwrap(),
             value: json!({"session_id":id,"status":"running"}),
             event_tx,
             request_id: String::new(),
@@ -317,24 +304,21 @@ mod tests {
                 .count(),
             8000
         );
-        transcript
-            .state
-            .context
-            .db
-            .with_conn(|conn| {
-                let messages = message_repo::get_messages_by_conversation(
-                    conn,
-                    transcript.state.value["session_id"].as_str().unwrap(),
-                )
-                .unwrap();
+        let crate::db::session_store::ExecutorHistory::Session(shard) = &transcript.state.history
+        else {
+            unreachable!()
+        };
+        shard
+            .read(|r| {
+                let messages = r.messages()?;
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].content, text);
                 assert_eq!(messages[0].thinking.as_deref(), Some("private reasoning"));
-                let tools =
-                    message_repo::get_tool_calls_for_message(conn, &messages[0].id).unwrap();
+                let tools = r.tools(&messages[0].id)?;
                 assert_eq!(tools.len(), 1);
                 assert_eq!(tools[0].id, format!("{}:call", messages[0].id));
                 assert_eq!(tools[0].output.as_deref(), Some("result"));
+                Ok(())
             })
             .unwrap();
     }
@@ -342,7 +326,7 @@ mod tests {
     #[test]
     fn cancellation_drains_reset_segments_and_partial_tool_input() {
         let (_temp, mut transcript, tx) = fixture();
-        let context = transcript.state.context.clone();
+        let history = transcript.state.history.clone();
         let session = transcript.state.value["session_id"]
             .as_str()
             .unwrap()
@@ -353,6 +337,7 @@ mod tests {
         tx.try_send(EngineEvent::ContextReset {
             session_id: session.clone(),
             boundary_id: "boundary".into(),
+            assistant_id: None,
         })
         .unwrap();
         tx.try_send(EngineEvent::Thinking("after thinking".into()))
@@ -372,18 +357,20 @@ mod tests {
         })
         .unwrap();
         drop(transcript);
-        context
-            .db
-            .with_conn(|conn| {
-                let messages = message_repo::get_messages_by_conversation(conn, &session).unwrap();
+        let crate::db::session_store::ExecutorHistory::Session(shard) = history else {
+            unreachable!()
+        };
+        shard
+            .read(|r| {
+                let messages = r.messages()?;
                 assert_eq!(messages.len(), 2);
                 assert_eq!(messages[0].content, "before");
                 assert_eq!(messages[1].content, "after");
                 assert_eq!(messages[1].thinking.as_deref(), Some("after thinking"));
-                let tools =
-                    message_repo::get_tool_calls_for_message(conn, &messages[1].id).unwrap();
+                let tools = r.tools(&messages[1].id)?;
                 assert_eq!(tools[0].input.as_deref(), Some("{\"path\":"));
                 assert!(tools[0].output.is_none());
+                Ok(())
             })
             .unwrap();
     }

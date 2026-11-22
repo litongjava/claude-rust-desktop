@@ -141,7 +141,7 @@ export const nativeEngineAPI = {
   },
 
   async createConversation(request: CreateConversationRequest): Promise<ConversationInfo> {
-    return invoke('native_create_conversation', { request });
+    return invoke('native_create_conversation', { model: request.model, title: request.title });
   },
 
   async listConversations(): Promise<ConversationInfo[]> {
@@ -259,8 +259,8 @@ export const diffAPI = {
     return invoke('apply_diff', { diffId });
   },
 
-  async rejectDiff(diffId: string): Promise<void> {
-    return invoke('reject_diff', { diffId });
+  async rejectDiff(diffId: string, conversationId?: string): Promise<void> {
+    return invoke('reject_diff', { diffId, conversationId });
   },
 
   async getCodeDiffs(conversationId: string, messageId?: string): Promise<CodeDiffInfo[]> {
@@ -479,10 +479,12 @@ export const permissionApprovalAPI = {
   async approvePermission(
     approvalId: string,
     userDecision: string,
-    decisionReason?: string
+    decisionReason?: string,
+    conversationId?: string
   ): Promise<void> {
     return invoke('approve_permission', {
       approvalId,
+      conversationId,
       userDecision,
       decisionReason,
     });
@@ -490,11 +492,13 @@ export const permissionApprovalAPI = {
 
   async rejectPermission(
     approvalId: string,
-    decisionReason?: string
+    decisionReason?: string,
+    conversationId?: string
   ): Promise<void> {
     return invoke('reject_permission', {
       approvalId,
-      decisionReason,
+      conversationId,
+      reason: decisionReason,
     });
   },
 

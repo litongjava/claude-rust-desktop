@@ -1,6 +1,7 @@
+use crate::db::session_store::GlobalSetting;
 use crate::cache::FileCache;
 use crate::cost_tracker::{BudgetCheckResult, CostTracker};
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::mcp::McpToolRegistry;
 use crate::native_engine::provider_manager::ProviderManager;
 use crate::native_engine::tool_loop::{EngineEvent, ToolLoopExecutor};
@@ -21,7 +22,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot, Mutex};
-use uuid::Uuid;
 
 #[path = "idle_children.rs"]
 mod idle_children;
@@ -89,6 +89,10 @@ pub struct ChatRequest {
     #[serde(default)]
     pub effort: Option<String>,
     pub system_prompt: Option<String>,
+    /// The standalone terminal is the frontend, so its constant facts travel in
+    /// the first user message as their own reminder.
+    #[serde(default)]
+    pub standalone_frontend: bool,
     pub max_tokens: Option<u32>,
     /// Per-request model/tool-loop budget. None keeps the configured default.
     #[serde(default)]
@@ -314,7 +318,7 @@ pub struct QueryEngine {
     context_usage: std::sync::Mutex<Option<(u64, u64)>>,
     bundled_resources: Arc<crate::skills::bundled_resources::Resources>,
     provider_manager: Arc<Mutex<ProviderManager>>,
-    db_manager: Arc<DbManager>,
+    db_manager: Arc<Stores>,
     active_turns: Arc<Mutex<HashMap<String, ActiveTurn>>>,
     /// Completion bookkeeping for the executor attempt that owns a session.
     /// Entries are created before the executor is spawned and removed by that
@@ -546,7 +550,7 @@ impl QueryEngine {
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
             return crate::services::compaction::native::generate(
-                &self.db_manager,
+                history,
                 session,
                 &provider,
                 instructions,
@@ -567,7 +571,7 @@ impl QueryEngine {
     }
     pub fn new(
         provider_manager: Arc<Mutex<ProviderManager>>,
-        db_manager: Arc<DbManager>,
+        db_manager: Arc<Stores>,
         workspaces_dir: PathBuf,
         permission_manager: Arc<PermissionManager>,
         file_cache: Arc<FileCache>,
@@ -715,6 +719,7 @@ impl QueryEngine {
         let mut pm = self.provider_manager.lock().await;
         let config_path = pm.config_path().clone();
         *pm = ProviderManager::from_providers(providers, config_path);
+        self.invalidate_child_bindings(&pm, None);
     }
 
     pub async fn resolve_provider(
@@ -740,51 +745,22 @@ impl QueryEngine {
         conv_id: &str,
     ) -> Result<Option<ConversationState>> {
         let db = self.db_manager.clone();
-        let conv_id_clone = conv_id.to_string();
-
-        let result =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ConversationState>> {
-                db.with_conn(|conn| {
-                    let messages = crate::db::message_repo::get_messages_by_conversation(
-                        conn,
-                        &conv_id_clone,
-                    )?;
-                    let conv =
-                        crate::db::conversation_repo::get_conversation(conn, &conv_id_clone)?;
-
-                    if messages.is_empty() && conv.is_none() {
-                        return Ok(None);
-                    }
-
-                    let model = conv.as_ref().and_then(|c| c.model.as_deref()).unwrap_or("");
-
-                    let start = messages
-                        .iter()
-                        .rposition(|msg| msg.is_compact_boundary)
-                        .unwrap_or(0);
-                    let messages_json: Vec<Value> = messages
-                        .into_iter()
-                        .skip(start)
-                        .map(|msg| {
-                            serde_json::json!({
-                                "role": msg.role,
-                                "content": msg.content,
-                            })
-                        })
-                        .collect();
-
-                    Ok(Some(ConversationState {
-                        conversation_id: conv_id_clone,
-                        model: model.to_string(),
-                        messages: messages_json,
-                        system_prompt: None,
-                        last_activity: Utc::now().to_rfc3339(),
-                        turn_count: 0,
-                        status: ConversationStatus::Idle,
-                    }))
-                })?
-            })
-            .await??;
+        let id = conv_id.to_owned();
+        let saved = tokio::task::spawn_blocking(move || db.engine_history(&id)).await??;
+        let result = saved.map(|(model, messages)| {
+            let start = messages.iter().rposition(|msg| msg.is_compact_boundary).unwrap_or(0);
+            ConversationState {
+                conversation_id: conv_id.to_owned(),
+                model: model.unwrap_or_default(),
+                messages: messages.into_iter().skip(start).map(|msg| {
+                    serde_json::json!({"role": msg.role, "content": msg.content})
+                }).collect(),
+                system_prompt: None,
+                last_activity: Utc::now().to_rfc3339(),
+                turn_count: 0,
+                status: ConversationStatus::Idle,
+            }
+        });
 
         if let Some(state) = &result {
             self.update_conversation_state(conv_id, state.clone()).await;
@@ -794,58 +770,12 @@ impl QueryEngine {
     }
 
     pub async fn save_conversation_state(&self, conv_id: &str) -> Result<()> {
-        let states = self.conversation_states.lock().await;
-        if let Some(state) = states.get(conv_id) {
+        let state = self.conversation_states.lock().await.get(conv_id).cloned();
+        if let Some(state) = state {
             let db = self.db_manager.clone();
-            let state_clone = state.clone();
-
-            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let result = db.with_conn(|conn| {
-                    let tx = crate::db::write_transaction(&conn)?;
-
-                    let existing = crate::db::conversation_repo::get_conversation(
-                        &tx,
-                        &state_clone.conversation_id,
-                    )?;
-                    if existing.is_none() {
-                        crate::db::conversation_repo::insert_conversation(
-                            &tx,
-                            &state_clone.conversation_id,
-                            None,
-                            Some(&state_clone.model),
-                            None,
-                            None,
-                            None,
-                            false,
-                            false,
-                            false,
-                            &state_clone.last_activity,
-                            &state_clone.last_activity,
-                            state_clone.turn_count as i64,
-                        )?;
-                    } else {
-                        crate::db::conversation_repo::update_conversation(
-                            &tx,
-                            &state_clone.conversation_id,
-                            None,
-                            Some(&state_clone.model),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            Some(&state_clone.last_activity),
-                            Some(state_clone.turn_count as i64),
-                        )?;
-                    }
-
-                    tx.commit()?;
-                    Ok(())
-                });
-                result?
-            })
-            .await??;
+            tokio::task::spawn_blocking(move || db.save_engine_state(
+                &state.conversation_id, &state.model, &state.last_activity, state.turn_count as i64,
+            )).await??;
         }
         Ok(())
     }
@@ -860,7 +790,7 @@ impl QueryEngine {
         request: ChatRequest,
         save_response: bool,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, false, None)
+        self.send_with_origin(request, save_response, false, None, None)
             .await
     }
 
@@ -870,7 +800,7 @@ impl QueryEngine {
         request: ChatRequest,
         save_response: bool,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, true, None)
+        self.send_with_origin(request, save_response, true, None, None)
             .await
     }
 
@@ -883,7 +813,7 @@ impl QueryEngine {
         save_response: bool,
         lease: std::sync::Arc<crate::services::session_messages::ExecutionLease>,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, false, Some(lease))
+        self.send_with_origin(request, save_response, false, Some(lease), None)
             .await
     }
 
@@ -894,7 +824,18 @@ impl QueryEngine {
         save_response: bool,
         lease: std::sync::Arc<crate::services::session_messages::ExecutionLease>,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
-        self.send_with_origin(request, save_response, true, Some(lease))
+        self.send_with_origin(request, save_response, true, Some(lease), None)
+            .await
+    }
+
+    /// A CLI turn can retain its final provider request for a single follow-up.
+    pub async fn send_with_suggestion_capture(
+        &self,
+        request: ChatRequest,
+        lease: Option<Arc<crate::services::session_messages::ExecutionLease>>,
+        capture: Option<super::suggestion::SuggestionCapture>,
+    ) -> Result<mpsc::Receiver<EngineEvent>> {
+        self.send_with_origin(request, false, false, lease, capture)
             .await
     }
 
@@ -904,30 +845,31 @@ impl QueryEngine {
         save_response: bool,
         hook_wake: bool,
         execution_lease: Option<std::sync::Arc<crate::services::session_messages::ExecutionLease>>,
+        suggestion: Option<super::suggestion::SuggestionCapture>,
     ) -> Result<mpsc::Receiver<EngineEvent>> {
         // Every submission owns the session for its whole attempt. A host that
         // already acquired (CLI, SDK, Desktop SSE) shares that same `Arc`; an
         // independent caller is refused here, before any turn work.
-        let execution_lease = match execution_lease {
-            Some(lease) => Some(lease),
-            None => {
-                let root = self
-                    .provider_manager
-                    .lock()
-                    .await
-                    .config_path()
-                    .parent()
-                    .context("Missing runtime directory")?
-                    .to_path_buf();
-                crate::services::session_messages::ExecutionLease::acquire(
-                    &root,
-                    &request.conversation_id,
-                )?
-                .map(std::sync::Arc::new)
-            }
+        let lease = match execution_lease {
+            Some(lease) => lease,
+            None => Arc::new(
+                self.db_manager
+                    .open_session(&request.conversation_id)?
+                    .acquire_execution()?,
+            ),
         };
+        let address = lease
+            .address
+            .as_ref()
+            .context("Execution lacks a recorded session")?;
+        anyhow::ensure!(
+            address.session == request.conversation_id,
+            "Execution session changed"
+        );
+        let selected = self.db_manager.resume_history(address)?;
+        let execution_lease = Some(lease);
         let applied_compaction = crate::services::compaction::apply_persisted_boundary(
-            &self.db_manager,
+            &selected,
             &request.conversation_id,
             &mut request.messages,
         )?;
@@ -956,11 +898,11 @@ impl QueryEngine {
             .to_path_buf();
         let plugin_context = crate::services::ServiceContext {
             paths: crate::runtime::RuntimePaths::new(plugin_root)?,
-            db: self.db_manager.clone(),
+            db: Arc::new(selected.scoped_stores()),
             credentials: Arc::new(crate::services::EnvironmentCredentials),
         };
         if let Some(router) =
-            plugin_context.setting::<crate::performance::RouterConfig>("performance.router")?
+            plugin_context.global_setting::<crate::performance::RouterConfig>(GlobalSetting::MachinePreference("performance.router"))?
         {
             // Route only a fresh plain-text turn; never switch models mid tool conversation.
             if router.enabled
@@ -1009,19 +951,8 @@ impl QueryEngine {
         let workspaces_root = self.workspaces_dir.clone();
         let requested_workspace = request.workspace_path.clone();
         let (workspace, project, prompt_profile) = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let (workspace, project) = super::workspace::resolve_workspace(
-                    conn,
-                    &workspaces_root,
-                    &project_conv_id,
-                    requested_workspace.as_deref(),
-                )?;
-                let profile =
-                    super::workspace::conversation_prompt_profile(conn, &project_conv_id)?;
-                Ok::<_, anyhow::Error>((workspace, project, profile))
-            })
-        })
-        .await???;
+            db.engine_workspace(&workspaces_root, &project_conv_id, requested_workspace.as_deref())
+        }).await??;
         crate::services::lifecycle_events::check_configuration(
             &plugin_context,
             &workspace,
@@ -1029,10 +960,10 @@ impl QueryEngine {
         )
         .await?;
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
+        let standalone_frontend = request.standalone_frontend;
         request.system_prompt = Some(crate::prompt::compose_customized(
             request.system_prompt.as_deref(),
             prompt_profile,
-            Some(&workspace),
             &customization.system_prompt,
         ));
         let snapshot_root = plugin_context.paths.data_dir.clone();
@@ -1046,8 +977,41 @@ impl QueryEngine {
             )
         })
         .await?;
+        // The environment and the date are frozen on the session's first
+        // request so a later date or runtime change cannot rewrite the first
+        // user message.
+        let environment_root = plugin_context.paths.data_dir.clone();
+        let environment_session = conv_id.clone();
+        let environment_workspace = workspace.clone();
+        let environment_project = project.as_ref().map(|project| {
+            (
+                project.name.clone(),
+                project
+                    .folders
+                    .iter()
+                    .map(|folder| folder.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        let (environment, frozen_date) = tokio::task::spawn_blocking(move || {
+            let project = environment_project
+                .as_ref()
+                .map(|(name, folders)| (name.as_str(), folders.as_slice()));
+            (
+                crate::prompt::environment_for_session(
+                    &environment_root,
+                    &environment_session,
+                    Some(&environment_workspace),
+                    project,
+                ),
+                crate::prompt::date_for_session(&environment_root, &environment_session),
+            )
+        })
+        .await?;
         let workspace_path = workspace.to_string_lossy().into_owned();
         let mut discovered_skills = crate::services::plugins::skill_commands(&plugin_context)?;
+        crate::skills::SkillsManager::with_path(plugin_context.paths.data_dir.join("skills"))
+            .ensure_installed()?;
         discovered_skills.extend(crate::skills::discovery::discover(
             &plugin_context.paths.data_dir,
             &workspace,
@@ -1059,9 +1023,11 @@ impl QueryEngine {
             Vec::new();
         if let Some((command, arguments)) = skill_invocation.filter(|_| !hook_wake) {
             let content = if let Some(skill) = discovered_skills.get(&command) {
-                let embedded =
-                    skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"));
-                let requires_execution = if embedded {
+                let bundled = crate::skills::discovery::is_bundled_path(
+                    &skill.path,
+                    &plugin_context.paths.data_dir,
+                );
+                let requires_execution = if bundled {
                     true
                 } else {
                     let template = skill.render_template(&arguments, &conv_id)?;
@@ -1126,9 +1092,12 @@ impl QueryEngine {
                 turn_blocks.push((content, Some(skill)));
             }
         }
-        let available_skills = discovered_skills
+        let model_skills: Vec<_> = discovered_skills
             .values()
             .filter(|skill| skill.model_invocable())
+            .collect();
+        let available_skills = model_skills
+            .iter()
             .map(|skill| {
                 skill_listing_line(
                     &skill.name,
@@ -1138,8 +1107,112 @@ impl QueryEngine {
                 )
             })
             .collect::<Vec<_>>();
-        if !available_skills.is_empty() {
-            request.system_prompt.get_or_insert_with(String::new).push_str(&format!("\nAvailable skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool.\n{}\n", available_skills.join("\n")));
+        let available_skill_names = model_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
+        // The set of tools ToolLoad can offer and the model-invocable skills
+        // are frozen into the first user message. A later discovery only adds a
+        // change reminder to the latest message, never an edit to that prefix.
+        let allowed_tool_names = agent.as_ref().and_then(|definition| definition.tools.clone());
+        let tool_load_available = customization.loading("ToolLoad").enabled
+            && allowed_tool_names
+                .as_ref()
+                .is_none_or(|names| names.iter().any(|name| name == "ToolLoad"));
+        let (loadable_builtin, loadable_mcp) = if tool_load_available {
+            let mcp_tools = match &self.mcp_registry {
+                Some(registry) => {
+                    crate::native_engine::tool_loop::discover_mcp_tools(registry)
+                        .await?
+                        .0
+                }
+                None => Vec::new(),
+            };
+            let mcp_states = crate::mcp::states::load(&plugin_context.paths.data_dir);
+            let goal_proposals = self
+                .local_goal_frontend
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && crate::services::goal_proposals::available(
+                    &self.db_manager,
+                    &conv_id,
+                    &plugin_context.paths.data_dir,
+                    &workspace,
+                    &self.permission_manager,
+                );
+            let compaction_requests = self
+                .context_usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some();
+            let catalog = crate::native_engine::tool_loop::builtin_catalog_for_session(
+                prompt_profile,
+                true,
+                goal_proposals,
+                compaction_requests,
+                true,
+                true,
+            );
+            let catalog = customization.described(catalog);
+            crate::native_engine::tool_loop::loadable_tool_lists(
+                &customization,
+                &catalog,
+                &mcp_tools,
+                &mcp_states,
+                allowed_tool_names.as_deref(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let loadable_names = loadable_builtin
+            .iter()
+            .chain(&loadable_mcp)
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        let first_message_root = plugin_context.paths.data_dir.clone();
+        let first_message_session = conv_id.clone();
+        let has_user_message = request
+            .messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("user"));
+        let (loadable_tools, available_skills_listing, set_changes) =
+            tokio::task::spawn_blocking(move || {
+                let loadable_tools = crate::prompt::loadable_tools_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &loadable_builtin,
+                    &loadable_mcp,
+                );
+                let available_skills = crate::prompt::skills_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &available_skills,
+                );
+                let changes = has_user_message
+                    .then(|| {
+                        let (now, gone) = if tool_load_available {
+                            crate::prompt::set_changes(
+                                &first_message_root,
+                                &first_message_session,
+                                crate::session_files::SET_CHANGE_LOADABLE_TOOLS,
+                                &loadable_names,
+                            )
+                        } else {
+                            (Vec::new(), Vec::new())
+                        };
+                        let (new_skills, removed_skills) = crate::prompt::set_changes(
+                            &first_message_root,
+                            &first_message_session,
+                            crate::session_files::SET_CHANGE_SKILLS,
+                            &available_skill_names,
+                        );
+                        crate::prompt::changes_reminder(now, gone, new_skills, removed_skills)
+                    })
+                    .flatten();
+                (loadable_tools, available_skills, changes)
+            })
+            .await?;
+        if let Some(reminder) = set_changes {
+            turn_blocks.push((reminder, None));
         }
         crate::tools::configure_lsp_servers(
             &workspace_path,
@@ -1147,7 +1220,7 @@ impl QueryEngine {
         )?;
         let hook_provider = {
             let pm = self.provider_manager.lock().await;
-            if let Some(id) = request.provider_id.as_deref() {
+            if let Some(active) = pm.binding.resolve(None) { Some(active) } else if let Some(id) = request.provider_id.as_deref() {
                 pm.resolve_selected(id, &request.model)
             } else {
                 pm.resolve_provider(&request.model).await
@@ -1212,12 +1285,28 @@ impl QueryEngine {
             &instruction_files,
         )
         .await?;
-        // Like the reference CLI, instructions and the Git snapshot open the first
-        // user message instead of the system prompt, which stays the same across
-        // projects and so shares one cache entry.
+        // Like the reference CLI, instructions, the environment and the Git
+        // snapshot open the first user message instead of the system prompt,
+        // which stays the same across projects and so shares one cache entry.
         let turn_root = plugin_context.paths.data_dir.clone();
         let turn_session = conv_id.clone();
         let turn_messages = request.messages.clone();
+        // The frozen environment keeps the first message stable; a date the
+        // session outlived is announced once, on the message it was attached to.
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let date_reminder = request
+            .messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .then(|| {
+                crate::prompt::date_change_reminder(
+                    &turn_root,
+                    &turn_session,
+                    &frozen_date,
+                    &today,
+                )
+            })
+            .flatten();
         let turn_context = tokio::task::spawn_blocking(move || {
             for (block, skill) in turn_blocks {
                 if let Some(entry) =
@@ -1230,22 +1319,38 @@ impl QueryEngine {
                     )?;
                 }
             }
+            if let Some(reminder) = date_reminder {
+                if let Some(entry) =
+                    crate::services::turn_context::for_last(&turn_messages, vec![reminder])
+                {
+                    crate::services::turn_context::save(&turn_root, &turn_session, &entry)?;
+                }
+            }
             crate::services::turn_context::load(&turn_root, &turn_session)
         })
         .await??;
-        // Skills whose message a compaction removed follow, as in the reference CLI.
-        let context_reminders: Vec<String> = crate::project_instructions::reminders(&instructions)
-            .into_iter()
-            .chain(
-                git_snapshot
+        // The first user message opens with the stable session context; skills
+        // whose message a compaction removed follow, as in the reference CLI.
+        let (user_instructions, project_instructions) =
+            crate::project_instructions::reminder_parts(&instructions);
+        let context_reminders = crate::prompt::first_message_reminders(
+            crate::prompt::SessionReminders {
+                user_instructions,
+                environment: Some(environment),
+                project_instructions,
+                standalone_frontend,
+                loadable_tools,
+                available_skills: available_skills_listing,
+                date: Some(frozen_date),
+                git: git_snapshot
                     .as_deref()
                     .map(crate::services::git_snapshot::reminder),
-            )
-            .chain(crate::services::turn_context::invoked_skills_reminder(
-                &turn_context,
-                &request.messages,
-            ))
-            .collect();
+                skills: crate::services::turn_context::invoked_skills_reminder(
+                    &turn_context,
+                    &request.messages,
+                ),
+            },
+        );
         let allowed_directories = project
             .as_ref()
             .map(|project| {
@@ -1257,13 +1362,7 @@ impl QueryEngine {
             })
             .unwrap_or_default();
         if let Some(project) = project {
-            let folders = project
-                .folders
-                .iter()
-                .map(|f| f.path.as_str())
-                .collect::<Vec<_>>();
             let system = request.system_prompt.get_or_insert_with(String::new);
-            crate::prompt::add_project_to_environment(system, &project.name, &folders);
             if let Some(instructions) = project
                 .instructions
                 .as_deref()
@@ -1343,7 +1442,7 @@ impl QueryEngine {
 
         let mut provider = {
             let pm = self.provider_manager.lock().await;
-            let resolved = if let Some(id) = request.provider_id.as_deref() {
+            let resolved = if let Some(active) = pm.binding.resolve(None) { Some(active) } else if let Some(id) = request.provider_id.as_deref() {
                 pm.resolve_selected(id, &model)
             } else {
                 pm.resolve_provider(&model).await
@@ -1417,7 +1516,7 @@ impl QueryEngine {
         // Super Agent identity is durable, so a resumed session keeps its role
         // and a task member keeps its member tools. A stale call is rejected at
         // execution even when the schema no longer offers it.
-        let super_agent_role = crate::super_agent::role::load(&self.db_manager, &conv_id)?;
+        let super_agent_role = crate::super_agent::role::load(&selected, &conv_id)?;
         let data_dir = self
             .workspaces_dir
             .parent()
@@ -1431,7 +1530,7 @@ impl QueryEngine {
             request.system_prompt.clone()
         };
         let learning = if plugin_context
-            .setting::<bool>("learning.enabled")?
+            .global_setting::<bool>(GlobalSetting::LearningRecord("learning.enabled"))?
             .unwrap_or(false)
         {
             Some(crate::learning::TurnObservation::new(
@@ -1441,6 +1540,7 @@ impl QueryEngine {
         } else {
             None
         };
+        let history = crate::db::session_store::ExecutorHistory::Session(selected);
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,
@@ -1451,6 +1551,7 @@ impl QueryEngine {
             reasoning_mode.clone(),
         )
         .with_owned_children(self.owned_children.clone())
+        .with_provider_manager(Some(self.provider_manager.clone()))
         .with_runtime_agents(
             self.runtime_agents
                 .read()
@@ -1477,6 +1578,7 @@ impl QueryEngine {
         .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(search_config_path)
         .with_conv_id(conv_id.clone())
+        .with_executor_history(history.clone())?
         .with_durable_super_agent(crate::super_agent::crp::ToolRuntime {
             db: self.db_manager.clone(),
             data_dir,
@@ -1509,14 +1611,16 @@ impl QueryEngine {
             workspace_path.clone(),
         )));
 
-        let memory_config = crate::memory::MemExClient::with_path(
-            plugin_context.paths.data_dir.join("memory.sqlite3"),
-        )
-        .get_config_blocking();
-        if memory_config.enabled {
+        if crate::services::memory_files::config(&plugin_context)?.enabled {
             executor = executor.with_file_memory(
                 crate::services::memory_files::FileMemory::session(&plugin_context, &conv_id)?,
             );
+        }
+        let selector = model.split_once("::").map_or(model.as_str(), |(_, id)| id);
+        if super::provider_manager::one_million_context_base(selector)
+            == Some(executor.model_selector.as_str())
+        {
+            executor.model_selector.push_str("[1m]");
         }
 
         if let Some(ref registry) = self.mcp_registry {
@@ -1526,6 +1630,7 @@ impl QueryEngine {
         // including the cleanup after the public MessageStop. The host shares
         // this same lease; the last remaining owner performs the explicit
         // unlock. The engine must not drop its reference early.
+        executor.suggestion = suggestion;
         executor.execution_lease = execution_lease;
         executor.share_owned_child_budget();
 
@@ -1533,9 +1638,9 @@ impl QueryEngine {
         let active_turns_clone = self.active_turns.clone();
         let conversation_states_clone = self.conversation_states.clone();
         let _tool_call_history_clone = self.tool_call_history.clone();
-        let db = self.db_manager.clone();
-        let provider_manager_title = self.provider_manager.clone();
+        let title_history = history.clone();
         let db_title = self.db_manager.clone();
+        let provider_manager_title = self.provider_manager.clone();
 
         tracing::info!(
             module = "EngineCore",
@@ -1636,7 +1741,7 @@ impl QueryEngine {
                         full_text.len()
                     );
                     if save_response && !full_text.is_empty() {
-                        let conv_id = conv_id_clone.clone();
+                        let assistant = executor.assistant_message_id().map(str::to_owned);
                         // This blocking write cannot be aborted once started, so
                         // it keeps the attempt's ownership until it exits: the
                         // session stays admitted and completion stays pending
@@ -1658,31 +1763,14 @@ impl QueryEngine {
                                 // holding anything the async side needs.
                                 let _ = release.recv();
                             }
-                            db.with_conn(|conn| {
-                                let msg_id = Uuid::new_v4().to_string();
-                                let now = Utc::now().to_rfc3339();
-                                let sort_order =
-                                    crate::db::message_repo::get_messages_by_conversation(
-                                        conn, &conv_id,
-                                    )
-                                    .unwrap_or_default()
-                                    .len() as i64;
-                                crate::db::message_repo::insert_message(
-                                    conn,
-                                    &msg_id,
-                                    &conv_id,
-                                    "assistant",
-                                    &full_text,
-                                    None,
-                                    &now,
-                                    false,
-                                    sort_order,
-                                )?;
-                                crate::db::conversation_repo::increment_message_count(
-                                    conn, &conv_id,
-                                )?;
-                                Ok::<(), anyhow::Error>(())
-                            })
+                            if let Some(message) = assistant {
+                                history.save_segment(&message, crate::db::session_store::SegmentUpdate {
+                                    text: Some(&full_text),
+                                    ..Default::default()
+                                })
+                            } else {
+                                history.finish_response(&full_text)
+                            }
                         })
                         .await;
                     }
@@ -1731,146 +1819,111 @@ impl QueryEngine {
                     let title_conv_id = conv_id_clone.clone();
                     let title_model = state.model.clone();
                     let pm = provider_manager_title.clone();
-                    let db_t = db_title.clone();
                     let title_identity = super::request_identity::TurnIdentity::new(
                         Some(title_conv_id.clone()),
                         None,
                     );
                     tokio::spawn(title_identity.scope(async move {
                         tracing::info!(module = "EngineCore", "Auto-generating title for conv_id={}", title_conv_id);
-                        let title_conv_id_inner = title_conv_id.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            db_t.with_conn(|conn| {
-                                let conv = crate::db::conversation_repo::get_conversation(conn, &title_conv_id_inner)?;
-                                if conv.as_ref().and_then(|c| c.title.as_ref()).map_or(false, |t| !t.is_empty()) {
-                                    return Ok::<bool, anyhow::Error>(false);
-                                }
-                                let messages = crate::db::message_repo::get_messages_by_conversation(conn, &title_conv_id_inner)?;
-                                let _first_user_msg = messages.iter().find(|m| m.role == "user").map(|m| m.content.clone());
-                                let _first_assistant_msg = messages.iter().find(|m| m.role == "assistant").map(|m| m.content.clone());
-                                Ok::<bool, anyhow::Error>(true)
-                            })
-                        }).await;
+                        let source = title_history.clone();
+                        let seed = tokio::task::spawn_blocking(move || source.title_seed()).await;
 
-                        let should_generate = match result {
-                            Ok(Ok(Ok(true))) => true,
-                            _ => false,
-                        };
-
-                        if should_generate {
+                        if let Ok(Ok(Some((user_msg, assistant_msg)))) = seed {
                             let resolved = {
                                 let pm_guard = pm.lock().await;
-                                pm_guard.resolve_provider(&title_model).await
+                                match pm_guard.binding.resolve(None) { Some(active) => Some(active), None => pm_guard.resolve_provider(&title_model).await }
                             };
 
                             if let Some(resolved) = resolved {
-                                let db_msgs = db_title.clone();
-                                let conv_id_for_msgs = title_conv_id.clone();
-                                let msgs_result = tokio::task::spawn_blocking(move || {
-                                    db_msgs.with_conn(|conn| {
-                                        let messages = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_for_msgs)?;
-                                        let first_user = messages.iter().find(|m| m.role == "user").map(|m| m.content.clone());
-                                        let first_assistant = messages.iter().find(|m| m.role == "assistant").map(|m| m.content.clone());
-                                        Ok::<_, anyhow::Error>((first_user, first_assistant))
-                                    })
-                                }).await;
+                                let assistant_text: String = assistant_msg.unwrap_or_default();
+                                let truncated_assistant = if assistant_text.chars().count() > 200 {
+                                    let mut end = 0;
+                                    for (i, _) in assistant_text.char_indices() {
+                                        if i >= 200 { break; }
+                                        end = i;
+                                    }
+                                    assistant_text[..end].to_string()
+                                } else {
+                                    assistant_text
+                                };
 
-                                if let Ok(Ok(Ok((Some(user_msg), assistant_msg)))) = msgs_result {
-                                    let assistant_text: String = assistant_msg.unwrap_or_default();
-                                    let truncated_assistant = if assistant_text.chars().count() > 200 {
-                                        let mut end = 0;
-                                        for (i, _) in assistant_text.char_indices() {
-                                            if i >= 200 { break; }
-                                            end = i;
-                                        }
-                                        assistant_text[..end].to_string()
-                                    } else {
-                                        assistant_text
-                                    };
+                                let prompt = format!(
+                                    "Based on the following conversation, generate a concise title (max 50 characters, in the same language as the user's message). Only output the title, nothing else.\n\nUser: {}\nAssistant: {}",
+                                    user_msg, truncated_assistant
+                                );
 
-                                    let prompt = format!(
-                                        "Based on the following conversation, generate a concise title (max 50 characters, in the same language as the user's message). Only output the title, nothing else.\n\nUser: {}\nAssistant: {}",
-                                        user_msg, truncated_assistant
-                                    );
+                                let user_msg_ref: &str = &user_msg;
+                                let fallback: String = if user_msg_ref.chars().count() > 30 {
+                                    let mut end = 0;
+                                    for (i, _) in user_msg_ref.char_indices() {
+                                        if i >= 30 { break; }
+                                        end = i;
+                                    }
+                                    user_msg_ref[..end].to_string()
+                                } else {
+                                    user_msg.clone()
+                                };
 
-                                    let user_msg_ref: &str = &user_msg;
-                                    let fallback: String = if user_msg_ref.chars().count() > 30 {
-                                        let mut end = 0;
-                                        for (i, _) in user_msg_ref.char_indices() {
-                                            if i >= 30 { break; }
-                                            end = i;
-                                        }
-                                        user_msg_ref[..end].to_string()
-                                    } else {
-                                        user_msg.clone()
-                                    };
-
-                                    let title_result: Result<String, anyhow::Error> = match resolved.provider.api_format {
-                                        crate::native_engine::provider_manager::ApiFormat::OpenAI => {
-                                            let client = crate::native_engine::openai_client::OpenAIClient::new()
-                                                .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
-                                            let msgs = vec![
-                                                crate::native_engine::openai_client::OpenAIMessage {
-                                                    role: "user".to_string(),
-                                                    content: crate::native_engine::openai_client::OpenAIContent::Text(prompt),
-                                                    tool_calls: None,
-                                                    tool_call_id: None,
-                                                    reasoning_content: None, provider_content: None,
-                                                }
-                                            ];
-                                            match client.send_message(&resolved, msgs, None, vec![], 100).await {
-                                                Ok(resp) => {
-                                                    let t = resp.choices.first()
-                                                        .map(|c| match &c.message.content {
-                                                            crate::native_engine::openai_client::OpenAIContent::Text(t) => t.trim().to_string(),
-                                                            crate::native_engine::openai_client::OpenAIContent::Multi(parts) => parts.iter()
-                                                                .filter_map(|p| if let crate::native_engine::openai_client::OpenAIContentPart::Text { text } = p { Some(text.as_str()) } else { None })
-                                                                .collect::<Vec<_>>()
-                                                                .join(""),
-                                                        })
-                                                        .unwrap_or_default();
-                                                    Ok(t)
-                                                }
-                                                Err(e) => Err(e),
+                                let title_result: Result<String, anyhow::Error> = match resolved.provider.api_format {
+                                    crate::native_engine::provider_manager::ApiFormat::OpenAI => {
+                                        let client = crate::native_engine::openai_client::OpenAIClient::new()
+                                            .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
+                                        let msgs = vec![
+                                            crate::native_engine::openai_client::OpenAIMessage {
+                                                role: "user".to_string(),
+                                                content: crate::native_engine::openai_client::OpenAIContent::Text(prompt),
+                                                tool_calls: None,
+                                                tool_call_id: None,
+                                                reasoning_content: None, provider_content: None,
                                             }
-                                        }
-                                        crate::native_engine::provider_manager::ApiFormat::Anthropic => {
-                                            let client = crate::native_engine::anthropic_client::AnthropicClient::new()
-                                                .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
-                                            let msgs = vec![
-                                                crate::native_engine::anthropic_client::AnthropicMessage {
-                                                    role: "user".to_string(),
-                                                    content: crate::native_engine::anthropic_client::AnthropicContent::Text(prompt),
-                                                }
-                                            ];
-                                            match client.send_message(&resolved, msgs, None, vec![], 100).await {
-                                                Ok(resp) => {
-                                                    let t = resp.content.iter()
-                                                        .filter_map(|block| if let crate::native_engine::anthropic_client::ContentBlock::Text { text } = block { Some(text.as_str()) } else { None })
-                                                        .collect::<Vec<_>>()
-                                                        .join("")
-                                                        .trim()
-                                                        .to_string();
-                                                    Ok(t)
-                                                }
-                                                Err(e) => Err(e),
+                                        ];
+                                        match client.send_message(&resolved, msgs, None, vec![], 100).await {
+                                            Ok(resp) => {
+                                                let t = resp.choices.first()
+                                                    .map(|c| match &c.message.content {
+                                                        crate::native_engine::openai_client::OpenAIContent::Text(t) => t.trim().to_string(),
+                                                        crate::native_engine::openai_client::OpenAIContent::Multi(parts) => parts.iter()
+                                                            .filter_map(|p| if let crate::native_engine::openai_client::OpenAIContentPart::Text { text } = p { Some(text.as_str()) } else { None })
+                                                            .collect::<Vec<_>>()
+                                                            .join(""),
+                                                    })
+                                                    .unwrap_or_default();
+                                                Ok(t)
                                             }
+                                            Err(e) => Err(e),
                                         }
-                                    };
+                                    }
+                                    crate::native_engine::provider_manager::ApiFormat::Anthropic => {
+                                        let client = crate::native_engine::anthropic_client::AnthropicClient::new()
+                                            .with_request_options(super::request_options::RequestOptions::from_db(&db_title, Some(&title_conv_id), "title"));
+                                        let msgs = vec![
+                                            crate::native_engine::anthropic_client::AnthropicMessage {
+                                                role: "user".to_string(),
+                                                content: crate::native_engine::anthropic_client::AnthropicContent::Text(prompt),
+                                            }
+                                        ];
+                                        match client.send_message(&resolved, msgs, None, vec![], 100).await {
+                                            Ok(resp) => {
+                                                let t = resp.content.iter()
+                                                    .filter_map(|block| if let crate::native_engine::anthropic_client::ContentBlock::Text { text } = block { Some(text.as_str()) } else { None })
+                                                    .collect::<Vec<_>>()
+                                                    .join("")
+                                                    .trim()
+                                                    .to_string();
+                                                Ok(t)
+                                            }
+                                            Err(e) => Err(e),
+                                        }
+                                    }
+                                };
 
-                                    let final_title = match title_result {
-                                        Ok(t) if !t.is_empty() => t,
-                                        _ => fallback,
-                                    };
+                                let final_title = match title_result {
+                                    Ok(t) if !t.is_empty() => t,
+                                    _ => fallback,
+                                };
 
-                                    let db_save = db_title.clone();
-                                    let conv_id_save = title_conv_id.clone();
-                                    let title_save = final_title.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        db_save.with_conn(|conn| {
-                                            crate::db::conversation_repo::update_title_if_empty(conn, &conv_id_save, &title_save)
-                                        })
-                                    }).await;
+                                let title_save = final_title.clone();
+                                if matches!(tokio::task::spawn_blocking(move || title_history.publish_title(&title_save)).await, Ok(Ok(true))) {
                                     tracing::info!(module = "EngineCore", "Title generated for {}: {}", title_conv_id, final_title);
                                 }
                             }
@@ -1984,6 +2037,18 @@ impl QueryEngine {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(session.to_owned(), agents);
+    }
+
+    /// Only a change to the shared catalog can revoke an independently retained child.
+    pub fn invalidate_child_bindings(
+        &self,
+        manager: &ProviderManager,
+        _owner: Option<(&str, &crate::native_engine::provider_manager::ResolvedProvider)>,
+    ) {
+        self.owned_children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, child| child.binding_is_current(manager));
     }
 
     pub fn clear_runtime_agents(&self, session: &str) {

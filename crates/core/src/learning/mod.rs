@@ -1,8 +1,8 @@
 //! Persistent experience collection and reviewable skill suggestions.
 //! Suggestions are data, never an alternate tool executor or implicit permission.
+use crate::db::session_store::{GlobalPreferences, GlobalSetting, LearningRecords};
 use crate::services::ServiceContext;
 use anyhow::{ensure, Result};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -54,7 +54,7 @@ fn key(id: &str) -> Result<String> {
     Ok(format!("learning.experience.{id}"))
 }
 
-pub fn record(ctx: &ServiceContext, experience: &Experience) -> Result<()> {
+pub fn record<D: LearningRecords>(ctx: &ServiceContext<D>, experience: &Experience) -> Result<()> {
     ensure!(
         experience.context.len() <= 32_768
             && experience.intent.len() <= 1024
@@ -68,65 +68,22 @@ pub fn record(ctx: &ServiceContext, experience: &Experience) -> Result<()> {
         "Feedback must be between zero and one"
     );
     let key = key(&experience.id)?;
-    let json = serde_json::to_string(experience)?;
-    ctx.db.with_conn(|c| -> Result<()> {
-        let tx = crate::db::write_transaction(&c)?;
-        let old: Option<String> = tx
-            .query_row(
-                "SELECT value FROM peripheral_settings WHERE key=?1",
-                [&key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if let Some(old) = old {
-            ensure!(
-                serde_json::from_str::<Experience>(&old)? == *experience,
-                "Experience ID conflicts with existing data"
-            );
-        } else {
-            tx.execute(
-                "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                [&key, &json],
-            )?;
-        }
-        tx.execute("DELETE FROM peripheral_settings WHERE key IN (SELECT key FROM peripheral_settings WHERE key LIKE 'learning.experience.%' ORDER BY rowid DESC LIMIT -1 OFFSET 1000)", [])?;
-        tx.commit()?;
-        Ok(())
-    })??;
-    Ok(())
+    ctx.db.record_experience(&key, experience)
 }
 
-pub fn feedback(ctx: &ServiceContext, id: &str, rating: f64) -> Result<()> {
+pub fn feedback<D: LearningRecords>(ctx: &ServiceContext<D>, id: &str, rating: f64) -> Result<()> {
     ensure!(
         rating.is_finite() && (0.0..=1.0).contains(&rating),
         "Feedback must be between zero and one"
     );
     let key = key(id)?;
-    ctx.db.with_conn(|c| -> Result<()> {
-        let tx = crate::db::write_transaction(&c)?;
-        let json: String = tx.query_row(
-            "SELECT value FROM peripheral_settings WHERE key=?1",
-            [&key],
-            |r| r.get(0),
-        )?;
-        let mut experience: Experience = serde_json::from_str(&json)?;
-        experience.feedback = Some(rating);
-        tx.execute(
-            "UPDATE peripheral_settings SET value=?2 WHERE key=?1",
-            [&key, &serde_json::to_string(&experience)?],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })??;
-    Ok(())
+    ctx.db.rate_experience(&key, rating)
 }
 
-pub fn status(ctx: &ServiceContext) -> Result<LearningStatus> {
-    let experiences = ctx.db.with_conn(|c| -> Result<Vec<Experience>> {
-        let mut statement = c.prepare("SELECT value FROM peripheral_settings WHERE key LIKE 'learning.experience.%' ORDER BY rowid")?;
-        let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
-        rows.map(|r| Ok(serde_json::from_str(&r?)?)).collect()
-    })??;
+pub fn status<D: LearningRecords + GlobalPreferences>(
+    ctx: &ServiceContext<D>,
+) -> Result<LearningStatus> {
+    let experiences = ctx.db.experiences()?;
     let mut groups: BTreeMap<(String, Vec<String>), Vec<&Experience>> = BTreeMap::new();
     for experience in &experiences {
         if !experience.tools_used.is_empty() {
@@ -185,7 +142,9 @@ pub fn status(ctx: &ServiceContext) -> Result<LearningStatus> {
             .sum::<f64>()
             / entries.len() as f64;
         let accepted = ctx
-            .setting::<bool>(&format!("learning.accepted.{id}"))?
+            .global_setting::<bool>(GlobalSetting::LearningRecord(&format!(
+                "learning.accepted.{id}"
+            )))?
             .unwrap_or(false);
         let skill_markdown = format!("---\nname: {}\ndescription: Reviewed workflow from local experience\n---\n\n# Observed workflow\n\nIntent: {}\n\nObserved tool sequence: {}\n\nValidate these observations for the current task. Use the normal tool permission checks.\n", skill_slug(&id), intent.replace('\n', " "), tools.join(" → "));
         let accepted = accepted
@@ -219,7 +178,10 @@ pub fn status(ctx: &ServiceContext) -> Result<LearningStatus> {
     })
 }
 
-pub fn accept(ctx: &ServiceContext, id: &str) -> Result<Suggestion> {
+pub fn accept<D: LearningRecords + GlobalPreferences>(
+    ctx: &ServiceContext<D>,
+    id: &str,
+) -> Result<Suggestion> {
     let mut suggestion = status(ctx)?
         .suggestions
         .into_iter()
@@ -268,20 +230,23 @@ pub fn accept(ctx: &ServiceContext, id: &str) -> Result<Suggestion> {
             }
         }
     }
-    ctx.save_setting(&format!("learning.accepted.{id}"), &true)?;
+    ctx.save_global_setting(
+        GlobalSetting::LearningRecord(&format!("learning.accepted.{id}")),
+        &true,
+    )?;
     suggestion.accepted = true;
     Ok(suggestion)
 }
 
 /// Drop records aborted tasks too. Only tool names and outcome are retained.
-pub struct TurnObservation {
+pub struct TurnObservation<D: LearningRecords = crate::db::DbManager> {
     pub tools: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    ctx: ServiceContext,
+    ctx: ServiceContext<D>,
     experience: Experience,
     started: std::time::Instant,
 }
-impl TurnObservation {
-    pub fn new(ctx: ServiceContext, session_id: String) -> Self {
+impl<D: LearningRecords> TurnObservation<D> {
+    pub fn new(ctx: ServiceContext<D>, session_id: String) -> Self {
         Self {
             tools: Default::default(),
             ctx,
@@ -302,7 +267,7 @@ impl TurnObservation {
         self.experience.success = success;
     }
 }
-impl Drop for TurnObservation {
+impl<D: LearningRecords> Drop for TurnObservation<D> {
     fn drop(&mut self) {
         self.experience.duration_ms =
             self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;

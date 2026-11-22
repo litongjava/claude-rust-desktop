@@ -22,7 +22,7 @@ struct Fixture {
     fork_count: Arc<Mutex<usize>>,
     agent_result: Arc<Mutex<Option<Value>>>,
     nested_result: Arc<Mutex<Option<String>>>,
-    /// Answer the fork's first request with another fork call.
+    /// Load Agent in the child, then request a second fork.
     nested_fork: bool,
 }
 
@@ -84,6 +84,9 @@ async fn respond(
     let frames = if is_fork_request {
         match next(&fixture.fork_count) {
             0 if fixture.nested_fork => tool_call_frame(
+                "call-nested-load", "ToolLoad", &json!({"names":["Agent"]}),
+            ),
+            1 if fixture.nested_fork => tool_call_frame(
                 "call-nested-fork",
                 "Agent",
                 &json!({"description":"nested fork check","prompt":"nested directive","subagent_type":"fork"}),
@@ -235,11 +238,6 @@ async fn run_parent_turns(fixture: &Fixture, data: &Path, workspace: &Path, sess
     .await;
 }
 
-fn open_db(data: &Path) -> rusqlite::Connection {
-    let conn = rusqlite::Connection::open(data.join("deepseek_code.db")).unwrap();
-    conn.busy_timeout(Duration::from_secs(10)).unwrap();
-    conn
-}
 
 #[tokio::test]
 async fn fork_runs_on_a_branch_of_the_parent_session() {
@@ -282,24 +280,13 @@ async fn fork_runs_on_a_branch_of_the_parent_session() {
     assert_eq!(result["backgrounded"], true, "{result}");
     let child = result["session_id"].as_str().expect("child session id");
 
-    let conn = open_db(&data);
-    let title: Option<String> = conn
-        .query_row("SELECT title FROM conversations WHERE id=?1", [child], |row| {
-            row.get(0)
-        })
-        .unwrap();
+    let stores=deepseek_code_core::db::session_store::Stores::open(&data).unwrap();
+    let title=stores.global().conversation(child).unwrap().unwrap().title;
     assert!(
         title.as_deref().unwrap_or_default().starts_with("Fork: "),
         "unexpected fork title: {title:?}"
     );
-    let setting: String = conn
-        .query_row(
-            "SELECT value FROM peripheral_settings WHERE key LIKE 'background-agent.%'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    let setting: Value = serde_json::from_str(&setting).unwrap();
+    let (_,setting)=stores.background_agents(None,Some(child)).unwrap().pop().unwrap();
     assert_eq!(setting["agent_type"], "fork", "{setting}");
     server.abort();
 }

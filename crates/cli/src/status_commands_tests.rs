@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use super::*;
 use clap::Parser;
 use deepseek_code_core::{
@@ -55,7 +57,7 @@ fn save_snapshot(session: &Session, snapshot: Value) {
     session
         .store
         .db
-        .with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([snapshot])))
+        .shard_sql(&session.id, |conn| message_repo::save_request_snapshots(conn, &message, &json!([snapshot])))
         .unwrap()
         .unwrap();
 }
@@ -200,7 +202,7 @@ async fn a_committed_compaction_replaces_pre_compaction_usage_and_counts_once() 
     session
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&session.id, |conn| {
             message_repo::save_request_snapshots(
                 conn,
                 &answer,
@@ -227,8 +229,8 @@ async fn a_committed_compaction_replaces_pre_compaction_usage_and_counts_once() 
     let estimate = deepseek_code_core::services::context_usage::estimated_after_compaction(
         &session.store,
         &session.id,
-        &session.model,
-        Some(&session.provider_id),
+        &session.binding_state().model,
+        Some(&session.binding_state().provider_id),
     )
     .unwrap()
     .expect("a post-compaction estimate");

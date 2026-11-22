@@ -1,4 +1,7 @@
 //! Real executable + local model fixture. No Desktop, paid API or user config.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -157,7 +160,7 @@ fn assert_durable_turn(data: &Path, result: &Value, status: &str) {
     assert!(turn["endedAt"].as_str().is_some());
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_owned()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| {
+    db.shard_sql(result["session_id"].as_str().unwrap(), |conn| {
         let messages = deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, result["session_id"].as_str().unwrap()).unwrap();
         let saved = messages.iter().filter_map(|message| deepseek_code_core::db::turn_repo::get_message_turn(conn, &message.id).unwrap()).find(|record| record.turn_id == turn["turnId"].as_str().unwrap()).unwrap();
         assert_eq!(serde_json::to_value(saved).unwrap(), *turn);
@@ -421,11 +424,18 @@ async fn piped_input_stream_json_and_legacy_import_are_scriptable() {
         .collect();
     assert!(events.iter().any(|v| v["type"] == "text"));
     assert_eq!(events.last().unwrap()["type"], "result");
-    assert!(fixture.requests.lock().unwrap()[0]["messages"]
+    let requests = fixture.requests.lock().unwrap();
+    let first_user = requests[0]["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| m["content"] == "piped 中文"));
+        .find(|m| m["role"] == "user")
+        .and_then(|m| m["content"].as_str())
+        .unwrap();
+    assert!(first_user.ends_with("piped 中文"));
+    assert!(first_user.contains(
+        "<system-reminder>\nStandalone DeepSeek Code terminal: no Desktop window or Bridge server"
+    ));
     task.abort();
     let old = temp.path().join("settings.json");
     let original = json!({"model":"deepseek-chat","api":{"base_url":"https://api.deepseek.com","api_key":"legacy-only-secret","max_tokens":4096}}).to_string();
@@ -566,11 +576,11 @@ async fn legacy_agent_import_preserves_allowlist_in_real_shared_engine() {
         "Read",
         deepseek_code_core::permissions::rules::PermissionAction::Confirm,
     )]);
-    db.with_conn(|conn| {
+    db.shard_sql(&id, |conn| {
         conn.execute(
             "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
             [
-                format!("cli.permissions.{id}"),
+                "cli.permissions".to_owned(),
                 serde_json::to_string(&rules).unwrap(),
             ],
         )
@@ -758,12 +768,12 @@ async fn a_queued_request_compacts_before_the_next_prompt_with_the_keep_text() {
         assert!(history.contains("SUMMARY_SENTINEL"), "{history}");
         assert!(!history.contains("ORIGINAL_SENTINEL"), "{history}");
     }
-    assert!(deepseek_code_core::services::compaction_requests::take(&store.db, id)
+    assert!(store.db.open_session(id).unwrap().delivery_owner().unwrap().claim_compaction()
         .unwrap()
         .is_none());
     let boundaries: i64 = store
         .db
-        .with_conn(|conn| {
+        .shard_sql(id, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1",
                 [id],
@@ -809,7 +819,7 @@ async fn manual_compact_clears_a_queued_request() {
         "{}",
         String::from_utf8_lossy(&compacted.stderr)
     );
-    assert!(deepseek_code_core::services::compaction_requests::take(&store.db, id)
+    assert!(store.db.open_session(id).unwrap().delivery_owner().unwrap().claim_compaction()
         .unwrap()
         .is_none());
     assert_eq!(fixture.requests.lock().unwrap().len(), 2);
@@ -1029,15 +1039,27 @@ async fn assert_cli_context_search(sdk: bool) {
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 6);
     let fresh = requests[0]["messages"].to_string();
-    assert!(fresh.contains("- `ContextSearch`"));
+    assert!(fresh.contains("- ContextSearch:"), "{fresh}");
     assert!(!fresh.contains("After compaction, load ContextSearch"));
+    assert!(
+        !requests[0]["messages"][0]["content"]
+            .to_string()
+            .contains("Tools you can load with ToolLoad"),
+        "the list must stay out of the system prompt: {}",
+        requests[0]["messages"][0]["content"]
+    );
     assert!(requests[1].to_string().contains(CONTEXT_SEARCH_FACT));
     assert!(requests[2].to_string().contains(CONTEXT_SEARCH_FACT));
     for body in &requests[3..5] {
         assert!(body["messages"].to_string().contains("COMPACT_FIXTURE"));
         assert!(!body.to_string().contains(CONTEXT_SEARCH_FACT));
     }
+    // The first message is frozen, so the same list appears after compaction
+    // and nothing is appended to the system prompt.
     assert!(requests[3]["messages"]
+        .to_string()
+        .contains("- ContextSearch:"));
+    assert!(!requests[3]["messages"]
         .to_string()
         .contains("After compaction, load ContextSearch with ToolLoad"));
     let tool = |index: usize| {
@@ -1068,7 +1090,7 @@ async fn assert_cli_context_search(sdk: bool) {
         .unwrap()
         .open_database()
         .unwrap();
-    db.with_conn(|conn| {
+    db.shard_sql(id, |conn| {
         use deepseek_code_core::db::{message_repo, turn_repo};
         let message_id = hit["message_id"].as_str().unwrap();
         let original = message_repo::get_message(conn, message_id)
@@ -1121,27 +1143,11 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
     std::fs::create_dir(&data).unwrap();
     let session = uuid::Uuid::new_v4().to_string();
     {
-        let path = data.join("deepseek_code.db");
-        let db = rusqlite::Connection::open(&path).unwrap();
-        // The base schema predates the search migration. Prove the pre-upgrade
-        // replay order before the real CLI opens and upgrades this file.
-        db.execute_batch(deepseek_code_core::db::schema::SCHEMA_SQL)
-            .unwrap();
-        // Create the same code session and trusted project as the CLI, using
-        // only the base schema. The resumed CLI will run the search migration.
-        let manager = deepseek_code_core::db::DbManager::new(path).unwrap();
-        deepseek_code_core::runtime::SessionStore::new(Arc::new(manager))
+        let stores=deepseek_code_core::runtime::RuntimePaths::new(data.clone()).unwrap().open_database().unwrap();
+        deepseek_code_core::runtime::SessionStore::new(stores.clone())
             .create_with_id(&project, "fixture-model", "cli-runtime", &session)
             .unwrap();
-        assert_eq!(
-            db.query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name='context_search_sources'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            0
-        );
+        stores.shard_sql(&session, |db| {
         for (id, role, content, boundary) in [
             ("z-old", "user", "legacy-marker original", false),
             ("m-boundary", "user", "Stored summary", true),
@@ -1164,12 +1170,8 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(ids, ["z-old", "m-boundary", "a-reply"]);
-        // A checkout which already ran the earlier I16 version also upgrades
-        // with its ID-ordered index installed.
-        db.execute_batch(
-            "CREATE INDEX idx_context_search_messages ON messages(conversation_id,sort_order,id)",
-        )
-        .unwrap();
+        db.execute("UPDATE manifest SET message_count=3,content_revision=content_revision+1",[]).unwrap();
+        }).unwrap();
     }
 
     let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1230,7 +1232,13 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
         .map(|m| (&m["role"], &m["content"]))
         .collect();
     assert_eq!(wire.len(), 3, "{wire:?}");
-    assert_eq!(wire[0], (&json!("user"), &json!("Stored summary")));
+    // The resumed session's first message keeps the frozen session context
+    // before the compacted summary.
+    assert_eq!(wire[0].0, &json!("user"));
+    let first = wire[0].1.as_str().unwrap();
+    assert!(first.ends_with("Stored summary"), "{first}");
+    assert!(first.contains("<system-reminder>\n# Working environment\n"), "{first}");
+    assert!(first.contains("<system-reminder>\nToday's date is "), "{first}");
     assert_eq!(
         wire[1],
         (&json!("assistant"), &json!("legacy-marker retained reply"))
@@ -1248,4 +1256,90 @@ async fn context_search_resume_preserves_legacy_ties_across_a_compaction_boundar
         assert_eq!(hits.len(), 1, "{result}");
         assert_eq!(hits[0]["message_id"], expected);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn redirected_output_config_confirmation_reports_enospc() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .unwrap();
+    let status = command(&data, root.path())
+        .args(["config", "set", "tools.Read.enabled", "true"])
+        .stderr(full)
+        .status()
+        .await
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(data.join("customization.json")).unwrap()).unwrap();
+    assert_eq!(saved["tool_loading"]["Read"]["enabled"], true);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cold_sessions_list_reads_the_directory_without_opening_history() -> anyhow::Result<()> {
+    use std::{
+        ffi::CString,
+        io::Read,
+        os::{fd::FromRawFd, unix::ffi::OsStrExt},
+    };
+
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("data");
+    let source = temp.path().join("session.json");
+    let id = uuid::Uuid::new_v4().to_string();
+    let at = "2026-11-20T00:00:00Z";
+    std::fs::write(
+        &source,
+        json!({
+            "id": id, "name": "Directory fixture", "created_at": at, "updated_at": at,
+            "messages": [{"role":"user", "content":"first question", "timestamp":at}]
+        })
+        .to_string(),
+    )?;
+    let mut import = command(&data, temp.path());
+    import
+        .current_dir(temp.path())
+        .args(["sessions", "import-legacy"])
+        .arg(source);
+    let result = execute(import).await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let shard = data.join("sessions").join(&id).join("session.db");
+    let path = CString::new(shard.as_os_str().as_bytes())?;
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    anyhow::ensure!(fd >= 0, std::io::Error::last_os_error());
+    let mut watch = unsafe { std::fs::File::from_raw_fd(fd) };
+    anyhow::ensure!(
+        unsafe { libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_OPEN) } >= 0,
+        std::io::Error::last_os_error()
+    );
+    let mut list = command(&data, temp.path());
+    list.args(["sessions", "list"]);
+    let result = execute(list).await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let rows: Vec<Value> = serde_json::from_slice(&result.stdout)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], id);
+    assert_eq!(rows[0]["title"], "Directory fixture");
+    let mut buf = [0; 1024];
+    assert_eq!(
+        watch.read(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    drop(std::fs::File::open(shard)?);
+    assert!(watch.read(&mut buf)? >= std::mem::size_of::<libc::inotify_event>());
+    Ok(())
 }

@@ -317,153 +317,9 @@ async fn stream_with_options_client_budget(
     client: reqwest::Client,
     budget: crate::performance::AttemptBudget,
 ) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let provider = &provider.current()?;
     let (entry, model) = metadata(provider)?;
     let (protocol, api) = resolved_transport(provider)?;
-    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
-    let configured = provider.provider.base_url.trim_end_matches('/');
-    let region = if protocol == "bedrock-converse-stream" {
-        provider
-            .model
-            .id
-            .strip_prefix("arn:aws:bedrock:")
-            .and_then(|s| s.split(':').next())
-            .map(str::to_string)
-            .or_else(|| std::env::var("AWS_REGION").ok())
-            .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-            .or_else(|| {
-                reqwest::Url::parse(if configured.is_empty() {
-                    model["baseUrl"].as_str().unwrap_or_default()
-                } else {
-                    configured
-                })
-                .ok()
-                .and_then(|u| {
-                    u.host_str()
-                        .and_then(|h| h.strip_prefix("bedrock-runtime."))
-                        .and_then(|h| h.split('.').next())
-                        .map(str::to_string)
-                })
-            })
-            .unwrap_or_else(|| "us-east-1".into())
-    } else {
-        String::new()
-    };
-    let base = resolved_base(configured, entry, model);
-    let base = if protocol == "bedrock-converse-stream"
-        && (configured.is_empty() || configured.contains(".amazonaws.com"))
-    {
-        format!(
-            "https://bedrock-runtime.{region}.amazonaws.com{}",
-            if region.starts_with("cn-") { ".cn" } else { "" }
-        )
-    } else if protocol == "google-vertex" && (base.is_empty() || base.contains("{location}")) {
-        if !key.is_empty() && key != "gcp-vertex-credentials" {
-            "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
-        } else {
-            let project = std::env::var("GOOGLE_CLOUD_PROJECT")
-                .or_else(|_| std::env::var("GCLOUD_PROJECT"))
-                .context("Vertex ADC requires GOOGLE_CLOUD_PROJECT")?;
-            let location = std::env::var("GOOGLE_CLOUD_LOCATION")
-                .context("Vertex ADC requires GOOGLE_CLOUD_LOCATION")?;
-            let host = if location == "global" {
-                "aiplatform.googleapis.com".to_string()
-            } else {
-                format!("{location}-aiplatform.googleapis.com")
-            };
-            format!(
-                "https://{host}/v1/projects/{}/locations/{}/publishers/google",
-                urlencoding::encode(&project),
-                urlencoding::encode(&location)
-            )
-        }
-    } else if protocol == "azure-openai-responses" && base.is_empty() {
-        std::env::var("AZURE_OPENAI_BASE_URL")
-            .or_else(|_| {
-                std::env::var("AZURE_OPENAI_RESOURCE_NAME")
-                    .map(|r| format!("https://{r}.openai.azure.com/openai/v1"))
-            })
-            .unwrap_or_default()
-    } else {
-        base.to_string()
-    };
-    if base.is_empty() {
-        bail!("Provider {} requires an explicit base URL", entry["id"]);
-    }
-    let mut base = base;
-    for name in ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"] {
-        let placeholder = format!("{{{name}}}");
-        if base.contains(&placeholder) {
-            base = base.replace(
-                &placeholder,
-                &urlencoding::encode(
-                    &std::env::var(name)
-                        .with_context(|| format!("Provider endpoint requires {name}"))?,
-                ),
-            );
-        }
-    }
-    let base = base.trim_end_matches('/');
-    let url = match api {
-        "openai-completions" => {
-            if protocol == "mistral-conversations" && !base.ends_with("/v1") {
-                endpoint(base, "/v1/chat/completions")
-            } else {
-                endpoint(base, "/chat/completions")
-            }
-        }
-        "anthropic-messages" => {
-            if base.ends_with("/messages") {
-                base.to_owned()
-            } else if base.ends_with("/v1") {
-                format!("{base}/messages")
-            } else {
-                format!("{base}/v1/messages")
-            }
-        }
-        "openai-responses" if protocol == "openai-codex-responses" => {
-            if base.ends_with("/codex") || base.ends_with("/codex/responses") {
-                endpoint(base, "/responses")
-            } else {
-                endpoint(base, "/codex/responses")
-            }
-        }
-        "openai-responses" if protocol == "azure-openai-responses" => {
-            let parsed = reqwest::Url::parse(base).context("Invalid Azure base URL")?;
-            let base = if parsed.path().trim_matches('/').is_empty() {
-                format!("{base}/openai/v1")
-            } else if parsed.path() == "/openai" {
-                format!("{base}/v1")
-            } else {
-                base.to_string()
-            };
-            format!(
-                "{}?api-version={}",
-                endpoint(&base, "/responses"),
-                urlencoding::encode(
-                    &std::env::var("AZURE_OPENAI_API_VERSION").unwrap_or_else(|_| "v1".into())
-                )
-            )
-        }
-        "openai-responses" => endpoint(base, "/responses"),
-        "bedrock-converse-stream" => format!(
-            "{base}/model/{}/converse-stream",
-            urlencoding::encode(&provider.model.id)
-        ),
-        _ => {
-            let parsed = reqwest::Url::parse(base).context("Invalid Gemini base URL")?;
-            let base = if protocol == "google-generative-ai"
-                && parsed.path().trim_matches('/').is_empty()
-            {
-                format!("{base}/v1beta")
-            } else {
-                base.to_string()
-            };
-            format!(
-                "{base}/models/{}:streamGenerateContent?alt=sse",
-                urlencoding::encode(&provider.model.id)
-            )
-        }
-    };
     let initiator = if messages.last().is_some_and(|m| m.role != "user") {
         "agent"
     } else {
@@ -549,18 +405,6 @@ async fn stream_with_options_client_budget(
             body["prompt_mode"] = serde_json::json!("reasoning");
         }
     }
-    let google_token =
-        if protocol == "google-vertex" && (key.is_empty() || key == "gcp-vertex-credentials") {
-            // A credential exchange is a buffered request, so it keeps the
-            // total-deadline policy even though the model body is idle-bounded.
-            let buffered = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()?;
-            Some(cloud_auth::google_token(&buffered).await?)
-        } else {
-            None
-        };
     if api == "anthropic-messages" {
         crate::services::anthropic_auth::apply_fast(
             &mut body,
@@ -570,7 +414,10 @@ async fn stream_with_options_client_budget(
         )?;
     } else {
         anyhow::ensure!(
-            !crate::services::anthropic_auth::is_oauth_marker(&key),
+            !crate::services::anthropic_auth::is_oauth_marker(&credential(
+                provider,
+                entry["id"].as_str().unwrap_or_default()
+            )),
             "Anthropic OAuth credentials require the Anthropic messages API"
         );
         anyhow::ensure!(
@@ -578,6 +425,193 @@ async fn stream_with_options_client_budget(
             "Fast mode requires the Anthropic messages API"
         );
     }
+    stream_body(
+        provider,
+        body,
+        initiator,
+        vision,
+        max_tokens,
+        context_capture,
+        options,
+        client,
+        budget,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_body(
+    provider: &ResolvedProvider,
+    body: Value,
+    initiator: &'static str,
+    vision: bool,
+    max_tokens: u32,
+    context_capture: Option<&super::request_context::ContextCapture>,
+    options: &super::request_options::RequestOptions,
+    client: reqwest::Client,
+    budget: crate::performance::AttemptBudget,
+) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
+    let account_state = provider.binding_snapshot();
+    let env = |name: &str| super::session_binding::account_var(account_state.as_deref(), name);
+    let (entry, model) = metadata(provider)?;
+    let (protocol, api) = resolved_transport(provider)?;
+    let key = credential(provider, entry["id"].as_str().unwrap_or_default());
+    let configured = provider.provider.base_url.trim_end_matches('/');
+    let region = if protocol == "bedrock-converse-stream" {
+        provider
+            .model
+            .id
+            .strip_prefix("arn:aws:bedrock:")
+            .and_then(|s| s.split(':').next())
+            .map(str::to_string)
+            .or_else(|| env("AWS_REGION").ok())
+            .or_else(|| env("AWS_DEFAULT_REGION").ok())
+            .or_else(|| {
+                reqwest::Url::parse(if configured.is_empty() {
+                    model["baseUrl"].as_str().unwrap_or_default()
+                } else {
+                    configured
+                })
+                .ok()
+                .and_then(|u| {
+                    u.host_str()
+                        .and_then(|h| h.strip_prefix("bedrock-runtime."))
+                        .and_then(|h| h.split('.').next())
+                        .map(str::to_string)
+                })
+            })
+            .unwrap_or_else(|| "us-east-1".into())
+    } else {
+        String::new()
+    };
+    let base = resolved_base(configured, entry, model);
+    let base = if protocol == "bedrock-converse-stream"
+        && (configured.is_empty() || configured.contains(".amazonaws.com"))
+    {
+        format!(
+            "https://bedrock-runtime.{region}.amazonaws.com{}",
+            if region.starts_with("cn-") { ".cn" } else { "" }
+        )
+    } else if protocol == "google-vertex" && (base.is_empty() || base.contains("{location}")) {
+        if !key.is_empty() && key != "gcp-vertex-credentials" {
+            "https://aiplatform.googleapis.com/v1/publishers/google".to_string()
+        } else {
+            let project = env("GOOGLE_CLOUD_PROJECT")
+                .or_else(|_| env("GCLOUD_PROJECT"))
+                .context("Vertex ADC requires GOOGLE_CLOUD_PROJECT")?;
+            let location = env("GOOGLE_CLOUD_LOCATION")
+                .context("Vertex ADC requires GOOGLE_CLOUD_LOCATION")?;
+            let host = if location == "global" {
+                "aiplatform.googleapis.com".to_string()
+            } else {
+                format!("{location}-aiplatform.googleapis.com")
+            };
+            format!(
+                "https://{host}/v1/projects/{}/locations/{}/publishers/google",
+                urlencoding::encode(&project),
+                urlencoding::encode(&location)
+            )
+        }
+    } else if protocol == "azure-openai-responses" && base.is_empty() {
+        env("AZURE_OPENAI_BASE_URL")
+            .or_else(|_| {
+                env("AZURE_OPENAI_RESOURCE_NAME")
+                    .map(|r| format!("https://{r}.openai.azure.com/openai/v1"))
+            })
+            .unwrap_or_default()
+    } else {
+        base.to_string()
+    };
+    if base.is_empty() {
+        bail!("Provider {} requires an explicit base URL", entry["id"]);
+    }
+    let mut base = base;
+    for name in ["CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_GATEWAY_ID"] {
+        let placeholder = format!("{{{name}}}");
+        if base.contains(&placeholder) {
+            base = base.replace(
+                &placeholder,
+                &urlencoding::encode(
+                    &env(name)
+                        .with_context(|| format!("Provider endpoint requires {name}"))?,
+                ),
+            );
+        }
+    }
+    let base = base.trim_end_matches('/');
+    let url = match api {
+        "openai-completions" => {
+            if protocol == "mistral-conversations" && !base.ends_with("/v1") {
+                endpoint(base, "/v1/chat/completions")
+            } else {
+                endpoint(base, "/chat/completions")
+            }
+        }
+        "anthropic-messages" => {
+            if base.ends_with("/messages") {
+                base.to_owned()
+            } else if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            }
+        }
+        "openai-responses" if protocol == "openai-codex-responses" => {
+            if base.ends_with("/codex") || base.ends_with("/codex/responses") {
+                endpoint(base, "/responses")
+            } else {
+                endpoint(base, "/codex/responses")
+            }
+        }
+        "openai-responses" if protocol == "azure-openai-responses" => {
+            let parsed = reqwest::Url::parse(base).context("Invalid Azure base URL")?;
+            let base = if parsed.path().trim_matches('/').is_empty() {
+                format!("{base}/openai/v1")
+            } else if parsed.path() == "/openai" {
+                format!("{base}/v1")
+            } else {
+                base.to_string()
+            };
+            format!(
+                "{}?api-version={}",
+                endpoint(&base, "/responses"),
+                urlencoding::encode(
+                    &env("AZURE_OPENAI_API_VERSION").unwrap_or_else(|_| "v1".into())
+                )
+            )
+        }
+        "openai-responses" => endpoint(base, "/responses"),
+        "bedrock-converse-stream" => format!(
+            "{base}/model/{}/converse-stream",
+            urlencoding::encode(&provider.model.id)
+        ),
+        _ => {
+            let parsed = reqwest::Url::parse(base).context("Invalid Gemini base URL")?;
+            let base = if protocol == "google-generative-ai"
+                && parsed.path().trim_matches('/').is_empty()
+            {
+                format!("{base}/v1beta")
+            } else {
+                base.to_string()
+            };
+            format!(
+                "{base}/models/{}:streamGenerateContent?alt=sse",
+                urlencoding::encode(&provider.model.id)
+            )
+        }
+    };
+    let google_token =
+        if protocol == "google-vertex" && (key.is_empty() || key == "gcp-vertex-credentials") {
+            // A credential exchange is a buffered request, so it keeps the
+            // total-deadline policy even though the model body is idle-bounded.
+            let buffered = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?;
+            Some(cloud_auth::google_token(&buffered, provider).await?)
+        } else {
+            None
+        };
     let encoded_body = serde_json::to_string(&body)?;
     let account = if protocol == "openai-codex-responses" {
         Some(codex_account(&key)?)
@@ -585,9 +619,10 @@ async fn stream_with_options_client_budget(
         None
     };
     let harness_headers = options.headers(provider)?;
-    let identity = super::request_identity::RequestIdentity::new(
+    let identity = super::request_identity::RequestIdentity::from_options(
         context_capture,
-        super::request_identity::is_opencode(provider),
+        provider,
+        &options,
     );
     let api = api.to_owned();
     let opened = {
@@ -603,6 +638,7 @@ async fn stream_with_options_client_budget(
         let options = options.clone();
         let capture = context_capture.cloned();
         let google_token = google_token.clone();
+        let account_state = account_state.clone();
         let api_owned = api.clone();
         move |identity: &super::request_identity::RequestIdentity| -> super::stream_retry::OpenFuture {
             let client = client.clone();
@@ -617,6 +653,7 @@ async fn stream_with_options_client_budget(
             let options = options.clone();
             let capture = capture.clone();
             let google_token = google_token.clone();
+        let account_state = account_state.clone();
             let api = api_owned.clone();
             let protocol = protocol.clone();
             let region = region.clone();
@@ -664,7 +701,7 @@ async fn stream_with_options_client_budget(
                     "bedrock-converse-stream" => {
                         if key.is_empty() {
                             request =
-                                request.headers(cloud_auth::aws_headers(&url, &region, &encoded_body)?);
+                                request.headers(cloud_auth::aws_headers(&url, &region, &encoded_body, account_state.as_deref())?);
                         } else {
                             request = request.bearer_auth(&key);
                         }
@@ -683,7 +720,7 @@ async fn stream_with_options_client_budget(
                 }
                 if let Some(capture) = &capture {
                     capture
-                        .record(&api, &body, provider.model.context_window, max_tokens)
+                        .record_transport(&api, &body, provider.model.context_window, max_tokens, Some(vision), &url, &provider.model.id)
                         .await;
                 }
                 checked_response(
@@ -866,7 +903,7 @@ fn credential(provider: &ResolvedProvider, id: &str) -> String {
     if !provider.provider.api_key.is_empty() {
         return provider.provider.api_key.clone();
     }
-    std::env::var(credential_env(id)).unwrap_or_default()
+    super::session_binding::account_var(provider.binding_snapshot().as_deref(), &credential_env(id)).unwrap_or_default()
 }
 
 pub fn credential_env(id: &str) -> String {

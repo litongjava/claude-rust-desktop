@@ -4,6 +4,9 @@
 //! launches a real `dcl` Coder, whose mock model calls CrpSubmit(plan); the host
 //! requests approval; a second real `dcl` router turn answers it with CrpAnswer;
 //! the tick resumes the same Coder. Only a local mock endpoint is used.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
     services::{EnvironmentCredentials, ServiceContext},
@@ -19,6 +22,9 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[path = "support/user_message.rs"]
+mod user_message;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -65,9 +71,8 @@ fn last_user(body: &Value) -> String {
         .flatten()
         .rev()
         .find(|message| message["role"] == "user")
-        .and_then(|message| message["content"].as_str())
+        .map(|message| user_message::user_text(&message["content"]))
         .unwrap_or_default()
-        .to_owned()
 }
 
 fn tool_results_this_turn(body: &Value) -> Vec<String> {
@@ -293,7 +298,7 @@ async fn router_role_creates_launches_and_approves_a_real_task() {
     assert!(!first.is_empty());
     let tasks = context
         .db
-        .with_conn(|conn| {
+        .directory_sql(|conn| {
             let mut statement = conn.prepare("SELECT task_id,router_session_id FROM sa_tasks")?;
             let mut rows = Vec::new();
             let mut mapped = statement.query_map([], |row| {
@@ -399,8 +404,7 @@ async fn router_role_creates_launches_and_approves_a_real_task() {
     assert_ne!(phase_before, task.phase);
     let coder_row = context
         .db
-        .with_conn(|conn| deepseek_code_core::db::conversation_repo::get_conversation(conn, &coder))
-        .unwrap()
+        .conversation_metadata(&coder)
         .unwrap()
         .unwrap();
     let coder_workspace = PathBuf::from(coder_row.workspace_path.unwrap());
@@ -500,12 +504,12 @@ async fn wait_for_jobs(
             let context = deepseek_code_core::services::session_messages::context(data).ok()?;
             let rows = context
                 .db
-                .with_conn(|conn| deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &job.session_id))
+                .shard_sql(&job.session_id, |conn| deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &job.session_id))
                 .ok()?
                 .ok()?;
             let calls = context
                 .db
-                .with_conn(|conn| -> anyhow::Result<Vec<(String, Option<String>, Option<String>, bool)>> {
+                .shard_sql(&job.session_id, |conn| -> anyhow::Result<Vec<(String, Option<String>, Option<String>, bool)>> {
                     let rows = deepseek_code_core::db::message_repo::get_messages_by_conversation(
                         conn,
                         &job.session_id,

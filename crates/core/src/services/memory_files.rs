@@ -1,9 +1,9 @@
 //! Host-bound project memories. Legacy SQLite remains an explicit archive, never
 //! an implicit source for file recall. No model argument can select a scope.
 use super::ServiceContext;
+use crate::db::session_store::{settings, GlobalSetting, Projects, SessionDb};
 use crate::memory::files::{ExpectedVersion, FileMemoryStore, MemoryScope, Snapshot};
 use anyhow::{ensure, Context, Result};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Component, Path, PathBuf};
@@ -20,7 +20,37 @@ pub struct FileMemory {
     pub context: ServiceContext,
     pub scope: MemoryScope,
     pub directory: PathBuf,
-    session: Option<String>,
+    session: Option<SessionDb>,
+    private_owner: Option<String>,
+}
+
+/// The directory database owns file-mode preferences. Import existing archive
+/// preferences read-only when upgrading a data directory from the old layout.
+pub fn config(context: &ServiceContext) -> Result<crate::memory::MemoryConfig> {
+    let key = GlobalSetting::MachinePreference("memory.files.config");
+    if let Some(config) = context.global_setting(key)? {
+        return Ok(config);
+    }
+    let archive = context.paths.data_dir.join("memory.sqlite3");
+    if archive.is_file() {
+        use rusqlite::{Connection, OpenFlags, OptionalExtension};
+        let conn = Connection::open_with_flags(archive, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        if conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_settings')", [], |row| row.get::<_, bool>(0))? {
+            let raw: Option<String> = conn.query_row("SELECT config FROM memory_settings WHERE id=1", [], |r| r.get(0)).optional()?;
+            if let Some(raw) = raw {
+                return Ok(serde_json::from_str(&raw)?);
+            }
+        }
+    }
+    Ok(Default::default())
+}
+
+pub fn save_config(context: &ServiceContext, config: &crate::memory::MemoryConfig) -> Result<()> {
+    config.validate()?;
+    context.save_global_setting(
+        GlobalSetting::MachinePreference("memory.files.config"),
+        config,
+    )
 }
 
 impl FileMemory {
@@ -33,9 +63,7 @@ impl FileMemory {
             return Self::session(context, session);
         }
         let id = selection.project_id.as_deref().unwrap();
-        let project = context
-            .db
-            .with_conn(|c| crate::db::project_repo::require_trusted(c, id))??;
+        let project = context.db.trusted_project(id)?;
         ensure!(
             !project.is_archived,
             "Archived project memory is unavailable"
@@ -55,125 +83,82 @@ impl FileMemory {
     }
 
     pub fn session(context: &ServiceContext, id: &str) -> Result<Self> {
-        let scope = context.db.with_conn(|conn| -> Result<MemoryScope> {
-            let conversation = crate::db::conversation_repo::get_conversation(conn, id)?
-                .context("Memory session not found")?;
-            ensure!(!conversation.archived, "Memory session is archived");
-            let (_, project) = crate::native_engine::workspace::resolve_workspace(
-                conn,
-                &context.paths.data_dir.join("workspaces"),
-                id,
-                None,
-            )?;
-            if let Some(project) = project.filter(|p| {
-                !(p.folders.len() == 1
-                    && dirs::home_dir().is_some_and(|h| {
-                        Path::new(&p.folders[0].path).canonicalize().ok() == h.canonicalize().ok()
-                    }))
-            }) {
-                MemoryScope::project(
-                    &project
-                        .folders
-                        .iter()
-                        .map(|f| PathBuf::from(&f.path))
-                        .collect::<Vec<_>>(),
-                    true,
-                )
-                .map_err(Into::into)
+        let shard = context.db.open_session(id)?;
+        Self::from_session(context, shard, None)
+    }
+
+    fn from_session(
+        context: &ServiceContext,
+        shard: SessionDb,
+        inherited: Option<&str>,
+    ) -> Result<Self> {
+        let (workspace, project, _) = shard.scoped_stores().engine_workspace(
+            &context.paths.data_dir.join("workspaces"),
+            shard.id(),
+            None,
+        )?;
+        let project_id = project.as_ref().map(|p| p.id.clone());
+        let roots: Vec<_> = project
+            .iter()
+            .flat_map(|p| &p.folders)
+            .map(|f| PathBuf::from(&f.path))
+            .collect();
+        let private = roots.is_empty()
+            || (roots.len() == 1
+                && dirs::home_dir()
+                    .is_some_and(|home| home.canonicalize().ok() == roots[0].canonicalize().ok()));
+        let mut private_owner = None;
+        let scope = if private {
+            let saved = shard.read(|r| r.setting(settings::MEMORY_OWNER))?;
+            let default_owner = if roots.is_empty() {
+                workspace
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .context("Missing private workspace owner")?
             } else {
-                let explicit: Option<String> = conn
-                    .query_row(
-                        "SELECT value FROM peripheral_settings WHERE key=?1",
-                        [format!("memory.private-owner.{id}")],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let explicit = explicit
-                    .map(|s| serde_json::from_str::<String>(&s))
-                    .transpose()?;
-                let owner = crate::native_engine::workspace::private_workspace_owner(conn, id)?
-                    .or(explicit)
-                    .unwrap_or_else(|| id.into());
-                MemoryScope::private(&owner).map_err(Into::into)
-            }
-        })??;
-        // Persist the binding atomically. Repository metadata or a workspace move
-        // must not silently transfer a resumed session's memory authority.
-        let key = format!("memory.scope.{id}");
-        let value = serde_json::to_string(scope.key())?;
-        context.db.with_conn(|conn| -> Result<()> {
-            let saved: Option<String> = conn
-                .query_row(
-                    "SELECT value FROM peripheral_settings WHERE key=?1",
-                    [&key],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(saved) = saved {
-                ensure!(
-                    saved == value,
-                    "Memory scope changed; explicitly rebind the session before using memory"
-                );
-                return Ok(());
-            }
-            conn.execute(
-                "INSERT OR IGNORE INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                [&key, &value],
-            )?;
-            let saved: String = conn.query_row(
-                "SELECT value FROM peripheral_settings WHERE key=?1",
-                [&key],
-                |r| r.get(0),
-            )?;
-            ensure!(
-                saved == value,
-                "Memory scope changed; explicitly rebind the session before using memory"
-            );
-            Ok(())
-        })??;
-        Self::new(context, scope, Some(id.into()))
+                shard.incarnation()
+            };
+            let owner = inherited
+                .or_else(|| {
+                    saved
+                        .as_ref()
+                        .filter(|(project, _)| project == &project_id)
+                        .map(|(_, owner)| owner.as_str())
+                })
+                .unwrap_or(default_owner);
+            private_owner = Some(owner.to_owned());
+            MemoryScope::private(owner)?
+        } else {
+            MemoryScope::project(&roots, true)?
+        };
+        let binding = (project_id.clone(), scope.key().to_owned());
+        let saved = shard.read(|r| r.setting(settings::MEMORY_SCOPE))?;
+        if saved.as_ref() != Some(&binding) {
+            shard.write(|w| {
+                if let Some((project, key)) = w.setting(settings::MEMORY_SCOPE)? {
+                    ensure!(
+                        project != project_id || key == scope.key(),
+                        "Memory scope changed; explicitly rebind the session before using memory"
+                    );
+                }
+                if let (Some(_), Some(owner)) = (inherited, &private_owner) {
+                    w.set_setting(settings::MEMORY_OWNER, &(project_id.clone(), owner.clone()))?;
+                }
+                w.set_setting(settings::MEMORY_SCOPE, &binding)
+            })?;
+        }
+        let mut memory = Self::new(context, scope, Some(shard))?;
+        memory.private_owner = private_owner;
+        Ok(memory)
     }
 
     /// Called only by the owned-child launcher, after it persists the child.
     pub fn child(&self, id: &str) -> Result<Self> {
-        let child = Self::session(&self.context, id)?;
-        if child.scope != self.scope && child.scope.is_private() && self.scope.is_private() {
-            let parent = self
-                .session
-                .as_deref()
-                .context("Child memory requires a parent session")?;
-            let owner = self
-                .context
-                .db
-                .with_conn(|conn| {
-                    crate::native_engine::workspace::private_workspace_owner(conn, parent)
-                })??
-                .or(self
-                    .context
-                    .setting::<String>(&format!("memory.private-owner.{parent}"))?)
-                .unwrap_or_else(|| parent.into());
-            self.context.db.with_conn(|conn| -> Result<()> {
-                let tx = rusqlite::Transaction::new_unchecked(
-                    conn,
-                    rusqlite::TransactionBehavior::Immediate,
-                )?;
-                tx.execute(
-                    "INSERT OR REPLACE INTO peripheral_settings(key,value) VALUES(?1,?2)",
-                    [
-                        format!("memory.private-owner.{id}"),
-                        serde_json::to_string(&owner)?,
-                    ],
-                )?;
-                tx.execute(
-                    "DELETE FROM peripheral_settings WHERE key=?1",
-                    [format!("memory.scope.{id}")],
-                )?;
-                tx.commit()?;
-                Ok(())
-            })??;
-            return Self::session(&self.context, id);
-        }
-        Ok(child)
+        Self::from_session(
+            &self.context,
+            self.context.db.open_session(id)?,
+            self.private_owner.as_deref(),
+        )
     }
 
     /// CLI management uses an explicitly selected cwd, never arbitrary model text.
@@ -191,7 +176,11 @@ impl FileMemory {
         )
     }
 
-    fn new(context: &ServiceContext, scope: MemoryScope, session: Option<String>) -> Result<Self> {
+    fn new(
+        context: &ServiceContext,
+        scope: MemoryScope,
+        session: Option<SessionDb>,
+    ) -> Result<Self> {
         let root = context.paths.data_dir.canonicalize()?;
         let directory = root
             .join("memory/projects")
@@ -199,37 +188,31 @@ impl FileMemory {
             .join("memory");
         // This changes service state only; old data and dream configuration stay.
         if !context
-            .setting::<bool>("memory.files.active")?
+            .global_setting::<bool>(GlobalSetting::MachinePreference("memory.files.active"))?
             .unwrap_or(false)
         {
-            context.save_setting("memory.files.active", &true)?;
+            context.save_global_setting(
+                GlobalSetting::MachinePreference("memory.files.active"),
+                &true,
+            )?;
         }
         Ok(Self {
             context: context.clone(),
             scope,
             directory,
             session,
+            private_owner: None,
         })
     }
 
     pub fn active(&self) -> bool {
-        self.config().enabled
-    }
-
-    fn config(&self) -> crate::memory::MemoryConfig {
-        crate::memory::MemExClient::with_path(
-            self.context.paths.data_dir.join("memory.sqlite3"),
-        )
-        .get_config_blocking()
+        config(&self.context).is_ok_and(|config| config.enabled)
     }
 
     pub fn store(&self, read_only: bool) -> Result<FileMemoryStore> {
-        ensure!(
-            self.active(),
-            "Local file memory is disabled"
-        );
+        ensure!(self.active(), "Local file memory is disabled");
         if let Some(id) = &self.session {
-            let current = Self::session(&self.context, id)?;
+            let current = Self::from_session(&self.context, id.clone(), None)?;
             ensure!(
                 current.scope.key() == self.scope.key(),
                 "Memory scope changed during the turn; restart the turn"
@@ -283,12 +266,9 @@ impl FileMemory {
     }
 
     fn recall_key(&self, turn: &crate::services::turn_context::Entry) -> Result<String> {
-        let session = self
-            .session
-            .as_deref()
-            .context("Recall requires a session")?;
+        let _session = self.session.as_ref().context("Recall requires a session")?;
         Ok(format!(
-            "memory.recall.{session}.{}.{}.{}",
+            "recall.{}.{}.{}",
             self.scope.key(),
             turn.key,
             turn.occurrence
@@ -297,8 +277,12 @@ impl FileMemory {
 
     pub(crate) fn recalled(&self, turn: &crate::services::turn_context::Entry) -> Result<bool> {
         Ok(self
-            .context
-            .setting::<Value>(&self.recall_key(turn)?)?
+            .session
+            .as_ref()
+            .context("Recall requires a session")?
+            .read(|r| {
+                r.setting::<Value>(settings::Setting::memory_receipt(self.recall_key(turn)?))
+            })?
             .is_some())
     }
 
@@ -307,10 +291,15 @@ impl FileMemory {
         turn: &crate::services::turn_context::Entry,
         hit: bool,
     ) -> Result<()> {
-        self.context.save_setting(
-            &self.recall_key(turn)?,
+        self.session
+            .as_ref()
+            .context("Recall requires a session")?
+            .write(|w| {
+                w.set_setting(
+            settings::Setting::memory_receipt(self.recall_key(turn)?),
             &json!({"version":1,"scope":self.scope.key(),"status":if hit {"hit"}else{"zero-hit"}}),
         )
+            })
     }
 
     pub fn context_block(&self, query: &str, read_only: bool) -> Result<(String, Option<String>)> {
@@ -389,7 +378,7 @@ impl FileMemory {
             b.0.total_cmp(&a.0)
                 .then_with(|| a.1.filename.cmp(&b.1.filename))
         });
-        let top = self.config().search_top_k.min(5);
+        let top = config(&self.context)?.search_top_k.min(5);
         ranked.truncate(top);
         let mut linked = Vec::new();
         for (_, entry) in &ranked {
@@ -595,9 +584,9 @@ impl FileMemory {
         };
         let session = self
             .session
-            .as_deref()
+            .as_ref()
             .context("Model memory tools require a session")?;
-        let receipt_key = format!("memory.read.{}.{}.{}", session, self.scope.key(), filename);
+        let receipt_key = format!("read.{}.{}", self.scope.key(), filename);
         if tool == "Read" {
             let bytes = before.context("Memory file not found")?;
             let text = std::str::from_utf8(&bytes)?;
@@ -614,7 +603,12 @@ impl FileMemory {
                 .join("\n");
             let hash = crate::memory::files::content_hash(&bytes);
             if offset == 1 && count >= lines.len() {
-                self.context.save_setting(&receipt_key, &hash)?;
+                session.write(|w| {
+                    w.set_setting(
+                        settings::Setting::memory_receipt(receipt_key.clone()),
+                        &hash,
+                    )
+                })?;
             }
             return Ok(
                 json!({"success":true,"content":shown,"file_path":self.directory.join(filename),"version":hash}),
@@ -623,9 +617,10 @@ impl FileMemory {
         let expected = match &before {
             None => ExpectedVersion::Absent,
             Some(bytes) => {
-                let seen = self
-                    .context
-                    .setting::<String>(&receipt_key)?
+                let seen = session
+                    .read(|r| {
+                        r.setting::<String>(settings::Setting::memory_receipt(receipt_key.clone()))
+                    })?
                     .context("Read the complete memory file before modifying it")?;
                 ensure!(
                     seen == crate::memory::files::content_hash(bytes),
@@ -668,7 +663,12 @@ impl FileMemory {
         } else {
             store.put(filename, text.as_bytes(), expected)?.hash
         };
-        self.context.save_setting(&receipt_key, &version)?;
+        session.write(|w| {
+            w.set_setting(
+                settings::Setting::memory_receipt(receipt_key.clone()),
+                &version,
+            )
+        })?;
         let snapshot = store.snapshot()?;
         let index = snapshot.index_context(&self.directory.join("MEMORY.md").to_string_lossy());
         Ok(
@@ -809,7 +809,7 @@ mod tests {
         assert!(!memory.recalled(&turn).unwrap());
         memory.record_recall(&turn, false).unwrap();
         let reopened =
-            FileMemory::session(&memory.context, memory.session.as_deref().unwrap()).unwrap();
+            FileMemory::session(&memory.context, memory.session.as_ref().unwrap().id()).unwrap();
         assert!(reopened.recalled(&turn).unwrap());
         let mut next = turn.clone();
         next.occurrence += 1;
@@ -927,19 +927,23 @@ mod tests {
         let (_root, memory) = fixture();
         assert!(FileMemory::select(&memory.context, &Selection::default()).is_err());
         let again =
-            FileMemory::session(&memory.context, memory.session.as_deref().unwrap()).unwrap();
+            FileMemory::session(&memory.context, memory.session.as_ref().unwrap().id()).unwrap();
         assert_eq!(again.scope.key(), memory.scope.key());
         memory
-            .context
-            .save_setting(
-                &format!("memory.scope.{}", memory.session.as_deref().unwrap()),
-                &"other",
-            )
+            .session
+            .as_ref()
+            .unwrap()
+            .write(|w| {
+                let (project, _) = w.setting(settings::MEMORY_SCOPE)?.unwrap();
+                w.set_setting(settings::MEMORY_SCOPE, &(project, "other".into()))
+            })
             .unwrap();
-        assert!(FileMemory::session(&memory.context, memory.session.as_deref().unwrap()).is_err());
+        assert!(
+            FileMemory::session(&memory.context, memory.session.as_ref().unwrap().id()).is_err()
+        );
         assert!(memory
             .context
-            .setting::<bool>("memory.files.active")
+            .global_setting::<bool>(GlobalSetting::MachinePreference("memory.files.active"))
             .unwrap()
             .unwrap());
     }

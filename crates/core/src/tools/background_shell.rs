@@ -783,7 +783,8 @@ pub fn request_background(root: &Path, session: &str) -> Result<()> {
 }
 
 /// Aborts a foreground call's process when the turn drops it.
-struct AbortOnDrop(Option<tokio::task::JoinHandle<Result<Value>>>);
+type ForegroundResult = Result<(Value, Option<super::bash_process::ShellCapture>)>;
+struct AbortOnDrop(Option<tokio::task::JoinHandle<ForegroundResult>>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         if let Some(handle) = self.0.take() {
@@ -892,7 +893,14 @@ pub(super) async fn run_foreground(
         // A managed call carries no timeout inside the capture: the poll loop
         // below hands the process to the model as a background task, so a
         // foreground timeout never kills what the command has already achieved.
-        super::bash_process::run_logged(&mut command, None, &shell_name, Some(logs), None).await
+        super::bash_process::run_logged_with_capture(
+            &mut command,
+            None,
+            &shell_name,
+            Some(logs),
+            None,
+        )
+        .await
     })));
     let reason = loop {
         let handle = running.0.as_mut().context("Shell task missing")?;
@@ -900,7 +908,9 @@ pub(super) async fn run_foreground(
             result = handle => {
                 running.0 = None;
                 let _ = std::fs::remove_dir_all(&directory);
-                return result.context("Shell task stopped")?;
+                let (value, capture) = result.context("Shell task stopped")??;
+                super::bash_process::publish_capture(capture);
+                return Ok(value);
             }
             _ = tokio::time::sleep(Duration::from_millis(100)) => {
                 let requested = std::fs::metadata(&signal)
@@ -960,7 +970,7 @@ pub(super) async fn run_foreground(
             }
         };
         let output = match result {
-            Ok(Ok(output)) => output,
+            Ok(Ok((output, _))) => output,
             Ok(Err(error)) => json!({"is_error":true,"error":format!("{error:#}")}),
             Err(error) => json!({"is_error":true,"error":format!("{error}")}),
         };
@@ -1408,7 +1418,15 @@ pub(super) fn control(
                 json!({"task_id":id,"status":status,"cancellation_requested":true,"message":"Monitor stop requested; you will get a final 'stopped' notification."}),
             ));
         }
-        let stdout = read_tail(&directory.join("stdout.log"), 64 * 1024)?;
+        let (stdout, size) = crate::performance::command_output::SnapshotSize::read_log(
+            &directory.join("stdout.log"),
+            64 * 1024,
+            true,
+        )?;
+        super::bash_process::publish_snapshot(
+            [size, Default::default()],
+            [stdout.len(), 0],
+        );
         let events = std::fs::File::open(directory.join("events.jsonl"))
             .ok()
             .map(|file| {
@@ -1443,22 +1461,19 @@ pub(super) fn control(
         }
         return Ok(Some(value));
     }
-    let read = |name| -> Result<String> {
-        use std::io::Read;
-        match std::fs::File::open(directory.join(name)) {
-            Ok(file) => {
-                let mut bytes = Vec::new();
-                file.take(1024 * 1024).read_to_end(&mut bytes)?;
-                Ok(String::from_utf8_lossy(&bytes).into_owned())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(error) => Err(error.into()),
-        }
+    let read = |name| {
+        crate::performance::command_output::SnapshotSize::read_log(
+            &directory.join(name),
+            1024 * 1024,
+            false,
+        )
     };
-    // TaskGet keeps the stored task fields (description, owner, metadata,
-    // dependencies, output) and adds the live status and bounded logs.
-    let stdout = read("stdout.log")?;
-    let stderr = read("stderr.log")?;
+    let (stdout, out_size) = read("stdout.log")?;
+    let (stderr, err_size) = read("stderr.log")?;
+    super::bash_process::publish_snapshot(
+        [out_size, err_size],
+        [stdout.len(), stderr.len()],
+    );
     let mut snapshot = task;
     snapshot["task_id"] = json!(id);
     snapshot["status"] = status.clone();
@@ -1466,6 +1481,24 @@ pub(super) fn control(
     snapshot["stderr"] = json!(stderr);
     let result = snapshot["output"].clone();
     snapshot["result"] = result;
+    // A plain managed shell stores the same payload a foreground Bash result
+    // carries. Render it the same way, so a finished task shows only its output
+    // and the status that matters instead of raw exit_code/shell_path
+    // bookkeeping. Status, IDs and paging cursors keep their structured values.
+    // A PTY/ConPTY console task instead stores its terminal outcome
+    // (`exit_code`, `cleanup_complete`, `final_drain_complete`, ...) as JSON that
+    // callers parse, so its output is left exactly as stored. "pty" covers the
+    // Linux PTY and the Windows ConPTY tasks; macOS has no PTY implementation.
+    let console = snapshot["metadata"]["interaction"].as_str() == Some("pty");
+    if !console {
+        for key in ["output", "result"] {
+            if let Some(text) = snapshot[key].as_str().map(str::to_owned) {
+                snapshot[key] = json!(crate::native_engine::tool_loop::model_tool_output(
+                    "Bash", &text
+                ));
+            }
+        }
+    }
     snapshot["block"] = json!(false);
     snapshot["retrieval_status"] = json!(if terminal(&status) {
         "success"
@@ -1476,6 +1509,15 @@ pub(super) fn control(
         snapshot["owner_loss"] = facts;
     }
     Ok(Some(snapshot))
+}
+
+/// The stored outcome is still structured before TaskGet replaces it with
+/// a display string or clears it from a page.
+fn stored_shell_signal(task: &Value) -> Option<i64> {
+    let output = &task["output"];
+    output["signal"].as_i64().or_else(|| {
+        serde_json::from_str::<Value>(output.as_str()?).ok()?["signal"].as_i64()
+    })
 }
 
 /// Reads at most `limit` bytes from the end of a log file.
@@ -1756,6 +1798,12 @@ fn page_task_get(
     let mut value = task;
     value["task_id"] = json!(id);
     value["status"] = status.clone();
+    super::bash_process::publish_page(&stdout, &stderr);
+    if done && value["metadata"]["interaction"] != "pty" {
+        if let Some(signal) = stored_shell_signal(&value) {
+            value["termination_reason"] = json!(format!("terminated by signal {signal}"));
+        }
+    }
     value["stdout"] = json!(stdout.text);
     value["stderr"] = json!(stderr.text);
     // Page mode exposes only the page; the stored text is never repeated.
@@ -1846,22 +1894,25 @@ pub(super) async fn control_async(
             snapshot_input.clone(),
             name.clone(),
         );
-        let snapshot = tokio::task::spawn_blocking(move || control(&name, &input, &root, &session));
-        let snapshot = if wait && managed_directory {
+        let snapshot = tokio::task::spawn_blocking(move || {
+            super::bash_process::capture_sync(|| control(&name, &input, &root, &session))
+        });
+        let (snapshot, metadata) = if wait && managed_directory {
             match tokio::time::timeout_at(deadline, snapshot).await {
-                Ok(result) => result??,
+                Ok(result) => result?,
                 Err(_) => {
                     last["retrieval_status"] = json!("timeout");
                     return Ok(Some(last));
                 }
             }
         } else {
-            snapshot.await??
+            snapshot.await?
         };
-        let Some(mut value) = snapshot else {
+        let Some(mut value) = snapshot? else {
             return Ok(None);
         };
         value["block"] = json!(block);
+        super::bash_process::replace_metadata(metadata);
         if terminal(&value["status"]) || !wait {
             return Ok(Some(value));
         }
@@ -1956,6 +2007,114 @@ mod tests {
         assert_eq!(snapshot["status"], "running");
         assert_eq!(snapshot["stdout"], "live output");
         assert_eq!(snapshot["retrieval_status"], "not_ready");
+    }
+
+    /// Starts a real shell command under `session` and returns its snapshot once
+    /// the task reaches a terminal status.
+    async fn finished_shell(root: &Path, session: &str, script: &str) -> Value {
+        let (owner_root, owner_session) = (root.to_owned(), session.to_owned());
+        let task = {
+            let mut command = Command::new("node");
+            command.arg("-e").arg(script);
+            let (root, session) = (owner_root.clone(), owner_session.clone());
+            let command_text = script.to_owned();
+            scope(Some((root, session)), async move {
+                start(
+                    command,
+                    None,
+                    "node",
+                    "fixture",
+                    &command_text,
+                    None,
+                    super::Interaction::None,
+                )
+                .unwrap()
+            })
+            .await
+        };
+        wait_until(
+            &owner_root,
+            &owner_session,
+            task["task_id"].as_str().unwrap(),
+            "the finished task",
+            |value| super::terminal(&value["status"]),
+        )
+        .await
+    }
+
+    /// TaskGet hands the model the same cleaned payload a foreground Bash call
+    /// produces: only the output and the status that matters. The structured
+    /// fields the task tools need keep their own values.
+    #[tokio::test]
+    async fn task_get_renders_a_finished_shell_like_a_bash_result() {
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        // One stdout body with nothing else is simply the output.
+        let with_output =
+            finished_shell(root.path(), &session, "process.stdout.write('hello\\n')").await;
+        assert_eq!(with_output["status"], "completed", "{with_output}");
+        assert_eq!(with_output["result"], "hello\n", "{with_output}");
+        assert_eq!(with_output["output"], "hello\n", "{with_output}");
+        assert!(with_output["task_id"].as_str().is_some(), "{with_output}");
+        // A finished task with no output still reads as finished.
+        let empty = finished_shell(root.path(), &session, "").await;
+        assert_eq!(empty["status"], "completed", "{empty}");
+        assert_eq!(empty["result"], "(Completed with no output)", "{empty}");
+        assert_eq!(empty["retrieval_status"], "success", "{empty}");
+        // A failure still names its non-zero exit code.
+        let failed = finished_shell(root.path(), &session, "process.exit(2)").await;
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(failed["result"], "Exit code: 2", "{failed}");
+    }
+
+    /// A ConPTY/console task stores a structured terminal outcome, not a Bash
+    /// payload. TaskGet must present it byte-for-byte so callers can still parse
+    /// the fields they rely on.
+    #[test]
+    fn task_get_keeps_a_console_task_outcome_structured() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let task = super::super::tasks::execute_for_shell_owner(
+            "TaskCreate",
+            json!({"subject":"console","metadata":{
+                "managed_shell":true,
+                "interaction":"pty"
+            }}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        let id = task["id"].as_str().unwrap();
+        let outcome = json!({
+            "exit_code":0,
+            "cleanup_complete":true,
+            "final_drain_complete":true,
+            "output_capture_complete":true
+        })
+        .to_string();
+        super::super::tasks::execute_for_shell_owner(
+            "TaskUpdate",
+            json!({"id":id,"status":"completed","output":outcome}),
+            root.path(),
+            &session,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("shell-tasks").join(&session).join(id)).unwrap();
+        let snapshot = control(
+            "TaskGet",
+            &json!({"task_id":id,"block":false}),
+            root.path(),
+            &session,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(snapshot["status"], "completed", "{snapshot}");
+        assert_eq!(snapshot["output"], outcome, "{snapshot}");
+        assert_eq!(snapshot["result"], outcome, "{snapshot}");
+        let parsed: Value = serde_json::from_str(snapshot["output"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["cleanup_complete"], true, "{parsed}");
+        assert_eq!(parsed["final_drain_complete"], true, "{parsed}");
     }
 
     #[test]
@@ -3633,7 +3792,13 @@ setInterval(() => {}, 10000);
         )
         .await;
         assert_eq!(timed_out["status"], "failed");
-        assert!(timed_out["result"].as_str().unwrap().contains("timed_out"));
+        assert!(
+            timed_out["result"]
+                .as_str()
+                .unwrap()
+                .contains("Command timed out"),
+            "{timed_out}"
+        );
         assert!(
             mentions(&timed_out, "stdout", "partial output"),
             "the timeout lost the output written before it: {timed_out}"
@@ -5899,11 +6064,7 @@ mod foreground_output_tests {
     fn output_tracks_appends_and_excludes_other_sessions_and_background_tasks() {
         let root = tempfile::tempdir().unwrap();
         let session = uuid::Uuid::new_v4().to_string();
-        let path = root
-            .path()
-            .join("shell-tasks")
-            .join(&session)
-            .join("fg-test");
+        let path = root.path().join("shell-tasks").join(&session).join("fg-test");
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("foreground-active"), b"running").unwrap();
         std::fs::write(path.join("stdout.log"), b"first").unwrap();
@@ -5930,7 +6091,11 @@ mod foreground_output_tests {
     fn an_unreadable_stream_is_skipped_by_foreground_output() {
         let root = tempfile::tempdir().unwrap();
         let session = uuid::Uuid::new_v4().to_string();
-        let path = root.path().join("shell-tasks").join(&session).join("fg-test");
+        let path = root
+            .path()
+            .join("shell-tasks")
+            .join(&session)
+            .join("fg-test");
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("foreground-active"), b"running").unwrap();
         std::fs::write(path.join("command.txt"), b"fixture").unwrap();

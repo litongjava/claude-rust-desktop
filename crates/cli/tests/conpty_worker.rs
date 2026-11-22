@@ -1,5 +1,8 @@
 //! Windows acceptance through a local model and real CLI persistent worker.
 #[cfg(windows)]
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+#[cfg(windows)]
 mod windows_tests {
     use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
     use deepseek_code_core::{
@@ -545,7 +548,7 @@ mod windows_tests {
         for pid in pids {
             h.wait_exited(pid).await;
         }
-        let db = rusqlite::Connection::open(h.data.join("deepseek_code.db")).unwrap();
+        let db = crate::fixture_sql::shard_connection(&h.data, &h.host.session_id).unwrap();
         let mut stmt=db.prepare("SELECT tc.id,tc.name,tc.output,tc.is_error FROM tool_calls tc JOIN messages m ON m.id=tc.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order,tc.sort_order").unwrap();
         let rows: Vec<(String, String, Option<String>, bool)> = stmt
             .query_map([&h.host.session_id], |r| {

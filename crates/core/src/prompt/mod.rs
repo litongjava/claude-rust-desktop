@@ -47,7 +47,7 @@ pub fn compose_desktop_system_prompt(custom_prompt: Option<&str>) -> String {
 }
 
 pub fn compose_system_prompt(custom_prompt: Option<&str>, profile: PromptProfile) -> String {
-    compose_system_prompt_in(custom_prompt, profile, None)
+    compose_system_prompt_in(custom_prompt, profile)
 }
 
 /// The built-in prompt text, which the user can start editing from.
@@ -55,15 +55,227 @@ pub fn default_system_prompt(profile: PromptProfile) -> String {
     static_sections(profile).join("\n\n")
 }
 
+/// The CLI's constant runtime facts. They describe the frontend, so they travel
+/// in the first user message as their own reminder instead of the system prompt.
+pub const STANDALONE_FRONTEND: &str = "Standalone DeepSeek Code terminal: no Desktop window or Bridge server; use native tools directly. For an interactive command like `gcloud auth login`, tell the user to enter `! <command>` and its output appears here.";
+
+pub fn standalone_frontend_reminder() -> String {
+    format!("<system-reminder>\n{STANDALONE_FRONTEND}\n</system-reminder>")
+}
+
+/// The lead-in of the reminder that lists tools ToolLoad can load.
+pub const LOADABLE_TOOLS_LEAD_IN: &str =
+    "Tools you can load with ToolLoad (pass exact names in the names array):";
+
+/// The lead-in of the reminder that lists the model-invocable skills.
+pub const SKILLS_LEAD_IN: &str = "Available skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool.";
+
+/// The first sentence of a description, whitespace collapsed and cut to
+/// `limit` characters. The loadable-tool listing uses 100.
+pub fn one_sentence(description: &str, limit: usize) -> String {
+    let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let sentence = text
+        .split(". ")
+        .next()
+        .unwrap_or(&text)
+        .trim_end_matches('.')
+        .trim();
+    if sentence.chars().count() <= limit {
+        return sentence.to_owned();
+    }
+    let mut cut: String = sentence.chars().take(limit.saturating_sub(1)).collect();
+    cut = cut.trim_end().to_owned();
+    cut.push('…');
+    cut
+}
+
+/// One reminder listing the loadable built-in tools first, then the on-demand
+/// MCP tools. None when ToolLoad has nothing to offer.
+pub fn loadable_tools_reminder(
+    builtin: &[(String, String)],
+    mcp: &[(String, String)],
+) -> Option<String> {
+    if builtin.is_empty() && mcp.is_empty() {
+        return None;
+    }
+    let mut text = String::from(LOADABLE_TOOLS_LEAD_IN);
+    for (name, description) in builtin.iter().chain(mcp) {
+        text.push_str(&format!("\n- {name}: {}", one_sentence(description, 100)));
+    }
+    Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
+}
+
+/// Read a frozen reminder stored as JSON `Option<String>`: `Some(None)` means
+/// the first request had an empty list, so later requests must keep omitting it.
+fn frozen_reminder(path: &Path) -> Option<Option<String>> {
+    let bytes = std::fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn store_frozen_reminder(path: &Path, reminder: &Option<String>) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_vec(reminder).unwrap_or_default());
+}
+
+/// The loadable-tool reminder frozen on the session's first request. A later
+/// MCP reconnect or settings change never rewrites the first user message.
+pub fn loadable_tools_for_session(
+    root: &Path,
+    session: &str,
+    builtin: &[(String, String)],
+    mcp: &[(String, String)],
+) -> Option<String> {
+    let path = crate::session_files::environment_file(root, session, ".loadable-tools.json");
+    if let Some(saved) = frozen_reminder(&path) {
+        return saved;
+    }
+    let reminder = loadable_tools_reminder(builtin, mcp);
+    store_frozen_reminder(&path, &reminder);
+    reminder
+}
+
+/// The reminder listing the model-invocable skills, with their one-line
+/// descriptions and context. None when there are no skills.
+pub fn skills_reminder(lines: &[String]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<system-reminder>\n{SKILLS_LEAD_IN}\n{}\n</system-reminder>",
+        lines.join("\n")
+    ))
+}
+
+/// The skill list frozen on the session's first request, for the same
+/// prefix-stability reason as the environment.
+pub fn skills_for_session(root: &Path, session: &str, lines: &[String]) -> Option<String> {
+    let path = crate::session_files::environment_file(root, session, ".skills.json");
+    if let Some(saved) = frozen_reminder(&path) {
+        return saved;
+    }
+    let reminder = skills_reminder(lines);
+    store_frozen_reminder(&path, &reminder);
+    reminder
+}
+
+/// The names added to and removed from a per-session set since the previous
+/// observed value. The first call records the set without reporting anything.
+/// Saving the current set here makes each change produce one reminder only.
+pub fn set_changes(
+    root: &Path,
+    session: &str,
+    kind: &str,
+    current: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut current: Vec<String> = current.to_vec();
+    current.sort();
+    current.dedup();
+    let path = crate::session_files::set_changes_file(root, session, kind);
+    let previous: Option<Vec<String>> = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, serde_json::to_vec(&current).unwrap_or_default());
+    let Some(previous) = previous else {
+        return (Vec::new(), Vec::new());
+    };
+    let before: std::collections::HashSet<_> = previous.iter().collect();
+    let after: std::collections::HashSet<_> = current.iter().collect();
+    (
+        current
+            .iter()
+            .filter(|name| !before.contains(name))
+            .cloned()
+            .collect(),
+        previous
+            .into_iter()
+            .filter(|name| !after.contains(&name))
+            .collect(),
+    )
+}
+
+/// One reminder on the latest user message describing only what changed since
+/// the first message froze its lists. None when nothing changed.
+pub fn changes_reminder(
+    now_loadable: Vec<String>,
+    no_longer_available: Vec<String>,
+    new_skills: Vec<String>,
+    removed_skills: Vec<String>,
+) -> Option<String> {
+    let mut lines = Vec::new();
+    if !now_loadable.is_empty() {
+        lines.push(format!("Now loadable: {}", now_loadable.join(", ")));
+    }
+    if !no_longer_available.is_empty() {
+        lines.push(format!(
+            "No longer available: {}",
+            no_longer_available.join(", ")
+        ));
+    }
+    if !new_skills.is_empty() {
+        lines.push(format!("New skills: {}", new_skills.join(", ")));
+    }
+    if !removed_skills.is_empty() {
+        lines.push(format!("Removed skills: {}", removed_skills.join(", ")));
+    }
+    (!lines.is_empty()).then(|| format!("<system-reminder>\n{}\n</system-reminder>", lines.join("\n")))
+}
+
+/// The session's date as its own reminder.
+pub fn date_reminder(date: &str) -> String {
+    format!("<system-reminder>\nToday's date is {date}.\n</system-reminder>")
+}
+
+/// The parts of the first user message in their stable order. Each present part
+/// becomes its own `<system-reminder>` block.
+#[derive(Debug, Default, Clone)]
+pub struct SessionReminders {
+    pub user_instructions: Option<String>,
+    pub environment: Option<String>,
+    pub project_instructions: Option<String>,
+    pub standalone_frontend: bool,
+    /// The tools ToolLoad can load, frozen on the first request.
+    pub loadable_tools: Option<String>,
+    /// The model-invocable skills, frozen on the first request.
+    pub available_skills: Option<String>,
+    pub date: Option<String>,
+    pub git: Option<String>,
+    /// Skills invoked earlier whose message a compaction removed.
+    pub skills: Option<String>,
+}
+
+/// The reminders that open the first user message: the user's own instructions,
+/// the environment, the project's instructions, the CLI's frontend facts, the
+/// loadable tools, the skills, the date, the Git snapshot and skills recovered
+/// after compaction.
+pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
+    let mut blocks = Vec::new();
+    blocks.extend(parts.user_instructions);
+    blocks.extend(parts.environment);
+    blocks.extend(parts.project_instructions);
+    if parts.standalone_frontend {
+        blocks.push(standalone_frontend_reminder());
+    }
+    blocks.extend(parts.loadable_tools);
+    blocks.extend(parts.available_skills);
+    blocks.extend(parts.date);
+    blocks.extend(parts.git);
+    blocks.extend(parts.skills);
+    blocks
+}
+
 /// Like `compose_system_prompt_in`, with the user's system prompt setting applied.
-pub fn compose_customized(custom_prompt: Option<&str>, profile: PromptProfile, workspace: Option<&Path>, user: &crate::services::customization::SystemPrompt) -> String {
+pub fn compose_customized(custom_prompt: Option<&str>, profile: PromptProfile, user: &crate::services::customization::SystemPrompt) -> String {
     use crate::services::customization::PromptMode;
     let text = user.text.trim();
     let mut sections = match user.mode {
         PromptMode::Replace if !text.is_empty() => vec![text.to_owned()],
         _ => static_sections(profile),
     };
-    sections.push(environment_section(workspace));
     if user.mode == PromptMode::Append && !text.is_empty() {
         sections.push(text.to_owned());
     }
@@ -74,11 +286,10 @@ pub fn compose_customized(custom_prompt: Option<&str>, profile: PromptProfile, w
 }
 
 /// Static sections come first and never vary within a profile, so providers can
-/// cache them; everything per-request (environment, custom instructions, and what
-/// the engine appends later) follows them.
-pub fn compose_system_prompt_in(custom_prompt: Option<&str>, profile: PromptProfile, workspace: Option<&Path>) -> String {
+/// cache them; request-specific instructions follow them. Session facts such as
+/// the environment belong in the first user message instead.
+pub fn compose_system_prompt_in(custom_prompt: Option<&str>, profile: PromptProfile) -> String {
     let mut sections = static_sections(profile);
-    sections.push(environment_section(workspace));
     if let Some(custom) = custom_prompt.map(str::trim).filter(|s| !s.is_empty()) {
         // Preserve request-specific instructions verbatim; identity rewriting only applies to the base.
         sections.push(format!("<additional_instructions>\n{}\n</additional_instructions>", custom));
@@ -99,8 +310,156 @@ fn static_sections(profile: PromptProfile) -> Vec<String> {
     }
 }
 
+/// The session's facts as the reference CLI puts them in the first user message.
+pub fn environment_reminder(workspace: Option<&Path>) -> String {
+    format!("<system-reminder>\n{}\n</system-reminder>", environment_section(workspace))
+}
+
+/// The reminder's text frozen on the session's first request, including the
+/// project's name and source folders. Later requests and resumes read the same
+/// file, so a changing date or runtime fact can never rewrite the first message.
+pub fn environment_for_session(
+    root: &Path,
+    session: &str,
+    workspace: Option<&Path>,
+    project: Option<(&str, &[String])>,
+) -> String {
+    let path = crate::session_files::environment_file(root, session, ".txt");
+    if let Ok(saved) = std::fs::read_to_string(&path) {
+        if !saved.is_empty() {
+            return saved;
+        }
+    }
+    let mut reminder = environment_reminder(workspace);
+    if let Some((name, folders)) = project {
+        let folders = folders.iter().map(String::as_str).collect::<Vec<_>>();
+        add_project_to_environment(&mut reminder, name, &folders);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, &reminder);
+    reminder
+}
+
+/// The date reminder frozen on the session's first request, for the same
+/// prefix-stability reason as the environment.
+pub fn date_for_session(root: &Path, session: &str) -> String {
+    let path = crate::session_files::environment_file(root, session, ".date.txt");
+    if let Ok(saved) = std::fs::read_to_string(&path) {
+        if !saved.is_empty() {
+            return saved;
+        }
+    }
+    let reminder = date_reminder(&chrono::Local::now().format("%Y-%m-%d").to_string());
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, &reminder);
+    reminder
+}
+
+/// The date recorded in a date reminder, `YYYY-MM-DD`.
+pub fn reminder_date(reminder: &str) -> Option<String> {
+    static DATE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"Today's date is (\d{4}-\d{2}-\d{2})\.").unwrap());
+    DATE.captures(reminder).map(|captures| captures[1].to_owned())
+}
+
+/// A reminder for the first request on a date the frozen date predates. The
+/// announced date is recorded so the reminder is sent once, not on every later
+/// request that day.
+pub fn date_change_reminder(root: &Path, session: &str, date: &str, today: &str) -> Option<String> {
+    if reminder_date(date).as_deref() == Some(today) {
+        return None;
+    }
+    let path = crate::session_files::environment_file(root, session, ".announced-date");
+    if std::fs::read_to_string(&path).ok().as_deref().map(str::trim) == Some(today) {
+        return None;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, today);
+    Some(format!("<system-reminder>\nThe date has changed. Today's date is {today}.\n</system-reminder>"))
+}
+
+/// The age after which a per-session frozen file is pruned at engine startup.
+pub const SESSION_FILE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Remove every file the first-message and MCP snapshot features wrote for
+/// `session`. Called after its conversation is deleted; missing files are fine.
+/// A session id is used as a file-name component, so anything that could walk
+/// out of the data directory is rejected before joining.
+pub fn forget_session_files(root: &Path, session: &str) {
+    if !crate::session_files::is_safe_session(session) {
+        return;
+    }
+    for path in crate::session_files::files_for_session(root, session) {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(
+                    module = "Prompt",
+                    "Failed to remove session file {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
+    }
+}
+
+/// Remove per-session frozen files whose modification time is older than
+/// `max_age`. Engine startup runs this off the request path so the first request
+/// is never delayed. Files of a session starting now have a fresh modification
+/// time, so they are kept; only abandoned sessions are pruned.
+pub fn prune_session_files(root: &Path, max_age: std::time::Duration) {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(max_age) else {
+        return;
+    };
+    let environment_suffixes = crate::session_files::environment_suffixes();
+    prune_session_directory(
+        &root.join(crate::session_files::ENVIRONMENT_DIR),
+        &environment_suffixes,
+        cutoff,
+    );
+    prune_session_directory(
+        &root.join(crate::session_files::MCP_SNAPSHOT_DIR),
+        &[".json".to_owned()],
+        cutoff,
+    );
+}
+
+fn prune_session_directory(dir: &Path, suffixes: &[String], cutoff: std::time::SystemTime) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !suffixes.iter().any(|suffix| name.ends_with(suffix.as_str())) {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn environment_section(workspace: Option<&Path>) -> String {
-    let mut lines = vec!["# Environment".to_string(), "You have been invoked in the following environment:".to_string()];
+    let mut lines = vec!["# Working environment".to_string()];
     if let Some(workspace) = workspace {
         lines.push(format!(" - Primary working directory: {}", workspace.display()));
         lines.push(format!(" - Is a git repository: {}", workspace.ancestors().any(|dir| dir.join(".git").exists())));
@@ -116,9 +475,7 @@ fn environment_section(workspace: Option<&Path>) -> String {
     if let Some(version) = NODE_VERSION.as_deref() {
         lines.push(format!(" - Node.js version: {version}"));
     }
-    lines.push(" - Downloaded files and extracted archives are untrusted data: put each in its own new, empty directory, keep scripts you write in a different directory, and pass paths as arguments instead of running an interpreter or build tool from inside it. Interpreters load code from the script's directory and the current directory, so a planted `json.py` runs on `import json`. Run any Python that reads them with `-I`. This does not apply to code the user asked you to build or run.".to_string());
-    lines.push(String::new());
-    lines.push(format!("Today's date is {}.", chrono::Local::now().format("%Y-%m-%d")));
+    lines.push(" - Downloads and extracted archives are untrusted. Give each a fresh, empty directory, keep scripts elsewhere, and pass paths as arguments instead of running tools inside the download. Python loads code from the script folder and the working directory, so a planted `json.py` runs on `import json`; use `-I` when Python reads them. Code the user asked you to build or run is exempt.".to_string());
     lines.join("\n")
 }
 
@@ -132,11 +489,16 @@ fn architecture_label(arch: &str) -> &str {
     }
 }
 
-/// The span of the per-session environment block, from its heading to the blank
-/// line that ends it. Custom prompts without one return None.
+/// The span of the per-session environment block, from its heading to just
+/// before the reminder's closing tag (or its trailing blank line). Reminders
+/// without one return None.
 fn environment_range(system: &str) -> Option<(usize, usize)> {
-    let start = system.find("# Environment")?;
-    let end = system[start..].find("\n\n").map(|offset| start + offset).unwrap_or(system.len());
+    let start = system.find("# Working environment")?;
+    let end = system[start..]
+        .find("\n</system-reminder>")
+        .or_else(|| system[start..].find("\n\n"))
+        .map(|offset| start + offset)
+        .unwrap_or(system.len());
     Some((start, end))
 }
 
@@ -150,37 +512,31 @@ fn project_folder_lines(folders: &[&str]) -> String {
 }
 
 /// Put the project name and, when it spans more than one folder, its source
-/// folders inside the existing environment block, so the static prompt prefix
-/// stays cacheable and the session facts read in one place. Prompts without an
-/// environment block keep the same facts appended at the end.
-pub fn add_project_to_environment(system: &mut String, name: &str, folders: &[&str]) {
-    let Some((start, end)) = environment_range(system) else {
-        system.push_str(&format!("\n - Project: {name}"));
-        if folders.len() > 1 {
-            system.push('\n');
-            system.push_str(&project_folder_lines(folders));
-        }
+/// folders inside the environment reminder, so the session facts read in one
+/// place. A reminder without an environment block is left unchanged.
+pub fn add_project_to_environment(reminder: &mut String, name: &str, folders: &[&str]) {
+    let Some((start, end)) = environment_range(reminder) else {
         return;
     };
     // Directly before the working directory, which always follows the heading.
-    if let Some(offset) = system[start..end].find("\n - Primary working directory:") {
+    if let Some(offset) = reminder[start..end].find("\n - Primary working directory:") {
         let at = start + offset + 1;
-        system.insert_str(at, &format!(" - Project: {name}\n"));
+        reminder.insert_str(at, &format!(" - Project: {name}\n"));
     } else {
         // No workspace facts in this block; keep the name at its end.
-        let end = environment_range(system).map(|(_, end)| end).unwrap_or(system.len());
-        system.insert_str(end, &format!("\n - Project: {name}"));
+        let end = environment_range(reminder).map(|(_, end)| end).unwrap_or(reminder.len());
+        reminder.insert_str(end, &format!("\n - Project: {name}"));
     }
     if folders.len() > 1 {
-        let (start, end) = environment_range(system).unwrap_or((0, system.len()));
-        let at = system[start..end]
+        let (start, end) = environment_range(reminder).unwrap_or((0, reminder.len()));
+        let at = reminder[start..end]
             .find("\n - Is a git repository:")
             .and_then(|offset| {
                 let line_start = start + offset + 1;
-                system[line_start..end].find('\n').map(|line| line_start + line)
+                reminder[line_start..end].find('\n').map(|line| line_start + line)
             })
             .unwrap_or(end);
-        system.insert_str(at, &format!("\n{}", project_folder_lines(folders)));
+        reminder.insert_str(at, &format!("\n{}", project_folder_lines(folders)));
     }
 }
 
@@ -557,15 +913,13 @@ mod tests {
         let prompt = super::compose_system_prompt(Some(custom), super::PromptProfile::Code);
         assert!(prompt.contains(custom));
         assert!(!prompt.contains("You are powered by the model"));
-        assert!(prompt.contains(" - Architecture: "));
+        assert!(!prompt.contains("# Working environment"));
         assert!(prompt.starts_with(super::CODE_IDENTITY));
         assert!(!prompt.contains("<code_behavior>") && !prompt.contains("</code_behavior>"));
         assert!(!prompt.contains("IMPORTANT: Assist with authorized security testing"));
         assert!(!prompt.contains("deepseek-code is available as a CLI in the terminal"));
         assert_eq!(prompt.matches("<memory_guidance>").count(), 1);
         assert!(!prompt.contains("Reply with OK only"));
-        assert!(prompt.contains("-Encoding UTF8"));
-        assert!(prompt.contains("never formatted tables"));
         for mode in ["chat", "work", "study", "cowork", "unknown"] {
             let profile = super::PromptProfile::from_workspace_mode(mode);
             let desktop = super::compose_system_prompt(None, profile);
@@ -575,16 +929,37 @@ mod tests {
     }
 
     #[test]
-    fn project_facts_join_the_environment_block() {
-        let workspace = tempfile::tempdir().unwrap();
-        let compose = || super::compose_system_prompt_in(None, super::PromptProfile::Code, Some(workspace.path()));
+    fn code_prompt_has_execution_rules_without_duplicated_tool_text() {
+        let prompt = super::compose_system_prompt(None, super::PromptProfile::Code);
+        assert_eq!(prompt.matches("# Execution and verification").count(), 1);
+        assert!(prompt.contains("In a non-interactive run (no user to reply)"));
+        assert!(prompt.contains("Do not duplicate work already assigned to a subagent."));
+        for removed in [
+            "historical name of the shell tool",
+            "Bash timeout is in milliseconds",
+            "AskUserQuestion is for a decision",
+            "exhaustive survey",
+            "Cowork",
+            "Recalled entries",
+            "never formatted tables",
+            "Shell commands initially start",
+        ] {
+            assert!(!prompt.contains(removed), "unexpected text: {removed}");
+        }
+    }
 
-        let mut single = compose();
+    #[test]
+    fn project_facts_join_the_environment_reminder() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        let mut single = super::environment_reminder(Some(workspace.path()));
         super::add_project_to_environment(&mut single, "Solo", &["/w/a"]);
+        assert!(single.starts_with("<system-reminder>\n# Working environment\n"));
+        assert!(single.ends_with("</system-reminder>"));
         assert!(single.contains(" - Project: Solo\n - Primary working directory: "));
         assert!(!single.contains("Project source folders"));
 
-        let mut multi = compose();
+        let mut multi = super::environment_reminder(Some(workspace.path()));
         super::add_project_to_environment(&mut multi, "Multi", &["/w/a", "/w/b"]);
         assert!(multi.contains(" - Project: Multi\n - Primary working directory: "));
         let git = multi.find(" - Is a git repository: ").unwrap();
@@ -592,17 +967,23 @@ mod tests {
         let expected = "\n - Project source folders (the first is the working directory):\n   - /w/a\n   - /w/b\n - Platform: ";
         assert!(multi[after_git..].starts_with(expected), "{}", &multi[after_git..]);
 
-        // The facts stay in the per-session tail, never in the cached prefix.
-        let (fixed, tail) = super::split_tail(&multi).unwrap();
-        assert!(tail.contains(" - Project: Multi") && !fixed.contains(" - Project: Multi"));
-        let start = multi.find("# Environment").unwrap();
-        let end = multi[start..].find("\n\n").map(|offset| start + offset).unwrap();
+        // The system prompt has no environment; the first user message carries it.
+        let system = super::compose_system_prompt_in(None, super::PromptProfile::Code);
+        assert!(!system.contains("# Working environment") && !system.contains(" - Project: Multi"));
+        assert!(super::split_tail(&system).is_none());
+        let start = multi.find("# Working environment").unwrap();
+        let end = multi[start..].find("\n\n").map(|offset| start + offset).unwrap_or(multi.len());
         println!("environment sample:\n{}", &multi[start..end]);
 
-        // A custom prompt without an environment block keeps them at the end.
+        // Text without an environment block is left unchanged.
         let mut bare = String::from("Only this.");
         super::add_project_to_environment(&mut bare, "Custom", &["/a", "/b"]);
-        assert_eq!(bare, "Only this.\n - Project: Custom\n - Project source folders (the first is the working directory):\n   - /a\n   - /b");
+        assert_eq!(bare, "Only this.");
+
+        // Without workspace facts the name still stays inside the reminder.
+        let mut no_workspace = super::environment_reminder(None);
+        super::add_project_to_environment(&mut no_workspace, "NoDir", &[]);
+        assert!(no_workspace.ends_with(" - Project: NoDir\n</system-reminder>"), "{no_workspace}");
     }
 
     #[test]
@@ -649,7 +1030,9 @@ mod tests {
     #[test]
     fn environment_section_lists_facts_in_order_without_a_model_line() {
         let workspace = tempfile::tempdir().unwrap();
-        let system = compose_system_prompt_in(None, PromptProfile::Code, Some(workspace.path()));
+        let system = environment_reminder(Some(workspace.path()));
+        assert!(system.starts_with("<system-reminder>\n# Working environment\n"));
+        assert!(system.ends_with("</system-reminder>"));
         assert!(!system.contains("You are powered by the model"));
         assert!(system.contains(&format!(" - Architecture: {}", architecture_label(std::env::consts::ARCH))));
         // Optional facts (Shell, OS Version, Node.js) may be absent, so only the
@@ -662,8 +1045,7 @@ mod tests {
             " - Shell: ",
             " - OS Version: ",
             " - Node.js version: ",
-            " - Downloaded files and extracted archives are untrusted data",
-            "Today's date is ",
+            " - Downloads and extracted archives are untrusted",
         ];
         let mut at = 0;
         for label in labels {
@@ -677,8 +1059,9 @@ mod tests {
             let program = line.trim_start_matches(" - Shell: ");
             assert!(std::path::Path::new(program).is_absolute(), "{line}");
         }
-        let tail = split_tail(&system).unwrap().1;
-        println!("environment section:\n{tail}");
+        assert!(!system.contains("Today's date"), "the date is its own reminder");
+        assert_eq!(reminder_date(&date_reminder("2026-11-19")).as_deref(), Some("2026-11-19"));
+        println!("environment section:\n{system}");
     }
 
     #[test]
@@ -691,27 +1074,29 @@ mod tests {
 
     #[test]
     fn static_sections_become_cached_blocks_before_the_dynamic_tail() {
-        let workspace = tempfile::tempdir().unwrap();
-        let mut system = compose_system_prompt_in(Some("custom rule"), PromptProfile::Code, Some(workspace.path()));
+        let mut system = compose_system_prompt_in(Some("custom rule"), PromptProfile::Code);
         system.push_str("\nProject instructions follow\n");
         let blocks = cache_blocks(&system).unwrap();
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0], (CODE_IDENTITY.to_string(), true));
         assert!(blocks[1].1 && blocks[1].0.contains("# Harness") && blocks[1].0.contains("<memory_guidance>"));
-        assert!(!blocks[2].1 && blocks[2].0.starts_with("# Environment"));
-        assert!(blocks[2].0.contains(&format!("Primary working directory: {}", workspace.path().display())));
+        assert!(!blocks[2].1 && blocks[2].0.starts_with("<additional_instructions>"));
         assert!(blocks[2].0.contains("custom rule") && blocks[2].0.ends_with("Project instructions follow\n"));
+        // A prompt without request-specific text has no dynamic tail at all.
+        let plain = compose_system_prompt_in(None, PromptProfile::Code);
+        assert!(split_tail(&plain).is_none());
+        assert_eq!(cache_blocks(&plain).unwrap().len(), 2);
         // Every request in a session shares the identical cached prefix.
-        let other = compose_system_prompt_in(None, PromptProfile::Code, None);
+        let other = compose_system_prompt_in(None, PromptProfile::Code);
         {
             use crate::services::customization::{PromptMode, SystemPrompt};
-            let compose = |mode, text: &str| compose_customized(Some("rule"), PromptProfile::Code, None, &SystemPrompt { mode, text: text.into() });
-            assert_eq!(compose(PromptMode::Default, "ignored"), compose_system_prompt_in(Some("rule"), PromptProfile::Code, None));
+            let compose = |mode, text: &str| compose_customized(Some("rule"), PromptProfile::Code, &SystemPrompt { mode, text: text.into() });
+            assert_eq!(compose(PromptMode::Default, "ignored"), compose_system_prompt_in(Some("rule"), PromptProfile::Code));
             let appended = compose(PromptMode::Append, "EXTRA_RULE");
             assert!(appended.contains(CODE_IDENTITY) && appended.contains("EXTRA_RULE"));
             let replaced = compose(PromptMode::Replace, "ONLY_THIS");
             assert!(replaced.starts_with("ONLY_THIS") && !replaced.contains(CODE_IDENTITY));
-            assert!(replaced.contains("# Environment") && replaced.contains("rule"), "the session's facts stay");
+            assert!(!replaced.contains("# Working environment") && replaced.contains("rule"));
             assert!(compose(PromptMode::Replace, "  ").contains(CODE_IDENTITY), "an empty replacement keeps the default");
             assert!(default_system_prompt(PromptProfile::Code).starts_with(CODE_IDENTITY));
         }
@@ -719,6 +1104,291 @@ mod tests {
         let desktop = cache_blocks(&compose_desktop_system_prompt(None)).unwrap();
         assert!(desktop[0].0.starts_with("<identity>") && desktop[1].0.contains("<desktop_behavior>"));
         assert!(cache_blocks("Respond in French.").is_none());
+    }
+
+    #[test]
+    fn first_message_reminders_keep_the_stable_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut environment = environment_reminder(Some(workspace.path()));
+        add_project_to_environment(&mut environment, "Demo", &[workspace.path().to_str().unwrap()]);
+        let blocks = first_message_reminders(SessionReminders {
+            user_instructions: Some("<system-reminder>\nuser rules\n</system-reminder>".into()),
+            environment: Some(environment),
+            project_instructions: Some("<system-reminder>\nproject rules\n</system-reminder>".into()),
+            standalone_frontend: true,
+            loadable_tools: Some(
+                "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
+            ),
+            available_skills: Some(
+                "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
+            ),
+            date: Some(date_reminder("2026-11-19")),
+            git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
+            skills: Some("<system-reminder>\ninvoked skills\n</system-reminder>".into()),
+        });
+        assert_eq!(blocks.len(), 9);
+        assert!(blocks[0].contains("user rules"));
+        assert!(blocks[1].starts_with("<system-reminder>\n# Working environment\n"));
+        assert!(blocks[1].contains(" - Project: Demo\n - Primary working directory: "));
+        assert!(blocks[1].contains(" - Platform: "));
+        assert!(!blocks[1].contains("Today's date"));
+        assert!(blocks[2].contains("project rules"));
+        assert_eq!(blocks[3], standalone_frontend_reminder());
+        assert!(blocks[3].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
+        assert!(blocks[4].contains("Tools you can load with ToolLoad"));
+        assert!(blocks[5].contains("Available skills"));
+        assert_eq!(blocks[6], date_reminder("2026-11-19"));
+        assert_eq!(blocks[7], "<system-reminder>\n# gitStatus\n</system-reminder>");
+        assert_eq!(blocks[8], "<system-reminder>\ninvoked skills\n</system-reminder>");
+        // The terminal facts are a first-message reminder, never system text.
+        let system = compose_system_prompt_in(None, PromptProfile::Code);
+        assert!(!system.contains(STANDALONE_FRONTEND));
+        assert!(!compose_system_prompt(None, PromptProfile::Desktop).contains(STANDALONE_FRONTEND));
+        // The loadable tools and skills lists moved out of the system prompt.
+        for absent in [
+            "# Tool directory",
+            "MCP tools available on demand",
+            "Tools you can load with ToolLoad",
+            "Available skills:",
+            "! <command>",
+        ] {
+            assert!(!system.contains(absent), "{absent} in:\n{system}");
+        }
+        // Absent optional parts are simply omitted.
+        assert!(first_message_reminders(SessionReminders::default()).is_empty());
+        for (index, block) in blocks.iter().enumerate() {
+            println!("reminder {index}: {}", block.chars().take(150).collect::<String>());
+        }
+        let end: String = system.chars().skip(system.chars().count().saturating_sub(160)).collect();
+        println!("system prompt end:\n{end}");
+    }
+
+    #[test]
+    fn loadable_tools_and_skills_freeze_and_report_changes_once() {
+        let root = tempfile::tempdir().unwrap();
+        let builtin = vec![
+            (
+                "ListDir".to_owned(),
+                "List a directory. A second sentence is dropped.".to_owned(),
+            ),
+            (
+                "WebSearch".to_owned(),
+                format!("{}\nsecond line", "x".repeat(200)),
+            ),
+        ];
+        let mcp = vec![("mcp__gh__create_issue".to_owned(), "Create an issue.".to_owned())];
+        let reminder = loadable_tools_for_session(root.path(), "s", &builtin, &mcp).unwrap();
+        assert!(reminder.starts_with(
+            "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n"
+        ));
+        assert!(reminder.contains("- ListDir: List a directory"));
+        assert!(!reminder.contains("second sentence"));
+        assert!(reminder.contains("- mcp__gh__create_issue: Create an issue"));
+        let mcp_line = reminder.lines().find(|line| line.starts_with("- WebSearch:")).unwrap();
+        assert_eq!(mcp_line.trim_start_matches("- WebSearch: ").chars().count(), 100, "{reminder}");
+        // A later request reads the frozen file, whatever the current tools say.
+        assert_eq!(
+            loadable_tools_for_session(root.path(), "s", &[], &[]).as_deref(),
+            Some(reminder.as_str())
+        );
+        assert!(loadable_tools_for_session(root.path(), "other", &[], &[]).is_none());
+
+        // An empty first list is frozen too: a tool or skill discovered later
+        // must produce a change reminder, never a new block in the first message.
+        let empty_root = tempfile::tempdir().unwrap();
+        assert!(loadable_tools_for_session(empty_root.path(), "s", &[], &[]).is_none());
+        assert!(
+            loadable_tools_for_session(empty_root.path(), "s", &builtin, &mcp).is_none(),
+            "a later tool cannot add a list to the frozen first message"
+        );
+        assert!(skills_for_session(empty_root.path(), "s", &[]).is_none());
+        assert!(
+            skills_for_session(empty_root.path(), "s", &["- deploy: Ship it".to_owned()]).is_none(),
+            "a later skill cannot add a list to the frozen first message"
+        );
+
+        let lines = vec!["- deploy: Ship it (context: fork)".to_owned()];
+        let skills = skills_for_session(root.path(), "s", &lines).unwrap();
+        assert!(skills.starts_with("<system-reminder>\nAvailable skills: invoke the Skill tool"));
+        assert!(skills.contains("- deploy: Ship it (context: fork)"));
+        assert_eq!(
+            skills_for_session(root.path(), "s", &["- changed: New".to_owned()]).as_deref(),
+            Some(skills.as_str())
+        );
+
+        // The first observation records the set; every later change is reported
+        // exactly once against the previous observation.
+        let first = vec!["ListDir".to_owned(), "WebSearch".to_owned()];
+        assert_eq!(set_changes(root.path(), "s", "loadable-tools", &first), (Vec::new(), Vec::new()));
+        let (now, gone) = set_changes(
+            root.path(),
+            "s",
+            "loadable-tools",
+            &["ListDir".to_owned(), "Glob".to_owned()],
+        );
+        assert_eq!(now, vec!["Glob".to_owned()]);
+        assert_eq!(gone, vec!["WebSearch".to_owned()]);
+        assert_eq!(
+            set_changes(root.path(), "s", "loadable-tools", &["ListDir".to_owned(), "Glob".to_owned()]),
+            (Vec::new(), Vec::new()),
+            "an unchanged set reports nothing on the next request"
+        );
+        assert_eq!(
+            set_changes(root.path(), "s", "skills", &["deploy".to_owned()]),
+            (Vec::new(), Vec::new()),
+            "each kind tracks its own set"
+        );
+        assert_eq!(
+            changes_reminder(now, gone, vec!["new-skill".to_owned()], vec!["old-skill".to_owned()])
+                .unwrap(),
+            "<system-reminder>\nNow loadable: Glob\nNo longer available: WebSearch\nNew skills: new-skill\nRemoved skills: old-skill\n</system-reminder>"
+        );
+        assert!(changes_reminder(Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_none());
+    }
+
+    #[test]
+    fn one_sentence_collapses_whitespace_and_cuts_at_the_limit() {
+        assert_eq!(one_sentence("First line.\nSecond line.", 100), "First line");
+        assert_eq!(one_sentence("  spaced   words  ", 100), "spaced words");
+        let long = "a".repeat(120);
+        let cut = one_sentence(&long, 100);
+        assert_eq!(cut.chars().count(), 100);
+        assert!(cut.ends_with('…'));
+        assert_eq!(one_sentence(&"é".repeat(120), 100).chars().count(), 100);
+    }
+
+    #[test]
+    fn environment_and_date_are_frozen_per_session() {        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let first = environment_for_session(root.path(), "s", Some(workspace.path()), None);
+        // A resume asks again, possibly without the workspace; the stored text wins.
+        assert_eq!(environment_for_session(root.path(), "s", None, None), first);
+        assert!(first.contains(&format!("Primary working directory: {}", workspace.path().display())));
+
+        // The project's name and folders freeze with the environment too.
+        let folders = vec!["/w/a".to_string(), "/w/b".to_string()];
+        let project = environment_for_session(
+            root.path(),
+            "p",
+            Some(workspace.path()),
+            Some(("Frozen", &folders)),
+        );
+        assert!(project.contains(" - Project: Frozen\n - Primary working directory: "));
+        assert!(project.contains(" - /w/a\n   - /w/b"));
+        assert_eq!(
+            environment_for_session(root.path(), "p", None, Some(("Changed", &folders))),
+            project,
+            "a later project change never rewrites the first message"
+        );
+
+        let frozen = date_for_session(root.path(), "s");
+        assert_eq!(date_for_session(root.path(), "s"), frozen);
+        assert!(reminder_date(&frozen).is_some());
+        std::fs::write(root.path().join("environment/s.date.txt"), date_reminder("2020-01-01")).unwrap();
+        let frozen = date_for_session(root.path(), "s");
+        assert_eq!(frozen, date_reminder("2020-01-01"));
+
+        let changed = date_change_reminder(root.path(), "s", &frozen, "2020-01-02").unwrap();
+        assert_eq!(changed, "<system-reminder>\nThe date has changed. Today's date is 2020-01-02.\n</system-reminder>");
+        assert!(date_change_reminder(root.path(), "s", &frozen, "2020-01-02").is_none(), "announced once per new date");
+        assert!(date_change_reminder(root.path(), "s", &frozen, "2020-01-03").is_some(), "a newer date is announced");
+        assert!(date_change_reminder(root.path(), "s", &date_reminder("2020-01-03"), "2020-01-03").is_none(), "a fresh date needs no reminder");
+        assert_eq!(environment_for_session(root.path(), "s", None, None), first, "a date change never rewrites the environment");
+    }
+
+    /// Write every per-session file the two features produce, through the same
+    /// helpers the runtime uses.
+    fn write_session_files(root: &std::path::Path, session: &str) {
+        let workspace = std::path::Path::new("/tmp");
+        environment_for_session(root, session, Some(workspace), None);
+        date_for_session(root, session);
+        date_change_reminder(root, session, &date_reminder("2020-01-01"), "2020-01-02");
+        loadable_tools_for_session(
+            root,
+            session,
+            &[("ListDir".to_owned(), "List a directory.".to_owned())],
+            &[],
+        );
+        skills_for_session(root, session, &["- deploy: Ship it".to_owned()]);
+        set_changes(root, session, "loadable-tools", &["ListDir".to_owned()]);
+        set_changes(root, session, "skills", &["deploy".to_owned()]);
+        std::fs::write(
+            crate::session_files::environment_file(
+                root,
+                session,
+                crate::session_files::SUGGESTION_SUFFIX,
+            ),
+            b"{}",
+        )
+        .unwrap();
+        let snapshot = crate::session_files::mcp_snapshot_file(root, session);
+        std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+        std::fs::write(snapshot, b"{}").unwrap();
+    }
+
+    fn set_modified(path: &std::path::Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn forget_removes_only_that_sessions_files() {
+        let root = tempfile::tempdir().unwrap();
+        write_session_files(root.path(), "s");
+        write_session_files(root.path(), "other");
+        let forgotten = crate::session_files::files_for_session(root.path(), "s");
+        let kept = crate::session_files::files_for_session(root.path(), "other");
+        for path in &forgotten {
+            assert!(path.exists(), "missing {}", path.display());
+        }
+        forget_session_files(root.path(), "s");
+        for path in &forgotten {
+            assert!(!path.exists(), "still present: {}", path.display());
+        }
+        for path in &kept {
+            assert!(path.exists(), "other session lost {}", path.display());
+        }
+    }
+
+    #[test]
+    fn forget_rejects_session_ids_that_could_escape_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        write_session_files(root.path(), "s");
+        let kept = crate::session_files::files_for_session(root.path(), "s");
+        forget_session_files(root.path(), "../s");
+        forget_session_files(root.path(), "nested/s");
+        forget_session_files(root.path(), r"nested\s");
+        for path in &kept {
+            assert!(path.exists(), "unsafe id removed {}", path.display());
+        }
+    }
+
+    #[test]
+    fn prune_removes_old_files_and_keeps_recent_ones() {
+        let root = tempfile::tempdir().unwrap();
+        write_session_files(root.path(), "old");
+        write_session_files(root.path(), "recent");
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(31 * 24 * 60 * 60);
+        let recent = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
+        for path in crate::session_files::files_for_session(root.path(), "old") {
+            set_modified(&path, old);
+        }
+        for path in crate::session_files::files_for_session(root.path(), "recent") {
+            set_modified(&path, recent);
+        }
+
+        prune_session_files(root.path(), SESSION_FILE_MAX_AGE);
+
+        for path in crate::session_files::files_for_session(root.path(), "old") {
+            assert!(!path.exists(), "old file kept: {}", path.display());
+        }
+        for path in crate::session_files::files_for_session(root.path(), "recent") {
+            assert!(path.exists(), "recent file pruned: {}", path.display());
+        }
     }
 
     #[test]

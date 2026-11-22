@@ -3,6 +3,9 @@
 //! a local model mock; the other cases need no model request.
 #![cfg(unix)]
 
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
     super_agent::{self, crp::ToolRuntime, ApprovalStatus, ApprovalType, Role, TaskSpec},
@@ -69,7 +72,7 @@ impl Fixture {
         std::fs::write(
             job.join("spec.json"),
             json!({
-                "id":id,"session":r.session_id,"workspace":self.workspace,
+                "id":id,"session":r.session_id,"history":r.db.open_session(&r.session_id).unwrap().address(),"workspace":self.workspace,
                 "assistant_id":null,"parent_tool_use_id":format!("inv-{phase}"),
                 "provider_id":"fixture","model":"fixture","source":source,"args":null,
                 "data_dir":r.data_dir,"settings_path":r.data_dir.join("config.json"),
@@ -365,7 +368,7 @@ async fn ordinary_plan_mode_matches_direct_bash_and_rejects_edit_tools() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(requests.load(Ordering::SeqCst), 2);
-    let direct: Vec<(String, String, bool)> = f.runtime.db.with_conn(|conn| {
+    let direct: Vec<(String, String, bool)> = f.runtime.db.shard_sql(&f.runtime.session_id, |conn| {
         let mut stmt = conn.prepare(
             "SELECT t.input, t.output, t.is_error FROM tool_calls t JOIN messages m ON m.id=t.message_id \
              WHERE m.conversation_id=?1 AND t.name='Bash' ORDER BY t.sort_order",
@@ -455,10 +458,10 @@ async fn corrupt_super_authority_fails_private_worker_before_any_call() {
     let f = Fixture::new();
     f.runtime
         .db
-        .with_conn(|conn| {
+        .shard_sql(&f.runtime.session_id, |conn| {
             conn.execute(
                 "INSERT INTO peripheral_settings(key,value) VALUES(?1,'invalid-role')",
-                [format!("super-agent.role.{}", f.runtime.session_id)],
+                ["super-agent.role"],
             )
         })
         .unwrap()

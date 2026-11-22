@@ -1,3 +1,6 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 use deepseek_code_core::{
     native_engine::provider_manager::ApiFormat,
     runtime::{RuntimePaths, SessionStore},
@@ -93,8 +96,8 @@ fn failed_persistence_rolls_back_summary_and_message_count() {
     let before = store.history(&id).unwrap();
     let count = store.resume(&id).unwrap().message_count;
     let prepared = prepare(&store.db, &id).unwrap();
-    store.db.with_conn(|conn| conn.execute_batch(
-        "CREATE TRIGGER fail_compaction_timestamp BEFORE UPDATE OF updated_at ON conversations BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;"
+    store.db.shard_sql(&id, |conn| conn.execute_batch(
+        "CREATE TRIGGER fail_compaction_count BEFORE UPDATE ON compaction_state BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;"
     )).unwrap().unwrap();
     assert!(commit(&store.db, prepared, "Valid summary").is_err());
     assert_eq!(store.history(&id).unwrap(), before);

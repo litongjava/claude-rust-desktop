@@ -1,4 +1,5 @@
 //! Lifecycle dispatch shared by standalone hosts and the native engine.
+use crate::db::session_store::{SessionAccess,settings as saved};
 use super::{
     tool_hooks::{HookEvent, HookOutcome, HookRunner},
     ServiceContext,
@@ -6,40 +7,50 @@ use super::{
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::{
-    io::Write,
     path::{Path, PathBuf},
 };
 
 /// Resolve the advertised transcript location without accessing storage.
 pub(crate) fn transcript_path(root: &Path, session: &str) -> PathBuf {
-    let name = session
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    use sha2::{Digest,Sha256};
+    let name = if session.len() > 100 {
+        format!("hash-{:x}",Sha256::digest(session.as_bytes()))
+    } else {
+        session.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    };
     root.join("hook-transcripts").join(format!("{name}.jsonl"))
 }
 
 /// A real, readable JSONL snapshot of the durable conversation (no request headers).
 pub(crate) fn transcript(root: &Path, session: &str) -> Result<PathBuf> {
-    let path = transcript_path(root, session);
+    snapshot(root, session, None)
+}
+
+pub(crate) fn snapshot_path(root: &Path, session: &str, history: Option<&crate::db::session_store::ExecutorHistory>) -> PathBuf {
+    if let Some(crate::db::session_store::ExecutorHistory::Session(s)) = history {
+        root.join("hook-transcripts").join(format!("{}.jsonl",s.incarnation()))
+    } else {
+        transcript_path(root, session)
+    }
+}
+
+pub(crate) fn snapshot(root:&Path, session:&str, bound:Option<&crate::db::session_store::ExecutorHistory>) -> Result<PathBuf> {
+    use crate::db::session_store::Stores;
+    let selected;
+    let history = if let Some(bound) = bound {
+        anyhow::ensure!(bound.id()==session,"Hook session does not match its bound history");
+        Some(bound)
+    } else if root.join("global.db").try_exists()? {
+        let stores = Stores::open(root)?;
+        selected = stores.listed_history(session)?;
+        selected.as_ref()
+    } else { None };
+    let path = snapshot_path(root, session, history);
     let directory = root.join("hook-transcripts");
     std::fs::create_dir_all(&directory)?;
     let mut snapshot = tempfile::NamedTempFile::new_in(&directory)?;
-    let database = root.join(crate::runtime::DATABASE_FILE);
-    if database.exists() {
-        let conn = rusqlite::Connection::open_with_flags(
-            database,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        for row in crate::db::message_repo::get_messages_by_conversation(&conn, session)? {
-            writeln!(
-                snapshot,
-                "{}",
-                json!({"type":row.role,"uuid":row.id,"sessionId":session,"timestamp":row.created_at,"message":{"role":row.role,"content":row.content}})
-            )?;
-        }
+    if let Some(history) = history {
+        history.write_hook_transcript(&mut snapshot)?;
     }
     snapshot.persist(&path).map_err(|e| e.error)?;
     Ok(path)
@@ -82,18 +93,20 @@ pub async fn setup(
         text.push('\n');
         text.push_str(&additional);
     }
-    context.save_setting(&super::session_hooks::key(session), &text)?;
+    context.db.select_session(session)?.set_preference(saved::SESSION_START_CONTEXT,Some(&text))?;
     Ok(result.warnings)
 }
 
-/// Check before consuming changed settings. Keep the accepted hook definitions so a
-/// changed file cannot remove its own ConfigChange guard. A denied change fails closed
-/// until corrected; the original settings file is never rewritten.
-pub async fn check_configuration(
+/// The configuration baseline to seal with a new session before it becomes visible.
+pub struct NewSessionConfiguration {
+    pub(crate) workspace: PathBuf,
+    pub(crate) files: Vec<Option<String>>,
+}
+
+fn configuration_files(
     context: &ServiceContext,
     workspace: &Path,
-    session: &str,
-) -> Result<()> {
+) -> Result<([(&'static str, PathBuf); 3], Vec<Option<String>>)> {
     let sources = [
         (
             "user_settings",
@@ -105,7 +118,6 @@ pub async fn check_configuration(
             workspace.join(".claude/settings.local.json"),
         ),
     ];
-    let key = format!("lifecycle-config:{session}:{}", workspace.display());
     let mut current = Vec::new();
     for (_, path) in &sources {
         let text = match std::fs::read_to_string(path) {
@@ -115,15 +127,44 @@ pub async fn check_configuration(
         };
         current.push(text);
     }
-    let rejected_key = format!("{key}:rejected");
+    Ok((sources, current))
+}
+
+pub fn prepare_new_configuration(
+    context: &ServiceContext,
+    workspace: &Path,
+) -> Result<NewSessionConfiguration> {
+    let (sources, files) = configuration_files(context, workspace)?;
+    let mut configs = super::plugins::command_hooks(context)?;
+    for ((_, path), content) in sources.into_iter().zip(&files) {
+        if let Some(content) = content {
+            let value = serde_json::from_str(content.trim_start_matches('\u{feff}'))
+                .with_context(|| format!("Invalid hook settings: {}", path.display()))?;
+            configs.push((path, value));
+        }
+    }
+    HookRunner::from_configs(&context.paths.data_dir, workspace, configs)?;
+    Ok(NewSessionConfiguration { workspace: workspace.to_owned(), files })
+}
+
+/// Check before consuming changed settings. Keep the accepted hook definitions so a
+/// changed file cannot remove its own ConfigChange guard. A denied change fails closed
+/// until corrected; the original settings file is never rewritten.
+pub async fn check_configuration(
+    context: &ServiceContext,
+    workspace: &Path,
+    session: &str,
+) -> Result<()> {
+    let (sources, current) = configuration_files(context, workspace)?;
+    let repo = context.db.select_session(session)?;
     if let Some((rejected, reason)) =
-        context.setting::<(Vec<Option<String>>, String)>(&rejected_key)?
+        repo.preference(saved::rejected_configuration(workspace))?
     {
         if rejected == current {
             anyhow::bail!("{reason}");
         }
     }
-    if let Some(previous) = context.setting::<Vec<Option<String>>>(&key)? {
+    if let Some(previous) = repo.preference(saved::accepted_configuration(workspace))? {
         if previous != current {
             let mut configs = super::plugins::command_hooks(context)?;
             for ((_, path), text) in sources.iter().zip(&previous) {
@@ -149,25 +190,19 @@ pub async fn check_configuration(
                     .await?;
                 if outcome.blocked {
                     let reason = format!("ConfigChange blocked {}: {}. Restore or correct the settings before continuing.", path.display(), outcome.reason);
-                    context.save_setting(&rejected_key, &(current, &reason))?;
+                    repo.set_preference(saved::rejected_configuration(workspace),Some(&(current, reason.clone())))?;
                     anyhow::bail!("{reason}");
                 }
             }
         } else {
-            context.save_setting(
-                &rejected_key,
-                &(Vec::<Option<String>>::new(), String::new()),
-            )?;
+            repo.set_preference(saved::rejected_configuration(workspace),None)?;
             return Ok(());
         }
     }
     // Validate before accepting, including event/type restrictions.
     HookRunner::load_with_plugins(context, workspace)?;
-    context.save_setting(
-        &rejected_key,
-        &(Vec::<Option<String>>::new(), String::new()),
-    )?;
-    context.save_setting(&key, &current)
+    repo.set_preference(saved::rejected_configuration(workspace),None)?;
+    repo.set_preference(saved::accepted_configuration(workspace), Some(&current))
 }
 
 pub async fn instructions(
@@ -176,16 +211,10 @@ pub async fn instructions(
     session: &str,
     files: &[(PathBuf, String)],
 ) -> Result<()> {
-    let key = format!("lifecycle-instructions:{session}");
-    let mut seen = context
-        .setting::<Vec<(PathBuf, String)>>(&key)?
-        .unwrap_or_default();
-    let boundary_key = format!("{key}:boundary");
-    let boundary = context.db.with_conn(|conn| {
-        use rusqlite::OptionalExtension;
-        conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC, rowid DESC LIMIT 1", [session], |row| row.get::<_, String>(0)).optional()
-    })??;
-    let previous_boundary = context.setting::<Option<String>>(&boundary_key)?.flatten();
+    let repo=context.db.select_session(session)?;
+    let mut seen=repo.preference(saved::SEEN_INSTRUCTIONS)?.unwrap_or_default();
+    let boundary=repo.latest_compact_message()?;
+    let previous_boundary=repo.preference(saved::INSTRUCTIONS_BOUNDARY)?;
     let compact = boundary.is_some() && boundary != previous_boundary;
     if compact {
         seen.clear();
@@ -219,10 +248,10 @@ pub async fn instructions(
         }
         seen.retain(|(loaded, _)| loaded != path);
         seen.push((path.clone(), fingerprint.clone()));
-        context.save_setting(&key, &seen)?;
+        repo.set_preference(saved::SEEN_INSTRUCTIONS,Some(&seen))?;
     }
-    context.save_setting(&key, &seen)?;
-    context.save_setting(&boundary_key, &boundary)?;
+    repo.set_preference(saved::SEEN_INSTRUCTIONS,Some(&seen))?;
+    repo.set_preference(saved::INSTRUCTIONS_BOUNDARY,boundary.as_ref())?;
     Ok(())
 }
 
@@ -274,7 +303,7 @@ mod tests {
         }
         context
             .db
-            .with_conn(|conn| {
+            .fixture_history_write(&session, |conn| {
                 crate::db::message_repo::insert_message(
                     conn,
                     "boundary",
@@ -287,7 +316,6 @@ mod tests {
                     1,
                 )
             })
-            .unwrap()
             .unwrap();
         for _ in 0..2 {
             instructions(
@@ -317,6 +345,7 @@ mod tests {
     async fn settings_change_is_audited_once_and_cannot_remove_its_guard() {
         let dir = tempfile::tempdir().unwrap();
         let context = super::super::session_messages::context(dir.path()).unwrap();
+        context.db.create("session",Default::default()).unwrap();
         let script = dir.path().join("guard.cjs");
         std::fs::write(&script, r#"const fs=require('fs');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>{fs.appendFileSync('config-events.jsonl',JSON.stringify(JSON.parse(s))+'\n');console.log(JSON.stringify({decision:'block',reason:'fixture rejection'}))});"#).unwrap();
         let settings = dir.path().join("settings.json");
@@ -350,6 +379,7 @@ mod tests {
         check_configuration(&context, dir.path(), "session")
             .await
             .unwrap();
+        context.db.create("other-session", Default::default()).unwrap();
         check_configuration(&context, dir.path(), "other-session")
             .await
             .unwrap();

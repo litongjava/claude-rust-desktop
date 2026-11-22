@@ -7,7 +7,7 @@ use crate::analytics::AnalyticsStore;
 use crate::clipboard::ClipboardManager;
 use crate::config::ConfigManager;
 use crate::cost_tracker::CostTracker;
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::engine::EnginePool;
 use crate::git::GitIntegration;
 use crate::logger::Logger;
@@ -40,7 +40,7 @@ pub struct AppState {
     pub research_mode: Arc<Mutex<HashMap<String, bool>>>,
     pub config_manager: Arc<Mutex<Option<ConfigManager>>>,
     pub skills_manager: Arc<Mutex<SkillsManager>>,
-    pub db_manager: Arc<DbManager>,
+    pub db_manager: Arc<Stores>,
     pub task_executor: Arc<Mutex<Option<crate::task::TaskExecutor>>>,
     pub process_manager: Arc<Mutex<ProcessManager>>,
     pub terminal_manager: Arc<Mutex<PtyManager>>,

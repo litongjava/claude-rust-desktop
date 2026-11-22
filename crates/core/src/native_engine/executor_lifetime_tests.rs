@@ -97,6 +97,7 @@ impl Fixture {
             provider_id: Some("fixture".into()),
             effort: None,
             system_prompt: Some("You are a fixture.".into()),
+            standalone_frontend: false,
             max_tokens: Some(64),
             max_turns: Some(1),
             response_schema: None,
@@ -109,32 +110,17 @@ impl Fixture {
 
     fn acquire_lease(&self) -> Arc<crate::services::session_messages::ExecutionLease> {
         Arc::new(
-            crate::services::session_messages::ExecutionLease::acquire(
-                &self.paths.data_dir,
-                &self.id,
-            )
-            .expect("lease acquisition")
-            .expect("session is a UUID"),
+            self.store.db.open_session(&self.id).unwrap().acquire_execution().unwrap(),
         )
     }
 
     fn active(&self) -> bool {
-        crate::services::session_messages::execution_active(&self.paths.data_dir, &self.id)
+        self.store.db.open_session(&self.id).and_then(|s| crate::services::session_messages::execution_active(&self.paths.data_dir, s.incarnation()))
             .expect("execution probe")
     }
 
     fn stored_messages(&self) -> i64 {
-        self.store
-            .db
-            .with_conn(|conn| {
-                Ok::<i64, anyhow::Error>(conn.query_row(
-                    "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-                    [&self.id],
-                    |row| row.get(0),
-                )?)
-            })
-            .unwrap()
-            .unwrap()
+        self.store.history(&self.id).unwrap().len() as i64
     }
 }
 
@@ -213,10 +199,7 @@ async fn the_outer_executor_tail_keeps_ownership_after_message_stop() {
         "the session was released before executor cleanup ended"
     );
     assert!(
-        crate::services::session_messages::ExecutionLease::acquire(
-            &fixture.paths.data_dir,
-            &fixture.id
-        )
+        fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
         .is_err(),
         "an independent lease was admitted while the executor tail was gated"
     );
@@ -255,10 +238,7 @@ async fn the_outer_executor_tail_keeps_ownership_after_message_stop() {
         "a waiter deadline must not release the session"
     );
     assert!(
-        crate::services::session_messages::ExecutionLease::acquire(
-            &fixture.paths.data_dir,
-            &fixture.id
-        )
+        fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
         .is_err(),
         "a waiter deadline must preserve exclusivity"
     );
@@ -275,12 +255,8 @@ async fn the_outer_executor_tail_keeps_ownership_after_message_stop() {
         !fixture.active(),
         "completed cleanup must release the session immediately"
     );
-    crate::services::session_messages::ExecutionLease::acquire(
-        &fixture.paths.data_dir,
-        &fixture.id,
-    )
-    .expect("the session is free after the executor ends")
-    .expect("a real session id");
+    fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
+    .expect("the session is free after the executor ends");
     assert_eq!(fixture.engine.executor_attempt_count(), 0);
 }
 
@@ -308,12 +284,8 @@ async fn cancelling_a_gated_executor_releases_its_lease_and_bookkeeping() {
         !fixture.active(),
         "an aborted executor must drop its execution lease"
     );
-    crate::services::session_messages::ExecutionLease::acquire(
-        &fixture.paths.data_dir,
-        &fixture.id,
-    )
-    .expect("the session is free after cancellation")
-    .expect("a real session id");
+    fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
+    .expect("the session is free after cancellation");
     assert_eq!(fixture.engine.executor_attempt_count(), 0);
     assert_eq!(fixture.streams.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.stored_messages(), 0);
@@ -345,12 +317,8 @@ async fn completion_bookkeeping_returns_to_baseline_without_a_waiter() {
         "a completed attempt must remove its own bookkeeping"
     );
     assert!(!fixture.active());
-    crate::services::session_messages::ExecutionLease::acquire(
-        &fixture.paths.data_dir,
-        &fixture.id,
-    )
-    .expect("the session is free after the executor ends")
-    .expect("a real session id");
+    fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
+    .expect("the session is free after the executor ends");
 }
 
 /// An executor error before the first model request still releases the lease
@@ -383,12 +351,8 @@ async fn an_early_executor_error_still_releases_ownership() {
         "an early error must not request the model"
     );
     assert!(!fixture.active());
-    crate::services::session_messages::ExecutionLease::acquire(
-        &fixture.paths.data_dir,
-        &fixture.id,
-    )
-    .expect("the session is free after the early error")
-    .expect("a real session id");
+    fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
+    .expect("the session is free after the early error");
     assert_eq!(fixture.engine.executor_attempt_count(), 0);
 }
 
@@ -480,10 +444,7 @@ async fn a_cancelled_turn_keeps_ownership_until_started_persistence_ends() {
         "a started persistence job must keep the session owned after cancellation"
     );
     assert!(
-        crate::services::session_messages::ExecutionLease::acquire(
-            &fixture.paths.data_dir,
-            &fixture.id
-        )
+        fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
         .is_err(),
         "an independent lease was admitted while persistence was in flight"
     );
@@ -533,12 +494,8 @@ async fn a_cancelled_turn_keeps_ownership_until_started_persistence_ends() {
         !fixture.active(),
         "completion must imply the session is free"
     );
-    crate::services::session_messages::ExecutionLease::acquire(
-        &fixture.paths.data_dir,
-        &fixture.id,
-    )
-    .expect("the session is free after the persistence job ends")
-    .expect("a real session id");
+    fixture.store.db.open_session(&fixture.id).unwrap().acquire_execution()
+    .expect("the session is free after the persistence job ends");
     assert_eq!(fixture.engine.executor_attempt_count(), 0);
     assert_eq!(
         fixture.stored_messages(),

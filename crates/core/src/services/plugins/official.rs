@@ -396,7 +396,7 @@ mod tests {
         std::fs::write(source.join("commands/review.md"), "Review $ARGUMENTS").unwrap();
         std::fs::write(source.join("scripts/server.js"), "// fixture").unwrap();
         std::fs::write(source.join("asset.bin"), [0xff, 0, 0x80]).unwrap();
-        let context = ServiceContext::open(
+        let context = ServiceContext::from_stores(
             crate::runtime::RuntimePaths::new(dir.path().join("data")).unwrap(),
             std::sync::Arc::new(crate::services::EnvironmentCredentials),
         )
@@ -455,7 +455,7 @@ mod tests {
             "---\ndescription: Check files\n---\nCheck the project",
         )
         .unwrap();
-        let context = ServiceContext::open(
+        let context = ServiceContext::from_stores(
             crate::runtime::RuntimePaths::new(dir.path().join("data")).unwrap(),
             std::sync::Arc::new(crate::services::EnvironmentCredentials),
         )

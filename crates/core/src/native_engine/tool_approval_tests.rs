@@ -37,7 +37,6 @@ async fn local_fetch_asks_each_time_and_only_approved_calls_reach_server() {
         (crate::permissions::PermissionMode::PlanMode, false),
         (crate::permissions::PermissionMode::PlanMode, true),
         (crate::permissions::PermissionMode::Auto, false),
-        (crate::permissions::PermissionMode::BypassPermissions, true),
     ]
     .into_iter()
     .enumerate()
@@ -61,13 +60,6 @@ async fn local_fetch_asks_each_time_and_only_approved_calls_reach_server() {
         })
         .await
         .unwrap();
-        if mode == crate::permissions::PermissionMode::BypassPermissions {
-            tokio::time::sleep(Duration::from_millis(350)).await;
-            assert!(
-                !task.is_finished(),
-                "Bypass must not auto-answer a local address request"
-            );
-        }
         let response = if allow {
             PermissionResponse::Allow {
                 updated_input: None,
@@ -95,7 +87,59 @@ async fn local_fetch_asks_each_time_and_only_approved_calls_reach_server() {
         .execute_tool_call("WebFetch", &json!({"url":url,"prompt":"Read"}), "no-host")
         .await;
     assert!(failed && output.contains("no approval host"), "{output}");
-    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn bypass_mode_fetches_a_local_address_without_a_prompt() {
+    use axum::{routing::get, Router};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let captured = hits.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/page", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/page",
+                get(move || {
+                    captured.fetch_add(1, Ordering::SeqCst);
+                    async { "BYPASS_LOCAL_FETCH_OK" }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let root = tempfile::tempdir().unwrap();
+    let (mut executor, mut events, manager) = hook_executor(root.path(), "PreToolUse", vec![]);
+    executor = executor.with_search_config_path(root.path().join("config.json"));
+    std::fs::write(
+        root.path().join("customization.json"),
+        json!({"tool_loading":{"WebFetch":{"enabled":true,"on_demand":false}}}).to_string(),
+    )
+    .unwrap();
+    // No approval host exists, so a prompt could not be answered.
+    executor.permission_host_available = false;
+    executor.raw_web_fetch = true;
+    manager.set_mode(crate::permissions::PermissionMode::BypassPermissions);
+    let (_, output, failed) = executor
+        .execute_tool_call(
+            "WebFetch",
+            &json!({"url":url,"prompt":"Read local page"}),
+            "bypass-local",
+        )
+        .await;
+    assert!(!failed, "{output}");
+    assert!(output.contains("BYPASS_LOCAL_FETCH_OK"), "{output}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, EngineEvent::ToolPermission { .. }),
+            "Bypass local fetch must not request permission"
+        );
+    }
     server.abort();
 }
 
@@ -923,8 +967,7 @@ pub(crate) fn super_agent_runtime_fixture(
     let data = temp.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     std::fs::create_dir_all(session_dir).unwrap();
-    let db = crate::db::DbManager::new(data.join(crate::runtime::DATABASE_FILE)).unwrap();
-    db.init().unwrap();
+    let db = crate::db::session_store::Stores::open(&data).unwrap();
     let db = Arc::new(db);
     let session = crate::runtime::SessionStore::new(db.clone())
         .create(session_dir, "fixture", "fixture")
@@ -1002,6 +1045,7 @@ async fn router_tool_visibility_and_execution_guard_are_enforced_at_runtime() {
     // Members get their own tools only, and only their report kinds.
     let coder_dir = temp.path().join("coder");
     let (_coder_data, coder_runtime, coder) = super_agent_runtime_fixture(&coder_dir);
+    coder_runtime.db.create(&router,Default::default()).unwrap();
     crate::super_agent::role::set(&coder_runtime.db, &router, crate::super_agent::Role::Router)
         .unwrap();
     let store = coder_runtime.store();

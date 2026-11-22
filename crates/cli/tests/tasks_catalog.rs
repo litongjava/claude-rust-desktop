@@ -45,7 +45,11 @@ fn tool_results(body: &Value) -> Vec<Value> {
         .flatten()
         .filter(|message| message["role"] == "tool")
         .filter_map(|message| message["content"].as_str())
-        .filter_map(|content| serde_json::from_str(content).ok())
+        .map(|content| {
+            // ToolLoad now reaches the model as one text line; keep it in the
+            // ordered results so the fixture can still count and place it.
+            serde_json::from_str(content).unwrap_or_else(|_| Value::String(content.to_owned()))
+        })
         .collect()
 }
 
@@ -263,18 +267,11 @@ fn scripted_response(body: &Value) -> Vec<Value> {
         // Both loads finished: every task tool is now in the request.
         2 => {
             assert_task_schemas(body);
-            for (index, expected) in [
-                (0, vec!["TaskCreate", "TaskUpdate"]),
-                (1, vec!["TaskGet", "TaskList"]),
+            for (index, loaded) in [
+                (0, "Loaded TaskCreate, TaskUpdate. Available from the next request."),
+                (1, "Loaded TaskGet, TaskList. Available from the next request."),
             ] {
-                assert_eq!(results[index]["success"], true, "{}", results[index]);
-                let loaded: Vec<&str> = results[index]["loaded_tools"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|name| name.as_str().unwrap())
-                    .collect();
-                assert_eq!(loaded, expected, "{}", results[index]);
+                assert_eq!(results[index], json!(loaded), "{}", results[index]);
             }
             calls_frame(&[
                 (

@@ -11,7 +11,8 @@ use deepseek_code_core::super_agent::config::SuperAgentConfig;
 use deepseek_code_core::super_agent::orchestrator::Orchestrator;
 
 pub async fn tick(session: &Session) -> Result<()> {
-    let role = deepseek_code_core::super_agent::role::load(&session.store.db, &session.id)?;
+    let router = session.selected_session()?;
+    let role = deepseek_code_core::super_agent::role::load(&router, router.id())?;
     if !role.is_router() {
         return Ok(());
     }
@@ -19,7 +20,7 @@ pub async fn tick(session: &Session) -> Result<()> {
     let config = SuperAgentConfig::load(&context)?;
     let provider = session
         .engine
-        .resolved_provider(&session.provider_id, &session.model)
+        .resolved_provider(&session.binding_state().provider_id, &session.binding_state().model)
         .await?;
     let orchestrator = Orchestrator::new(
         context,
@@ -28,7 +29,7 @@ pub async fn tick(session: &Session) -> Result<()> {
         session.permission_mode().to_owned(),
         None,
     );
-    let report = orchestrator.tick_watched(&session.id).await?;
+    let report = orchestrator.tick_watched_session(&router).await?;
     if report.is_empty() {
         return Ok(());
     }

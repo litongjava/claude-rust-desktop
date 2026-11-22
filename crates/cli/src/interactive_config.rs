@@ -1,5 +1,7 @@
 //! Interactive provider management. Credentials are stored inline, or read
 //! from the environment when the user names a variable.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::terminal::input::TerminalInput;
 use crate::{args::Cli, config, session::Session};
 use anyhow::{bail, ensure, Context, Result};
@@ -471,19 +473,30 @@ pub async fn wizard(
 }
 
 pub fn select(paths: &RuntimePaths, provider: &str, model: &str) -> Result<config::Selection> {
-    // Deliberately discard startup endpoint/auth overrides on an explicit switch.
+    select_saved(paths, provider, model, None)
+}
+
+pub(crate) fn select_saved(
+    paths: &RuntimePaths,
+    provider: &str,
+    model: &str,
+    startup: Option<(&config::StartupProvider, &deepseek_code_core::native_engine::provider_manager::Provider)>,
+) -> Result<config::Selection> {
     let mut cli = Cli::parse_from(["dcl"]);
     cli.provider = Some(provider.into());
     cli.model = Some(model.into());
     cli.base_url = None;
+    if let Some((startup, bound)) = startup.filter(|(startup, _)| startup.id == provider) {
+        startup.apply(&mut cli, bound);
+    }
     config::select(&cli, paths, None, None)
 }
 
 pub fn status(session: &Session) {
     command_eprintln!(
         "Provider: {}\nModel: {}\nRouting: {}",
-        session.provider_id,
-        session.model,
+        session.binding_state().provider_id,
+        session.binding_state().model,
         if session.auto_route {
             "automatic"
         } else {
@@ -715,7 +728,7 @@ async fn refresh_provider(
 ) -> Result<()> {
     // A malformed configuration is never overwritten; the save reloads it too.
     let config = paths.read_config()?;
-    let target = id.unwrap_or(&session.provider_id).to_owned();
+    let target = id.unwrap_or(&session.binding_state().provider_id).to_owned();
     let provider = config
         .providers
         .iter()
@@ -785,8 +798,8 @@ async fn refresh_provider(
         .filter(|model| model.enabled)
         .map(|model| model.id.as_str())
         .collect();
-    let previous_model = session.model.clone();
-    let current_invalid = target == session.provider_id && !enabled.contains(previous_model.as_str());
+    let previous_model = session.binding_state().model.clone();
+    let current_invalid = target == session.binding_state().provider_id && !enabled.contains(previous_model.as_str());
     let saved_default = config::default_model(paths);
     // Valid means the endpoint still offers the model and it is enabled
     // locally; comparing against the removed set alone would miss a default
@@ -1275,8 +1288,9 @@ pub async fn handle(
             "Testing a real text request (no tools or conversation history); Ctrl+C cancels."
         );
         let started = std::time::Instant::now();
+        let state = session.binding_state();
         let response = tokio::select! {
-            result = session.engine.generate_text(&session.provider_id, &session.model, "This is a connection test. Reply only OK.", "Reply OK.") => result?,
+            result = session.engine.generate_text(&state.provider_id, &state.model, "This is a connection test. Reply only OK.", "Reply OK.") => result?,
             _ = crate::signals::interrupted() => bail!("Test cancelled"),
         };
         command_eprintln!(
@@ -1314,7 +1328,7 @@ pub async fn handle(
                 ensure!(words.next().is_none(), "Unexpected argument");
                 if let Some(selection) = configure_preset(paths, input, preset).await? {
                     session.switch(paths, selection).await?;
-                    config::save_default_model(paths, &session.provider_id, &session.model)?;
+                    config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
                     status(session);
                 }
                 return Ok(true);
@@ -1338,7 +1352,7 @@ pub async fn handle(
                 .map(|model| model.id.clone())
                 .context("The saved provider has no enabled models")?;
             session.switch(paths, select(paths, &id, &model)?).await?;
-            config::save_default_model(paths, &session.provider_id, &session.model)?;
+            config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
             status(session);
         }
         return Ok(true);
@@ -1382,14 +1396,14 @@ pub async fn handle(
         let model = provider
             .models
             .iter()
-            .find(|m| m.enabled && m.id == session.model)
+            .find(|m| m.enabled && m.id == session.binding_state().model)
             .or_else(|| provider.models.iter().find(|m| m.enabled))
             .context("Provider has no enabled models")?;
         (provider.id.clone(), model.id.clone())
     } else {
         let provider = providers
             .iter()
-            .find(|p| p.id == session.provider_id)
+            .find(|p| p.id == session.binding_state().provider_id)
             .with_context(|| {
                 let saved = providers.iter().map(|p| p.id.as_str()).collect::<Vec<_>>();
                 let next = match saved.first() {
@@ -1398,7 +1412,7 @@ pub async fn handle(
                 };
                 format!(
                     "The current provider ({}) comes from command-line options or environment variables and is not saved, so it has no model list. {next}",
-                    session.provider_id
+                    session.binding_state().provider_id
                 )
             })?;
         let models: Vec<_> = provider.models.iter().filter(|m| m.enabled).collect();
@@ -1408,12 +1422,12 @@ pub async fn handle(
             let efforts = crate::session_commands::EFFORTS;
             let current_effort = crate::session_commands::session_effort(session)?;
             let mut effort = efforts.iter().position(|level| Some(*level) == current_effort.as_deref()).unwrap_or(0);
-            let mut selected = models.iter().position(|m| m.id == session.model).unwrap_or(0);
+            let mut selected = models.iter().position(|m| m.id == session.binding_state().model).unwrap_or(0);
             loop {
                 let entries: Vec<Entry> = models
                     .iter()
                     .map(|m| Entry {
-                        title: if m.id == session.model { format!("{} \u{2714}", m.id) } else { m.id.clone() },
+                        title: if m.id == session.binding_state().model { format!("{} \u{2714}", m.id) } else { m.id.clone() },
                         detail: if m.name.is_empty() || m.name == m.id { String::new() } else { m.name.clone() },
                     })
                     .collect();
@@ -1432,14 +1446,17 @@ pub async fn handle(
                     }
                     Picked::Entry(index) => {
                         let chosen = (efforts[effort] != "default").then(|| efforts[effort].to_owned());
-                        if chosen != current_effort {
-                            crate::session_commands::set_session_effort(session, chosen.clone())?;
-                            command_eprintln!("Session effort: {}", chosen.as_deref().unwrap_or("default"));
+                        let effort_change = (chosen != current_effort).then_some(chosen.as_deref());
+                        let change_model = models[index].id != session.binding_state().model;
+                        if change_model || effort_change.is_some() {
+                            let selection = change_model.then(|| select(paths, &provider.id, &models[index].id)).transpose()?;
+                            session.switch_with_effort(paths, selection, effort_change).await?;
                         }
-                        if models[index].id != session.model {
-                            let selection = select(paths, &provider.id, &models[index].id)?;
-                            session.switch(paths, selection).await?;
-                            config::save_default_model(paths, &session.provider_id, &session.model)?;
+                        if let Some(level) = effort_change {
+                            command_eprintln!("Session effort: {}", level.unwrap_or("default"));
+                        }
+                        if change_model {
+                            config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
                             status(session);
                             command_eprintln!("Conversation history preserved. Use /test to verify connectivity.");
                         }
@@ -1478,7 +1495,7 @@ pub async fn handle(
     };
     let selection = select(paths, &provider, &model)?;
     session.switch(paths, selection).await?;
-    config::save_default_model(paths, &session.provider_id, &session.model)?;
+    config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
     status(session);
     command_eprintln!("Conversation history preserved. Use /test to verify connectivity.");
     Ok(true)
@@ -1910,12 +1927,12 @@ mod tests {
         handle("/provider two", &paths, &mut session, &mut input)
             .await
             .unwrap();
-        assert_eq!(session.provider_id, "two");
+        assert_eq!(session.binding_state().provider_id, "two");
         assert!(handle("/model missing", &paths, &mut session, &mut input)
             .await
             .is_err());
-        assert_eq!(session.provider_id, "two");
-        assert_eq!(session.model, "model-a");
+        assert_eq!(session.binding_state().provider_id, "two");
+        assert_eq!(session.binding_state().model, "model-a");
         handle("/test", &paths, &mut session, &mut input)
             .await
             .unwrap();
@@ -2037,8 +2054,8 @@ mod tests {
         assert_eq!(provider.models[0].name, "Local keep");
         assert_eq!(provider.models[0].context_window, Some(1234));
         assert!(provider.models[1].enabled, "a new model starts enabled");
-        assert_eq!(session.provider_id, "one");
-        assert_eq!(session.model, "keep", "the current model still exists");
+        assert_eq!(session.binding_state().provider_id, "one");
+        assert_eq!(session.binding_state().model, "keep", "the current model still exists");
         session.close().await.unwrap();
         server.abort();
     }
@@ -2059,8 +2076,8 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("cancelled"), "{error:#}");
         assert_eq!(std::fs::read(paths.data_dir.join("config.json")).unwrap(), before);
-        assert_eq!(session.provider_id, "one");
-        assert_eq!(session.model, "gone");
+        assert_eq!(session.binding_state().provider_id, "one");
+        assert_eq!(session.binding_state().model, "gone");
         session.close().await.unwrap();
         server.abort();
     }
@@ -2091,8 +2108,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(session.provider_id, "one");
-        assert_eq!(session.model, "new", "the replacement is selected");
+        assert_eq!(session.binding_state().provider_id, "one");
+        assert_eq!(session.binding_state().model, "new", "the replacement is selected");
         assert_eq!(
             before,
             serde_json::to_value(session.store.history(&session.id).unwrap()).unwrap(),
@@ -2160,8 +2177,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(two_after, two_before, "the other provider is unchanged");
-        assert_eq!(session.provider_id, "one");
-        assert_eq!(session.model, "keep", "the session is unchanged");
+        assert_eq!(session.binding_state().provider_id, "one");
+        assert_eq!(session.binding_state().model, "keep", "the session is unchanged");
         assert_eq!(
             config::default_model(&paths),
             Some(("two".into(), "other".into())),
@@ -2240,8 +2257,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(two_after, two_before, "the other provider is unchanged");
-        assert_eq!(session.provider_id, "one");
-        assert_eq!(session.model, "keep", "the session is unchanged");
+        assert_eq!(session.binding_state().provider_id, "one");
+        assert_eq!(session.binding_state().model, "keep", "the session is unchanged");
         session.close().await.unwrap();
         server.abort();
     }
@@ -2303,8 +2320,8 @@ mod tests {
             ["other"],
             "the other provider's list is untouched"
         );
-        assert_eq!(session.provider_id, "one");
-        assert_eq!(session.model, "keep");
+        assert_eq!(session.binding_state().provider_id, "one");
+        assert_eq!(session.binding_state().model, "keep");
         session.close().await.unwrap();
         server.abort();
     }
@@ -2331,7 +2348,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(session.model, "new");
+        assert_eq!(session.binding_state().model, "new");
         assert_eq!(
             config::default_model(&paths),
             Some(("one".into(), "new".into())),
@@ -2371,7 +2388,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(session.model, "keep");
+        assert_eq!(session.binding_state().model, "keep");
         assert_eq!(
             config::default_model(&paths),
             Some(("two".into(), "other".into())),
@@ -2406,7 +2423,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(session.model, "keep", "the current model is unchanged");
+        assert_eq!(session.binding_state().model, "keep", "the current model is unchanged");
         assert_eq!(
             config::default_model(&paths),
             Some(("one".into(), "new".into())),
@@ -2439,7 +2456,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(session.model, "keep");
+        assert_eq!(session.binding_state().model, "keep");
         assert_eq!(
             config::default_model(&paths),
             Some(("one".into(), "defaulted".into())),
@@ -2488,7 +2505,7 @@ mod tests {
         session
             .store
             .db
-            .with_conn(|conn| {
+            .directory_sql(|conn| {
                 conn.execute_batch(
                     "CREATE TRIGGER refresh_switch_failure BEFORE UPDATE ON conversations \
                      BEGIN SELECT RAISE(ABORT, 'injected'); END;",
@@ -2511,11 +2528,11 @@ mod tests {
             ["keep", "gone"],
             "the saved list is restored"
         );
-        assert_eq!(session.model, "gone", "the session is unchanged");
+        assert_eq!(session.binding_state().model, "gone", "the session is unchanged");
         session
             .store
             .db
-            .with_conn(|conn| conn.execute_batch("DROP TRIGGER refresh_switch_failure"))
+            .directory_sql(|conn| conn.execute_batch("DROP TRIGGER refresh_switch_failure"))
             .unwrap()
             .unwrap();
         session.close().await.unwrap();
@@ -2569,7 +2586,7 @@ mod tests {
             ["keep", "gone"],
             "the saved list is restored"
         );
-        assert_eq!(session.model, "gone", "the session is restored");
+        assert_eq!(session.binding_state().model, "gone", "the session is restored");
         assert_eq!(
             std::fs::read(&cli_path).unwrap(),
             before,
@@ -2621,8 +2638,8 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(session.provider_id, "one", "another provider stays unselected");
-        assert_eq!(session.model, "current");
+        assert_eq!(session.binding_state().provider_id, "one", "another provider stays unselected");
+        assert_eq!(session.binding_state().model, "current");
         let saved = paths.read_config().unwrap();
         let provider = saved.providers.iter().find(|p| p.id == "two").unwrap();
         assert_eq!(
@@ -2749,7 +2766,7 @@ async fn settings_menu(
             argument
         } else {
             let display = crate::display_commands::load(session)?;
-            command_eprintln!("Settings | {}\nProvider: {} | Model: {}\nPermissions: {} | Theme: {} | Color: {} | Focus: {} | Renderer: {}\nprovider | model | permissions | theme | color | focus | output-style | statusline | tui | effort | autocompact\nChoose a setting, or enter done to return.", paths.data_dir.display(), session.provider_id, session.model, session.permission_mode(), display.theme, display.color, display.focus, display.tui);
+            command_eprintln!("Settings | {}\nProvider: {} | Model: {}\nPermissions: {} | Theme: {} | Color: {} | Focus: {} | Renderer: {}\nprovider | model | permissions | theme | color | focus | output-style | statusline | tui | effort | autocompact\nChoose a setting, or enter done to return.", paths.data_dir.display(), session.binding_state().provider_id, session.binding_state().model, session.permission_mode(), display.theme, display.color, display.focus, display.tui);
             ask(input, "Setting").await?
         };
         if matches!(choice.as_str(), "" | "done" | "exit") {

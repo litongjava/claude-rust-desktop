@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ChevronDown, FileText, Check, Globe, Loader2 } from 'lucide-react';
-import ClaudeLogo from '../ClaudeLogo';
+import DeepSeekCodeLogo from '../DeepSeekCodeLogo';
 import MarkdownRenderer from '../MarkdownRenderer';
 import RequestErrorCard from './RequestErrorCard';
 import ToolDiffView, { shouldUseDiffView, hasExpandableContent, getToolStats } from '../ToolDiffView';
@@ -355,7 +355,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
             }}
             onReject={async () => {
               try {
-                await invoke('reject_diff', { diffId: diff.id });
+                await invoke('reject_diff', { diffId: diff.id, conversationId: diff.conversation_id ?? msg.conversation_id });
                 const updated = msg.codeDiffs.map((d: any) =>
                   d.id === diff.id ? { ...d, status: 'rejected' } : d
                 );
@@ -457,14 +457,14 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
     if (msg.content || msg.thinking || msg.searchStatus || normalizeDocumentDrafts(msg).length > 0 || (msg.toolCalls && msg.toolCalls.length > 0)) {
       return (
         <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
-          <ClaudeLogo autoAnimate style={{ width: '40px', height: '40px', display: 'inline-block' }} />
+          <DeepSeekCodeLogo autoAnimate style={{ width: '40px', height: '40px', display: 'inline-block' }} />
         </span>
       );
     }
 
     return (
       <span className="inline-block ml-1 align-middle" style={{ verticalAlign: 'middle' }}>
-        <ClaudeLogo breathe style={{ width: '40px', height: '40px', display: 'inline-block' }} />
+        <DeepSeekCodeLogo breathe style={{ width: '40px', height: '40px', display: 'inline-block' }} />
       </span>
     );
   };
@@ -475,7 +475,7 @@ const AssistantMessage: React.FC<AssistantMessageProps> = ({
 
     return (
       <div className="flex items-start gap-4 mt-6 ml-1 mb-2">
-        <ClaudeLogo breathe={compactStatus.state === 'compacting'} style={{ width: '36px', height: '36px', flexShrink: 0, marginTop: '2px' }} />
+        <DeepSeekCodeLogo breathe={compactStatus.state === 'compacting'} style={{ width: '36px', height: '36px', flexShrink: 0, marginTop: '2px' }} />
         {compactStatus.state === 'compacting' && <CompactingStatus />}
       </div>
     );

@@ -4,9 +4,7 @@ use serde_json::Value;
 
 /// Numeric metrics have dedicated nullable SQL columns for later aggregation.
 pub fn save_request(conn: &Connection, message_id: &str, request: &Value) -> Result<()> {
-    let integer = |key: &str| request[key].as_i64();
-    let text = |key: &str| request[key].as_str();
-    conn.execute(
+    apply_request(conn, message_id, request,
         "INSERT INTO model_requests (
             id, message_id, conversation_id, request_number, provider_id, model, response_model, api_format, status,
             started_at_ms, first_token_at_ms, ended_at_ms, total_duration_ms, ttft_ms, generation_ms,
@@ -28,6 +26,36 @@ pub fn save_request(conn: &Connection, message_id: &str, request: &Value) -> Res
             cache_write_tokens = excluded.cache_write_tokens, finish_reason = excluded.finish_reason,
             response_id = excluded.response_id, timing_source = excluded.timing_source, error = excluded.error,
             response_blocks_json = excluded.response_blocks_json, usage_json = excluded.usage_json",
+    )
+}
+
+/// Anonymous entries have no conflict key. Remove one normalized copy of the
+/// previous trajectory entry, preserving standalone metrics for the message.
+pub(super) fn remove_anonymous_snapshot(
+    conn: &Connection,
+    message_id: &str,
+    request: &Value,
+) -> Result<()> {
+    apply_request(conn, message_id, request,
+        "DELETE FROM model_requests WHERE rowid=(
+            SELECT rowid FROM model_requests WHERE id IS NULL AND message_id=:message AND
+            (id, request_number, provider_id, model, response_model, api_format, status,
+             started_at_ms, first_token_at_ms, ended_at_ms, total_duration_ms, ttft_ms, generation_ms,
+             throughput_tokens_per_second, input_tokens, output_tokens, reasoning_tokens, content_tokens,
+             total_tokens, cache_read_tokens, cache_write_tokens, max_output_tokens, effort, finish_reason,
+             response_id, timing_source, error, response_blocks_json, usage_json)
+            IS (:id,:number,:provider,:model,:response_model,:format,:status,
+                :start,:first,:end,:duration,:ttft,:generation,:throughput,:input,:output,:reasoning,
+                :content,:total,:cache_read,:cache_write,:max_output,:effort,:finish,:response_id,
+                :timing_source,:error,:blocks,:usage) ORDER BY rowid LIMIT 1)",
+    )
+}
+
+fn apply_request(conn: &Connection, message_id: &str, request: &Value, sql: &str) -> Result<()> {
+    let integer = |key: &str| request[key].as_i64();
+    let text = |key: &str| request[key].as_str();
+    conn.execute(
+        sql,
         named_params! {
             ":id": text("id"), ":message": message_id, ":number": integer("number"),
             ":provider": text("providerId"), ":model": text("model"), ":response_model": text("responseModel"),

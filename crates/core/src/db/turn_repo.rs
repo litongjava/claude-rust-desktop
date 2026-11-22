@@ -1,6 +1,6 @@
 //! Durable, host-owned timing of a complete execution turn (not a model request).
 use super::DbManager;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -96,7 +96,7 @@ pub fn copy_message_turn(
     link_message(conn, &id, target_message)
 }
 
-fn status_name(status: TurnStatus) -> &'static str {
+pub(super) fn status_name(status: TurnStatus) -> &'static str {
     match status {
         TurnStatus::Running => "running",
         TurnStatus::Completed => "completed",
@@ -111,9 +111,7 @@ impl TurnRecord {
     /// cancellation always records `ended_at` and `elapsed_ms`, so a missing
     /// endpoint is the durable marker.
     pub fn interrupted(&self) -> bool {
-        self.status == TurnStatus::Cancelled
-            && self.ended_at.is_none()
-            && self.elapsed_ms.is_none()
+        self.status == TurnStatus::Cancelled && self.ended_at.is_none() && self.elapsed_ms.is_none()
     }
 }
 
@@ -167,26 +165,35 @@ pub fn turn_messages(conn: &Connection, turn_id: &str) -> rusqlite::Result<Vec<S
 /// time as work time. The caller must first establish that no process holds the
 /// execution lease.
 pub fn settle_interrupted(conn: &Connection, conversation_id: &str) -> Result<Vec<TurnRecord>> {
-    let running: Vec<TurnRecord> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT id,started_at,ended_at,elapsed_ms,status FROM execution_turns WHERE conversation_id=?1 AND status='running'",
-        )?;
-        let rows = stmt.query_map([conversation_id], read_record)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for record in &running {
-        conn.execute(
-            "UPDATE execution_turns SET ended_at=NULL, elapsed_ms=NULL, status='cancelled' WHERE id=?1 AND status='running'",
-            [&record.turn_id],
-        )?;
-    }
-    let mut settled = running;
-    for record in &mut settled {
-        record.status = TurnStatus::Cancelled;
-        record.ended_at = None;
-        record.elapsed_ms = None;
+    let mut settled = Vec::new();
+    while running_turn(conn, conversation_id)?.is_some() {
+        // Recheck the candidate after acquiring the writer. Commit each
+        // settlement so a later damaged row cannot undo earlier progress.
+        let turn = super::write_tx(
+            conn,
+            "settle interrupted turn",
+            super::STARTUP_WRITE_DEADLINE,
+            |tx| settle_next(tx, conversation_id),
+        )
+        .context("Settling interrupted turn")?;
+        let Some(turn) = turn else { break };
+        settled.push(turn);
     }
     Ok(settled)
+}
+
+pub(crate) fn settle_next(conn: &Connection, conversation_id: &str) -> Result<Option<TurnRecord>> {
+    let Some(mut record) = running_turn(conn, conversation_id)? else {
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE execution_turns SET ended_at=NULL,elapsed_ms=NULL,status='cancelled' WHERE id=?1 AND status='running'",
+        [&record.turn_id],
+    )?;
+    record.ended_at = None;
+    record.elapsed_ms = None;
+    record.status = TurnStatus::Cancelled;
+    Ok(Some(record))
 }
 
 pub fn terminal_status(stop_reason: Option<&str>, failed: bool) -> TurnStatus {
@@ -198,9 +205,13 @@ pub fn terminal_status(stop_reason: Option<&str>, failed: bool) -> TurnStatus {
     }
 }
 
+enum TurnStore {
+    Shared(Arc<DbManager>, String),
+    Session(super::session_store::SessionDb),
+}
+
 pub struct TurnTimer {
-    db: Arc<DbManager>,
-    conversation_id: String,
+    store: TurnStore,
     started: Instant,
     record: TurnRecord,
     message_id: Option<String>,
@@ -209,6 +220,21 @@ pub struct TurnTimer {
 
 impl TurnTimer {
     pub fn start(db: Arc<DbManager>, conversation_id: &str) -> Result<Self> {
+        Self::begin(TurnStore::Shared(db, conversation_id.into()))
+    }
+
+    pub fn in_session(session: super::session_store::SessionDb) -> Result<Self> {
+        Self::begin(TurnStore::Session(session))
+    }
+
+    pub(crate) fn from_dispatch(shard:super::session_store::SessionDb, id:&str)->Result<Self>{
+        let record = shard.read(|r| r.dispatched_turn(id))?;
+        let elapsed=(chrono::Utc::now()-chrono::DateTime::parse_from_rfc3339(&record.started_at)?.to_utc()).to_std().unwrap_or_default();
+        let now=Instant::now();
+        Ok(Self {store:TurnStore::Session(shard), started:now.checked_sub(elapsed).unwrap_or(now),record,message_id:None,finished:false})
+    }
+
+    fn begin(store: TurnStore) -> Result<Self> {
         let started = Instant::now();
         let record = TurnRecord {
             turn_id: uuid::Uuid::new_v4().to_string(),
@@ -217,18 +243,32 @@ impl TurnTimer {
             elapsed_ms: None,
             status: TurnStatus::Running,
         };
-        db.with_conn(|conn| conn.execute(
+        match &store {
+            TurnStore::Session(shard) => {
+                shard.write(|w| w.start_turn_at(&record.turn_id, &record.started_at))?
+            }
+            TurnStore::Shared(db, conversation_id) => {
+                db.with_conn(|conn| conn.execute(
             "INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES(?1,?2,?3,'running')",
             params![record.turn_id, conversation_id, record.started_at],
         ))??;
+            }
+        }
         Ok(Self {
-            db,
-            conversation_id: conversation_id.into(),
+            store,
             started,
             record,
             message_id: None,
             finished: false,
         })
+    }
+
+    pub fn history(&self) -> super::session_store::ExecutorHistory {
+        use super::session_store::ExecutorHistory;
+        match &self.store {
+            TurnStore::Shared(db, id) => ExecutorHistory::Shared(db.clone(), id.clone()),
+            TurnStore::Session(shard) => ExecutorHistory::Session(shard.clone()),
+        }
     }
 
     pub fn record(&self) -> &TurnRecord {
@@ -255,17 +295,31 @@ impl TurnTimer {
         self.message_id = None;
     }
 
+    pub fn resume_reset_segment(&mut self, reserved: Option<String>) -> Result<String> {
+        let Some(message) = reserved else { return self.new_segment() };
+        anyhow::ensure!(self.history().segment_belongs_to_turn(&message, &self.record.turn_id)?,
+            "Planning segment belongs to another turn");
+        self.message_id = Some(message.clone());
+        Ok(message)
+    }
+
     pub fn new_segment(&mut self) -> Result<String> {
-        let id = uuid::Uuid::new_v4().to_string();
-        self.db.with_conn(|conn| -> Result<()> {
+        let id = match &self.store {
+            TurnStore::Session(shard) => shard.write(|w| w.segment(&self.record.turn_id))?,
+            TurnStore::Shared(db, conversation_id) => {
+                let id = uuid::Uuid::new_v4().to_string();
+                db.with_conn(|conn| -> Result<()> {
             super::write_tx(conn, "start turn segment", Duration::from_secs(30), |tx| {
                 tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES(?1,?2,'assistant','',?3,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?2))",
-                    params![id,self.conversation_id,chrono::Utc::now().to_rfc3339()])?;
+                    params![id,conversation_id,chrono::Utc::now().to_rfc3339()])?;
                 link_message(tx, &self.record.turn_id, &id)?;
-                tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1", [&self.conversation_id])?;
+                tx.execute("UPDATE conversations SET message_count=(SELECT COUNT(*) FROM messages WHERE conversation_id=?1) WHERE id=?1", [conversation_id])?;
                 Ok(())
             })
         })??;
+                id
+            }
+        };
         self.message_id = Some(id.clone());
         Ok(id)
     }
@@ -294,7 +348,11 @@ impl TurnTimer {
         self.ensure_segment()?;
         // Finalize in the database first; memory fields change only after the
         // write commits, so a retry never re-applies half of the state.
-        self.db.with_conn(|conn| {
+        match &self.store {
+            TurnStore::Session(shard) => shard
+                .write(|w| w.finish_turn_at(&self.record.turn_id, status, elapsed_ms, &ended_at))?,
+            TurnStore::Shared(db, conversation_id) => {
+                db.with_conn(|conn| {
             super::write_tx(conn, "finish turn", Duration::from_secs(30), |tx| {
                 let changed = tx.execute(
                     "UPDATE execution_turns SET ended_at=?2,elapsed_ms=?3,status=?4 WHERE id=?1 AND status='running'",
@@ -306,17 +364,30 @@ impl TurnTimer {
                         .map(|end| now.max(end.to_utc()))
                         .unwrap_or(now);
                     super::conversation_repo::update_conversation_timestamp(
-                        tx, &self.conversation_id, &latest.to_rfc3339(),
+                        tx, conversation_id, &latest.to_rfc3339(),
                     )?;
                 }
                 Ok(())
             })
         })??;
+            }
+        }
         self.record.ended_at = Some(ended_at);
         self.record.elapsed_ms = Some(elapsed_ms);
         self.record.status = status;
         self.finished = true;
         Ok(self.record.clone())
+    }
+}
+
+impl DbManager {
+    pub fn start_turn_timer(self: &Arc<Self>, id: &str) -> Result<TurnTimer> {
+        TurnTimer::start(self.clone(), id)
+    }
+}
+impl super::session_store::Stores {
+    pub fn start_turn_timer(&self, id: &str) -> Result<TurnTimer> {
+        TurnTimer::in_session(self.open_session(id)?)
     }
 }
 
@@ -393,6 +464,54 @@ mod tests {
         let session = store.create(temp.path(), "model", "provider").unwrap();
         store.append(&session, "user", "task").unwrap();
         (temp, db, session)
+    }
+
+    #[test]
+    fn settle_interrupted_waits_for_another_writer_instead_of_failing() {
+        let (temp, db, session) = fixture();
+        let mut turn = TurnTimer::start(db.clone(), &session).unwrap();
+        turn.ensure_segment().unwrap();
+        let path = temp.path().join("turns.sqlite");
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = std::time::Instant::now();
+        let settled = db
+            .with_conn(|conn| settle_interrupted(conn, &session))
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "settle returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert!(!settled.is_empty());
+        drop(turn);
+    }
+
+    #[test]
+    fn settlement_rechecks_running_rows_and_preserves_prior_commits_on_error() {
+        let (_temp, db, session) = fixture();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO execution_turns(id,conversation_id,started_at,status) VALUES ('first',?1,'now','running')",
+                [&session],
+            ).unwrap();
+            conn.execute_batch("
+                CREATE TRIGGER add_late AFTER UPDATE OF status ON execution_turns WHEN NEW.id='first'
+                BEGIN INSERT INTO execution_turns(id,conversation_id,started_at,status)
+                      VALUES('late',NEW.conversation_id,'later','running'); END;
+                CREATE TRIGGER reject_late BEFORE UPDATE OF status ON execution_turns WHEN NEW.id='late'
+                BEGIN SELECT RAISE(ABORT,'late settlement rejected'); END;
+            ").unwrap();
+            let error = settle_interrupted(conn, &session).unwrap_err();
+            assert_eq!(super::super::sqlite_extended_code(&error), Some(1811));
+            assert_eq!(get_turn(conn, "first").unwrap().unwrap().status, TurnStatus::Cancelled);
+            assert_eq!(get_turn(conn, "late").unwrap().unwrap().status, TurnStatus::Running);
+            conn.execute_batch("DROP TRIGGER reject_late").unwrap();
+            assert_eq!(settle_interrupted(conn, &session).unwrap()[0].turn_id, "late");
+        }).unwrap();
     }
 
     #[test]

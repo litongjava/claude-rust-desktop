@@ -11,7 +11,7 @@ struct SettingsScreen;
 
 impl SettingsScreen {
     fn enter() -> std::io::Result<Self> {
-        crossterm::execute!(std::io::stderr(), crossterm::terminal::EnterAlternateScreen,
+        crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::EnterAlternateScreen,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0))?;
         Ok(Self)
@@ -20,7 +20,7 @@ impl SettingsScreen {
 
 impl Drop for SettingsScreen {
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stderr(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::LeaveAlternateScreen);
     }
 }
 
@@ -94,13 +94,7 @@ fn usage_rows(session: &Session, paths: &RuntimePaths) -> Result<Vec<String>> {
         let seconds = ms / 1000;
         if seconds < 60 { format!("{seconds}s") } else { format!("{}m {}s", seconds / 60, seconds % 60) }
     };
-    let (added, removed) = session.store.db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT COALESCE(SUM(json_extract(t.output,'$.file_change.added')),0), COALESCE(SUM(json_extract(t.output,'$.file_change.removed')),0) FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE m.conversation_id=?1 AND json_valid(t.output) AND t.is_error=0",
-            [&session.id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )
-    })??;
+    let (added, removed) = session.selected_session()?.read(|r| r.changed_lines())?;
     let wall = crate::terminal::STARTED.get().map_or(0, |started| started.elapsed().as_millis() as i64);
     let cost = match billing["total_usd"].as_f64() {
         Some(total) if billing["unpriced_requests"].as_i64().unwrap_or(0) == 0 => format!("${total:.4}"),
@@ -135,8 +129,8 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
     let effort = crate::session_commands::session_effort(session)?.unwrap_or_else(|| "default".into());
     let autocompact = crate::session_commands::autocompact_label(session)?;
     let settings: Vec<(&str, &str, String)> = vec![
-        ("model", "Model", session.model.clone()),
-        ("provider", "Provider", session.provider_id.clone()),
+        ("model", "Model", session.binding_state().model.clone()),
+        ("provider", "Provider", session.binding_state().provider_id.clone()),
         ("permissions", "Permission mode", session.permission_mode().to_owned()),
         ("effort", "Effort", effort),
         ("autocompact", "Auto-compact", autocompact),

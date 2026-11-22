@@ -1,3 +1,4 @@
+use crate::db::session_store::TaskState as _;
 use super::*;
 use crate::native_engine::provider_manager::ResolvedProvider;
 use crate::runtime::{RuntimePaths, SessionStore};
@@ -216,8 +217,7 @@ async fn manual_plan_approval_launches_then_resumes_the_same_coder_once() {
     let conversation = fixture
         .context
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, &coder))
-        .unwrap()
+        .conversation_metadata(&coder)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -326,8 +326,7 @@ async fn a_missing_configured_model_falls_back_and_reports_a_warning() {
     );
     let task = fixture.store().get_task(&task.task_id).unwrap().unwrap();
     let record: crate::super_agent::launcher::LaunchRecord = fixture
-        .context
-        .setting(&format!("super-agent.launch.{}.coder", task.task_id))
+        .context.db.task_state(&format!("super-agent.launch.{}.coder", task.task_id))
         .unwrap()
         .unwrap();
     assert_eq!(record.model, "router-model");
@@ -388,8 +387,7 @@ async fn the_reviewer_gets_a_pinned_checkout_separate_from_the_coder() {
     let conversation = fixture
         .context
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, &reviewer))
-        .unwrap()
+        .conversation_metadata(&reviewer)
         .unwrap()
         .unwrap();
     let review_workspace = PathBuf::from(conversation.workspace_path.unwrap());
@@ -691,7 +689,7 @@ async fn changes_requested_resumes_the_same_coder_with_round_and_issues() {
         "super-agent.resume-changes.{}.{}.{}",
         task.task_id, task.spec_version, current.review_round
     );
-    assert!(fixture.context.setting::<Value>(&marker).unwrap().is_some());
+    assert!(fixture.context.db.task_state::<Value>(&marker).unwrap().is_some());
 
     // The corrected implementation is pinned again and the same Reviewer is
     // resumed for the new round.
@@ -727,8 +725,7 @@ async fn changes_requested_resumes_the_same_coder_with_round_and_issues() {
         task.task_id, reviewing.spec_version, reviewing.review_round
     );
     assert!(fixture
-        .context
-        .setting::<Value>(&reviewer_marker)
+        .context.db.task_state::<Value>(&reviewer_marker)
         .unwrap()
         .is_some());
 }
@@ -874,7 +871,7 @@ async fn an_interrupted_launch_is_adopted_on_the_next_tick() {
     let mut operation = launcher.load_operation(&key).unwrap().unwrap();
     operation.handle = None;
     operation.state = "session".into();
-    fixture.context.save_setting(&key, &operation).unwrap();
+    fixture.context.db.save_task_state(&key, &operation).unwrap();
 
     let report = orchestrator.tick(&fixture.router).await.unwrap();
     assert_eq!(report.blocked, Vec::<String>::new(), "{report:?}");
@@ -1691,7 +1688,7 @@ fn typed_operation(
         LaunchKind::Resume,
         &operation.purpose,
     );
-    launcher.context.save_setting(&key, &operation).unwrap();
+    launcher.context.db.save_task_state(&key, &operation).unwrap();
     operation
 }
 
@@ -1732,7 +1729,7 @@ fn legacy_operation(
         LaunchKind::Resume,
         "delivery",
     );
-    launcher.context.save_setting(&key, &operation).unwrap();
+    launcher.context.db.save_task_state(&key, &operation).unwrap();
     operation
 }
 
@@ -1843,14 +1840,14 @@ fn a_bound_receipt_must_name_its_own_job_operation_and_durable_identity() {
         LaunchKind::Resume,
         &identity_a.purpose_key(),
     );
-    let stored: Value = launcher.context.setting(&key_a).unwrap().unwrap();
+    let stored: Value = launcher.context.db.task_state(&key_a).unwrap().unwrap();
     let stored_binding = std::fs::read(binding_path(&fixture.data, &job_a)).unwrap();
 
     // A bound receipt whose operation record is missing has no proof.
     launcher
         .context
         .db
-        .with_conn(|conn| conn.execute("DELETE FROM peripheral_settings WHERE key=?1", [&key_a]))
+        .fixture_directory(|conn| conn.execute("DELETE FROM global_settings WHERE domain='super-agent' AND name=?1", [&key_a]))
         .unwrap()
         .unwrap();
     let reason = orchestrator
@@ -1858,13 +1855,13 @@ fn a_bound_receipt_must_name_its_own_job_operation_and_durable_identity() {
         .unwrap()
         .expect("a receipt without its operation must be refused");
     assert!(reason.contains("no launch operation"), "{reason}");
-    launcher.context.save_setting(&key_a, &stored).unwrap();
+    launcher.context.db.save_task_state(&key_a, &stored).unwrap();
 
     // A typed operation whose identity field was removed is incomplete, not
     // legacy, and cannot be observed.
     let mut stripped = serde_json::to_value(&operation_a).unwrap();
     stripped.as_object_mut().unwrap().remove("delivery");
-    launcher.context.save_setting(&key_a, &stripped).unwrap();
+    launcher.context.db.save_task_state(&key_a, &stripped).unwrap();
     let reason = orchestrator
         .bound_delivery_mismatch(&task, &plan, &dispatch_a, &job_a)
         .unwrap()
@@ -1873,7 +1870,7 @@ fn a_bound_receipt_must_name_its_own_job_operation_and_durable_identity() {
         reason.contains("does not match the receipt") && reason.contains("purpose"),
         "{reason}"
     );
-    launcher.context.save_setting(&key_a, &stored).unwrap();
+    launcher.context.db.save_task_state(&key_a, &stored).unwrap();
 
     // Changing the operation's repository, plan, evidence, OIDs, attempt or
     // session is a contradiction, and the stored row is preserved.
@@ -1888,13 +1885,13 @@ fn a_bound_receipt_must_name_its_own_job_operation_and_durable_identity() {
     ] {
         let mut changed = stored.clone();
         mutate(&mut changed);
-        launcher.context.save_setting(&key_a, &changed).unwrap();
+        launcher.context.db.save_task_state(&key_a, &changed).unwrap();
         let reason = orchestrator
             .bound_delivery_mismatch(&task, &plan, &dispatch_a, &job_a)
             .unwrap()
             .expect("a contradictory operation must be refused");
         assert!(!reason.is_empty());
-        launcher.context.save_setting(&key_a, &stored).unwrap();
+        launcher.context.db.save_task_state(&key_a, &stored).unwrap();
     }
 
     // The job's own durable binding must match the operation, not only the
@@ -1916,7 +1913,7 @@ fn a_bound_receipt_must_name_its_own_job_operation_and_durable_identity() {
     // The handle must point at the same reserved job as the operation.
     let mut moved = stored.clone();
     moved["job_id"] = json!(job_b);
-    launcher.context.save_setting(&key_a, &moved).unwrap();
+    launcher.context.db.save_task_state(&key_a, &moved).unwrap();
     let reason = orchestrator
         .bound_delivery_mismatch(&task, &plan, &dispatch_a, &job_b)
         .unwrap()
@@ -1925,7 +1922,7 @@ fn a_bound_receipt_must_name_its_own_job_operation_and_durable_identity() {
 
     // Everything rejected above left the original rows byte-identical.
     assert_eq!(
-        launcher.context.setting::<Value>(&key_a).unwrap().unwrap()["task_id"],
+        launcher.context.db.task_state::<Value>(&key_a).unwrap().unwrap()["task_id"],
         json!(task.task_id)
     );
     assert_eq!(
@@ -2186,7 +2183,7 @@ mod two_repository_delivery {
             // through the real state machine so the seeded state is valid.
             store
                 .db()
-                .with_conn(|conn| {
+                .fixture_directory(|conn| {
                     conn.execute(
                         "UPDATE sa_tasks SET phase='IMPLEMENTING', status='RUNNING' WHERE task_id=?1",
                         [&task.task_id],
@@ -2683,8 +2680,7 @@ mod two_repository_delivery {
         }
 
         fn final_completion_marker(&self) -> Value {
-            self.context
-                .setting::<Value>(&format!(
+            self.context.db.task_state::<Value>(&format!(
                     "super-agent.reviewer-resume.{}.{}.{}.final-completion",
                     self.task_id,
                     self.task().spec_version,
@@ -3052,7 +3048,7 @@ mod two_repository_delivery {
         fixture
             .store()
             .db()
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "DELETE FROM sa_task_repos WHERE task_id=?1 AND repository_id=?2",
                     [&fixture.task_id, &fixture.repos[1].repository_id],
@@ -3628,13 +3624,13 @@ mod two_repository_delivery {
         fixture
             .context
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
-                    "DELETE FROM peripheral_settings WHERE key=?1",
+                    "DELETE FROM global_settings WHERE domain='super-agent' AND name=?1",
                     [&marker],
                 )?;
                 conn.execute(
-                    "DELETE FROM peripheral_settings WHERE key=?1",
+                    "DELETE FROM global_settings WHERE domain='super-agent' AND name=?1",
                     [&operation_pattern],
                 )?;
                 Ok(())
@@ -3642,13 +3638,11 @@ mod two_repository_delivery {
             .unwrap()
             .unwrap();
         assert!(fixture
-            .context
-            .setting::<Value>(&marker)
+            .context.db.task_state::<Value>(&marker)
             .unwrap()
             .is_none());
         assert!(fixture
-            .context
-            .setting::<Value>(&operation_pattern)
+            .context.db.task_state::<Value>(&operation_pattern)
             .unwrap()
             .is_none());
 
@@ -3868,7 +3862,7 @@ mod two_repository_delivery {
         fixture
             .context
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "DELETE FROM sa_repository_dispatches WHERE task_id=?1 AND plan_operation_id=?2",
                     rusqlite::params![fixture.task_id, plan.operation_id],
@@ -3878,7 +3872,7 @@ mod two_repository_delivery {
                     rusqlite::params![fixture.task_id, plan.operation_id],
                 )?;
                 conn.execute(
-                    "DELETE FROM peripheral_settings WHERE key LIKE ?1",
+                    "DELETE FROM global_settings WHERE domain='super-agent' AND name LIKE ?1",
                     [format!("super-agent.launch-op.{}.coder.%", fixture.task_id)],
                 )?;
                 Ok(())
@@ -3969,8 +3963,7 @@ mod two_repository_delivery {
         );
         let marker = fixture.final_completion_marker();
         fixture
-            .context
-            .save_setting(
+            .context.db.save_task_state(
                 &key,
                 &json!({
                     "session_id": marker["session_id"],
@@ -4113,7 +4106,7 @@ mod two_repository_delivery {
         fixture
             .context
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "UPDATE sa_repository_delivery_observations SET plan_operation_id=?2 WHERE task_id=?1",
                     rusqlite::params![fixture.task_id, other.operation_id],
@@ -4313,7 +4306,7 @@ mod two_repository_delivery {
         fixture
             .store()
             .db()
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "DELETE FROM sa_task_repos WHERE task_id=?1",
                     [&fixture.task_id],
@@ -4337,7 +4330,7 @@ mod two_repository_delivery {
         fixture
             .store()
             .db()
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE sa_tasks SET phase='FINALIZING', status='RUNNING' WHERE task_id=?1",
                     [&fixture.task_id],
@@ -4589,8 +4582,7 @@ mod two_repository_delivery {
         )
         .unwrap();
         fixture
-            .context
-            .save_setting(
+            .context.db.save_task_state(
                 &key,
                 &json!({"session_id": reviewer, "job_id": other, "at": "2026-01-01T00:00:00Z"}),
             )
@@ -4619,8 +4611,7 @@ mod two_repository_delivery {
             fixture.task_id, 1, 0
         );
         fixture
-            .context
-            .save_setting(
+            .context.db.save_task_state(
                 &key,
                 &json!({
                     "session_id": "other-session",
@@ -4642,4 +4633,21 @@ mod two_repository_delivery {
         assert_eq!(fixture.task_completed_count(), 0);
     }
     include!("cleanup_tests.rs");
+}
+
+#[tokio::test]
+async fn router_pass_holds_selected_incarnation_during_launch_effects() {
+    let fixture = Fixture::new();
+    fixture.task();
+    let path = fixture.data.join("session-locks").join(&fixture.router);
+    let inspected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = inspected.clone();
+    let host = fixture.orchestrator(json!({})).with_gate(Arc::new(move |_| {
+        let file = std::fs::File::options().read(true).write(true).open(&path)?;
+        assert!(matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
+        seen.store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }));
+    host.tick_watched(&fixture.router).await.unwrap();
+    assert!(inspected.load(std::sync::atomic::Ordering::Relaxed));
 }

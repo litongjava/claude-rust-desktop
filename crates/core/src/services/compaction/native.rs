@@ -47,15 +47,12 @@ pub(crate) fn validate_history(messages: &[Value], provider: &ResolvedProvider) 
 }
 
 pub(crate) async fn generate(
-    db: &std::sync::Arc<DbManager>,
+    history: Vec<Value>,
     id: &str,
     provider: &ResolvedProvider,
     instructions: &str,
     options: crate::native_engine::request_options::RequestOptions,
 ) -> Result<GeneratedSummary> {
-    let history =
-        crate::runtime::SessionStore::new(db.clone()).model_history(id, &ApiFormat::OpenAI)?;
-    validate_history(&history, provider)?;
     let messages = history
         .into_iter()
         .map(serde_json::from_value::<OpenAIMessage>)
@@ -65,6 +62,7 @@ pub(crate) async fn generate(
         options.compaction("native"),
         messages,
         instructions,
+        Some(id),
     )
     .await
 }
@@ -82,6 +80,7 @@ pub(crate) async fn generate_messages(
             .compaction("native"),
         messages,
         instructions,
+        session,
     )
     .await
 }
@@ -91,7 +90,9 @@ pub(crate) async fn generate_messages_with_options(
     options: crate::native_engine::request_options::RequestOptions,
     messages: Vec<OpenAIMessage>,
     instructions: &str,
+    session: Option<&str>,
 ) -> Result<GeneratedSummary> {
+    let provider = &provider.current()?;
     let body = provider_runtime::compaction_request(provider, messages, instructions)?;
     let mut url = reqwest::Url::parse(provider.provider.base_url.trim_end_matches('/'))
         .context("Native compaction requires a configured gateway URL")?;
@@ -111,10 +112,20 @@ pub(crate) async fn generate_messages_with_options(
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let identity = crate::native_engine::request_identity::RequestIdentity::for_explicit(
+        provider,
+        "compaction",
+        session,
+        options
+            .recording
+            .as_ref()
+            .and_then(|context| context.parent_session_id.as_deref()),
+        options.model_request_id.as_deref(),
+    );
     let mut request = client
         .post(url)
         .headers(options.headers(provider)?)
-        .header("x-request-id", uuid::Uuid::new_v4().to_string())
+        .headers(identity.headers())
         .json(&body);
     if !provider.provider.api_key.is_empty() {
         request = request.bearer_auth(&provider.provider.api_key);
@@ -177,7 +188,7 @@ mod tests {
             if conflict {
                 store.append(&id, "user", "New instruction").unwrap();
             } else {
-                store.db.with_conn(|conn| conn.execute_batch("CREATE TRIGGER fail_timestamp BEFORE UPDATE OF updated_at ON conversations BEGIN SELECT RAISE(ABORT, 'failure'); END;")).unwrap().unwrap();
+                store.db.fixture_shard(&id, |conn| conn.execute_batch("CREATE TRIGGER fail_native BEFORE UPDATE ON compaction_state BEGIN SELECT RAISE(ABORT, 'failure'); END;")).unwrap().unwrap();
             }
             let before = store.history(&id).unwrap();
             let summary = GeneratedSummary {
@@ -186,7 +197,7 @@ mod tests {
             };
             assert!(commit_with_context(&store.db, prepared, &summary, None).is_err());
             assert_eq!(store.history(&id).unwrap(), before);
-            let count = store.db.with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM peripheral_settings WHERE key LIKE 'compaction.native.%'", [], |r| r.get::<_, i64>(0))).unwrap().unwrap();
+            let count = store.db.fixture_shard(&id, |conn| conn.query_row("SELECT COUNT(*) FROM native_boundaries", [], |r| r.get::<_, i64>(0))).unwrap().unwrap();
             assert_eq!(count, 0);
         }
     }

@@ -103,10 +103,7 @@ async fn apply(action: &str, id: &str, paths: &RuntimePaths, session: &mut Sessi
         );
     }
     let target = if action == "conversation" || action == "both" {
-        let messages = session
-            .store
-            .db
-            .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &session.id))??;
+        let messages = session.selected_session()?.repository().messages()?;
         let index = messages
             .iter()
             .position(|message| message.id == checkpoint.message_id)
@@ -114,9 +111,7 @@ async fn apply(action: &str, id: &str, paths: &RuntimePaths, session: &mut Sessi
         Some(if index == 0 {
             session.store.clear(&session.id)?
         } else {
-            session.store.db.with_conn(|conn| {
-                conversation_repo::branch_conversation(conn, &session.id, None, Some(index - 1))
-            })??
+            session.store.db.branch_conversation(&session.id, None, Some(index - 1))?
         })
     } else {
         None
@@ -145,10 +140,7 @@ async fn pick(paths: &RuntimePaths, session: &mut Session) -> Result<bool> {
         command_eprintln!("No checkpoints captured for this session. Checkpoints are created around turns in supported Git worktrees.");
         return Ok(true);
     }
-    let messages = session
-        .store
-        .db
-        .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &session.id))??;
+    let messages = session.selected_session()?.repository().messages()?;
     let mut entries: Vec<Entry> = saved
         .iter()
         .map(|checkpoint| {
@@ -220,8 +212,9 @@ async fn pick(paths: &RuntimePaths, session: &mut Session) -> Result<bool> {
     let prompt = messages.iter().find(|message| message.id == checkpoint.message_id).map(|message| message.content.clone()).unwrap_or_default();
     if action == "from" || action == "up-to" {
         let part = if action == "from" { compaction::Part::From } else { compaction::Part::UpTo };
+        let state = session.binding_state();
         let (branch, count) = tokio::select! {
-            result = compaction::summarize_part(&session.engine, &session.store.db, &session.id, &checkpoint.message_id, part, &session.provider_id, &session.model) => result?,
+            result = compaction::summarize_part(&session.engine, &session.store.db, &session.id, &checkpoint.message_id, part, &state.provider_id, &state.model) => result?,
             _ = crate::signals::interrupted() => anyhow::bail!("Summary interrupted; the conversation is unchanged"),
         };
         crate::background_commands::copy_settings(session, &branch)?;
@@ -288,7 +281,7 @@ fn ago(created_at: &str) -> String {
 /// Clears the screen and shows the conversation as it now is.
 fn redraw(session: &Session) -> Result<()> {
     eprint!("\x1b[2J\x1b[3J\x1b[H");
-    command_eprintln!("{}", crate::terminal::banner(&session.model, &session.workspace));
+    command_eprintln!("{}", crate::terminal::banner(&session.binding_state().model, &session.workspace));
     let color = std::env::var_os("NO_COLOR").is_none();
     let width = (crate::terminal::size().0 as usize).saturating_sub(1);
     for line in crate::repl::transcript_of(session, &session.id)? {

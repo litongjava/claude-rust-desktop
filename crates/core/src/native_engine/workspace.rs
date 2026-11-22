@@ -18,14 +18,14 @@ use crate::db::{conversation_repo, project_repo};
 /// child-resume path refuses a workspace change unless the launcher set
 /// `allow_workspace_move`.
 pub fn rebind_conversation_workspace(conn: &Connection, id: &str, workspace: &Path) -> Result<()> {
-    let workspace = workspace
-        .canonicalize()
-        .context("Workspace is unavailable")?;
-    ensure!(workspace.is_dir(), "Workspace must be a directory");
-    let path = workspace.to_string_lossy().into_owned();
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let conversation =
-        conversation_repo::get_conversation(&tx, id)?.context("Session not found")?;
+    crate::db::write_tx(conn,"rebind session workspace",crate::db::STARTUP_WRITE_DEADLINE,|tx|rebind_in(tx,id,workspace))
+}
+
+pub(crate) fn rebind_in(tx:&Connection,id:&str,workspace:&Path)->Result<()> {
+    let workspace=workspace.canonicalize().context("Workspace is unavailable")?;
+    ensure!(workspace.is_dir(),"Workspace must be a directory");
+    let path=workspace.to_string_lossy().into_owned();
+    let conversation=conversation_repo::conversation_metadata(tx,id)?.context("Session not found")?;
     // A managed worktree owns its own resolution path; rebinding the project
     // underneath it would make the binding inconsistent.
     let managed: bool = tx.query_row(
@@ -82,15 +82,6 @@ pub fn rebind_conversation_workspace(conn: &Connection, id: &str, workspace: &Pa
         )? == 1,
         "Session not found"
     );
-    tx.execute(
-        "DELETE FROM peripheral_settings WHERE key=?1",
-        [format!("memory.scope.{id}")],
-    )?;
-    tx.execute(
-        "DELETE FROM peripheral_settings WHERE key=?1",
-        [format!("memory.private-owner.{id}")],
-    )?;
-    tx.commit()?;
     Ok(())
 }
 
@@ -138,13 +129,13 @@ pub(crate) fn move_conversation_workspace_with(
 
 /// Use persisted mode, never infer Code from a directory, model, or client prompt.
 pub fn conversation_prompt_profile(conn: &Connection, id: &str) -> Result<crate::prompt::PromptProfile> {
-    Ok(conversation_repo::get_conversation(conn, id)?
+    Ok(conversation_repo::conversation_metadata(conn, id)?
         .map(|conversation| crate::prompt::PromptProfile::from_workspace_mode(&conversation.workspace_mode))
         .unwrap_or_default())
 }
 
 pub fn conversation_project(conn: &Connection, id: &str) -> Result<Option<project_repo::ProjectRow>> {
-    let conversation = conversation_repo::get_conversation(conn, id)?;
+    let conversation = conversation_repo::conversation_metadata(conn, id)?;
     if let Some(conversation) = conversation {
         if let Some(project_id) = conversation.project_id.filter(|id| !id.is_empty()) {
             let project = project_repo::require_trusted(conn, &project_id)?;
@@ -161,13 +152,13 @@ pub(crate) fn private_workspace_owner(conn: &Connection, id: &str) -> Result<Opt
         Ok(conn.query_row("SELECT parent_id FROM conversation_private_workspace_bindings WHERE child_id=?1", [id], |row| row.get(0)).optional()?)
     };
     if binding(id)?.is_none() { return Ok(None); }
-    let child = conversation_repo::get_conversation(conn,id)?.context("Private child not found")?;
+    let child = conversation_repo::conversation_metadata(conn,id)?.context("Private child not found")?;
     let mode = child.workspace_mode;
     let mut current=id.to_owned();
     let mut seen=std::collections::HashSet::new();
     for _ in 0..16 {
         ensure!(seen.insert(current.clone()), "Private workspace ownership cycle");
-        let session=conversation_repo::get_conversation(conn,&current)?.context("Private workspace owner not found")?;
+        let session=conversation_repo::conversation_metadata(conn,&current)?.context("Private workspace owner not found")?;
         ensure!(!session.archived && session.workspace_mode==mode && session.project_id.as_deref().is_none_or(str::is_empty), "Private workspace ownership mode/project/trust changed");
         match binding(&current)? {Some(parent)=>current=parent,None=>return Ok(Some(current))}
     }
@@ -181,6 +172,19 @@ pub fn resolve_workspace(
     workspaces_root: &Path,
     id: &str,
     requested: Option<&str>,
+) -> Result<(PathBuf, Option<project_repo::ProjectRow>)> {
+    resolve_workspace_inner(conn, workspaces_root, id, requested, true)
+}
+
+/// `persist_private_path` is false when resolving again after another writer
+/// rebound the conversation: the private directory must not replace that
+/// committed binding, even if the session is still projectless.
+fn resolve_workspace_inner(
+    conn: &Connection,
+    workspaces_root: &Path,
+    id: &str,
+    requested: Option<&str>,
+    persist_private_path: bool,
 ) -> Result<(PathBuf, Option<project_repo::ProjectRow>)> {
     let private_owner = private_workspace_owner(conn, id)?;
     if let Some(mut project) = conversation_project(conn, id)? {
@@ -197,7 +201,7 @@ pub fn resolve_workspace(
         return Ok((PathBuf::from(path), Some(project)));
     }
 
-    let conversation = conversation_repo::get_conversation(conn, id)?;
+    let conversation = conversation_repo::conversation_metadata(conn, id)?;
     // Internal jobs without a desktop conversation may explicitly supply their cwd.
     if conversation.is_none() {
         if let Some(path) = requested.filter(|path| !path.trim().is_empty()) {
@@ -219,8 +223,65 @@ pub fn resolve_workspace(
     let directory = std::fs::canonicalize(directory)?;
     ensure!(directory.starts_with(&root) && directory != root, "Conversation workspace is outside the application workspace directory");
     if private_owner.is_some() { ensure!(directory == expected, "Private workspace owner path is redirected"); }
-    if conversation.is_some() {
-        conn.execute("UPDATE conversations SET workspace_path = ?1 WHERE id = ?2", params![directory.to_string_lossy(), id])?;
+    if conversation.is_some() && persist_private_path {
+        let previous_path = conversation
+            .as_ref()
+            .and_then(|conversation| conversation.workspace_path.clone());
+        let directory_text = directory.to_string_lossy().into_owned();
+        let persist = |connection: &Connection| -> Result<bool> {
+            // Another host may bind a project while this attempt waits for the
+            // writer. Re-read the binding under the acquired transaction so a
+            // committed assignment is never overwritten by the private path.
+            let (project_id, workspace_path) = connection
+                .query_row(
+                    "SELECT project_id, workspace_path FROM conversations WHERE id=?1",
+                    [id],
+                    |row| {
+                        Ok((
+                            row.get::<_, Option<String>>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .context("Session not found")?;
+            let projectless = project_id.is_none_or(|project_id| project_id.is_empty());
+            if !projectless || workspace_path != previous_path {
+                return Ok(false);
+            }
+            ensure!(
+                connection.execute(
+                    "UPDATE conversations SET workspace_path=?1 \
+                     WHERE id=?2 AND (project_id IS NULL OR project_id='') \
+                     AND (workspace_path IS NULL OR workspace_path=?3)",
+                    params![directory_text, id, previous_path],
+                )? == 1,
+                "Session not found"
+            );
+            Ok(true)
+        };
+        let persisted = if conn.is_autocommit() {
+            crate::db::write_tx(
+                conn,
+                "private session workspace",
+                crate::db::STARTUP_WRITE_DEADLINE,
+                |tx| persist(tx),
+            )
+            .context("Saving private session workspace")?
+        } else {
+            persist(conn)?
+        };
+        if !persisted {
+            // The binding changed while this attempt waited. Use the committed
+            // state instead of the directory created for the old decision.
+            let (path, project) =
+                resolve_workspace_inner(conn, workspaces_root, id, requested, false)?;
+            ensure!(
+                project.is_some() || path != directory,
+                "Session workspace binding changed while it was being saved"
+            );
+            return Ok((path, project));
+        }
     }
     Ok((directory, None))
 }
@@ -236,6 +297,152 @@ mod tests {
         conversation_repo::insert_conversation(&conn, "session", None, None, None, Some("."), None, false, false, false, "now", "now", 0).unwrap();
         conversation_repo::set_workspace_mode(&conn, "session", mode).unwrap();
         (conn, tempfile::tempdir().unwrap())
+    }
+
+    #[test]
+    fn projectless_code_resume_resolves_during_another_directory_write() {
+        use crate::{
+            db::test_support,
+            runtime::{RuntimePaths, SessionStore},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store
+            .db
+            .fixture_directory(|conn| {
+                conn.execute(
+                    "UPDATE conversations SET project_id=NULL, workspace_path=NULL WHERE id=?1",
+                    [&id],
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        let (holder, release) = test_support::hold_write_lock(paths.data_dir.join("global.db"));
+        let releaser =
+            test_support::release_after(release, holder, std::time::Duration::from_secs(6));
+        let private = store
+            .workspace(&id, &paths.data_dir.join("workspaces"))
+            .unwrap();
+        releaser.join().unwrap();
+        assert_eq!(
+            private,
+            paths
+                .data_dir
+                .join("workspaces")
+                .join(store.db.open_session(&id).unwrap().incarnation())
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            store.resume(&id).unwrap().workspace_path.as_deref(),
+            private.to_str()
+        );
+    }
+
+    #[test]
+    fn projectless_resume_observes_the_committed_assignment_on_next_lookup() {
+        use crate::runtime::{RuntimePaths, SessionStore};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store
+            .db
+            .fixture_directory(|conn| {
+                conn.execute(
+                    "UPDATE conversations SET project_id=NULL, workspace_path=NULL WHERE id=?1",
+                    [&id],
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        let project_dir = root.path().join("project");
+        std::fs::create_dir(&project_dir).unwrap();
+        let project_dir = project_dir.canonicalize().unwrap();
+        let project_path = project_dir.to_string_lossy().into_owned();
+        store
+            .db
+            .fixture_directory(|conn| -> Result<()> {
+                project_repo::insert_project(
+                    conn,
+                    "project",
+                    "Project",
+                    None,
+                    None,
+                    Some(&project_path),
+                    false,
+                    "now",
+                    "now",
+                )?;
+                project_repo::set_folders(conn, "project", std::slice::from_ref(&project_path))?;
+                project_repo::trust_folders(conn, "project", std::slice::from_ref(&project_path))?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+
+        // The first read sees the previous snapshot. The next lookup must
+        // observe the assignment and never overwrite it with a private path.
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let id_for_holder = id.clone();
+        let path_for_holder = project_path.clone();
+        let db_path = paths.data_dir.join("global.db");
+        let holder = std::thread::spawn(move || {
+            let conn = Connection::open(db_path).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+            conn.execute(
+                "UPDATE conversations SET project_id='project', workspace_path=?1 WHERE id=?2",
+                params![path_for_holder, id_for_holder],
+            )
+            .unwrap();
+            conn.execute_batch("COMMIT").unwrap();
+        });
+        locked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            release_tx.send(()).unwrap();
+            holder.join().unwrap();
+        });
+
+        let workspaces = paths.data_dir.join("workspaces");
+        let private = store.workspace(&id, &workspaces).unwrap();
+        assert!(private.starts_with(&workspaces));
+        releaser.join().unwrap();
+        let resolved = store.workspace(&id, &workspaces).unwrap();
+
+        assert_eq!(
+            std::fs::canonicalize(&resolved).unwrap(),
+            project_dir,
+            "resume must use the project committed while the write retried"
+        );
+        let (project_id, workspace_path) = store
+            .db
+            .fixture_directory(|conn| -> Result<(Option<String>, Option<String>)> {
+                Ok(conn.query_row(
+                    "SELECT project_id, workspace_path FROM conversations WHERE id=?1",
+                    [&id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(project_id.as_deref(), Some("project"));
+        assert_eq!(
+            workspace_path.as_deref(),
+            Some(project_path.as_str()),
+            "the private path must not replace the committed project path"
+        );
+        assert_ne!(resolved, private);
     }
 
     #[test]
@@ -319,8 +526,7 @@ mod tests {
             let second = root.path().join("second");
             std::fs::create_dir(&first).unwrap();
             std::fs::create_dir(&second).unwrap();
-            let db = crate::db::DbManager::new(root.path().join("db.sqlite")).unwrap();
-            db.init().unwrap();
+            let db = crate::db::session_store::Stores::open(root.path()).unwrap();
             let store = crate::runtime::SessionStore::new(std::sync::Arc::new(db));
             let parent = store.create(&first, "model", "provider").unwrap();
             let member = store.create(&first, "model", "provider").unwrap();
@@ -340,7 +546,7 @@ mod tests {
         fn resolve(&self, id: &str) -> PathBuf {
             self.store
                 .db
-                .with_conn(|conn| resolve_workspace(conn, &self.workspaces, id, None))
+                .fixture_directory(|conn| resolve_workspace(conn, &self.workspaces, id, None))
                 .unwrap()
                 .unwrap()
                 .0
@@ -349,7 +555,7 @@ mod tests {
         fn project_id(&self, id: &str) -> String {
             self.store
                 .db
-                .with_conn(|conn| -> Result<String> {
+                .fixture_directory(|conn| -> Result<String> {
                     Ok(conn.query_row(
                         "SELECT project_id FROM conversations WHERE id=?1",
                         [id],
@@ -363,7 +569,7 @@ mod tests {
         fn project(&self, id: &str) -> project_repo::ProjectRow {
             self.store
                 .db
-                .with_conn(|conn| -> Result<Option<project_repo::ProjectRow>> {
+                .fixture_directory(|conn| -> Result<Option<project_repo::ProjectRow>> {
                     project_repo::get_project(conn, id)
                 })
                 .unwrap()
@@ -374,7 +580,7 @@ mod tests {
         fn conversation(&self, id: &str) -> (Option<String>, Option<String>) {
             self.store
                 .db
-                .with_conn(|conn| -> Result<(Option<String>, Option<String>)> {
+                .fixture_directory(|conn| -> Result<(Option<String>, Option<String>)> {
                     Ok(conn.query_row(
                         "SELECT project_id, workspace_path FROM conversations WHERE id=?1",
                         [id],
@@ -394,7 +600,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "UPDATE projects SET instructions=?1 WHERE id=?2",
                     params!["keep these project instructions", shared],
@@ -411,7 +617,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
+            .fixture_directory(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
             .unwrap()
             .unwrap();
 
@@ -463,7 +669,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace(
                     conn,
                     fixture._root.path(),
@@ -499,7 +705,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "INSERT INTO conversation_worktrees(conversation_id,project_id,source_path,repo_path,path,branch) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![
@@ -519,7 +725,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace(
                     conn,
                     fixture._root.path(),
@@ -563,7 +769,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace(
                     conn,
                     fixture._root.path(),
@@ -598,7 +804,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 move_conversation_workspace_with(
                     conn,
                     fixture._root.path(),
@@ -643,7 +849,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute(
                     "INSERT INTO conversation_worktrees(conversation_id,project_id,source_path,repo_path,path,branch) VALUES(?1,?2,?3,?4,?5,?6)",
                     params![
@@ -662,7 +868,7 @@ mod tests {
         let error = fixture
             .store
             .db
-            .with_conn(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
+            .fixture_directory(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
             .unwrap()
             .unwrap_err();
         assert!(
@@ -685,7 +891,7 @@ mod tests {
             fixture
                 .store
                 .db
-                .with_conn(|conn| -> Result<i64> {
+                .fixture_directory(|conn| -> Result<i64> {
                     Ok(
                         conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                             row.get(0)
@@ -702,7 +908,7 @@ mod tests {
         fixture
             .store
             .db
-            .with_conn(|conn| -> Result<()> {
+            .fixture_directory(|conn| -> Result<()> {
                 conn.execute_batch(&format!(
                     "CREATE TRIGGER fail_conversation_update BEFORE UPDATE ON conversations \
                      WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
@@ -715,7 +921,7 @@ mod tests {
         let result = fixture
             .store
             .db
-            .with_conn(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
+            .fixture_directory(|conn| rebind_conversation_workspace(conn, &fixture.member, &fixture.second))
             .unwrap();
         assert!(result.is_err(), "the forced failure must propagate");
         assert_eq!(

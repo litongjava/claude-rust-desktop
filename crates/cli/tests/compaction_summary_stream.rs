@@ -1,4 +1,7 @@
 //! Auto-compaction before a resumed --print turn, against built-in provider fixtures.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{extract::State, routing::post, Json, Router};
 use deepseek_code_core::{
     db::message_repo::get_messages_by_conversation,
@@ -168,7 +171,7 @@ async fn scenario(malformed_first_fragment: bool) {
     let requests = requests.lock().unwrap();
     let rows = store
         .db
-        .with_conn(|db| get_messages_by_conversation(db, &session))
+        .shard_sql(&session, |db| get_messages_by_conversation(db, &session))
         .unwrap()
         .unwrap();
     assert!(stderr.contains("threshold 800000"), "{stderr}");

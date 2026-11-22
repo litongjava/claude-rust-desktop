@@ -1,3 +1,6 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 use axum::{routing::post, Json, Router};
 use deepseek_code_core::{
     cache::FileCache,
@@ -26,12 +29,18 @@ async fn fixture(
     let dir = tempfile::tempdir().unwrap();
     let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
     if real_data {
-        std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::copy(
-            std::env::var_os("DCL_COMPACTION_BACKUP").expect("Set a read-only backup path"),
-            paths.data_dir.join("deepseek_code.db"),
-        )
-        .unwrap();
+        // The supplied backup is a quiescent copy of a split-store data directory.
+        let backup = std::path::PathBuf::from(std::env::var_os("DCL_COMPACTION_BACKUP").expect("Set a read-only data directory backup"));
+        assert!(backup.join("global.db").is_file());
+        for entry in walkdir::WalkDir::new(&backup) {
+            let entry = entry.unwrap();
+            let destination = paths.data_dir.join(entry.path().strip_prefix(&backup).unwrap());
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(destination).unwrap();
+            } else if entry.file_type().is_file() {
+                std::fs::copy(entry.path(),destination).unwrap();
+            }
+        }
     }
     let store = SessionStore::new(paths.open_database().unwrap());
     let id = if real_data {
@@ -241,10 +250,10 @@ async fn a_fallback_budget_too_large_for_the_window_sends_no_request_and_keeps_s
             // No summary was cached, so a later retry starts from the same state.
             let cached = store
                 .db
-                .with_conn(|conn| {
+                .shard_sql(&id, |conn| {
                     Ok::<Option<String>, anyhow::Error>(conn
                         .query_row(
-                            "SELECT value FROM peripheral_settings WHERE key LIKE 'compaction.checkpoint.%'",
+                            "SELECT group_concat(summary) FROM compaction_checkpoint HAVING count(*)>0",
                             [],
                             |row| row.get::<_, String>(0),
                         )
@@ -334,7 +343,7 @@ async fn oversized_rewind_summary_keeps_original_and_creates_a_resumable_branch(
     let before = store.history(&id).unwrap();
     let message_id = store
         .db
-        .with_conn(|c| {
+        .shard_sql(&id, |c| {
             c.query_row(
                 "SELECT id FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC LIMIT 1",
                 [&id],
@@ -367,7 +376,7 @@ async fn real_session_compaction_replay_uses_copied_database() {
     for format in ["openai", "anthropic"] {
         let (dir, store, id, engine, requests, server) = fixture(format, 0, true).await;
         let before = store.history(&id).unwrap();
-        let before_tools = store.db.with_conn(|c| c.query_row("SELECT COUNT(*) FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?1)", [&id], |r| r.get::<_, i64>(0))).unwrap().unwrap();
+        let before_tools = store.db.shard_sql(&id, |c| c.query_row("SELECT COUNT(*) FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?1)", [&id], |r| r.get::<_, i64>(0))).unwrap().unwrap();
         let report = compaction::compact(
             &engine,
             &store.db,
@@ -398,7 +407,7 @@ async fn real_session_compaction_replay_uses_copied_database() {
             )
             .unwrap();
         assert_eq!(active.len(), 1);
-        let after_tools = store.db.with_conn(|c| c.query_row("SELECT COUNT(*) FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?1)", [&id], |r| r.get::<_, i64>(0))).unwrap().unwrap();
+        let after_tools = store.db.shard_sql(&id, |c| c.query_row("SELECT COUNT(*) FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE conversation_id=?1)", [&id], |r| r.get::<_, i64>(0))).unwrap().unwrap();
         assert_eq!(before_tools, after_tools);
         println!("{format}: {} original messages and {before_tools} tools preserved; {calls} bounded local summary requests; resumed history {} message", before.len(), active.len());
         server.abort();

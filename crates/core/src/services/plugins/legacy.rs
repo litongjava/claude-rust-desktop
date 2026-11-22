@@ -1,6 +1,6 @@
 //! Read-only conversion of historical plugin.json directories.
 use super::*;
-use rusqlite::TransactionBehavior;
+
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,7 +83,7 @@ fn collect(
     Ok(())
 }
 
-pub fn import_legacy(context: &ServiceContext, source: &Path, preview: bool) -> Result<Report> {
+pub fn import_legacy(context: &ServiceContext<impl PluginCatalog>, source: &Path, preview: bool) -> Result<Report> {
     let root = source.canonicalize()?;
     ensure!(
         root.is_dir(),
@@ -137,29 +137,8 @@ pub fn import_legacy(context: &ServiceContext, source: &Path, preview: bool) -> 
         files,
     };
     bundle.validate()?;
-    let payload = serde_json::to_string(&bundle)?;
-    let backup = if preview {
-        None
-    } else {
-        let directory = context.paths.data_dir.join("backups");
-        std::fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("plugins-{}.sqlite3", uuid::Uuid::new_v4()));
-        context
-            .db
-            .with_conn(|c| c.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()]))??;
-        Some(path.to_string_lossy().into_owned())
-    };
-    context.db.with_conn(|c| -> Result<Report> {
-        let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
-        let prior: Option<(String, bool)> = tx.query_row("SELECT bundle,enabled FROM installed_plugins WHERE id=?1", [&bundle.id], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-        let (skipped, enabled) = if let Some((prior, enabled)) = prior {
-            ensure!(serde_json::from_str::<Value>(&prior)? == serde_json::from_str::<Value>(&payload)?, "Plugin ID conflicts with an installed package"); (true, enabled)
-        } else { (false, manifest.enabled) };
-        if !preview && !skipped {
-            tx.execute("INSERT INTO installed_plugins(id,bundle,source,enabled) VALUES(?1,?2,?3,?4)", params![bundle.id,payload,root.to_string_lossy(),manifest.enabled])?;
-        }
-        if preview { tx.rollback()?; } else { tx.commit()?; }
+    let backup = if preview {None} else {Some(context.db.backup_plugins(&context.paths.data_dir)?.to_string_lossy().into_owned())};
+    let (skipped,enabled)=context.db.save_plugin(&bundle,&root.to_string_lossy(),PluginInstall::Import{enabled:manifest.enabled,preview})?;
         Ok(Report {id:bundle.id,preview,imported:!preview&&!skipped,skipped,enabled,backup,
             notes:vec!["Full original plugin.json is preserved. Each declared command executes main with --key=value string arguments; review this explicit conversion because historical manifest loading did not wire command handlers.".into(), "Import does not execute code. Running requires the usual explicit execution permission; code uses current OS permissions.".into()]})
-    })?
 }

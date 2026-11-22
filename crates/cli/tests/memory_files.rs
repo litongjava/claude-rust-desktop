@@ -230,17 +230,7 @@ async fn scenario(protocol: &'static str, plan: bool) {
     } else {
         "updated-body-marker"
     }));
-    let id = context
-        .db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT id FROM conversations ORDER BY created_at DESC LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
+    let id = context.db.latest_code(&workspace).unwrap().unwrap().id;
     run(
         &paths.data_dir,
         &workspace,

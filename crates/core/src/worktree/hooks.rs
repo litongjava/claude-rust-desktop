@@ -1,11 +1,15 @@
 //! Explicit hook-backed worktree lifecycle shared by CLI and Desktop.
 //! Hook paths are retained by default; removal never recursively deletes in Rust.
+#[cfg(test)]
+use crate::db::DbManager;
 use crate::{
-    db::DbManager,
+    db::session_store::{SessionAccess, SessionRepository},
     services::tool_hooks::{HookEvent, HookRunner},
 };
 use anyhow::{ensure, Context, Result};
-use rusqlite::{params, OptionalExtension};
+#[cfg(test)]
+use rusqlite::params;
+use rusqlite::OptionalExtension;
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
@@ -141,7 +145,7 @@ fn fingerprint(path: &Path) -> Result<String> {
 
 pub async fn create(
     root: &Path,
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     source: &Path,
     name: Option<&str>,
@@ -157,20 +161,8 @@ pub async fn create(
     {
         return Ok(None);
     }
-    let project = db
-        .with_conn(|conn| crate::native_engine::workspace::conversation_project(conn, session))??
-        .context("Worktree requires a trusted project")?;
-    ensure!(
-        Path::new(
-            project
-                .workspace_path
-                .as_deref()
-                .context("Project source missing")?
-        )
-        .canonicalize()?
-            == source.canonicalize()?,
-        "Worktree source does not match the trusted project"
-    );
+    let owner = db.select_session(session)?;
+    owner.check_worktree_source(source)?;
     let name = name
         .map(str::to_owned)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
@@ -187,13 +179,9 @@ pub async fn create(
     let baseline = fingerprint(&path).ok();
     let metadata = json!({"canonical_path":path,"created_ns":created_ns,"newly_created":newly_created,"baseline":baseline,"provenance":provenance(&runner)?});
     // A failed DB transaction deliberately retains hook output rather than deleting unknown files.
-    db.with_conn(|conn|->Result<()> {
-        let tx=crate::db::write_transaction(&conn)?;
-        tx.execute("INSERT INTO conversation_worktrees(conversation_id,project_id,source_path,repo_path,path,branch) VALUES(?1,?2,?3,?3,?4,?5)",params![session,project.id,source.to_string_lossy(),path.to_string_lossy(),name])?;
-        tx.execute("INSERT INTO conversation_worktree_backends(conversation_id,backend,metadata) VALUES(?1,'hook',?2)",params![session,metadata.to_string()])?;
-        tx.execute("UPDATE conversations SET workspace_path=?1 WHERE id=?2",params![path.to_string_lossy(),session])?;
-        tx.commit()?; Ok(())
-    })??;
+    owner
+        .bind_worktree(source, source, &path, &name, Some(&metadata))
+        .context("Binding hook worktree")?;
     Ok(Some(path))
 }
 
@@ -221,16 +209,14 @@ pub(super) fn resolve(conn: &rusqlite::Connection, session: &str, path: &Path) -
     Ok(true)
 }
 
-pub fn status(db: &DbManager, session: &str) -> Result<Option<Value>> {
-    db.with_conn(|conn| {
-        conn.query_row("SELECT w.source_path,w.path,w.branch,COALESCE(b.backend,'git') FROM conversation_worktrees w LEFT JOIN conversation_worktree_backends b USING(conversation_id) WHERE w.conversation_id=?1",[session],|row|Ok(json!({"source":row.get::<_,String>(0)?,"path":row.get::<_,String>(1)?,"name":row.get::<_,String>(2)?,"backend":row.get::<_,String>(3)?}))).optional().map_err(Into::into)
-    })?
+pub fn status(db: &impl SessionAccess, session: &str) -> Result<Option<Value>> {
+    db.select_session(session)?.worktree_status()
 }
 
 /// Read-only preflight: run before shutting down an idle worker, then recheck at release.
 pub fn ensure_idle(root: &Path, session: &str) -> Result<()> {
     ensure!(
-        !crate::services::background_sessions::list(root, None)?
+        !crate::services::background_sessions::possible_executions(root, session)?
             .iter()
             .any(|job| job.session_id == session
                 && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")),
@@ -246,45 +232,37 @@ pub fn ensure_idle(root: &Path, session: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn release(root: &Path, db: &DbManager, session: &str, remove: bool) -> Result<PathBuf> {
+pub async fn release(
+    root: &Path,
+    db: &impl SessionAccess,
+    session: &str,
+    remove: bool,
+) -> Result<PathBuf> {
+    let owner = db.select_session(session)?;
+    release_bound(root, &owner, session, remove).await
+}
+
+pub(crate) async fn release_bound(
+    root: &Path,
+    owner: &SessionRepository<'_>,
+    session: &str,
+    remove: bool,
+) -> Result<PathBuf> {
     ensure_idle(root, session)?;
-    let state = status(db, session)?.context("This session has no managed worktree")?;
+    let state = owner
+        .worktree_status()?
+        .context("This session has no managed worktree")?;
     let source = PathBuf::from(state["source"].as_str().unwrap());
     let path = PathBuf::from(state["path"].as_str().unwrap());
     ensure!(source.is_dir(), "Original source directory is unavailable");
     if remove {
-        db.with_conn(|conn| -> Result<()> {
-            let project = crate::native_engine::workspace::conversation_project(conn, session)?
-                .context("Worktree requires trusted project")?;
-            super::session::resolve(conn, session, &project.id, &source)?
-                .context("Worktree binding missing")?;
-            Ok(())
-        })??;
-        let shared: i64 = db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM conversation_worktrees WHERE path=?1",
-                [path.to_string_lossy().as_ref()],
-                |row| row.get(0),
-            )
-        })??;
-        ensure!(
-            shared == 1,
-            "Other sessions share this worktree; detach those bindings before removal"
-        );
+        let metadata = owner.removal_metadata(&source, &path)?;
         if state["backend"] == "hook" {
-            let metadata: String = db.with_conn(|conn| {
-                conn.query_row(
-                    "SELECT metadata FROM conversation_worktree_backends WHERE conversation_id=?1",
-                    [session],
-                    |row| row.get(0),
-                )
-            })??;
-            let metadata: Value = serde_json::from_str(&metadata)?;
+            let metadata = metadata.context("Worktree hook binding changed")?;
             ensure!(
                 metadata["newly_created"] == true,
                 "Cannot prove this hook created the directory; retain it or use detach"
             );
-            db.with_conn(|conn| resolve(conn, session, &path))??;
             let initial = metadata["baseline"].as_str().context(
                 "Initial cleanup scan was unavailable or exceeded budget; retain the worktree",
             )?;
@@ -335,23 +313,7 @@ pub async fn release(root: &Path, db: &DbManager, session: &str, remove: bool) -
             // Retain the branch: committed work is never discarded by cleanup.
         }
     }
-    db.with_conn(|conn| -> Result<()> {
-        let tx = crate::db::write_transaction(&conn)?;
-        tx.execute(
-            "DELETE FROM conversation_worktree_backends WHERE conversation_id=?1",
-            [session],
-        )?;
-        tx.execute(
-            "DELETE FROM conversation_worktrees WHERE conversation_id=?1",
-            [session],
-        )?;
-        tx.execute(
-            "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
-            params![source.to_string_lossy(), session],
-        )?;
-        tx.commit()?;
-        Ok(())
-    })??;
+    owner.detach_worktree(&source, &path)?;
     Ok(source)
 }
 #[cfg(test)]
@@ -442,6 +404,30 @@ mod tests {
         crate::services::plugins::enable(&context, "worktree-fixture", false).unwrap();
         assert!(!configured(&paths.data_dir, &source).unwrap());
     }
+    #[tokio::test]
+    async fn hook_binding_waits_for_another_writer_instead_of_failing() {
+        use std::time::{Duration, Instant};
+        let (_temp, paths, store, source) = fixture();
+        let session = store.create(&source, "fixture", "fixture").unwrap();
+        let (holder, release) = crate::db::test_support::hold_write_lock(
+            paths.data_dir.join("global.db"),
+        );
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = Instant::now();
+        let path = create(&paths.data_dir, &store.db, &session, &source, Some("wait"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "binding returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert!(path.exists());
+    }
+
     fn fixture() -> (tempfile::TempDir, RuntimePaths, SessionStore, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("source");

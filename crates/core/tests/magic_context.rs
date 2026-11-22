@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[test]
 fn conversation_context_is_opt_in_scoped_revocable_and_bounded() {
     let dir = tempfile::tempdir().unwrap();
-    let context = ServiceContext::open(
+    let context = ServiceContext::from_stores(
         RuntimePaths::new(dir.path().join("data")).unwrap(),
         Arc::new(EnvironmentCredentials),
     )
@@ -27,6 +27,12 @@ fn conversation_context_is_opt_in_scoped_revocable_and_bounded() {
         .unwrap()
         .is_none());
     magic_context::configure(&context, root, id, true).unwrap();
+    assert!(
+        magic_context::collect_cancellable(&context, root, Some(id), vec![], &|| true)
+            .unwrap_err()
+            .to_string()
+            .contains("cancelled")
+    );
     let content = magic_context::collect(&context, root, Some(id), vec![])
         .unwrap()
         .unwrap();

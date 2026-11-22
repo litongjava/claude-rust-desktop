@@ -1,8 +1,8 @@
 //! Durable session role: a session is a normal Agent unless the user makes it a
 //! Router. The role never changes the permission mode.
+#[cfg(test)]
 use crate::db::DbManager;
-use anyhow::{bail, Result};
-use rusqlite::OptionalExtension;
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -60,58 +60,27 @@ impl MemberRole {
     }
 }
 
-fn key(session: &str) -> String {
-    format!("super-agent.role.{session}")
+pub fn load(db: &impl crate::db::session_store::SessionAccess, session: &str) -> Result<Role> {
+    db.select_session(session)?.role()
 }
 
-pub fn load(db: &DbManager, session: &str) -> Result<Role> {
-    let value: Option<String> = db.with_conn(|conn| {
-        conn.query_row(
-            "SELECT value FROM peripheral_settings WHERE key=?1",
-            [key(session)],
-            |row| row.get(0),
-        )
-        .optional()
-    })??;
-    match value.as_deref() {
-        None | Some("") => Ok(Role::Agent),
-        Some(value) => Role::parse(value),
-    }
-}
-
-pub fn set(db: &DbManager, session: &str, role: Role) -> Result<()> {
+pub fn set(
+    db: &impl crate::db::session_store::SessionAccess,
+    session: &str,
+    role: Role,
+) -> Result<()> {
     anyhow::ensure!(!session.trim().is_empty(), "Session is required");
-    db.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [key(session), role.as_str().to_owned()],
-        )
-    })??;
-    Ok(())
+    db.select_session(session)?
+        .set_role(role)
+        .context("Saving session role")
 }
 
-/// The task whose current coder or reviewer is this session, if any. This is
-/// the only way a member tool grants access; the model cannot claim membership.
-pub fn membership(db: &DbManager, session: &str) -> Result<Option<(String, MemberRole)>> {
-    db.with_conn(|conn| {
-        let row: Option<(String, Option<String>, Option<String>)> = conn
-            .query_row(
-                "SELECT task_id, coder_session_id, reviewer_session_id FROM sa_tasks WHERE coder_session_id=?1 OR reviewer_session_id=?1 ORDER BY updated_at DESC LIMIT 1",
-                [session],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        Ok(row.and_then(|(task_id, coder, reviewer)| {
-            if coder.as_deref() == Some(session) {
-                Some((task_id, MemberRole::Coder))
-            } else if reviewer.as_deref() == Some(session) {
-                Some((task_id, MemberRole::Reviewer))
-            } else {
-                None
-            }
-        }))
-    })?
+/// Only the task directory can grant a member tool access to a task.
+pub fn membership(
+    db: &impl crate::db::session_store::TaskMembership,
+    session: &str,
+) -> Result<Option<(String, MemberRole)>> {
+    db.member_session(session)
 }
 
 #[cfg(test)]
@@ -119,7 +88,7 @@ mod tests {
     use super::*;
     use crate::runtime::RuntimePaths;
 
-    fn fixture() -> (tempfile::TempDir, std::sync::Arc<DbManager>) {
+    fn fixture() -> (tempfile::TempDir, std::sync::Arc<crate::db::session_store::Stores>) {
         let temp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
         let db = paths.open_database().unwrap();
@@ -151,8 +120,9 @@ mod tests {
 
     #[test]
     fn membership_comes_from_the_task_record_only() {
-        let (temp, db) = fixture();
+        let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
+        let db = std::sync::Arc::new(crate::db::session_store::Stores::open(&data).unwrap());
         let store = crate::super_agent::TaskStore::new(db.clone(), data.clone());
         let sessions = crate::runtime::SessionStore::new(db.clone());
         let router = sessions.create(temp.path(), "fixture", "fixture").unwrap();
@@ -180,5 +150,33 @@ mod tests {
         );
         assert_eq!(membership(&db, &outsider).unwrap(), None);
         assert_eq!(membership(&db, &router).unwrap(), None);
+        set(&db, &coder, Role::Router).unwrap();
+        assert_eq!(load(&db, &coder).unwrap(), Role::Router);
+        db.open_session(&coder).unwrap().delete().unwrap();
+        db.create_code_session(temp.path(), "fixture", "fixture", &coder)
+            .unwrap();
+        assert_eq!(membership(&db, &coder).unwrap(), None);
+        assert_eq!(load(&db, &coder).unwrap(), Role::Agent);
+    }
+
+    #[test]
+    fn set_waits_for_another_writer_instead_of_failing() {
+        use std::time::{Duration, Instant};
+        let (_temp, db) = fixture();
+        let session=uuid::Uuid::new_v4().to_string();
+        db.create(&session,Default::default()).unwrap();
+        let path = db.data_dir().join("sessions").join(&session).join("session.db");
+        let (holder, release) = crate::db::test_support::hold_write_lock(path);
+        let releaser =
+            crate::db::test_support::release_after(release, holder, Duration::from_secs(6));
+        let started = Instant::now();
+        set(&db, &session, Role::Router).unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_secs(5),
+            "set returned after {:?}",
+            started.elapsed()
+        );
+        releaser.join().unwrap();
+        assert_eq!(load(&db, &session).unwrap(), Role::Router);
     }
 }

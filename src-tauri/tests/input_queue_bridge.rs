@@ -1,4 +1,4 @@
-use deepseek_code_core::services::{input_queue as queue, session_messages::ExecutionLease};
+use deepseek_code_core::services::input_queue as queue;
 use deepseek_desktop_tauri_lib::{
     bridge::BridgeServer,
     runtime::{RuntimePaths, SessionStore},
@@ -74,48 +74,16 @@ async fn durable_queue_roundtrip() {
     .unwrap();
     let url = format!("{base}/api/conversations/{id}/queue");
     // Desktop Code submissions need a selected project before any side effects.
-    let original_project: String = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT project_id FROM conversations WHERE id=?1",
-                [&id],
-                |row| row.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE conversations SET project_id=NULL,workspace_mode='code' WHERE id=?1",
-            [&id],
-        )
-    })
-    .unwrap()
-    .unwrap();
+    let original_project = db.conversation_metadata(&id).unwrap().unwrap().project_id.unwrap();
+    let shard=db.open_session(&id).unwrap();
+    shard.edit_conversation(&json!({"project_id":null,"workspace_mode":"code"})).unwrap();
     let rejected = client.post(format!("{base}/api/chat")).header("x-api-key", &key)
         .json(&json!({"conversation_id":id,"messages":[{"role":"user","content":"must not persist"}],"model":"fixture-model","provider_id":"fixture"})).send().await.unwrap();
     assert_eq!(rejected.status(), 400);
     assert!(rejected.text().await.unwrap().contains("Select a project"));
-    let count: i64 = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM messages WHERE conversation_id=?1",
-                [&id],
-                |row| row.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(count, 0);
+    assert!(shard.read(|r|r.messages()).unwrap().is_empty());
     assert!(requests.try_recv().is_err());
-    db.with_conn(|conn| {
-        conn.execute(
-            "UPDATE conversations SET project_id=?2 WHERE id=?1",
-            rusqlite::params![id, original_project],
-        )
-    })
-    .unwrap()
-    .unwrap();
+    shard.edit_conversation(&json!({"project_id":original_project})).unwrap();
     queue::set_paused(&db, &id, true).unwrap();
     let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aY9sAAAAASUVORK5CYII=";
     let content = json!([
@@ -197,7 +165,7 @@ async fn durable_queue_roundtrip() {
         queue::QueueState::Queued
     );
     // Contending process ownership cannot consume the admitted row.
-    let lease = ExecutionLease::acquire(dir.path(), &id).unwrap().unwrap();
+    let lease = shard.acquire_execution().unwrap();
     client
         .post(format!("{url}/resume"))
         .header("x-api-key", &key)
@@ -255,28 +223,10 @@ async fn durable_queue_roundtrip() {
         queue::list(&db, &id).unwrap()[0].state,
         queue::QueueState::Handoff
     );
-    let count: i64 = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT COUNT(*) FROM messages WHERE id=?1",
-                [format!("queue-input-{}", first["id"])],
-                |r| r.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(count, 1);
-    let saved: String = db
-        .with_conn(|conn| {
-            conn.query_row(
-                "SELECT content_json FROM message_user_content WHERE message_id=?1",
-                [format!("queue-input-{}", first["id"])],
-                |row| row.get(0),
-            )
-        })
-        .unwrap()
-        .unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&saved).unwrap(), content);
+    let handoff=queue::list(&db,&id).unwrap()[0].handoff_id.clone().unwrap();
+    let messages=shard.read(|r|r.messages()).unwrap();
+    assert_eq!(messages.iter().filter(|m|m.id==handoff).count(),1);
+    assert_eq!(shard.read(|r|r.user_content(&handoff)).unwrap(),content);
     client
         .post(format!("{base}/api/conversations/{id}/stop-generation"))
         .header("x-api-key", &key)
@@ -286,6 +236,26 @@ async fn durable_queue_roundtrip() {
         .error_for_status()
         .unwrap();
     assert!(queue::is_paused(&db, &id).unwrap());
+    // A rejected first request must leave the ID available for a sealed first turn.
+    let first_id = uuid::Uuid::new_v4().to_string();
+    let first = |content: Value| {
+        client.post(format!("{base}/api/chat")).header("x-api-key",&key)
+        .json(&json!({"conversation_id":first_id,"messages":[{"role":"user","content":content}],"model":"fixture-model","provider_id":"fixture"}))
+    };
+    let invalid = first(json!({"invalid":"content"})).send().await.unwrap();
+    assert_eq!(invalid.status(), 400);
+    assert!(db.conversation_metadata(&first_id).unwrap().is_none());
+    let content = json!([{"type":"text","text":"accepted first prompt"}]);
+    let accepted = first(content.clone()).send().await.unwrap();
+    assert!(accepted.status().is_success());
+    let _ = accepted.bytes().await.unwrap();
+    let (_, rows) = db.conversation_detail(&first_id).unwrap();
+    let users = rows
+        .iter()
+        .filter(|row| row["role"] == "user")
+        .collect::<Vec<_>>();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0]["content"], content);
     server.abort();
     model.abort();
 }

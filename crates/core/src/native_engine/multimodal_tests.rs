@@ -216,6 +216,8 @@ async fn durable_steer_handoff_waits_for_boundary_and_pause_preserves_next_turn(
     )
     .unwrap();
     let (mut engine, _events) = executor("http://127.0.0.1:1", "openai", json!("initial"));
+    let owner = Arc::new(std::sync::Mutex::new(store.db.open_session(&id).unwrap().delivery_owner().unwrap()));
+    engine.turn_delivery = Arc::downgrade(&owner);
     engine.goal_db = Some(store.db.clone());
     engine.conv_id = Some(id.clone());
     assert!(engine.deliver_queued_inputs(false).await.is_empty());
@@ -239,7 +241,7 @@ async fn durable_steer_handoff_waits_for_boundary_and_pause_preserves_next_turn(
     assert_eq!(
         store
             .db
-            .with_conn(|conn| crate::db::message_repo::get_message(conn, &delivered[0].origin))
+            .fixture_shard(&id, |conn| crate::db::message_repo::get_message(conn, delivered[0].message_id.as_deref().unwrap()))
             .unwrap()
             .unwrap()
             .unwrap()
@@ -270,13 +272,15 @@ async fn queued_images_replay_after_file_removal_without_becoming_approval_notes
         &[temp.path().join("missing.png"), png.clone()],
     )
     .unwrap();
-    input_queue::push(&store.db, &id, "look [Image #2]").unwrap();
+    store.db.open_session(&id).unwrap().enqueue_cli_prompt("look [Image #2]").unwrap();
     let notice = format!(
         "{} [Image #2] internal",
         crate::tools::background_shell::NOTIFICATION_START
     );
-    input_queue::push(&store.db, &id, &notice).unwrap();
+    store.db.open_session(&id).unwrap().enqueue_cli_notification(&notice).unwrap();
     let (mut engine, mut events) = executor("http://127.0.0.1:1", "openai", json!("initial"));
+    let owner = Arc::new(std::sync::Mutex::new(store.db.open_session(&id).unwrap().delivery_owner().unwrap()));
+    engine.turn_delivery = Arc::downgrade(&owner);
     engine.goal_db = Some(store.db.clone());
     engine.conv_id = Some(id.clone());
     engine.search_config_path = Some(temp.path().join("config.json"));
@@ -294,7 +298,7 @@ async fn queued_images_replay_after_file_removal_without_becoming_approval_notes
     let assistant = store.append(&id, "assistant", "").unwrap();
     store
         .db
-        .with_conn(|conn| -> Result<()> {
+        .fixture_shard(&id, |conn| -> Result<()> {
             crate::db::message_repo::insert_tool_call(
                 conn,
                 "call",

@@ -1,4 +1,5 @@
 //! Native device adapter. A dedicated thread owns CPAL's non-Send stream.
+use deepseek_code_core::db::session_store::GlobalSetting;
 use anyhow::{bail, ensure, Context, Result};
 #[cfg(not(target_os = "android"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -168,7 +169,7 @@ pub async fn run(
         "Microphone mode requires interactive stdin; use --file for scripts"
     );
     let config: deepseek_code_core::services::voice::VoiceConfig = context
-        .setting("voice")?
+        .global_setting(GlobalSetting::MachinePreference("voice"))?
         .context("Voice backend is not configured; use voice-config")?;
     config.validate()?;
     context.credentials.get(&config.credential)?;
@@ -186,14 +187,7 @@ pub async fn run(
         if let Some(id) = &resume_id {
             let db = paths.open_database()?;
             let resumed = deepseek_code_core::runtime::SessionStore::new(db.clone()).resume(id)?;
-            let (workspace, _) = db.with_conn(|c| {
-                deepseek_code_core::native_engine::workspace::resolve_workspace(
-                    c,
-                    &paths.data_dir.join("workspaces"),
-                    id,
-                    None,
-                )
-            })??;
+            let workspace = db.open_session(id)?.workspace()?;
             if cli.path.is_some() {
                 ensure!(
                     std::fs::canonicalize(&workspace)?

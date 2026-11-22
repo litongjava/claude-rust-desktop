@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 fn create_mock_provider() -> ResolvedProvider {
     let provider = Provider {
+        lease: None,
         id: "test-anthropic".to_string(),
         name: "Anthropic".to_string(),
         base_url: "https://api.anthropic.com".to_string(),

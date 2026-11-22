@@ -1,6 +1,7 @@
 //! Explicit session goals. All mutations are transactional; stale evaluations
 //! cannot recreate a cleared or replaced goal.
-use crate::db::DbManager;
+use crate::db::session_store::SessionAccess;
+#[cfg(test)] use crate::db::DbManager;
 use anyhow::{ensure, Result};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
@@ -29,29 +30,15 @@ pub struct Goal {
 }
 
 #[derive(Default, Serialize, Deserialize)]
-struct State {
+pub(crate) struct State {
     active: Option<Goal>,
     last: Option<Goal>,
     #[serde(default)]
     revision: u64,
 }
 
-fn modify<T>(db: &DbManager, session: &str, f: impl FnOnce(&mut State) -> T) -> Result<T> {
-    modify_with_conn(db, session, |_, state| Ok(f(state)))
-}
-
-fn modify_with_conn<T>(
-    db: &DbManager,
-    session: &str,
-    f: impl FnOnce(&rusqlite::Connection, &mut State) -> Result<T>,
-) -> Result<T> {
-    db.with_conn(|conn| -> Result<T> {
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let result = modify_conn(&tx, session, f)?;
-        tx.commit()?;
-        Ok(result)
-    })?
+fn modify<T>(db:&impl SessionAccess,session:&str,mut f:impl FnMut(&mut State)->T)->Result<T>{
+    db.select_session(session)?.update_goal(None,|s|Ok(f(s)))
 }
 
 fn read_conn(conn: &rusqlite::Connection, session: &str) -> Result<State> {
@@ -68,7 +55,7 @@ fn read_conn(conn: &rusqlite::Connection, session: &str) -> Result<State> {
         .unwrap_or_default())
 }
 
-fn modify_conn<T>(
+pub(crate) fn modify_conn<T>(
     conn: &rusqlite::Connection,
     session: &str,
     f: impl FnOnce(&rusqlite::Connection, &mut State) -> Result<T>,
@@ -84,29 +71,21 @@ pub fn revision_conn(conn: &rusqlite::Connection, session: &str) -> Result<u64> 
     Ok(read_conn(conn, session)?.revision)
 }
 
-pub fn active(db: &DbManager, session: &str) -> Result<Option<Goal>> {
+pub fn active(db: &impl SessionAccess, session: &str) -> Result<Option<Goal>> {
     // Read without acquiring a write transaction: evaluator polls this while
     // another process may be clearing the goal.
-    db.with_conn(|conn| -> Result<Option<Goal>> {
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT value FROM peripheral_settings WHERE key=?1",
-                [format!("session.goal.{session}")],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(json
-            .map(|s| serde_json::from_str::<State>(&s))
-            .transpose()?
-            .and_then(|s| s.active))
-    })?
+    db.select_session(session)?.active_goal()
 }
 
-pub fn status(db: &DbManager, session: &str) -> Result<Option<Goal>> {
+pub(crate) fn active_conn(conn: &rusqlite::Connection, session: &str) -> Result<Option<Goal>> {
+    Ok(read_conn(conn, session)?.active)
+}
+
+pub fn status(db: &impl SessionAccess, session: &str) -> Result<Option<Goal>> {
     modify(db, session, |s| s.active.clone().or_else(|| s.last.clone()))
 }
 
-pub fn set(db: &DbManager, session: &str, condition: &str) -> Result<Goal> {
+pub fn set(db: &impl SessionAccess, session: &str, condition: &str) -> Result<Goal> {
     let goal = new_goal(condition)?;
     modify(db, session, |s| replace(s, &goal))?;
     Ok(goal)
@@ -124,19 +103,13 @@ pub fn set_conn(conn: &rusqlite::Connection, session: &str, condition: &str) -> 
 }
 
 pub fn set_from_user(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     condition: &str,
     raw_input: &str,
 ) -> Result<Goal> {
     let goal = new_goal(condition)?;
-    modify_with_conn(db, session, |conn, state| {
-        super::permission_authority::record_conn(
-            conn,
-            session,
-            super::permission_authority::Source::User,
-            &serde_json::json!(raw_input),
-        )?;
+    db.select_session(session)?.update_goal(Some(raw_input),|state| {
         replace(state, &goal);
         Ok(())
     })?;
@@ -172,31 +145,31 @@ fn new_goal(condition: &str) -> Result<Goal> {
     })
 }
 
-pub fn clear(db: &DbManager, session: &str) -> Result<bool> {
-    modify(db, session, |s| {
-        s.revision = s.revision.saturating_add(1);
-        s.active.take().is_some()
-    })
+pub fn clear(db: &impl SessionAccess, session: &str) -> Result<bool> {
+    modify(db, session, clear_state)
+}
+
+fn clear_state(s: &mut State) -> bool {
+    s.revision = s.revision.saturating_add(1);
+    s.active.take().is_some()
+}
+
+pub(crate) fn clear_conn(conn: &rusqlite::Connection, session: &str) -> Result<bool> {
+    modify_conn(conn, session, |_, state| Ok(clear_state(state)))
 }
 
 /// Host-only boundary for an explicit human cancellation. Persist revocation
 /// with the state change so automatic permission review cannot retain only
 /// the earlier goal after cancellation. Internal cleanup must use `clear`.
-pub fn clear_from_user(db: &DbManager, session: &str, raw_input: &str) -> Result<bool> {
-    modify_with_conn(db, session, |conn, state| {
-        super::permission_authority::record_conn(
-            conn,
-            session,
-            super::permission_authority::Source::User,
-            &serde_json::json!(raw_input),
-        )?;
+pub fn clear_from_user(db: &impl SessionAccess, session: &str, raw_input: &str) -> Result<bool> {
+    db.select_session(session)?.update_goal(Some(raw_input),|state| {
         state.revision = state.revision.saturating_add(1);
         Ok(state.active.take().is_some())
     })
 }
 
 /// Only a real user input resets the shared Stop-hook continuation budget.
-pub fn begin_input(db: &DbManager, session: &str) -> Result<()> {
+pub fn begin_input(db: &impl SessionAccess, session: &str) -> Result<()> {
     modify(db, session, |s| {
         if let Some(g) = &mut s.active {
             g.id = uuid::Uuid::new_v4().to_string();
@@ -209,7 +182,7 @@ pub fn begin_input(db: &DbManager, session: &str) -> Result<()> {
     })
 }
 
-pub fn pause(db: &DbManager, session: &str, id: &str, reason: &str) -> Result<bool> {
+pub fn pause(db: &impl SessionAccess, session: &str, id: &str, reason: &str) -> Result<bool> {
     modify(db, session, |s| {
         let Some(g) = s.active.as_mut().filter(|g| g.id == id) else {
             return false;
@@ -222,7 +195,7 @@ pub fn pause(db: &DbManager, session: &str, id: &str, reason: &str) -> Result<bo
 }
 
 pub fn record_turn(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     id: &str,
     tokens: u64,
@@ -239,7 +212,7 @@ pub fn record_turn(
     })
 }
 
-pub fn verdict(db: &DbManager, session: &str, id: &str, state: &str, reason: &str) -> Result<bool> {
+pub fn verdict(db: &impl SessionAccess, session: &str, id: &str, state: &str, reason: &str) -> Result<bool> {
     modify(db, session, |s| {
         let Some(g) = s
             .active
@@ -275,7 +248,7 @@ fn retry_delay_ms(attempt: u8, jitter_per_mille: u16) -> Option<i64> {
 }
 
 /// Persist before announcing a retry, so another frontend can interrupt it.
-pub fn arm_retry(db: &DbManager, session: &str, id: &str, reason: &str) -> Result<Option<Goal>> {
+pub fn arm_retry(db: &impl SessionAccess, session: &str, id: &str, reason: &str) -> Result<Option<Goal>> {
     let bytes = uuid::Uuid::new_v4();
     let jitter = u16::from_le_bytes([bytes.as_bytes()[0], bytes.as_bytes()[1]]) % 201;
     modify(db, session, |s| {
@@ -292,7 +265,7 @@ pub fn arm_retry(db: &DbManager, session: &str, id: &str, reason: &str) -> Resul
     })
 }
 
-pub fn retry_ready(db: &DbManager, session: &str, id: &str, now_ms: i64) -> Result<bool> {
+pub fn retry_ready(db: &impl SessionAccess, session: &str, id: &str, now_ms: i64) -> Result<bool> {
     modify(db, session, |s| {
         let Some(g) = s
             .active
@@ -312,7 +285,7 @@ pub fn retry_ready(db: &DbManager, session: &str, id: &str, now_ms: i64) -> Resu
 
 /// Returns None when there is no active goal: ordinary Stop hooks then use
 /// their executor-local budget. Child sessions never consume their parent's.
-pub fn block(db: &DbManager, session: &str, id: Option<&str>, cap: u64) -> Result<Option<bool>> {
+pub fn block(db: &impl SessionAccess, session: &str, id: Option<&str>, cap: u64) -> Result<Option<bool>> {
     modify(db, session, |s| {
         let g = s.active.as_mut()?;
         if id.is_some_and(|id| id != g.id) {

@@ -6,6 +6,10 @@
 //! The test asserts the host resumes the original Coder with the Reviewer's
 //! exact issues and then the same Reviewer session for the new submitted
 //! version. It stops before delivery integration.
+use deepseek_code_core::db::session_store::TaskState;
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     runtime::{RuntimePaths, SessionStore},
     services::{EnvironmentCredentials, ServiceContext},
@@ -400,7 +404,7 @@ fn delivery_tool_calls(state: &MockState) -> usize {
                     .is_some_and(|prompt| prompt.contains("deliver the host-verified integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.starts_with("Exit code:"))
+                    .is_some_and(|result| is_bash_result(result))
         })
         .count()
 }
@@ -416,7 +420,7 @@ async fn wait_for_delivery_tool(state: &MockState) {
                     .is_some_and(|prompt| prompt.contains("deliver the host-verified integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.contains("Exit code: 0"))
+                    .is_some_and(|result| is_bash_result(result) && bash_succeeded(result))
         });
         if ran {
             return;
@@ -437,7 +441,7 @@ async fn wait_for_integration_tool(state: &MockState) {
                     .is_some_and(|prompt| prompt.contains("Prepare integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.starts_with("Exit code:"))
+                    .is_some_and(|result| is_bash_result(result))
         });
         if ran {
             return;
@@ -461,7 +465,7 @@ fn integration_tool_calls(state: &MockState) -> usize {
                     .is_some_and(|prompt| prompt.contains("Prepare integration"))
                 && request["last_tool_result"]
                     .as_str()
-                    .is_some_and(|result| result.starts_with("Exit code:"))
+                    .is_some_and(|result| is_bash_result(result))
         })
         .count()
 }
@@ -471,6 +475,27 @@ fn tool_output(result: &str) -> String {
         .split_once("Output:\n")
         .map(|(_, output)| output.trim().to_owned())
         .unwrap_or_else(|| result.trim().to_owned())
+}
+
+/// A rendered shell result no longer leads with `Exit code: 0`, so a successful
+/// call is any result whose first status line is not a failure.
+fn bash_succeeded(result: &str) -> bool {
+    if result.starts_with("Error: ") {
+        return false;
+    }
+    let first = result.lines().next().unwrap_or_default();
+    !(first.starts_with("Exit code:")
+        || first == "Command failed"
+        || first.starts_with("Command timed out")
+        || first == "Tool reported an error")
+}
+
+/// Whether a model-visible result came from the shell tool. Shell text is
+/// rendered without a label once it has a single stdout body, so anything that
+/// is not a JSON payload (or a tool-start failure) counts here; this fixture's
+/// only non-shell tools return JSON.
+fn is_bash_result(result: &str) -> bool {
+    !result.starts_with("Error: ") && !result.trim_start().starts_with('{')
 }
 
 fn integration_repository(prompt: &str) -> String {
@@ -571,7 +596,7 @@ async fn coder_response(
                 let oid = |value: &str| {
                     value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
                 };
-                if !result.contains("Exit code: 0") || !oid(&before) || !oid(&after) {
+                if !bash_succeeded(&result) || !oid(&before) || !oid(&after) {
                     state.violation(format!(
                         "the integration merge did not yield two commits: {result}"
                     ));
@@ -615,7 +640,7 @@ async fn coder_response(
             ),
             1 => {
                 let result = last_result.unwrap_or_default();
-                if !result.contains("Exit code: 0") {
+                if !bash_succeeded(&result) {
                     state.violation(format!(
                         "the reviewed correction command failed instead of committing: {result}"
                     ));
@@ -1561,38 +1586,12 @@ fn job_directory_ids(data: &Path) -> Vec<String> {
 /// Durable settings rows under one prefix, keyed and ordered, so adding or
 /// rewriting a launch operation or resume marker is visible.
 fn setting_entries(context: &ServiceContext, prefix: &str) -> Vec<(String, String)> {
-    let pattern = format!("{prefix}%");
-    context
-        .db
-        .with_conn(|conn| -> anyhow::Result<Vec<(String, String)>> {
-            let mut statement = conn.prepare(
-                "SELECT key,value FROM peripheral_settings WHERE key LIKE ?1 ORDER BY key",
-            )?;
-            let rows = statement.query_map([pattern], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let rows: Vec<(String, String)> = rows.collect::<Result<_, _>>()?;
-            Ok(rows)
-        })
-        .unwrap()
-        .unwrap()
+    context.db.task_state_rows(prefix).unwrap()
 }
 
 fn operation_prompts(context: &ServiceContext, task_id: &str) -> Vec<Value> {
-    let prefix = format!("super-agent.launch-op.{task_id}.%");
-    context
-        .db
-        .with_conn(|conn| -> anyhow::Result<Vec<Value>> {
-            let mut statement = conn
-                .prepare("SELECT value FROM peripheral_settings WHERE key LIKE ?1 ORDER BY key")?;
-            let rows = statement.query_map([prefix], |row| row.get::<_, String>(0))?;
-            Ok(rows
-                .filter_map(|row| row.ok())
-                .filter_map(|value| serde_json::from_str::<Value>(&value).ok())
-                .collect())
-        })
-        .unwrap()
-        .unwrap()
+    context.db.task_state_rows(&format!("super-agent.launch-op.{task_id}.")).unwrap().into_iter()
+        .map(|(_,raw)|serde_json::from_str::<Value>(&raw).unwrap()).collect()
 }
 
 /// The durable storage key of one repository's typed delivery operation.
@@ -1620,11 +1619,11 @@ fn delivery_operation_key(
 /// key it was found under.
 fn tamper_delivery_operation(context: &ServiceContext, key: &str, edit: impl FnOnce(&mut Value)) {
     let mut operation = context
-        .setting::<Value>(key)
+        .db.task_state::<Value>(key)
         .unwrap()
         .expect("delivery launch operation");
     edit(&mut operation);
-    context.save_setting(key, &operation).unwrap();
+    context.db.save_task_state(key, &operation).unwrap();
 }
 
 /// Bytes of the worktree's real index file. A denied delivery must not rewrite
@@ -2061,12 +2060,8 @@ async fn run_review_loop_with(
                 .unwrap_or_default()
         })
         .filter_map(|result| result.as_str().map(str::to_owned))
-        .filter(|result| result.starts_with("Exit code:"))
-        .filter_map(|result| {
-            result
-                .split_once("Output:\n")
-                .map(|(_, output)| output.trim().to_owned())
-        })
+        .filter(|result| is_bash_result(result))
+        .map(|result| tool_output(&result))
         .collect();
     assert_eq!(
         bash_outputs.len(),
@@ -2090,10 +2085,7 @@ async fn run_review_loop_with(
     assert_eq!(lines[2], second_commit, "Reviewer read a different commit");
     let reviewer_row = context
         .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::get_conversation(conn, &reviewer)
-        })
-        .unwrap()
+        .conversation_metadata(&reviewer)
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -2428,12 +2420,8 @@ async fn run_review_loop_with(
                     .unwrap_or_default()
             })
             .filter_map(|result| result.as_str().map(str::to_owned))
-            .filter(|result| result.starts_with("Exit code:"))
-            .filter_map(|result| {
-                result
-                    .split_once("Output:\n")
-                    .map(|(_, output)| output.trim().to_owned())
-            })
+            .filter(|result| is_bash_result(result))
+            .map(|result| tool_output(&result))
             .collect();
         let final_output = reviewer_outputs
         .iter()
@@ -2631,8 +2619,7 @@ async fn run_review_loop_with(
             // resumed delivery child must receive the denial; it must not keep
             // the authority of the mode it was first launched with.
             context
-                .save_setting(
-                    &format!("cli.permissions.{coder}"),
+                .db.seed_preference(&coder, deepseek_code_core::db::session_store::settings::PERMISSIONS,
                     &json!({"Bash": "Deny"}),
                 )
                 .unwrap();
@@ -2949,7 +2936,7 @@ async fn run_review_loop_with(
             // The live Router mode is the only denial source.
             assert!(
                 context
-                    .setting::<Value>(&format!("cli.permissions.{coder}"))
+                    .db.fixture_preference(&coder, deepseek_code_core::db::session_store::settings::PERMISSIONS)
                     .unwrap()
                     .is_none(),
                 "this scenario must not seed a Coder-specific deny rule"
@@ -3107,7 +3094,7 @@ async fn run_review_loop_with(
                 if delivery == DeliveryMode::Interrupted {
                     reopened
                         .db
-                        .with_conn(|conn| {
+                        .directory_sql(|conn| {
                             conn.execute(
                                 "UPDATE sa_delivery_dispatches SET job_id=NULL WHERE task_id=?1",
                                 [&task_id],
@@ -3157,7 +3144,7 @@ async fn run_review_loop_with(
                         .expect("another real job of the same Coder");
                     reopened
                         .db
-                        .with_conn(|conn| {
+                        .directory_sql(|conn| {
                             conn.execute(
                                 "UPDATE sa_repository_dispatches SET job_id=?3 WHERE task_id=?1 AND plan_operation_id=?2",
                                 [
@@ -3245,7 +3232,7 @@ async fn run_review_loop_with(
                         .pop()
                         .expect("delivery plan");
                     let key = delivery_operation_key(&task, &plan, &coder);
-                    let preserved = reopened.setting::<Value>(&key).unwrap().unwrap();
+                    let preserved = reopened.db.task_state::<Value>(&key).unwrap().unwrap();
                     assert_eq!(preserved["task_id"], json!("task-999"));
                     assert_eq!(preserved["handle"], Value::Null);
                     // Release the exact hostile child and let it exit.
@@ -3302,7 +3289,7 @@ async fn run_review_loop_with(
                     );
                     let key = delivery_operation_key(&task, &plan, &coder);
                     let operation = reopened
-                        .setting::<Value>(&key)
+                        .db.task_state::<Value>(&key)
                         .unwrap()
                         .expect("delivery launch operation");
                     assert_eq!(
@@ -3455,18 +3442,12 @@ async fn run_review_loop_with(
                             })
                             && request["last_tool_result"]
                                 .as_str()
-                                .is_some_and(|result| result.starts_with("Exit code:"))
+                                .is_some_and(|result| is_bash_result(result))
                     })
                     .and_then(|request| request["last_tool_result"].as_str().map(str::to_owned))
                     .expect("delivery Bash result");
-                assert!(
-                    delivery_result.contains("Exit code: 0"),
-                    "{delivery_result}"
-                );
-                let output = delivery_result
-                    .split_once("Output:\n")
-                    .map(|(_, output)| output.trim())
-                    .unwrap_or_default();
+                assert!(bash_succeeded(&delivery_result), "{delivery_result}");
+                let output = tool_output(&delivery_result);
                 assert_eq!(
                     std::fs::canonicalize(output.lines().next().unwrap_or_default()).unwrap(),
                     std::fs::canonicalize(&coder_worktree).unwrap(),
@@ -3628,7 +3609,7 @@ async fn run_review_loop_with(
                                 "super-agent.reviewer-resume.{task_id}.1.{round}.final-completion"
                             );
                             let marker = context
-                                .setting::<Value>(&marker_key)
+                                .db.task_state::<Value>(&marker_key)
                                 .unwrap()
                                 .expect("final completion Reviewer marker");
                             let job_id = marker["job_id"]
@@ -3860,7 +3841,7 @@ async fn run_review_loop_with(
                                     "a reopened host added or rewrote a resume marker"
                                 );
                                 let reopened_marker = reopened_context
-                                    .setting::<Value>(&marker_key)
+                                    .db.task_state::<Value>(&marker_key)
                                     .unwrap()
                                     .expect("final completion Reviewer marker");
                                 assert_eq!(reopened_marker["job_id"], json!(job_id));
@@ -4101,10 +4082,7 @@ async fn run_review_loop_with(
     let conversation = |session: &str| -> Value {
         context
             .db
-            .with_conn(|conn| {
-                deepseek_code_core::db::conversation_repo::get_conversation(conn, session)
-            })
-            .unwrap()
+            .conversation_metadata(session)
             .unwrap()
             .map(|row| {
                 json!({
@@ -4683,13 +4661,10 @@ mod two_repository_cli {
                 .unwrap();
             // The Coder is a Router child, as a real launch would have made it.
             let now = chrono::Utc::now().to_rfc3339();
-            context
-                .save_setting(
-                    &format!(
-                        "{}{}",
-                        deepseek_code_core::native_engine::child_session::OWNER_KEY_PREFIX,
-                        coder
-                    ),
+            {
+                use deepseek_code_core::db::session_store::WorkerDirectory;
+                let pair=context.db.worker_pair(&router,&coder).unwrap();
+                context.db.save_child_owner(&pair,
                     &deepseek_code_core::native_engine::child_session::ChildOwnership {
                         parent_session_id: router.clone(),
                         agent_type: "general".into(),
@@ -4701,8 +4676,8 @@ mod two_repository_cli {
                         updated_at: now,
                         last_error: None,
                     },
-                )
-                .unwrap();
+                ).unwrap();
+            }
             // The runtime plan gate requires a durable approved plan for this
             // exact spec version and permission policy before any Coder Bash.
             let approval = store
@@ -4882,7 +4857,7 @@ mod two_repository_cli {
                 .collect();
             store
                 .db()
-                .with_conn(|conn| {
+                .directory_sql(|conn| {
                     conn.execute(
                         "UPDATE sa_tasks SET phase='REVIEWING', status='RUNNING' WHERE task_id=?1",
                         [&task.task_id],
@@ -5120,7 +5095,7 @@ mod two_repository_cli {
             let marker = self.marker.to_string_lossy().into_owned();
             self.context
                 .db
-                .with_conn(|conn| -> anyhow::Result<Vec<String>> {
+                .shard_sql(&self.coder, |conn| -> anyhow::Result<Vec<String>> {
                     let messages =
                         deepseek_code_core::db::message_repo::get_messages_by_conversation(
                             conn,

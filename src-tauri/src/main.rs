@@ -5,7 +5,6 @@ use deepseek_desktop_tauri_lib::*;
 use bridge::BridgeServer;
 use native_engine::engine_core::NativeEngine;
 use native_engine::provider_manager::ProviderManager;
-use native_engine::session_manager::SessionManager;
 use mcp::McpServerManager;
 use permissions::PermissionManager;
 use tauri::Manager;
@@ -170,7 +169,6 @@ fn main() {
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<ProviderManager>>>)))
         .manage(Arc::new(Mutex::new(None::<Arc<Mutex<McpServerManager>>>)))
         .manage(Arc::new(std::sync::Mutex::new(None::<String>)))
-        .manage(Arc::new(Mutex::new(None::<SessionManager>)))
         .manage(Arc::new(Mutex::new(None::<Arc<PermissionManager>>)))
         .setup(move |app| {
             app.manage(commands::peripheral::PeripheralHost::default());
@@ -181,21 +179,10 @@ fn main() {
             if let Err(e) = crate::config::OrchestrationConfig::init_global() {
                 tracing::warn!("Failed to load orchestration.toml, using defaults: {}", e);
             }
-            // Initialize SQLite database with persistent storage
-            let db_path = data_dir.join(deepseek_code_core::runtime::DATABASE_FILE);
-            let db_manager = match crate::db::DbManager::new(db_path.clone()) {
-                Ok(db) => Arc::new(db),
-                Err(e) => {
-                    tracing::error!(module = "FATAL", error = %e);
-                    std::process::exit(1);
-                }
-            };
-            if let Err(e) = db_manager.init() {
-                tracing::error!(module = "FATAL", error = %e);
-                std::process::exit(1);
-            }
+            let paths = deepseek_code_core::runtime::RuntimePaths::new(std::path::absolute(&data_dir)?)?;
+            let db_manager = paths.open_database()?;
             app.manage(db_manager.clone());
-            tracing::info!(module = "SQLite", "Database initialized at {:?}", db_path);
+            tracing::info!(module = "SQLite", "Database initialized in {:?}", data_dir);
 
             let im_manager = Arc::new(
                 crate::im_integration::ImIntegrationManager::new(db_manager.clone())
@@ -235,12 +222,12 @@ fn main() {
             {
                 use tokio::sync::mpsc;
                 use crate::im_integration::message_router::{UnifiedMessage, MessageType, ReplyPayload};
-                use crate::db::DbManager;
+                use crate::db::session_store::Stores;
                 use crate::native_engine::NativeEngine;
 
                 let (msg_tx, mut msg_rx) = mpsc::unbounded_channel::<UnifiedMessage>();
                 let im_manager_ref = app.state::<Arc<crate::im_integration::ImIntegrationManager>>().inner().clone();
-                let db_for_im = app.state::<Arc<DbManager>>().inner().clone();
+                let db_for_im = app.state::<Arc<Stores>>().inner().clone();
                 let native_engine_state = app.state::<Arc<Mutex<Option<NativeEngine>>>>().inner().clone();
                 let _ = db_for_im;
 
@@ -301,6 +288,7 @@ fn main() {
                             })],
                             model: "claude-sonnet-4-6".to_string(),
                             system_prompt: None,
+                            standalone_frontend: false,
                             max_tokens: None,
                             workspace_path: None,
                             temperature: None,
@@ -311,7 +299,7 @@ fn main() {
                         // Send initial "thinking" card
                         let card_start = serde_json::json!({
                             "config": { "wide_screen_mode": true },
-                            "header": { "title": { "tag": "plain_text", "content": "Claude" }, "template": "blue" },
+                            "header": { "title": { "tag": "plain_text", "content": "DeepSeek Code" }, "template": "blue" },
                             "elements": [
                                 { "tag": "markdown", "content": "🤔 *正在思考...*" },
                                 { "tag": "note", "elements": [{ "tag": "plain_text", "content": "流式输出中..." }] }
@@ -348,7 +336,7 @@ fn main() {
                                                 };
                                                 let card_update = serde_json::json!({
                                                     "config": { "wide_screen_mode": true },
-                                                    "header": { "title": { "tag": "plain_text", "content": "Claude" }, "template": "blue" },
+                                                    "header": { "title": { "tag": "plain_text", "content": "DeepSeek Code" }, "template": "blue" },
                                                     "elements": [
                                                         { "tag": "markdown", "content": preview },
                                                         { "tag": "note", "elements": [{ "tag": "plain_text", "content": "流式输出中..." }] }
@@ -380,7 +368,7 @@ fn main() {
                                             // Finalize card
                                             let card_final = serde_json::json!({
                                                 "config": { "wide_screen_mode": true },
-                                                "header": { "title": { "tag": "plain_text", "content": "Claude" }, "template": "blue" },
+                                                "header": { "title": { "tag": "plain_text", "content": "DeepSeek Code" }, "template": "blue" },
                                                 "elements": [
                                                     { "tag": "markdown", "content": &if full_text.is_empty() { "_(空回复)_" } else { &full_text } }
                                                 ]
@@ -440,14 +428,6 @@ fn main() {
                 });
             }
 
-            // Initialize SessionManager
-            let sessions_path = data_dir.join("sessions.json");
-            let workspaces_dir = data_dir.join("workspaces");
-            let session_mgr = SessionManager::new(sessions_path, workspaces_dir);
-            tauri::async_runtime::block_on(async {
-                *app.state::<Arc<Mutex<Option<SessionManager>>>>().lock().await = Some(session_mgr);
-            });
-            tracing::info!(module = "SessionManager", "Initialized");
             let bridge_ready = Arc::new(Notify::new());
             let _bridge_ready_clone = bridge_ready.clone();
 
@@ -475,29 +455,10 @@ fn main() {
             }
 
             let api_key_store = app.state::<Arc<std::sync::Mutex<Option<String>>>>().inner().clone();
-            let db_manager_for_bridge = match app.try_state::<Arc<crate::db::DbManager>>() {
-                Some(state) => state.inner().clone(),
-                None => {
-                    tracing::error!(module = "Main", "DbManager not found in state, creating new one for Bridge");
-                    let new_db = match crate::db::DbManager::new(db_path.clone()) {
-                        Ok(db) => Arc::new(db),
-                        Err(e) => {
-                            tracing::error!(module = "FATAL", error = %e);
-                            std::process::exit(1);
-                        }
-                    };
-                    if let Err(e) = new_db.init() {
-                        tracing::error!(module = "FATAL", error = %e);
-                        std::process::exit(1);
-                    }
-                    new_db
-                }
-            };
-
             let bridge_ready = Arc::new(tokio::sync::Notify::new());
             let bridge_ready_for_bridge = bridge_ready.clone();
 
-            let bridge = BridgeServer::new(data_dir, db_manager_for_bridge)
+            let bridge = BridgeServer::new(data_dir, db_manager.clone())
                 .with_launch_permissions(launch_permissions);
             // Native mode controls and Bridge execution must use the same authority.
             tauri::async_runtime::block_on(async {
@@ -522,18 +483,10 @@ fn main() {
                 }
             });
 
-            let db_manager_for_scheduler = match app.try_state::<Arc<crate::db::DbManager>>() {
-                Some(state) => state.inner().clone(),
-                None => {
-                    tracing::error!(module = "Scheduler", "DbManager not found, scheduler disabled");
-                    return Ok(());
-                }
-            };
-
             match crate::commands::app_data_dir() {
                 Ok(data_dir) => {
                     tauri::async_runtime::spawn(async move {
-                        crate::scheduler::ScheduledTaskScheduler::new(db_manager_for_scheduler)
+                        crate::scheduler::ScheduledTaskScheduler::new(db_manager)
                             .with_data_dir(data_dir)
                             .start()
                             .await;

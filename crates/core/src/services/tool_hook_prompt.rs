@@ -6,7 +6,7 @@ use crate::native_engine::{
     provider_manager::{ApiFormat, ResolvedProvider},
 };
 
-const SYSTEM: &str = "You are evaluating a hook in Claude Code.\n\nYour response must be a JSON object matching one of the following schemas:\n1. If the condition is met, return: {\"ok\": true}\n2. If the condition is not met, return: {\"ok\": false, \"reason\": \"Reason for why it is not met\"}";
+const SYSTEM: &str = "You are evaluating a hook in DeepSeek Code.\n\nYour response must be a JSON object matching one of the following schemas:\n1. If the condition is met, return: {\"ok\": true}\n2. If the condition is not met, return: {\"ok\": false, \"reason\": \"Reason for why it is not met\"}";
 const MAX_TOKENS: u32 = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,7 +85,7 @@ pub(super) fn select_provider(
     config: &PromptHook,
     current: &ResolvedProvider,
 ) -> Result<ResolvedProvider> {
-    let mut provider = current.clone();
+    let mut provider = current.current()?;
     if let Some(model) = &config.model {
         provider.model = provider
             .provider

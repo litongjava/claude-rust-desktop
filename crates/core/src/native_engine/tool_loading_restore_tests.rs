@@ -2,6 +2,7 @@
 //! session is reopened, and no other session may.
 
 use super::*;
+use crate::db::session_store::Stores;
 use crate::runtime::{RuntimePaths, SessionStore};
 
 fn restore_executor(paths: &RuntimePaths, messages: Vec<Value>) -> ToolLoopExecutor {
@@ -24,7 +25,7 @@ fn restore_executor(paths: &RuntimePaths, messages: Vec<Value>) -> ToolLoopExecu
 
 /// Stores one assistant tool call and its result the way the host does.
 fn record_call(
-    store: &SessionStore,
+    store: &SessionStore<Stores>,
     session: &str,
     assistant: &str,
     id: &str,
@@ -33,24 +34,24 @@ fn record_call(
 ) {
     store
         .db
-        .with_conn(|conn| {
-            crate::db::message_repo::save_stream_tool_result(
-                conn,
-                session,
+        .open_session(session)
+        .unwrap()
+        .write(|w| {
+            w.stream_tools(
                 assistant,
                 "",
-                &crate::db::message_repo::ToolCallRow {
-                    id: format!("{assistant}:{id}"),
+                &[crate::db::message_repo::ToolCallRow {
+                    id: id.to_owned(),
                     message_id: assistant.to_owned(),
                     name: name.to_owned(),
-                    input: Some("{}".to_owned()),
+                    input: Some("{}".into()),
                     output: Some(output.to_owned()),
                     is_error: false,
                     sort_order: 0,
-                },
+                }],
+                &Default::default(),
             )
         })
-        .unwrap()
         .unwrap();
 }
 
@@ -63,12 +64,56 @@ fn request_names(executor: &ToolLoopExecutor) -> Vec<String> {
         .collect()
 }
 
+/// The load order survives a resume: both the message history and the durable
+/// rows append the loaded tools in the order their ToolLoad calls ran, not in
+/// alphabetical order, so the request prefix after the resident tools stays
+/// what the provider cached.
+#[test]
+fn a_resumed_session_keeps_the_loaded_tool_order() {
+    let _ = crate::config::OrchestrationConfig::init_global();
+    let dir = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
+    let store = SessionStore::new(Arc::new(paths.open_stores().unwrap()));
+    let session = store.create(dir.path(), "fixture", "fixture").unwrap();
+
+    store.append(&session, "user", "Load both").unwrap();
+    for (name, suffix) in [("WebFetch", "web"), ("ListDir", "dir")] {
+        let assistant = uuid::Uuid::new_v4().to_string();
+        record_call(
+            &store,
+            &session,
+            &assistant,
+            suffix,
+            "ToolLoad",
+            &json!({"success":true,"loaded_tools":[name],"tools":[]}).to_string(),
+        );
+    }
+
+    let mut from_messages = restore_executor(
+        &paths,
+        store.model_history(&session, &ApiFormat::OpenAI).unwrap(),
+    );
+    from_messages.restore_loaded_tools();
+    let sent = request_names(&from_messages);
+    assert_eq!(&sent[sent.len() - 2..], ["WebFetch", "ListDir"], "{sent:?}");
+
+    // The durable rows restore the same order even when the submitted display
+    // history is empty.
+    let mut from_rows = restore_executor(&paths, vec![])
+        .with_conv_id(session.clone())
+        .with_executor_history(store.db.executor_history(&session).unwrap())
+        .unwrap();
+    from_rows.restore_persisted_loaded_tools().unwrap();
+    let sent = request_names(&from_rows);
+    assert_eq!(&sent[sent.len() - 2..], ["WebFetch", "ListDir"], "{sent:?}");
+}
+
 #[test]
 fn a_persisted_search_still_counts_after_a_restart_and_only_in_that_session() {
     let _ = crate::config::OrchestrationConfig::init_global();
     let dir = tempfile::tempdir().unwrap();
     let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
-    let store = SessionStore::new(paths.open_database().unwrap());
+    let store = SessionStore::new(Arc::new(paths.open_stores().unwrap()));
     let session = store.create(dir.path(), "fixture", "fixture").unwrap();
     let marker = json!({"success":true,"loaded_tools":["ListDir"],"tools":[]}).to_string();
     let assistant = uuid::Uuid::new_v4().to_string();
@@ -161,4 +206,76 @@ fn a_persisted_search_still_counts_after_a_restart_and_only_in_that_session() {
             .await;
         assert!(!failed, "{output}");
     });
+}
+
+#[test]
+fn executor_saves_hook_adjusted_mcp_to_its_admitted_occurrence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let paths = RuntimePaths::new(dir.path().join("data"))?;
+    let stores = paths.open_stores()?;
+    let session = stores.create("owner", Default::default())?;
+    let assistant = session.write(|w| w.append("assistant", ""))?;
+    let mut executor = restore_executor(&paths, vec![])
+        .with_conv_id("owner".into())
+        .with_executor_history(stores.executor_history("owner")?)?
+        .with_parent_message_id(assistant.clone());
+    let mut content =
+        McpOutput::from_transport(&json!({"content":"original","_meta":{"trace":17}}))?;
+    content.replace(&json!("after hook"));
+    executor.finish_mcp_output("repeat", "tool", "display", false, Some(content.clone()))?;
+    let (value, metadata, _) = session
+        .read(|r| r.mcp(&format!("{assistant}:repeat"), "display"))?
+        .unwrap();
+    assert_eq!(value, json!("after hook"));
+    assert_eq!(metadata["_meta"]["trace"], 17);
+    session.delete()?;
+    stores.create("owner", Default::default())?;
+    assert!(executor
+        .finish_mcp_output("repeat", "tool", "display", false, Some(content))
+        .is_err());
+    assert!(stores
+        .open_session("owner")?
+        .read(|r| r.mcp(&format!("{assistant}:repeat"), "display"))?
+        .is_none());
+    Ok(())
+}
+
+#[test]
+fn failed_read_cannot_authorize_an_edit_and_the_successful_read_survives_resume() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let paths = RuntimePaths::new(temp.path().join("data"))?;
+    let stores = paths.open_stores()?;
+    let s = stores.create("file-owner", Default::default())?;
+    let file = temp.path().join("file.txt");
+    std::fs::write(&file, "original")?;
+    let read = json!({"file_path":file});
+    assert!(crate::tools::read::execute_bound(
+        json!({"file_path":file,"pages":"1"}),
+        temp.path().to_str().unwrap(),
+        Some(&s)
+    )
+    .is_err());
+    let mut executor = restore_executor(&paths, vec![])
+        .with_conv_id(s.id().into())
+        .with_executor_history(stores.executor_history(s.id())?)?;
+    assert!(executor.unread_file_error("Edit", &read).is_some());
+    let response =
+        crate::tools::read::execute_bound(read.clone(), temp.path().to_str().unwrap(), Some(&s))?;
+    assert!(response["content"].as_str().unwrap().contains("original"));
+    let mut resumed = restore_executor(&paths, vec![])
+        .with_conv_id(s.id().into())
+        .with_executor_history(stores.executor_history(s.id())?)?;
+    assert!(resumed.unread_file_error("Edit", &read).is_none());
+    let time = std::fs::metadata(&file)?.modified()?;
+    std::fs::write(&file, "modified")?;
+    std::fs::File::options()
+        .write(true)
+        .open(&file)?
+        .set_modified(time)?;
+    assert!(resumed
+        .unread_file_error("Edit", &read)
+        .unwrap()
+        .contains("modified"));
+    assert!(!paths.data_dir.join("file-state").exists());
+    Ok(())
 }

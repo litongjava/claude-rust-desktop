@@ -15,11 +15,7 @@ pub fn routes() -> Router<AppState> {
             "/api/memory/items/{id}",
             put(file_update).delete(file_delete),
         )
-        .route(
-            "/api/memory/config",
-            get(super::super::memory_get_config_handler)
-                .put(super::super::memory_update_config_handler),
-        )
+        .route("/api/memory/config", get(get_config).put(set_config))
         .route("/api/memory/legacy/export", get(export))
         .route("/api/memory/legacy/import", post(import))
         .route(
@@ -34,14 +30,8 @@ pub fn routes() -> Router<AppState> {
             "/api/memory/legacy/stats",
             get(super::super::memory_stats_handler),
         )
-        .route(
-            "/api/memory/legacy/config",
-            get(super::super::memory_get_config_handler),
-        )
-        .route(
-            "/api/memory/legacy/config",
-            put(super::super::memory_update_config_handler),
-        )
+        .route("/api/memory/legacy/config", get(get_config))
+        .route("/api/memory/legacy/config", put(set_config))
         .route(
             "/api/memory/legacy/clear",
             post(super::super::memory_clear_handler),
@@ -60,10 +50,14 @@ struct UpdateItem {
 
 fn item_result(
     result: anyhow::Result<bool>,
-) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)>
+{
     match result {
         Ok(true) => Ok(axum::Json(serde_json::json!({"status": "ok"}))),
-        Ok(false) => Err((axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": "Memory not found"})))),
+        Ok(false) => Err((
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "Memory not found"})),
+        )),
         Err(e) => Err(error(e)),
     }
 }
@@ -72,14 +66,21 @@ async fn update_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::Json(request): axum::Json<UpdateItem>,
-) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
-    item_result(state.memex_client.update(&id, &request.content, request.importance).await)
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)>
+{
+    item_result(
+        state
+            .memex_client
+            .update(&id, &request.content, request.importance)
+            .await,
+    )
 }
 
 async fn delete_item(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
-) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)>
+{
     item_result(state.memex_client.delete(&id).await)
 }
 
@@ -129,15 +130,30 @@ fn error(error: anyhow::Error) -> (axum::http::StatusCode, axum::Json<serde_json
 use deepseek_code_core::services::memory_files::{FileMemory, Selection};
 type FileResponse =
     Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, axum::Json<serde_json::Value>)>;
-fn file_service(state: &AppState, scope: &Selection) -> anyhow::Result<FileMemory> {
-    let context = deepseek_code_core::services::ServiceContext {
+fn context(state: &AppState) -> deepseek_code_core::services::ServiceContext {
+    deepseek_code_core::services::ServiceContext {
         paths: deepseek_code_core::runtime::RuntimePaths {
             data_dir: (*state.data_dir).clone(),
         },
         db: state.db_manager.clone(),
         credentials: std::sync::Arc::new(deepseek_code_core::services::EnvironmentCredentials),
-    };
-    FileMemory::select(&context, scope)
+    }
+}
+async fn get_config(axum::extract::State(state): axum::extract::State<AppState>) -> FileResponse {
+    Ok(axum::Json(serde_json::json!(
+        deepseek_code_core::services::memory_files::config(&context(&state)).map_err(error)?
+    )))
+}
+async fn set_config(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(config): axum::Json<crate::memory::MemoryConfig>,
+) -> FileResponse {
+    deepseek_code_core::services::memory_files::save_config(&context(&state), &config)
+        .map_err(error)?;
+    Ok(axum::Json(serde_json::json!({"status":"updated"})))
+}
+fn file_service(state: &AppState, scope: &Selection) -> anyhow::Result<FileMemory> {
+    FileMemory::select(&context(state), scope)
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]

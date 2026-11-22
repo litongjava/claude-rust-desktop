@@ -34,7 +34,7 @@ notify = { version = "6", default-features = false, features = ["macos_fsevent"]
 tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 dirs = "5"
-rusqlite = { version = "0.31", features = ["bundled", "chrono", "blob"] }
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "blob", "backup"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 base64 = "0.22"
@@ -43,7 +43,7 @@ unicode-normalization = "0.1"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 ring = "0.17"
-windows = { version = "0.58", features = ["Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_IO", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_System_Memory", "Win32_Storage_FileSystem"] }
+windows = { version = "0.58", features = ["Win32_Storage_FileSystem", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_JobObjects", "Win32_System_IO", "Win32_System_Threading", "Win32_Security", "Win32_Security_Cryptography", "Win32_Security_Authorization", "Win32_System_Memory"] }
 cron = "0.12"
 diffy = "0.4"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
@@ -54,7 +54,6 @@ scraper = "0.24"
 
 tempfile = "3"
 semver = "1"
-qrcode = { version = "0.14", default-features = false }
 snow = "0.10"
 ignore = "0.4"
 pdf-extract = "0.12.1"

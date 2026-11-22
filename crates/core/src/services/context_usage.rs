@@ -1,6 +1,6 @@
 //! Local inspection of the last parent-session request; never prepares a new request.
 use crate::{
-    db::{message_repo, DbManager},
+    db::session_store::SessionAccess,
     native_engine::request_context::ContextUsage,
 };
 use anyhow::Result;
@@ -23,7 +23,7 @@ pub struct Boundary {
     pub created_at_ms: Option<i64>,
 }
 
-pub fn last_request(db: &DbManager, session: &str) -> Result<Option<LastRequest>> {
+pub fn last_request(db: &impl SessionAccess, session: &str) -> Result<Option<LastRequest>> {
     matching_request(db, session, |_| true)
 }
 
@@ -54,7 +54,7 @@ fn same_configuration(snapshot: &Value, model: &str, provider: Option<&str>) -> 
 /// proof, so a request that started before a boundary in the same millisecond
 /// is never mistaken for one that used the new context.
 pub fn last_request_for(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     boundary: Option<&str>,
     model: &str,
@@ -68,7 +68,7 @@ pub fn last_request_for(
 /// Last parent request that recorded this exact boundary and configuration.
 /// Kept for callers that only know the boundary id.
 pub fn last_request_since(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     boundary_id: &str,
 ) -> Result<Option<LastRequest>> {
@@ -78,34 +78,19 @@ pub fn last_request_since(
 }
 
 /// The latest successful compaction boundary, with its id and commit time.
-pub fn latest_boundary(db: &DbManager, session: &str) -> Result<Option<Boundary>> {
-    db.with_conn(|conn| -> Result<Option<Boundary>> {
-        use rusqlite::OptionalExtension;
-        let row: Option<(String, String)> = conn
-            .query_row(
-                "SELECT id, created_at FROM messages WHERE conversation_id=?1 AND is_compact_boundary=1 ORDER BY sort_order DESC, rowid DESC LIMIT 1",
-                [session],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(row.map(|(id, created)| Boundary {
-            id,
-            created_at_ms: chrono::DateTime::parse_from_rfc3339(&created)
-                .ok()
-                .map(|at| at.timestamp_millis()),
-        }))
-    })?
+pub fn latest_boundary(db: &impl SessionAccess, session: &str) -> Result<Option<Boundary>> {
+    db.select_session(session)?.context_boundary()
 }
 
 /// When the latest successful compaction boundary was committed, in
 /// milliseconds since the epoch. `None` before the first compaction.
-pub fn latest_boundary_ms(db: &DbManager, session: &str) -> Result<Option<i64>> {
+pub fn latest_boundary_ms(db: &impl SessionAccess, session: &str) -> Result<Option<i64>> {
     Ok(latest_boundary(db, session)?.and_then(|boundary| boundary.created_at_ms))
 }
 
 /// Last measured parent input, for a clearly labelled historical status fallback.
 pub fn last_reported_request(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     model: &str,
 ) -> Result<Option<LastRequest>> {
@@ -117,36 +102,11 @@ pub fn last_reported_request(
 }
 
 fn matching_request(
-    db: &DbManager,
+    db: &impl SessionAccess,
     session: &str,
     accept: impl Fn(&Value) -> bool,
 ) -> Result<Option<LastRequest>> {
-    let snapshot = db.with_conn(|conn| -> Result<Option<Value>> {
-        let mut statement = conn.prepare(
-            "SELECT t.requests_json FROM message_trajectory t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 ORDER BY m.sort_order DESC, m.created_at DESC, m.rowid DESC",
-        )?;
-        let mut rows = statement.query([session])?;
-        while let Some(row) = rows.next()? {
-            let raw: String = row.get(0)?;
-            let Ok(snapshots) = serde_json::from_str::<Value>(&raw) else {
-                // A corrupt row may hide a newer request. Do not report stale data.
-                return Ok(None);
-            };
-            let Some(items) = snapshots.as_array() else { return Ok(None); };
-            if let Some(snapshot) = items.iter().rev().find(|s| (s["source"] == "native_engine" || s.get("source").is_none()) && accept(s)) {
-                // Preserve unknown metadata on this request; never replace it
-                // with an older request merely because the old one has counts.
-                // Only the selected snapshot is expanded: restoring every row
-                // would multiply the status query's work.
-                let mut snapshot = snapshot.clone();
-                message_repo::load_trajectory_blobs(conn, &mut snapshot)?;
-                return Ok(Some(snapshot));
-            }
-            // Local workflows and failed pre-request turns can persist [].
-            // A row containing only side-query snapshots is not a parent request.
-        }
-        Ok(None)
-    })??;
+    let snapshot = db.select_session(session)?.matching_snapshot(accept)?;
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
@@ -214,7 +174,7 @@ fn estimate_history(
 ) -> Result<Option<Estimate>> {
     let exists = store
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, session))??
+        .conversation_metadata(session)?
         .is_some();
     if !exists {
         return Ok(None);
@@ -348,7 +308,7 @@ mod tests {
             ),
         ] {
             let message = store.append(session, "assistant", "private body").unwrap();
-            store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":id,"source":"native_engine","model":model,"usage":usage,"status":"completed"}]))).unwrap().unwrap();
+            store.db.fixture_shard(session, |conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":id,"source":"native_engine","model":model,"usage":usage,"status":"completed"}]))).unwrap().unwrap();
         }
         let result = last_request(&store.db, &parent).unwrap().unwrap();
         assert_eq!(result.model, "model");
@@ -370,7 +330,7 @@ mod tests {
                 .unwrap();
             store
                 .db
-                .with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &snapshots))
+                .fixture_shard(&parent, |conn| message_repo::save_request_snapshots(conn, &message, &snapshots))
                 .unwrap()
                 .unwrap();
             let prior = last_request(&store.db, &parent).unwrap().unwrap();
@@ -378,7 +338,7 @@ mod tests {
             assert_eq!(prior.reported_input_tokens, Some(60));
         }
         let message = store.append(&parent, "assistant", "new response").unwrap();
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"new","source":"native_engine","model":"new-model","contextUsage":{"bad":"PRIVATE"}}]))).unwrap().unwrap();
+        store.db.fixture_shard(&parent, |conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"new","source":"native_engine","model":"new-model","contextUsage":{"bad":"PRIVATE"}}]))).unwrap().unwrap();
         let result = last_request(&store.db, &parent).unwrap().unwrap();
         assert_eq!(result.model, "new-model");
         assert!(result.usage.is_none());
@@ -396,13 +356,7 @@ mod tests {
         assert!(last_reported_request(&store.db, &child, "model")
             .unwrap()
             .is_none());
-        store
-            .db
-            .with_conn(|conn| {
-                conn.execute("DELETE FROM messages WHERE conversation_id=?1", [&parent])
-            })
-            .unwrap()
-            .unwrap();
+        store.db.open_session(&parent).unwrap().write(|w|w.replace_messages(&[])).unwrap();
         assert!(last_request(&store.db, &parent).unwrap().is_none());
     }
 
@@ -432,7 +386,7 @@ mod tests {
         let estimate = |tokens: u64| json!({"serialized_utf8_bytes":tokens * 3,"estimated_tokens":tokens,"unknown_parts":0});
         let usage = json!({"version":1,"history":estimate(1),"instructions":estimate(500),"tools":estimate(700),"output_schema":estimate(0),
             "configured_context_window":null,"requested_output_budget":0,"sent_output_reserve":null,"estimated_input_tokens":null});
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"r","source":"native_engine","providerId":"fixture","model":"fixture-model","contextUsage":usage}]))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"r","source":"native_engine","providerId":"fixture","model":"fixture-model","contextUsage":usage}]))).unwrap().unwrap();
         assert_eq!(
             estimated_tokens(&store, &session, "fixture-model", Some("fixture"))
                 .unwrap()
@@ -441,7 +395,7 @@ mod tests {
         );
         store
             .db
-            .with_conn(|conn| -> anyhow::Result<()> {
+            .fixture_shard(&session, |conn| -> anyhow::Result<()> {
                 message_repo::insert_message(
                     conn, "boundary", &session, "user", "summary", None, "now", true, 10,
                 )?;
@@ -473,7 +427,7 @@ mod tests {
         let estimate = |tokens: u64| json!({"serialized_utf8_bytes":tokens * 3,"estimated_tokens":tokens,"unknown_parts":0});
         let usage = json!({"version":1,"history":estimate(1),"instructions":estimate(500),"tools":estimate(700),"output_schema":estimate(0),
             "configured_context_window":null,"requested_output_budget":0,"sent_output_reserve":null,"estimated_input_tokens":null});
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"before","source":"native_engine","providerId":"fixture","model":"fixture-model","startedAt":1000,"status":"completed","inputTokens":90000,"usage":{"input_tokens":90000},"contextUsage":usage}]))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn| message_repo::save_request_snapshots(conn, &answer, &json!([{"id":"before","source":"native_engine","providerId":"fixture","model":"fixture-model","startedAt":1000,"status":"completed","inputTokens":90000,"usage":{"input_tokens":90000},"contextUsage":usage}]))).unwrap().unwrap();
         assert_eq!(
             last_request(&store.db, &session)
                 .unwrap()
@@ -501,7 +455,7 @@ mod tests {
         assert!(estimate.tokens < 90000, "{estimate:?}");
         // A request that recorded the new boundary restores measured usage.
         let message = store.append(&session, "assistant", "after").unwrap();
-        store.db.with_conn(|conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"after","source":"native_engine","providerId":"fixture","contextBoundary":boundary.id,"model":"fixture-model","startedAt":boundary.created_at_ms.map(|ms|ms+1),"status":"completed","inputTokens":48000,"usage":{"input_tokens":48000}}]))).unwrap().unwrap();
+        store.db.fixture_shard(&session, |conn| message_repo::save_request_snapshots(conn, &message, &json!([{"id":"after","source":"native_engine","providerId":"fixture","contextBoundary":boundary.id,"model":"fixture-model","startedAt":boundary.created_at_ms.map(|ms|ms+1),"status":"completed","inputTokens":48000,"usage":{"input_tokens":48000}}]))).unwrap().unwrap();
         let after = last_request_since(&store.db, &session, &boundary.id)
             .unwrap()
             .unwrap();
@@ -524,7 +478,7 @@ mod tests {
             "configured_context_window":128000,"requested_output_budget":1000,"sent_output_reserve":1000,"estimated_input_tokens":null});
         store
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&session, |conn| {
                 message_repo::save_request_snapshots(
                     conn,
                     &answer,
@@ -561,7 +515,7 @@ mod tests {
             "configured_context_window":128000,"requested_output_budget":1000,"sent_output_reserve":1000,"estimated_input_tokens":null});
         store
             .db
-            .with_conn(|conn| {
+            .fixture_shard(&session, |conn| {
                 message_repo::save_request_snapshots(
                     conn,
                     &answer,

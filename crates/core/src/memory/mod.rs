@@ -1,4 +1,4 @@
-//! MemEx - Infinite Memory Engine for Claude Desktop (Tauri)
+//! MemEx - Infinite Memory Engine for DeepSeek Code (Tauri)
 //!
 //! Provides: local semantic search, auto-ingest, context compression
 //! Backend: persistent local SQLite, retained for the legacy archive,
@@ -69,6 +69,17 @@ pub struct MemoryConfig {
     pub min_importance_threshold: f64,
 }
 
+impl MemoryConfig {
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=50).contains(&self.search_top_k) { return Err(anyhow!("Search result count must be between 1 and 50")); }
+        if !self.min_importance_threshold.is_finite() || !(0.0..=1.0).contains(&self.min_importance_threshold) {
+            return Err(anyhow!("Importance threshold must be between 0 and 1"));
+        }
+        if self.compression_threshold_tokens == 0 { return Err(anyhow!("Compression threshold must be positive")); }
+        Ok(())
+    }
+}
+
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
@@ -121,11 +132,7 @@ impl MemExClient {
     }
 
     pub async fn update_config(&self, config: MemoryConfig) -> Result<()> {
-        if !(1..=50).contains(&config.search_top_k) { return Err(anyhow!("Search result count must be between 1 and 50")); }
-        if !config.min_importance_threshold.is_finite() || !(0.0..=1.0).contains(&config.min_importance_threshold) {
-            return Err(anyhow!("Importance threshold must be between 0 and 1"));
-        }
-        if config.compression_threshold_tokens == 0 { return Err(anyhow!("Compression threshold must be positive")); }
+        config.validate()?;
         self.local.save_config(&config)?;
         *self.config.write().await = config;
         Ok(())

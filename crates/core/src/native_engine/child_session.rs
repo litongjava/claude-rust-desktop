@@ -5,7 +5,8 @@
 //! This module owns that launch path so a later feature cannot silently drift
 //! from the delegation behavior. Callers remain responsible for their own
 //! entry-point limits, such as the delegation depth check.
-use crate::native_engine::provider_manager::{ApiFormat, ResolvedProvider};
+use crate::native_engine::provider_manager::ResolvedProvider;
+use crate::db::session_store::{SessionAccess, WorkerDirectory, WorkerPair};
 use crate::runtime::{RuntimePaths, SessionStore};
 use crate::services::{
     agents, background_sessions, subagents, EnvironmentCredentials, ServiceContext,
@@ -40,6 +41,7 @@ pub struct ChildLaunchConfig {
 
 #[derive(Debug, Clone)]
 pub struct ChildInvocation {
+    pub parent_message_id: Option<String>,
     pub tool_use_id: String,
     pub description: String,
     pub mode: String,
@@ -129,7 +131,11 @@ pub async fn spawn_child_session(
     config: ChildLaunchConfig,
     spawn: ChildSpawn,
 ) -> Result<ChildHandle> {
-    let prepared = prepare_child_session(config, spawn).await?;
+    let context = ServiceContext::open(
+        RuntimePaths::new(spawn.data_dir.clone())?,
+        std::sync::Arc::new(EnvironmentCredentials),
+    )?;
+    let prepared = prepare_child_session(context, config, spawn).await?;
     launch_prepared_child(prepared)
 }
 
@@ -152,15 +158,19 @@ pub(crate) struct PreparedChildLaunch {
     invocation: Option<ChildInvocation>,
     reserved_job_id: Option<String>,
     ownership: ChildOwnership,
+    owners: WorkerPair,
 }
 
 /// Validates the parent, allocates or adopts the child session, and builds the
 /// launch. This function performs no external process side effect, so a host
 /// may stop after it and recover against the durable session identity.
 pub(crate) async fn prepare_child_session(
-    config: ChildLaunchConfig,
+    context: ServiceContext,
+    mut config: ChildLaunchConfig,
     spawn: ChildSpawn,
 ) -> Result<PreparedChildLaunch> {
+    // Freeze the version at preparation; the independent job owns that selection.
+    config.provider = config.provider.current()?;
     ensure!(
         !config.provider.provider.id.trim().is_empty(),
         "Child provider is required"
@@ -183,10 +193,15 @@ pub(crate) async fn prepare_child_session(
         "Data directory must be absolute"
     );
 
-    let context = ServiceContext::open(
-        RuntimePaths::new(spawn.data_dir.clone())?,
-        std::sync::Arc::new(EnvironmentCredentials),
-    )?;
+    let resume_pair = spawn
+        .resume_session
+        .as_deref()
+        .map(|child| context.db.worker_pair(&spawn.parent_session_id, child))
+        .transpose()?;
+    let _resume_guard = resume_pair
+        .as_ref()
+        .map(|pair| pair.hold_for_resume(&context.db))
+        .transpose()?;
     let parent = require_session(&context, &spawn.parent_session_id, "Parent session")?;
     ensure!(!parent.archived, "Parent session is archived");
     ensure!(
@@ -245,10 +260,7 @@ pub(crate) async fn prepare_child_session(
             );
             // Never start a second process for a session that is still executing.
             ensure!(
-                !crate::services::session_messages::execution_active(
-                    &context.paths.data_dir,
-                    session
-                )?,
+                !context.db.select_session(session)?.execution_active(&context.paths.data_dir)?,
                 "Child session still has an active execution; stop it before resuming"
             );
             let stored = child
@@ -272,14 +284,7 @@ pub(crate) async fn prepare_child_session(
                     // checkout and takes precedence over the new workspace, so
                     // it is staged with the move: restored if the database
                     // rebind fails, dropped when it commits.
-                    context.db.with_conn(|conn| -> Result<()> {
-                        super::workspace::move_conversation_workspace(
-                            conn,
-                            &context.paths.data_dir,
-                            session,
-                            requested,
-                        )
-                    })??;
+                    context.db.select_session(session)?.move_child_workspace(&context.paths.data_dir,session,requested)?;
                 }
             }
             (session.to_owned(), true)
@@ -288,29 +293,8 @@ pub(crate) async fn prepare_child_session(
             // A fork is a branch of this session: messages, tool calls and the
             // agent and worktree bindings are copied, so the child keeps the
             // parent's history instead of starting empty.
-            let child = context.db.with_conn(|conn| {
-                crate::db::conversation_repo::branch_conversation(
-                    conn,
-                    &spawn.parent_session_id,
-                    None,
-                    None,
-                )
-            })??;
-            context.db.with_conn(|conn| {
-                crate::db::conversation_repo::update_conversation_title(
-                    conn,
-                    &child,
-                    &format!("Fork: {description}"),
-                )
-            })??;
-            context.save_setting(
-                &format!("fork-of.{child}"),
-                &json!({"parent": spawn.parent_session_id}),
-            )?;
-            crate::services::permission_authority::record_user(
-                &context.db,
-                &child,
-                &json!(spawn.prompt),
+            let child = context.db.fork_agent(
+                &spawn.parent_session_id, &format!("Fork: {description}"), &spawn.prompt,
             )?;
             (child, false)
         }
@@ -344,9 +328,7 @@ pub(crate) async fn prepare_child_session(
                             id.to_owned()
                         }
                         Err(error) => {
-                            let existing = context.db.with_conn(|conn| {
-                                crate::db::conversation_repo::get_conversation(conn, id)
-                            })??;
+                            let existing = context.db.conversation_metadata(id)?;
                             let Some(row) = existing else {
                                 return Err(error);
                             };
@@ -394,6 +376,10 @@ pub(crate) async fn prepare_child_session(
         }
     };
 
+    let owners = match resume_pair {
+        Some(pair) => pair,
+        None => context.db.worker_pair(&spawn.parent_session_id, &session_id)?,
+    };
     let workspace = match &spawn.workspace {
         ChildWorkspace::Directory(_) => requested_workspace
             .clone()
@@ -417,8 +403,12 @@ pub(crate) async fn prepare_child_session(
         }
     };
 
-    let (mut arguments, mut environment) =
-        child_cli_arguments(&config.provider, &config.permission_mode, &spawn.data_dir);
+    let (mut arguments, mut environment) = child_cli_arguments(
+        &config.provider,
+        &config.provider.model.id,
+        &config.permission_mode,
+        &spawn.data_dir,
+    );
     if let Some(model) = spawn.model.as_deref() {
         let at = arguments
             .iter()
@@ -521,6 +511,7 @@ pub(crate) async fn prepare_child_session(
         invocation: spawn.invocation,
         reserved_job_id: spawn.reserved_job_id,
         ownership,
+        owners,
     })
 }
 
@@ -544,11 +535,13 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
         invocation,
         reserved_job_id,
         mut ownership,
+        owners,
     } = prepared;
+    let _owners = owners.hold(&context.db)?;
     ownership.status = "starting".into();
     ownership.updated_at = chrono::Utc::now().to_rfc3339();
     ownership.last_error = None;
-    save_owner(&context, &session_id, &ownership)?;
+    context.db.save_child_owner(&owners, &ownership)?;
 
     if let Some((task_id, member)) = &member_binding {
         let store =
@@ -571,6 +564,7 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
             &session_id,
             &invocation.description,
             Some(&invocation.tool_use_id),
+            invocation.parent_message_id.as_deref(),
             &invocation.mode,
         )?,
         None => None,
@@ -613,7 +607,7 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
             ownership.status = "failed".into();
             ownership.updated_at = chrono::Utc::now().to_rfc3339();
             ownership.last_error = Some(format!("{error:#}"));
-            let _ = save_owner(&context, &session_id, &ownership);
+            let _ = context.db.save_child_owner(&owners, &ownership);
             if let Some(invocation) = invocation.as_mut() {
                 let _ = invocation.finish(&Err(anyhow::anyhow!(error.to_string())));
             }
@@ -623,7 +617,7 @@ pub(crate) fn launch_prepared_child(prepared: PreparedChildLaunch) -> Result<Chi
     ownership.status = job.status.clone();
     ownership.job_id = Some(job.id.clone());
     ownership.updated_at = chrono::Utc::now().to_rfc3339();
-    save_owner(&context, &session_id, &ownership)?;
+    context.db.save_child_owner(&owners, &ownership)?;
     if let Some(invocation) = invocation.as_mut() {
         invocation.finish(&Ok(json!({"backgrounded":true})))?;
     }
@@ -679,6 +673,7 @@ pub(crate) fn record_adopted_ownership(
 /// the parent worker's auto-route decision.
 pub(crate) fn child_cli_arguments(
     provider: &ResolvedProvider,
+    model_selector: &str,
     permission_mode: &str,
     data_dir: &Path,
 ) -> (Vec<String>, Vec<(String, String)>) {
@@ -688,21 +683,11 @@ pub(crate) fn child_cli_arguments(
         "--provider".into(),
         provider.provider.id.clone(),
         "--model".into(),
-        provider.model.id.clone(),
+        model_selector.to_owned(),
         "--permission-mode".into(),
         permission_mode.to_owned(),
     ];
-    if provider.provider.builtin_id.is_none() {
-        arguments.extend(["--base-url".into(), provider.provider.base_url.clone()]);
-        arguments.extend([
-            "--api-format".into(),
-            match provider.provider.api_format {
-                ApiFormat::Anthropic => "anthropic",
-                ApiFormat::OpenAI => "openai",
-            }
-            .into(),
-        ]);
-    }
+    arguments.extend(provider.provider.child_transport_arguments());
     let mut environment = vec![(
         background_sessions::WORKER_MODEL_ENV.to_owned(),
         serde_json::to_string(&provider.model).unwrap_or_default(),
@@ -718,57 +703,55 @@ pub(crate) fn child_cli_arguments(
 }
 
 pub(crate) struct InvocationGuard {
-    context: ServiceContext,
-    key: String,
-    value: Value,
+    parent:crate::db::session_store::ExecutorHistory,
+    child:crate::db::session_store::ExecutorHistory,
+    invocation:subagents::Invocation,
 }
 
 impl InvocationGuard {
     pub(crate) fn finish(&mut self, result: &Result<Value>) -> Result<()> {
-        self.value["status"] = json!(match result {
+        self.invocation.status=match result {
             Ok(value) if value["backgrounded"] == true => "running",
             Ok(_) => "completed",
             Err(_) => "failed",
-        });
-        self.context.save_setting(&self.key, &self.value)
+        }.into();
+        self.parent.save_invocation(&self.child,&self.invocation)
     }
 }
 
 impl Drop for InvocationGuard {
     fn drop(&mut self) {
-        if self.value["status"] == "starting" {
-            self.value["status"] = json!("cancelled");
-            let _ = self.context.save_setting(&self.key, &self.value);
+        if self.invocation.status=="starting" {
+            self.invocation.status="cancelled".into();
+            let _=self.parent.save_invocation(&self.child,&self.invocation);
         }
     }
 }
 
-/// Records an Agent-tool invocation so the parent transcript can show which
-/// child it started. Super Agent launches have no tool-use row and skip this.
 pub(crate) fn record_child_invocation(
     context: &ServiceContext,
     parent: &str,
     child: &str,
     description: &str,
     tool_use_id: Option<&str>,
+    parent_message: Option<&str>,
     mode: &str,
 ) -> Result<Option<InvocationGuard>> {
-    let Some(tool_use_id) = tool_use_id else {
-        return Ok(None);
+    let Some(tool_use_id)=tool_use_id else{return Ok(None)};
+    let parent=context.db.executor_history(parent)?;
+    let child=context.db.executor_history(child)?;
+    let invocation=subagents::Invocation {
+        parent_session_id:parent.id().into(),
+        parent_message_id:parent.invocation_message(parent_message)?,
+        tool_use_id:tool_use_id.into(),
+        child_session_id:child.id().into(),
+        attempt_id:uuid::Uuid::new_v4().to_string(),
+        mode:mode.into(),
+        status:"starting".into(),
+        description:description.into(),
     };
-    let parent_message_id = context.db.with_conn(|conn| -> Result<String> {
-        use rusqlite::OptionalExtension;
-        Ok(conn.query_row("SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC, rowid DESC LIMIT 1", [parent], |row| row.get(0)).optional()?.unwrap_or_default())
-    })??;
-    let attempt_id = uuid::Uuid::new_v4().to_string();
-    let key = format!("subagent_invocation:{parent}:{tool_use_id}:{attempt_id}");
-    let value = json!({"parent_session_id":parent,"parent_message_id":parent_message_id,"tool_use_id":tool_use_id,"child_session_id":child,"attempt_id":attempt_id,"mode":mode,"status":"starting","description":description});
-    context.save_setting(&key, &value)?;
-    Ok(Some(InvocationGuard {
-        context: context.clone(),
-        key,
-        value,
-    }))
+    parent.save_invocation(&child,&invocation)?;
+    Ok(Some(InvocationGuard{parent,child,invocation}))
 }
 
 /// The matching standalone CLI for this host. Desktop may not be beside an
@@ -842,16 +825,13 @@ fn canonical_directory(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
-fn owner_key(session: &str) -> String {
-    format!("{OWNER_KEY_PREFIX}{session}")
+pub fn owner_record<D: WorkerDirectory>(context: &ServiceContext<D>, session: &str) -> Result<Option<ChildOwnership>> {
+    context.db.child_owner(session)
 }
 
-pub fn owner_record(context: &ServiceContext, session: &str) -> Result<Option<ChildOwnership>> {
-    context.setting(&owner_key(session))
-}
-
-fn save_owner(context: &ServiceContext, session: &str, owner: &ChildOwnership) -> Result<()> {
-    context.save_setting(&owner_key(session), owner)
+fn save_owner<D: WorkerDirectory>(context: &ServiceContext<D>, session: &str, owner: &ChildOwnership) -> Result<()> {
+    let owners = context.db.worker_pair(&owner.parent_session_id,session)?;
+    context.db.save_child_owner(&owners,owner)
 }
 
 fn require_session(
@@ -862,7 +842,7 @@ fn require_session(
     ensure!(!session.trim().is_empty(), "{label} ID is required");
     let row = context
         .db
-        .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, session))??;
+        .conversation_metadata(session)?;
     row.with_context(|| format!("{label} not found"))
 }
 
@@ -878,26 +858,7 @@ fn child_belongs_to_parent(
     if let Some(owner) = owner {
         return Ok(owner.parent_session_id == parent);
     }
-    let invoked = context
-        .db
-        .with_conn(|conn| subagents::list_invocations(conn, parent, None))??
-        .into_iter()
-        .any(|invocation| invocation.child_session_id == child);
-    if invoked {
-        return Ok(true);
-    }
-    let bound = context.db.with_conn(|conn| -> Result<bool> {
-        use rusqlite::OptionalExtension;
-        Ok(conn
-            .query_row(
-                "SELECT 1 FROM conversation_private_workspace_bindings WHERE child_id=?1 AND parent_id=?2",
-                rusqlite::params![child, parent],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    })??;
-    Ok(bound)
+    context.db.child_of(parent,child)
 }
 
 #[cfg(test)]
@@ -1031,7 +992,7 @@ mod tests {
         assert!(!error.to_string().is_empty());
         let children: Vec<String> = context
             .db
-            .with_conn(|conn| -> Result<Vec<String>> {
+            .fixture_directory(|conn| -> Result<Vec<String>> {
                 let mut statement = conn.prepare("SELECT id FROM conversations WHERE id <> ?1")?;
                 let ids = statement
                     .query_map([&parent], |row| row.get::<_, String>(0))?
@@ -1111,7 +1072,7 @@ mod tests {
     fn conversation_count(context: &ServiceContext) -> i64 {
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.query_row("SELECT COUNT(*) FROM conversations", [], |row| row.get(0))
             })
             .unwrap()
@@ -1139,7 +1100,7 @@ mod tests {
         let parent = sessions.create(temp.path(), "fixture", "fixture").unwrap();
         context
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute("UPDATE conversations SET archived=1 WHERE id=?1", [&parent])
             })
             .unwrap()
@@ -1161,7 +1122,7 @@ mod tests {
     #[test]
     fn child_arguments_keep_the_explicit_snapshot_and_credential_without_auto_route() {
         let (arguments, environment) =
-            child_cli_arguments(&provider(), "ask", Path::new("/tmp/data"));
+            child_cli_arguments(&provider(), "fixture", "ask", Path::new("/tmp/data"));
         assert!(pair(&arguments, "--provider", "fixture"));
         assert!(pair(&arguments, "--model", "fixture"));
         let names: Vec<&str> = environment.iter().map(|(key, _)| key.as_str()).collect();
@@ -1200,10 +1161,7 @@ mod tests {
         assert_eq!(handle.workspace, canonical);
         let row = context
             .db
-            .with_conn(|conn| {
-                crate::db::conversation_repo::get_conversation(conn, &handle.session_id)
-            })
-            .unwrap()
+            .conversation_metadata(&handle.session_id)
             .unwrap()
             .unwrap();
         assert_eq!(

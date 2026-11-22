@@ -1,3 +1,5 @@
+use deepseek_code_core::db::session_store::{SegmentPlacement,SegmentUpdate};
+use deepseek_code_core::{services::input_queue::QueueItem,native_engine::provider_manager::ApiFormat};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -31,8 +33,18 @@ pub(super) async fn chat_handler(
 pub(super) async fn start_chat(
     state: AppState,
     req: ChatRequest,
-    queued: Option<deepseek_code_core::services::input_queue::QueueItem>,
+    queued: Option<(QueueItem,ApiFormat)>,
 ) -> axum::response::Response {
+    start_authorized_chat(state,req,queued,None).await
+}
+
+pub(super) async fn start_authorized_chat(
+    state: AppState,
+    req: ChatRequest,
+    queued: Option<(QueueItem,ApiFormat)>,
+    grant: Option<deepseek_code_core::db::session_store::H5Session>,
+) -> axum::response::Response {
+    let h5 = grant.is_some();
     crate::metrics::HTTP_REQUESTS_TOTAL.inc();
     let _request_timer = crate::metrics::HTTP_REQUEST_DURATION.start_timer();
 
@@ -56,110 +68,95 @@ pub(super) async fn start_chat(
     // Reject invalid Code/project requests before persisting messages or invoking a model.
     let db = state.db_manager.clone();
     let project_conversation_id = req.conversation_id.clone();
-    let project_check = tokio::task::spawn_blocking(move || db.with_conn(|conn| {
-        (|| -> anyhow::Result<_> {
-            let conversation =
-                crate::db::conversation_repo::get_conversation(conn, &project_conversation_id)?;
-            if let Some(conversation) = conversation {
-                anyhow::ensure!(
-                    conversation.workspace_mode != "code"
-                        || conversation.project_id.as_deref().is_some_and(|id| !id.is_empty()),
-                    "Select a project before sending messages in Code mode"
-                );
-            }
-            crate::native_engine::workspace::conversation_project(conn, &project_conversation_id)
-        })()
-    })).await;
-    match project_check {
-        Ok(Ok(Ok(_))) => {}
-        Ok(Ok(Err(error))) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": error.to_string()}))).into_response(),
-        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not validate conversation project"}))).into_response(),
+    match tokio::task::spawn_blocking(move ||db.validate_chat_project(&project_conversation_id)).await {
+        Ok(Ok(()))=>{},
+        Ok(Err(error))=>return (StatusCode::BAD_REQUEST,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+        Err(_)=>return (StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":"Could not validate conversation project"}))).into_response(),
     }
 
-    // The backend keeps this lease for the whole turn; the engine shares it
-    // without retaining a second reference that could outlive this release.
-    let execution_lease = match super::input_queue::execution_lease(&state.db_manager, &req.conversation_id) {
-        Ok(lease) => std::sync::Arc::new(lease),
-        Err(error) => return (StatusCode::CONFLICT, Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+    let user_content = req
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .and_then(|m| m.get("content"))
+        .cloned();
+    if let Some(content) = &user_content {
+        if !content.is_string() {
+            if let Err(error) = crate::runtime::normalize_user_content(content) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error":error.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let user_content = if queued.is_some() { None } else { user_content };
+    let (execution_lease, sealed_first) = match state.db_manager.admit_chat_execution(
+        &req.conversation_id,
+        &req.model,
+        user_content.as_ref(),
+    ) {
+        Ok((lease, sealed)) => (std::sync::Arc::new(lease), sealed),
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error":error.to_string()})),
+            )
+                .into_response()
+        }
     };
     let native_engine = state.native_engine.clone();
     let config_manager = state.config_manager.clone();
     let conv_id = req.conversation_id.clone();
     let model = req.model.clone();
-    if let Err(error) = super::input_queue::remember(&state, &req) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":error.to_string()}))).into_response();
-    }
+    let queue_context = (!h5).then(|| {
+        let mut context = req.clone();
+        context.messages.clear();
+        context
+    });
     let lifecycle_state = state.clone();
     let lifecycle_id = conv_id.clone();
-    let messages = req.messages;
+    let mut messages = req.messages;
 
     tracing::info!(module = "Chat", "[1/7] Parsed request: conv_id={}, model={}, messages={}", conv_id, model, messages.len());
 
     // Save user messages to SQLite before starting the engine
     tracing::info!(module = "Chat", "[2/7] Starting SQLite save...");
-    {
+    if !sealed_first {
         let db = state.db_manager.clone();
         let conv_id_save = conv_id.clone();
-        // The request contains history; only append the current user turn.
-        let user_content = messages.iter().rev()
-            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-            .and_then(|m| m.get("content")).cloned();
-        if let Some(content) = &user_content {
-            if !content.is_string() {
-                if let Err(error) = crate::runtime::normalize_user_content(content) {
-                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":error.to_string()}))).into_response();
-                }
-            }
-        }
-        if let Some(item) = &queued {
-            let claimed = if item.state == deepseek_code_core::services::input_queue::QueueState::Queued {
-                deepseek_code_core::services::input_queue::claim(&state.db_manager, &conv_id, item.id, item.revision)
-            } else { Ok(item.clone()) };
-            let result = claimed.and_then(|item| super::input_queue::handoff(&state.db_manager, &conv_id, &item));
-            if let Err(error) = result {
-                return (StatusCode::CONFLICT, Json(serde_json::json!({"error":error.to_string()}))).into_response();
-            }
-        }
-        let user_content = if queued.is_some() { None } else { user_content };
         let model_save = model.clone();
-        let saved = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                let tx = deepseek_code_core::db::write_transaction(conn)?;
-                let now = chrono::Utc::now().to_rfc3339();
-                if crate::db::conversation_repo::get_conversation(&tx, &conv_id_save)?.is_none() {
-                    crate::db::conversation_repo::insert_conversation(
-                        &tx, &conv_id_save, None, Some(&model_save), None, None, None,
-                        false, false, false, &now, &now, 0,
-                    )?;
-                }
-                if let Some(content) = user_content.filter(|c| c.as_str() != Some("")) {
-                    let sort_order: i64 = tx.query_row(
-                        "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?1",
-                        rusqlite::params![conv_id_save], |row| row.get(0),
-                    )?;
-                    crate::db::message_repo::save_user_message(
-                        &tx, &uuid::Uuid::new_v4().to_string(), &conv_id_save, &content, &now, sort_order,
-                    )?;
-                }
-                tx.execute(
-                    "UPDATE conversations SET message_count = (SELECT COUNT(*) FROM messages WHERE conversation_id = ?1), updated_at = ?2 WHERE id = ?1",
-                    rusqlite::params![conv_id_save, now],
-                )?;
-                tx.commit()?;
-                Ok::<(), anyhow::Error>(())
-            })
-        }).await;
-        if !matches!(saved, Ok(Ok(Ok(())))) {
+        let saved=tokio::task::spawn_blocking(move || db.admit_chat_message(&conv_id_save,&model_save,user_content.as_ref())).await;
+        if !matches!(saved,Ok(Ok(()))) {
             tracing::error!("Could not persist user content: {:?}", saved);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"Could not save user message"}))).into_response();
         }
     }
+    if let Some(context) = queue_context {
+        if let Err(error) = state.db_manager.remember_desktop_context(&context) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":error.to_string()}))).into_response();
+        }
+    }
     tracing::info!(module = "Chat", "[2/7] SQLite save COMPLETED");
 
-    let mut turn = match deepseek_code_core::db::turn_repo::TurnTimer::start(state.db_manager.clone(), &conv_id) {
+    let timer = match &queued {
+        Some((item,_)) => state.db_manager.start_desktop_input(&conv_id,execution_lease.clone(),item),
+        None => state.db_manager.start_turn_timer(&conv_id),
+    };
+    let mut turn = match timer {
         Ok(turn) => turn,
+        Err(error) if error.downcast_ref::<deepseek_code_core::services::input_queue::QueueError>().is_some() =>
+            return (StatusCode::CONFLICT,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("Could not start turn timing: {error:#}")}))).into_response(),
     };
+    if let Some((_,format)) = queued {
+        messages = match crate::runtime::SessionStore::new(state.db_manager.clone()).model_history(&conv_id,&format) {
+            Ok(history) => history,
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR,Json(serde_json::json!({"error":error.to_string()}))).into_response(),
+        };
+    }
     let first_assistant_id = match turn.ensure_segment() {
         Ok(id) => id,
         Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":format!("Could not persist assistant segment: {error:#}")}))).into_response(),
@@ -202,6 +199,7 @@ pub(super) async fn start_chat(
                 messages: messages.clone(),
                 model: if model.is_empty() { "claude-sonnet-4-6".to_string() } else { model.clone() },
                 system_prompt: req.system_prompt.clone(),
+                standalone_frontend: false,
                 max_tokens: req.max_tokens,
                 workspace_path: req.workspace_path.clone(),
                 temperature: req.temperature,
@@ -242,6 +240,7 @@ pub(super) async fn start_chat(
     crate::metrics::ACTIVE_SSE_CONNECTIONS.inc();
     let stream = async_stream::stream! {
         // Keep the session owned until this stream has persisted the turn.
+        let _h5_grant = grant;
         let _turn_lease = execution_lease;
         let db_clone = db_for_stream;
         yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"turn_timing","turn":turn.record(),"assistant_id":first_assistant_id}).to_string()));
@@ -262,18 +261,19 @@ pub(super) async fn start_chat(
             }
         };
 
+        let history=turn.history();
         let mut assistant_id = first_assistant_id;
-        let mut observed_plan_boundary = deepseek_code_core::services::plan_approval::latest_boundary(&db_clone, &conv_id).unwrap_or(None);
+        let mut observed_plan_boundary = history.latest_plan_boundary().unwrap_or(None);
         let mut request_snapshots = Vec::<serde_json::Value>::new();
-        let db_number = db_clone.clone();
-        let conv_number = conv_id.clone();
-        let mut request_number = tokio::task::spawn_blocking(move || db_number.with_conn(|conn| {
-            conn.query_row("SELECT COALESCE(MAX(request_number), 0) FROM model_requests WHERE conversation_id = ?1", rusqlite::params![conv_number], |row| row.get::<_, i64>(0))
-        })).await.ok().and_then(Result::ok).and_then(Result::ok).unwrap_or(0);
+        let numbers=history.clone();
+        let mut request_number = tokio::task::spawn_blocking(move || numbers.last_request_number())
+            .await.ok().and_then(Result::ok).unwrap_or(0);
         let mut terminal_event = None;
         let mut permission_watches = super::permission_watch::PermissionWatches::default();
         let mut full_text = String::new();
-        let mut collected_tool_calls: Vec<(String, String, String, Option<String>, bool)> = Vec::new(); // (tool_use_id, tool_name, input_json, output, is_error)
+        let mut tools = Vec::new();
+        let mut origins = deepseek_code_core::services::tool_history::ToolOrigins::new();
+        let mut arguments = std::collections::HashMap::new();
 
         loop {
             let next = tokio::select! {
@@ -315,27 +315,44 @@ pub(super) async fn start_chat(
                     break;
                 }
             };
+            use crate::native_engine::tool_loop::EngineEvent;
+            deepseek_code_core::services::tool_history::apply_event(&mut tools,&mut origins,&mut arguments,&event);
+            if let EngineEvent::ToolUseDone {tool_use_id,..} | EngineEvent::PipelineToolResult {tool_use_id,..}
+                | EngineEvent::NestedToolCall {tool_use_id,..} = &event {
+                if let Some(tool)=tools.iter().find(|t| t.id==*tool_use_id).cloned() {
+                    let writer=history.clone();
+                    let message=assistant_id.clone();
+                    let content=full_text.clone();
+                    let origin=origins.get(tool_use_id).map(|o|(tool_use_id.clone(),o.clone())).into_iter().collect();
+                    let saved=tokio::task::spawn_blocking(move || writer.save_segment(&message,SegmentUpdate {
+                        text:Some(&content),tools:std::slice::from_ref(&tool),origins:Some(&origin),..Default::default()
+                    })).await;
+                    if !matches!(saved,Ok(Ok(()))) {tracing::error!("Could not persist tool result: {saved:?}");}
+                }
+            }
             let event_data = match event {
-                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id } => {
+                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved } => {
                     if session_id == conv_id {
-                        let rows = collected_tool_calls.iter().enumerate().map(|(i,(id,name,input,output,is_error))| crate::db::message_repo::ToolCallRow { id:id.clone(),message_id:assistant_id.clone(),name:name.clone(),input:Some(input.clone()),output:output.clone(),is_error:*is_error,sort_order:i as i64 }).collect::<Vec<_>>();
-                        if let Err(error) = deepseek_code_core::services::plan_approval::archive_segment(&db_clone, &conv_id, &boundary_id, Some(&assistant_id), &full_text, "", &rows, &request_snapshots) {
+                        if let Err(error) = history.save_segment(&assistant_id, SegmentUpdate {
+                            placement: SegmentPlacement::Before(&boundary_id), text: Some(&full_text), thinking: Some(""),
+                            tools: &tools, origins:Some(&origins), snapshots:Some(&serde_json::json!(request_snapshots)), ..Default::default()
+                        }) {
                             terminal_event = Some(serde_json::json!({"type":"error","error":format!("Cannot archive planning context: {error:#}")}));
                             break;
                         }
-                        assistant_id = match turn.new_segment() {
+                        assistant_id = match turn.resume_reset_segment(reserved) {
                             Ok(id) => id,
                             Err(error) => {
                                 terminal_event = Some(serde_json::json!({"type":"error","error":format!("Cannot create assistant segment: {error:#}")}));
                                 break;
                             }
                         };
-                        full_text.clear(); collected_tool_calls.clear(); request_snapshots.clear();
+                        full_text.clear(); tools.clear(); origins.clear(); arguments.clear(); request_snapshots.clear();
                         run.reset_progress();
                         run.set_turn(turn.record(), &assistant_id);
                         observed_plan_boundary = Some(boundary_id.clone());
                     }
-                    let content = db_clone.with_conn(|conn| crate::db::message_repo::get_message(conn, &boundary_id)).ok().and_then(Result::ok).flatten().map(|m|m.content).unwrap_or_default();
+                    let content = history.message_text(&boundary_id).ok().flatten().unwrap_or_default();
                     Some(serde_json::json!({"type":"context_reset","boundary_id":boundary_id,"content":content,"assistant_id":assistant_id,"turn":turn.record()}))
                 }
                 crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(mut snapshot) => {
@@ -347,20 +364,13 @@ pub(super) async fn start_chat(
                         snapshot["number"] = serde_json::json!(request_number);
                         request_snapshots.push(snapshot.clone());
                     }
-                    let db = db_clone.clone();
+                    let writer = history.clone();
                     let message_id = assistant_id.clone();
-                    let conversation_id = conv_id.clone();
                     let snapshots = serde_json::json!(request_snapshots);
-                    let saved = tokio::task::spawn_blocking(move || db.with_conn(|conn| -> anyhow::Result<()> {
-                        let tx = deepseek_code_core::db::write_transaction(&conn)?;
-                        let now = chrono::Utc::now().to_rfc3339();
-                        tx.execute("INSERT OR IGNORE INTO messages (id, conversation_id, role, content, created_at, sort_order) VALUES (?1, ?2, 'assistant', '', ?3, (SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?2))",
-                            rusqlite::params![message_id, conversation_id, now])?;
-                        crate::db::message_repo::save_request_snapshots(&tx, &message_id, &snapshots)?;
-                        tx.commit()?;
-                        Ok(())
+                    let saved = tokio::task::spawn_blocking(move || writer.save_segment(&message_id, SegmentUpdate {
+                        snapshots: Some(&snapshots), ..Default::default()
                     })).await;
-                    let persisted = matches!(saved, Ok(Ok(Ok(()))));
+                    let persisted = matches!(saved, Ok(Ok(())));
                     if !persisted { tracing::error!("Could not persist trajectory request: {:?}", saved); }
                     Some(serde_json::json!({"type": "request_snapshot", "snapshot": snapshot, "persisted": persisted}))
                 }
@@ -376,14 +386,10 @@ pub(super) async fn start_chat(
                     let queue_item = input.origin.strip_prefix("queue-input-")
                         .and_then(|id| id.parse::<i64>().ok())
                         .and_then(|id| deepseek_code_core::services::input_queue::list(&db_clone, &conv_id).ok()?.into_iter().find(|item| item.id == id));
-                    if let Some((tool_id, ..)) = collected_tool_calls.last().filter(|_| queue_item.is_none()) {
-                        let saved = db_clone.with_conn(|conn| -> anyhow::Result<()> {
-                            let call_id = format!("{assistant_id}:{tool_id}");
-                            let mut inputs = deepseek_code_core::services::input_queue::load_delivered(conn, &call_id)?;
-                            inputs.push(input.clone());
-                            deepseek_code_core::services::input_queue::save_delivered(conn, &call_id, &inputs)
-                        });
-                        if !matches!(saved, Ok(Ok(()))) { tracing::error!("Could not persist queued input: {saved:?}"); }
+                    if let Some(tool) = tools.iter().rev().find(|tool|tool.output.is_some()).filter(|_| queue_item.is_none()) {
+                        if let Err(error)=history.add_segment_input(&assistant_id,&tool.id,&input) {
+                            tracing::error!("Could not persist queued input: {error:#}");
+                        }
                     }
                     Some(serde_json::json!({"type": "queued_input", "text": input.text, "content": input.content, "origin": input.origin, "queueItem": queue_item}))
                 }
@@ -432,21 +438,6 @@ pub(super) async fn start_chat(
                 }
                 crate::native_engine::tool_loop::EngineEvent::ToolUseDone { tool_use_id, tool_name, tool_input, output, is_error } => {
                     tracing::info!(module = "Chat", "Tool use completed: {} ({}) is_error={}", tool_name, tool_use_id, is_error);
-                    let input_json = serde_json::to_string(&tool_input).unwrap_or_default();
-                    collected_tool_calls.push((tool_use_id.clone(), tool_name.clone(), input_json, Some(output.clone()), is_error));
-                    let db = db_clone.clone();
-                    let conversation_id = conv_id.clone();
-                    let message_id = assistant_id.clone();
-                    let content = full_text.clone();
-                    let tool = crate::db::message_repo::ToolCallRow {
-                        id: format!("{assistant_id}:{tool_use_id}"), message_id: message_id.clone(), name: tool_name.clone(),
-                        input: Some(serde_json::to_string(&tool_input).unwrap_or_default()), output: Some(output.clone()),
-                        is_error, sort_order: (collected_tool_calls.len() - 1) as i64,
-                    };
-                    let saved = tokio::task::spawn_blocking(move || db.with_conn(|conn| {
-                        crate::db::message_repo::save_stream_tool_result(conn, &conversation_id, &message_id, &content, &tool)
-                    })).await;
-                    if !matches!(saved, Ok(Ok(Ok(())))) { tracing::error!("Could not persist tool result: {:?}", saved); }
                     Some(serde_json::json!({
                         "type": "tool_use_done",
                         "tool_use_id": tool_use_id,
@@ -533,7 +524,7 @@ pub(super) async fn start_chat(
                         "total_count": total_count,
                     }))
                 }
-                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name } => {
+                crate::native_engine::tool_loop::EngineEvent::AgentProgress { session_id, agent_type, status, tool_name, .. } => {
                     Some(serde_json::json!({
                         "type": "agent_progress",
                         "session_id": session_id,
@@ -558,6 +549,10 @@ pub(super) async fn start_chat(
                     || data.get("type").and_then(|t| t.as_str()) == Some("error");
                 if is_stop { terminal_event = Some(data); break; }
                 run.record_event();
+                let data = if h5 {
+                    let Some(event) = super::h5::client_event(data) else {continue};
+                    event
+                } else {data};
                 yield Ok::<Event, Infallible>(Event::default().data(data.to_string()));
             }
         }
@@ -596,73 +591,22 @@ pub(super) async fn start_chat(
         }
         // Save assistant message to SQLite after stream ends
         {
-            let db = db_clone;
-            let conv_id_save = conv_id.clone();
-            let assistant_text = full_text.clone();
-            let tool_calls_save = collected_tool_calls.clone();
-            let snapshots_save = serde_json::json!(request_snapshots);
             let saved = tokio::task::spawn_blocking(move || {
-                db.with_conn(|conn| {
-                    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-                    let conn = &*tx;
-                    tracing::info!(module = "BridgeDB", "Saving assistant message for conv_id={}", conv_id_save);
-                    let msg_id = assistant_id;
-                    let now = chrono::Utc::now().to_rfc3339();
-                    let (sort_order, archive) = deepseek_code_core::services::plan_approval::final_response_order(conn, &conv_id_save, observed_plan_boundary.as_deref())?;
-                    tracing::info!(module = "BridgeDB", "Inserting assistant message: id={}, content_len={}, sort_order={}", msg_id, assistant_text.len(), sort_order);
-                    let insert_result = if let Some(message) = crate::db::message_repo::get_message(conn, &msg_id)? {
-                        anyhow::ensure!(message.conversation_id == conv_id_save && message.role == "assistant", "Response session identity changed");
-                        if archive { conn.execute("UPDATE messages SET sort_order=?2 WHERE id=?1",rusqlite::params![msg_id,sort_order])?; }
-                        crate::db::message_repo::update_message_content(conn, &msg_id, &assistant_text)
-                    } else {
-                        crate::db::message_repo::insert_message(conn, &msg_id, &conv_id_save, "assistant", &assistant_text, None, &now, false, sort_order)
-                    };
-                    tracing::info!(module = "BridgeDB", "Assistant message insert result: {:?}", insert_result.is_ok());
-
-                    // Save tool calls for this message
-                    if insert_result.is_ok() {
-                        crate::db::message_repo::save_request_snapshots(conn, &msg_id, &snapshots_save)?;
-                        for (i, (tc_id, tc_name, tc_input, tc_output, tc_is_error)) in tool_calls_save.iter().enumerate() {
-                            let tc_row_id = format!("{msg_id}:{tc_id}");
-                            let _ = crate::db::message_repo::insert_tool_call(
-                                conn,
-                                &tc_row_id,
-                                &msg_id,
-                                tc_name,
-                                Some(tc_input.as_str()),
-                                tc_output.as_deref(),
-                                *tc_is_error,
-                                i as i64,
-                            );
-                        }
-                        if !tool_calls_save.is_empty() {
-                            tracing::info!(module = "BridgeDB", "Saved {} tool_calls for message {}", tool_calls_save.len(), msg_id);
-                        }
-                    } else { insert_result?; }
-
-                    // Update conversation message_count and updated_at
-                    let total_msgs = crate::db::message_repo::get_messages_by_conversation(conn, &conv_id_save)
-                        .unwrap_or_default()
-                        .len() as i64;
-                    let _ = conn.execute(
-                        "UPDATE conversations SET message_count = ?1, updated_at = ?2 WHERE id = ?3",
-                        rusqlite::params![total_msgs, &now, &conv_id_save],
-                    );
-
-                    tx.commit()?;
-                    Ok::<(), anyhow::Error>(())
+                history.save_segment(&assistant_id,SegmentUpdate {
+                    placement: SegmentPlacement::Final {observed_boundary:observed_plan_boundary.as_deref()},
+                    text: Some(&full_text),tools:&tools,origins:Some(&origins),snapshots:Some(&serde_json::json!(request_snapshots)),..Default::default()
                 })
             }).await;
-            let persisted = matches!(saved, Ok(Ok(Ok(()))));
+            let persisted=matches!(saved,Ok(Ok(())));
             if !persisted {
                 tracing::error!("Could not persist final assistant trajectory: {:?}", saved);
                 let _ = deepseek_code_core::services::input_queue::set_paused(&lifecycle_state.db_manager, &lifecycle_id, true);
             }
-            for snapshot in pending_snapshot_updates {
+            for snapshot in pending_snapshot_updates.into_iter().filter(|_|!h5) {
                 yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"request_snapshot", "snapshot":snapshot, "persisted":persisted}).to_string()));
             }
         }
-        if let Some(record) = final_turn {
+        if let Some(record) = final_turn.filter(|_|!h5) {
             yield Ok::<Event, Infallible>(Event::default().data(serde_json::json!({"type":"turn_timing","turn":record,"assistant_id":final_assistant_id}).to_string()));
         }
         if terminal_event.as_ref().is_none_or(|event| event["type"] == "error" || event["stop_reason"] == "cancelled" || event["stop_reason"] == "error" || event["stop_reason"] == "channel_closed") {
@@ -673,6 +617,7 @@ pub(super) async fn start_chat(
         drop(_turn_lease);
         super::input_queue::kick(lifecycle_state, lifecycle_id);
         if let Some(event) = terminal_event {
+            let event = if h5 && event["type"]=="message_stop" {serde_json::json!({"type":"message_stop","stop_reason":event["stop_reason"]})}else{event};
             yield Ok::<Event, Infallible>(Event::default().data(event.to_string()));
         }
     };
@@ -683,7 +628,7 @@ pub(super) async fn start_chat(
         use futures::StreamExt;
         futures::pin_mut!(stream);
         while let Some(event) = stream.next().await {
-            let _ = sse_tx.send(event).await;
+            if sse_tx.send(event).await.is_err() && h5 { break; }
         }
     });
     let mut response = Sse::new(tokio_stream::wrappers::ReceiverStream::new(sse_rx)).keep_alive(KeepAlive::default()).into_response();

@@ -10,6 +10,8 @@ use std::sync::{
 
 pub(super) async fn start_pending(
     worker: &Worker,
+    owner: Option<&deepseek_code_core::db::session_store::SessionDb>,
+    expected_binding: Option<&str>,
     sessions: &Arc<tokio::sync::Mutex<Option<Session>>>,
     active: &Arc<AtomicBool>,
     admission_released: &Arc<tokio::sync::Notify>,
@@ -24,18 +26,23 @@ pub(super) async fn start_pending(
     let Some(session) = current.as_ref() else {
         return Ok(());
     };
-    let child =
+    let Some((installed, _)) = &session.idle_launch else { return Ok(()); };
+    if expected_binding.is_some_and(|expected| installed != expected) {
+        return Ok(());
+    }
+    let selected =
         if deepseek_code_core::services::async_hooks::has_pending_wake(&worker.root, &worker.session_id) {
-            String::new()
+            None
         } else if let Some(child) = session
             .engine
             .pending_owned_child(&worker.session_id)
             .await?
         {
-            child
+            Some(child)
         } else {
             return Ok(());
         };
+    let child = selected.as_ref().map(|s| s.id().to_owned()).unwrap_or_default();
     if active
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -47,34 +54,23 @@ pub(super) async fn start_pending(
     // prompt that arrives after its completion waits for this release instead
     // of being refused as busy.
     *current_turn.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.clone());
-    if let Err(error) = service::begin_job(
+    if let Err(error) = super::begin_selected_job(
         worker,
+        owner,
         &id,
         &if child.is_empty() {
             "Async hook blocking feedback".into()
         } else {
             format!("Resume owned child {child} from inbox")
         },
+        selected.as_ref(),
     ) {
         *current_turn.lock().unwrap_or_else(|e| e.into_inner()) = None;
         active.store(false, Ordering::Release);
         return Err(error);
     }
     // Automatic work is visible under /tasks and never seizes the input prompt.
-    let publish = (|| -> Result<()> {
-        if !child.is_empty() {
-            std::fs::write(
-                worker
-                    .root
-                    .join("background-tasks")
-                    .join(&id)
-                    .join("owned-child.json"),
-                serde_json::to_vec(&child)?,
-            )?;
-        }
-        jobs::detach(&worker.root, &id, &worker.session_id)
-    })();
-    if let Err(error) = publish {
+    if let Err(error) = jobs::detach(&worker.root, &id, &worker.session_id) {
         let _ = service::finish_job(worker, &id, Some(error.to_string())).await;
         *current_turn.lock().unwrap_or_else(|e| e.into_inner()) = None;
         active.store(false, Ordering::Release);
@@ -97,7 +93,14 @@ pub(super) async fn start_pending(
         let cleanup_sessions = sessions.clone();
         let cleanup_child = child.clone();
         let result = tokio::spawn(async move {
-            Box::pin(execute(&task_worker, &task_id, &child, sessions, target)).await
+            Box::pin(execute(
+                &task_worker,
+                &task_id,
+                selected.as_ref(),
+                sessions,
+                target,
+            ))
+            .await
         })
         .await;
         let error = match result {
@@ -138,7 +141,7 @@ pub(super) async fn start_pending(
 async fn execute(
     worker: &Worker,
     id: &str,
-    child: &str,
+    selected: Option<&deepseek_code_core::db::session_store::SessionDb>,
     sessions: Arc<tokio::sync::Mutex<Option<Session>>>,
     mode_target: ModeTarget,
 ) -> Result<()> {
@@ -159,13 +162,8 @@ async fn execute(
             session.permissions.set_mode(mode);
         }
     }
-    if child.is_empty() {
-        let cli = session
-            .hook_wake_cli
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .context("Hook wake requires live worker options")?;
+    let Some(child) = selected else {
+        let (_, cli) = session.idle_launch.as_ref().context("Hook wake requires live worker options")?;
         *mode_target.lock().unwrap_or_else(|e| e.into_inner()) = Some(ModeControl {
             job_id: id.into(),
             session_id: session.id.clone(),
@@ -176,8 +174,14 @@ async fn execute(
             bypass_available: session.bypass_available,
             full_access: session.full_access,
         });
-        return session.wake_hooks(&cli, &mut None).await;
-    }
+        return session.wake_hooks(cli, &mut None).await;
+    };
+    let _target = child.hold_incarnation()?;
+    let _owner = session
+        .binding
+        .selected_session(&session.id)?
+        .hold_incarnation()?;
+    let child = child.id();
     let (manager, provider) = session
         .engine
         .owned_child_permission_target(&session.id, child)?;

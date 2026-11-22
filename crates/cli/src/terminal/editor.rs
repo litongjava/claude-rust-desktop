@@ -73,8 +73,8 @@ pub struct PromptEditor {
     transcript: Vec<crate::terminal::change_view::Line>,
     transcript_printed: bool,
     /// Suggested next prompts, generated after a turn; Tab accepts one.
-    suggestions: Option<std::sync::mpsc::Receiver<String>>,
-    suggestion: Option<String>,
+    suggestions: Option<std::sync::mpsc::Receiver<Option<crate::prompt_suggestion::Ghost>>>,
+    suggestion: Option<crate::prompt_suggestion::Ghost>,
     /// Project root for `@` file completion, and its files once listed.
     workspace: Option<std::path::PathBuf>,
     files: Option<Vec<String>>,
@@ -87,7 +87,7 @@ pub struct PromptEditor {
     background_counter: Option<Box<dyn Fn() -> (usize, usize) + Send>>,
     /// Rows for running background agents at a width, shown above the editor.
     subagent_context: Option<(deepseek_code_core::services::ServiceContext, String)>,
-    agent_details: Option<Box<dyn Fn(&str) -> String + Send>>,
+    agent_details: Option<Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>>,
     agent_rows: Option<Box<dyn Fn() -> Vec<crate::background_commands::Agent> + Send>>,
     /// The model and reasoning effort, at the right of the footer.
     effort: Option<String>,
@@ -141,7 +141,7 @@ struct RawMode;
 impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = execute!(
-            io::stderr(),
+            crate::terminal_output::stderr(),
             DisableBracketedPaste,
             DisableMouseCapture,
             ResetColor
@@ -634,7 +634,7 @@ impl Screen {
             return self.draw_pinned(lines, row, col);
         }
         self.cursor_col = col;
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         // Synchronized output keeps a large repaint from showing half drawn.
         out.write_all(b"\x1b[?2026h")?;
         let result = self.draw_to(&mut out, lines, row, col);
@@ -647,7 +647,7 @@ impl Screen {
         let rows = crate::terminal::size().1.max(1);
         let (_, cursor_y) = crate::terminal::cursor_position()?;
         self.cursor_col = col;
-        let mut out = io::stderr().lock();
+        let mut out = crate::terminal_output::stderr_locked();
         out.write_all(b"\x1b[?2026h")?;
         let result =
             self.draw_pinned_to(&mut out, lines, row, col, rows as usize, cursor_y as usize);
@@ -870,14 +870,14 @@ impl Screen {
     }
 
     pub(crate) fn suspend(&mut self) -> io::Result<()> {
-        let mut out = io::stderr();
+        let mut out = crate::terminal_output::stderr();
         self.erase(&mut out)?;
         out.flush()
     }
 
     /// Remove the editor from the screen without echoing a submitted line.
     fn clear(&mut self) -> io::Result<()> {
-        let mut out = io::stderr();
+        let mut out = crate::terminal_output::stderr();
         self.erase(&mut out)?;
         out.flush()
     }
@@ -905,7 +905,7 @@ impl Screen {
         history: &mut crate::terminal::scrollback::Scrollback,
     ) -> io::Result<()> {
         // Clear menu and borders, retaining just submitted input in scrollback.
-        let mut out = io::stderr();
+        let mut out = crate::terminal_output::stderr();
         out.write_all(b"\x1b[?2026h")?;
         self.erase(&mut out)?;
         if let Some(end) = self.transcript_end.take() {
@@ -1104,7 +1104,7 @@ impl PromptEditor {
         self.subagent_context = Some((context, session));
     }
 
-    pub fn set_agent_details(&mut self, details: Box<dyn Fn(&str) -> String + Send>) {
+    pub fn set_agent_details(&mut self, details: Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>) {
         self.agent_details = Some(details);
     }
 
@@ -1124,7 +1124,10 @@ impl PromptEditor {
     pub fn set_todos(&mut self, todos: Box<dyn Fn() -> Vec<(String, String)> + Send>) {
         self.todos = Some(todos);
     }
-    pub fn set_suggestions(&mut self, suggestions: std::sync::mpsc::Receiver<String>) {
+    pub fn set_suggestions(
+        &mut self,
+        suggestions: std::sync::mpsc::Receiver<Option<crate::prompt_suggestion::Ghost>>,
+    ) {
         self.suggestions = Some(suggestions);
     }
     pub fn set_keybindings(&mut self, bindings: crate::keybindings::Keybindings) {
@@ -1170,7 +1173,7 @@ impl PromptEditor {
         terminal::enable_raw_mode()?;
         let _raw = RawMode;
         // Capture both tool disclosure clicks and drag selection.
-        execute!(io::stderr(), EnableBracketedPaste, EnableMouseCapture)?;
+        execute!(crate::terminal_output::stderr(), EnableBracketedPaste, EnableMouseCapture)?;
         let mut input_reader = crate::terminal::paste_input::Reader::new()?;
         let mut above = crate::terminal::scrollback::Scrollback::handoff();
         let mut buffer = self.resume_buffer();
@@ -1226,9 +1229,9 @@ impl PromptEditor {
             .unwrap_or_else(std::time::Instant::now);
         let mut agents: Vec<String> = Vec::new();
         let mut agent_records = Vec::<crate::background_commands::Agent>::new();
-        let mut agent_click: Option<(String, std::time::Instant)> = None;
+        let mut agent_click: Option<(crate::background_commands::HistoryAddress, std::time::Instant)> = None;
         let mut subagents: Option<crate::terminal::subagents::View> = None;
-        let mut agent_detail: Option<String> = None;
+        let mut agent_detail: Option<crate::background_commands::HistoryAddress> = None;
         let mut agent_preview = String::new();
         let mut agent_scroll = 0usize;
         let mut selection_size = None;
@@ -1246,9 +1249,6 @@ impl PromptEditor {
         self.suggestion = None;
         // Files may have changed since the last prompt; list them again on `@`.
         self.files = None;
-        if let Some(suggestions) = &self.suggestions {
-            while suggestions.try_recv().is_ok() {}
-        }
         loop {
             if yielded.load(std::sync::atomic::Ordering::Acquire) {
                 self.pending_draft = buffer.text();
@@ -1283,19 +1283,19 @@ impl PromptEditor {
                     history_view.close()?;
                     screen.finish("", "", &mut above)?;
                     write_notice(
-                        &mut io::stderr(),
+                        &mut crate::terminal_output::stderr(),
                         &mut above,
                         &notice,
                         crate::terminal::size().0.saturating_sub(1) as usize,
                     )?;
-                    io::stderr().flush()?;
+                    crate::terminal_output::stderr().flush()?;
                     screen = Screen::pinned();
                     screen.align_transcript = !above.has_welcome();
                 }
             }
             if let Some(suggestions) = &self.suggestions {
                 while let Ok(suggestion) = suggestions.try_recv() {
-                    self.suggestion = Some(suggestion);
+                    self.suggestion = suggestion;
                 }
             }
             // Tasks start during turns, after this prompt set its counts, so the
@@ -1326,7 +1326,11 @@ impl PromptEditor {
                 }
             }
             let text = buffer.text();
-            let ghost = self.suggestion.clone().filter(|_| buffer.chars.is_empty());
+            let ghost = self
+                .suggestion
+                .as_ref()
+                .filter(|_| buffer.chars.is_empty())
+                .map(|g| g.saved.text.clone());
             let mention_query = mention(&text)
                 .filter(|_| buffer.cursor == buffer.chars.len())
                 .map(str::to_owned);
@@ -1659,11 +1663,11 @@ impl PromptEditor {
             } else if !selection.retained() {
                 if screen.height == 0 && above.needs_separator() {
                     if let Some(top) = screen.top {
-                        execute!(io::stderr(), MoveTo(0, top))?;
+                        execute!(crate::terminal_output::stderr(), MoveTo(0, top))?;
                         screen.top = Some(top.saturating_add(1).min(rows.saturating_sub(1)));
                     }
-                    write!(io::stderr(), "\r\n")?;
-                    io::stderr().flush()?;
+                    write!(crate::terminal_output::stderr(), "\r\n")?;
+                    crate::terminal_output::stderr().flush()?;
                     above.push(String::new(), None);
                 }
                 screen.draw(&lines, input_row, cursor_col)?;
@@ -1692,7 +1696,7 @@ impl PromptEditor {
                     screen.top.unwrap_or(0) as usize
                 };
                 command_overlay.draw_to(
-                    &mut io::stderr().lock(),
+                    &mut crate::terminal_output::stderr_locked(),
                     &command_menu,
                     bottom,
                     &background,
@@ -1717,7 +1721,7 @@ impl PromptEditor {
             };
             // Remove the overlay before an event can resize, scroll or repaint
             // its background. Otherwise a menu row can enter the transcript.
-            command_overlay.draw_to(&mut io::stderr().lock(), &[], 0, &[])?;
+            command_overlay.draw_to(&mut crate::terminal_output::stderr_locked(), &[], 0, &[])?;
             if matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Left | KeyCode::Right))
             {
                 if let Some((context, session)) = &self.subagent_context {
@@ -1764,7 +1768,7 @@ impl PromptEditor {
                         history_view.invalidate();
                         if !history_view.active() {
                             write!(
-                                io::stderr(),
+                                crate::terminal_output::stderr(),
                                 "{}",
                                 above.repaint(
                                     screen
@@ -1775,7 +1779,7 @@ impl PromptEditor {
                                     cols
                                 )
                             )?;
-                            io::stderr().flush()?;
+                            crate::terminal_output::stderr().flush()?;
                         }
                         screen.invalidated = true;
                         continue;
@@ -1820,7 +1824,7 @@ impl PromptEditor {
                             .min(new_rows.saturating_sub(1));
                         let bottom = above.repaint_bottom(bottom, columns);
                         above.update_welcome(bottom as usize);
-                        let mut out = io::stderr().lock();
+                        let mut out = crate::terminal_output::stderr_locked();
                         write!(
                             out,
                             "\x1b[?2026h{}\x1b[?2026l",
@@ -1863,7 +1867,7 @@ impl PromptEditor {
                             mouse.row as usize,
                             agent_records.len(),
                         ) {
-                            let id = agent_records[index].session_id.clone();
+                            let id = agent_records[index].address.clone();
                             if agent_click.as_ref().is_some_and(|(old, at)| {
                                 old == &id && at.elapsed() < std::time::Duration::from_millis(500)
                             }) {
@@ -2050,7 +2054,7 @@ impl PromptEditor {
                             out.push_str("\r\n");
                             above.push_logged(line);
                         }
-                        let mut stderr = io::stderr().lock();
+                        let mut stderr = crate::terminal_output::stderr_locked();
                         stderr.write_all(out.as_bytes())?;
                         stderr.flush()?;
                         screen = Screen::pinned();
@@ -2327,7 +2331,7 @@ impl PromptEditor {
                                 text.push_str("\r\n");
                             }
                             text.push_str("\x1b[?2026l");
-                            let mut out = io::stderr();
+                            let mut out = crate::terminal_output::stderr();
                             out.write_all(text.as_bytes())?;
                             out.flush()?;
                             screen = Screen::pinned();
@@ -2388,7 +2392,9 @@ impl PromptEditor {
                         .as_ref()
                         .filter(|_| matches!(key.code, KeyCode::Tab | KeyCode::Right) && !control)
                     {
-                        buffer.insert(suggestion);
+                        if self.suggestion.as_ref().is_some_and(|g| g.accept()) {
+                            buffer.insert(suggestion);
+                        }
                         self.suggestion = None;
                         continue;
                     }
@@ -3145,7 +3151,6 @@ mod tests {
             "/color",
             "/copy",
             "/model",
-            "/mobile",
             "/memory",
             "/auto-mode-setup",
         ];
@@ -3165,7 +3170,7 @@ mod tests {
         );
         assert_eq!(
             order("/mo"),
-            ["/model", "/mobile", "/auto-mode-setup", "/memory"]
+            ["/model", "/auto-mode-setup", "/memory"]
         );
         assert_eq!(order("/")[..3], ["/auto-mode-setup", "/color", "/compact"]);
         // Scattered letters elsewhere in a long name are no match.

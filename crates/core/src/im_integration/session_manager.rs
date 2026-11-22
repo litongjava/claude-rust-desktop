@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::db::DbManager;
-
 use super::message_router::UnifiedMessage;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +28,10 @@ impl SessionContext {
     pub fn thread_key(&self) -> String {
         match &self.thread_id {
             Some(thread_id) => {
-                format!("{}:{}:{}:{}", self.platform, self.user_id, self.chat_id, thread_id)
+                format!(
+                    "{}:{}:{}:{}",
+                    self.platform, self.user_id, self.chat_id, thread_id
+                )
             }
             None => self.session_key(),
         }
@@ -64,116 +65,118 @@ pub struct SessionMessage {
     pub raw_data: Option<serde_json::Value>,
 }
 
+pub trait ThreadHistory: Send + Sync + 'static {
+    fn im_threads(&self) -> Result<Vec<SessionContext>>;
+    fn save_im_thread(
+        &self,
+        thread: &SessionContext,
+        message: Option<&SessionMessage>,
+    ) -> Result<()>;
+    fn im_messages(&self, thread: &str, limit: usize) -> Result<Vec<SessionMessage>>;
+    fn delete_im_thread(&self, thread: &str) -> Result<()>;
+}
+
 pub struct SessionManager {
-    db: Arc<DbManager>,
+    db: Arc<dyn ThreadHistory>,
     sessions: RwLock<HashMap<String, SessionContext>>,
 }
 
 impl SessionManager {
-    pub fn new(db: Arc<DbManager>) -> Self {
+    pub fn new(db: Arc<dyn ThreadHistory>) -> Self {
         Self {
             db,
-            sessions: RwLock::new(HashMap::new()),
+            sessions: Default::default(),
         }
     }
 
     pub async fn initialize(&self) -> Result<()> {
-        self.ensure_tables().await?;
-        self.load_sessions().await?;
+        let db = self.db.clone();
+        let mut sessions = self.sessions.write().await;
+        let rows = tokio::task::spawn_blocking(move || db.im_threads()).await??;
+        *sessions = rows.into_iter().map(|s| (s.thread_key(), s)).collect();
         Ok(())
     }
 
+    async fn save(&self, thread: SessionContext, message: Option<SessionMessage>) -> Result<()> {
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.save_im_thread(&thread, message.as_ref())).await?
+    }
+
     pub async fn get_or_create_session(&self, msg: &UnifiedMessage) -> Result<SessionContext> {
+        let mut sessions = self.sessions.write().await;
         let key = msg.thread_key();
-        {
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(&key) {
-                return Ok(session.clone());
-            }
+        if let Some(s) = sessions.get(&key) {
+            return Ok(s.clone());
         }
-
-        let session = SessionContext::from(msg);
-        self.persist_session(&session).await?;
-
-        let mut sessions = self.sessions.write().await;
-        sessions.insert(key, session.clone());
-
-        Ok(session)
+        let thread = SessionContext::from(msg);
+        self.save(thread.clone(), None).await?;
+        sessions.insert(key, thread.clone());
+        Ok(thread)
     }
-
-    pub async fn get_session(&self, platform: &str, user_id: &str, chat_id: &str, thread_id: Option<&str>) -> Option<SessionContext> {
-        let key = match thread_id {
-            Some(tid) => format!("{}:{}:{}:{}", platform, user_id, chat_id, tid),
-            None => format!("{}:{}:{}", platform, user_id, chat_id),
-        };
-        let sessions = self.sessions.read().await;
-        sessions.get(&key).cloned()
-    }
-
     pub async fn update_session(&self, msg: &UnifiedMessage) -> Result<SessionContext> {
-        let key = msg.thread_key();
         let mut sessions = self.sessions.write().await;
-
-        let session = sessions.entry(key.clone()).or_insert_with(|| SessionContext::from(msg));
-        session.updated_at = Utc::now();
-        session.message_count += 1;
-        session.last_message_content = Some(msg.content.clone());
-
-        let session_clone = session.clone();
-        drop(sessions);
-
-        self.persist_session(&session_clone).await?;
-        self.persist_message(&session_clone, msg).await?;
-
-        Ok(session_clone)
+        let key = msg.thread_key();
+        let mut thread = sessions
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| SessionContext::from(msg));
+        thread.updated_at = Utc::now();
+        thread.last_message_content = Some(msg.content.clone());
+        thread.message_count += 1;
+        let message = SessionMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_key: key.clone(),
+            role: "user".into(),
+            content: msg.content.clone(),
+            message_type: msg.message_type.as_str().into(),
+            timestamp: msg.timestamp,
+            raw_data: Some(msg.raw_data.clone()),
+        };
+        self.save(thread.clone(), Some(message)).await?;
+        sessions.insert(key, thread.clone());
+        Ok(thread)
     }
 
+    pub async fn get_session(
+        &self,
+        platform: &str,
+        user_id: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+    ) -> Option<SessionContext> {
+        self.sessions
+            .read()
+            .await
+            .get(&thread_key(platform, user_id, chat_id, thread_id))
+            .cloned()
+    }
     pub async fn list_sessions(&self) -> Vec<SessionContext> {
-        let sessions = self.sessions.read().await;
-        sessions.values().cloned().collect()
+        self.sessions.read().await.values().cloned().collect()
     }
-
     pub async fn list_sessions_by_platform(&self, platform: &str) -> Vec<SessionContext> {
-        let sessions = self.sessions.read().await;
-        sessions
+        self.sessions
+            .read()
+            .await
             .values()
             .filter(|s| s.platform == platform)
             .cloned()
             .collect()
     }
-
-    pub async fn delete_session(&self, platform: &str, user_id: &str, chat_id: &str, thread_id: Option<&str>) -> Result<()> {
-        let key = match thread_id {
-            Some(tid) => format!("{}:{}:{}:{}", platform, user_id, chat_id, tid),
-            None => format!("{}:{}:{}", platform, user_id, chat_id),
-        };
-
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.remove(&key);
-        }
-
+    pub async fn delete_session(
+        &self,
+        platform: &str,
+        user_id: &str,
+        chat_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<()> {
+        let key = thread_key(platform, user_id, chat_id, thread_id);
         let db = self.db.clone();
-        let key_clone = key.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            db.with_conn(|conn| {
-                conn.execute(
-                    "DELETE FROM im_sessions WHERE session_key = ?1",
-                    rusqlite::params![key_clone],
-                )?;
-                conn.execute(
-                    "DELETE FROM im_session_messages WHERE session_key = ?1",
-                    rusqlite::params![key_clone],
-                )?;
-                Ok::<(), anyhow::Error>(())
-            })??;
-            Ok(())
-        })
-        .await??;
-
+        let mut sessions = self.sessions.write().await;
+        let id = key.clone();
+        tokio::task::spawn_blocking(move || db.delete_im_thread(&id)).await??;
+        sessions.remove(&key);
         Ok(())
     }
-
     pub async fn get_session_messages(
         &self,
         platform: &str,
@@ -182,55 +185,10 @@ impl SessionManager {
         thread_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SessionMessage>> {
-        let key = match thread_id {
-            Some(tid) => format!("{}:{}:{}:{}", platform, user_id, chat_id, tid),
-            None => format!("{}:{}:{}", platform, user_id, chat_id),
-        };
-
+        let key = thread_key(platform, user_id, chat_id, thread_id);
         let db = self.db.clone();
-        let key_clone = key.clone();
-        let messages = tokio::task::spawn_blocking(move || -> Result<Vec<SessionMessage>> {
-            db.with_conn(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT id, session_key, role, content, message_type, timestamp, raw_data 
-                     FROM im_session_messages 
-                     WHERE session_key = ?1 
-                     ORDER BY timestamp DESC 
-                     LIMIT ?2"
-                )?;
-                let rows = stmt.query_map(
-                    rusqlite::params![key_clone, limit as i64],
-                    |row| {
-                        let raw_data_str: Option<String> = row.get(6)?;
-                        let raw_data = raw_data_str
-                            .and_then(|s| serde_json::from_str(&s).ok());
-                        let ts_str: String = row.get(5)?;
-                        let timestamp = DateTime::parse_from_rfc3339(&ts_str)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| Utc::now());
-                        Ok(SessionMessage {
-                            id: row.get(0)?,
-                            session_key: row.get(1)?,
-                            role: row.get(2)?,
-                            content: row.get(3)?,
-                            message_type: row.get(4)?,
-                            timestamp,
-                            raw_data,
-                        })
-                    },
-                )?;
-                let mut result = Vec::new();
-                for row in rows {
-                    result.push(row?);
-                }
-                Ok(result)
-            })?
-        })
-        .await??;
-
-        Ok(messages)
+        tokio::task::spawn_blocking(move || db.im_messages(&key, limit)).await?
     }
-
     pub async fn add_message_to_session(
         &self,
         platform: &str,
@@ -242,49 +200,28 @@ impl SessionManager {
         message_type: &str,
         raw_data: Option<serde_json::Value>,
     ) -> Result<SessionMessage> {
-        let key = match thread_id {
-            Some(tid) => format!("{}:{}:{}:{}", platform, user_id, chat_id, tid),
-            None => format!("{}:{}:{}", platform, user_id, chat_id),
-        };
-
-        let msg = SessionMessage {
+        let key = thread_key(platform, user_id, chat_id, thread_id);
+        let mut sessions = self.sessions.write().await;
+        let mut thread = sessions
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("IM thread unavailable"))?;
+        let message = SessionMessage {
             id: uuid::Uuid::new_v4().to_string(),
             session_key: key.clone(),
-            role: role.to_string(),
-            content: content.to_string(),
-            message_type: message_type.to_string(),
+            role: role.into(),
+            content: content.into(),
+            message_type: message_type.into(),
             timestamp: Utc::now(),
-            raw_data: raw_data.clone(),
+            raw_data,
         };
-
-        let db = self.db.clone();
-        let msg_clone = msg.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let raw_data_str = msg_clone.raw_data.as_ref().map(|v| v.to_string());
-            db.with_conn(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    "INSERT INTO im_session_messages 
-                     (id, session_key, role, content, message_type, timestamp, raw_data) 
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-                )?;
-                stmt.execute(rusqlite::params![
-                    msg_clone.id,
-                    msg_clone.session_key,
-                    msg_clone.role,
-                    msg_clone.content,
-                    msg_clone.message_type,
-                    msg_clone.timestamp.to_rfc3339(),
-                    raw_data_str,
-                ])?;
-                Ok::<(), anyhow::Error>(())
-            })??;
-            Ok(())
-        })
-        .await??;
-
-        Ok(msg)
+        thread.message_count += 1;
+        thread.updated_at = message.timestamp;
+        thread.last_message_content = Some(content.to_owned());
+        self.save(thread.clone(), Some(message.clone())).await?;
+        sessions.insert(key, thread);
+        Ok(message)
     }
-
     pub async fn set_session_metadata(
         &self,
         platform: &str,
@@ -293,200 +230,22 @@ impl SessionManager {
         thread_id: Option<&str>,
         metadata: serde_json::Value,
     ) -> Result<()> {
-        let key = match thread_id {
-            Some(tid) => format!("{}:{}:{}:{}", platform, user_id, chat_id, tid),
-            None => format!("{}:{}:{}", platform, user_id, chat_id),
-        };
-
-        {
-            let mut sessions = self.sessions.write().await;
-            if let Some(session) = sessions.get_mut(&key) {
-                session.metadata = metadata.clone();
-            }
-        }
-
-        let metadata_str = serde_json::to_string(&metadata)?;
-        let db = self.db.clone();
-        let key_clone = key.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            db.with_conn(|conn| {
-                conn.execute(
-                    "UPDATE im_sessions SET metadata = ?1, updated_at = ?2 WHERE session_key = ?3",
-                    rusqlite::params![metadata_str, Utc::now().to_rfc3339(), key_clone],
-                )?;
-                Ok::<(), anyhow::Error>(())
-            })??;
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
-    }
-
-    async fn ensure_tables(&self) -> Result<()> {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            db.with_conn(|conn| {
-                conn.execute_batch(
-                    r#"
-                    CREATE TABLE IF NOT EXISTS im_sessions (
-                        session_key TEXT PRIMARY KEY,
-                        platform TEXT NOT NULL,
-                        user_id TEXT NOT NULL,
-                        chat_id TEXT NOT NULL,
-                        thread_id TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL,
-                        message_count INTEGER DEFAULT 0,
-                        last_message_content TEXT,
-                        metadata TEXT
-                    );
-
-                    CREATE TABLE IF NOT EXISTS im_session_messages (
-                        id TEXT PRIMARY KEY,
-                        session_key TEXT NOT NULL,
-                        role TEXT NOT NULL,
-                        content TEXT NOT NULL,
-                        message_type TEXT NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        raw_data TEXT,
-                        FOREIGN KEY (session_key) REFERENCES im_sessions(session_key) ON DELETE CASCADE
-                    );
-
-                    CREATE INDEX IF NOT EXISTS idx_im_sessions_platform ON im_sessions(platform);
-                    CREATE INDEX IF NOT EXISTS idx_im_sessions_user ON im_sessions(user_id);
-                    CREATE INDEX IF NOT EXISTS idx_im_sessions_chat ON im_sessions(chat_id);
-                    CREATE INDEX IF NOT EXISTS idx_im_session_messages_session ON im_session_messages(session_key);
-                    CREATE INDEX IF NOT EXISTS idx_im_session_messages_timestamp ON im_session_messages(timestamp);
-                    "#
-                )?;
-                Ok::<(), anyhow::Error>(())
-            })??;
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
-    }
-
-    async fn load_sessions(&self) -> Result<()> {
-        let db = self.db.clone();
-        let rows = tokio::task::spawn_blocking(move || -> Result<Vec<SessionContext>> {
-            db.with_conn(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    "SELECT session_key, platform, user_id, chat_id, thread_id, created_at, updated_at, message_count, last_message_content, metadata 
-                     FROM im_sessions"
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    let metadata_str: Option<String> = row.get(9)?;
-                    let metadata = metadata_str
-                        .and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                    let created_at_str: String = row.get(5)?;
-                    let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now());
-                    let updated_at_str: String = row.get(6)?;
-                    let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(|_| Utc::now());
-                    Ok(SessionContext {
-                        platform: row.get(1)?,
-                        user_id: row.get(2)?,
-                        chat_id: row.get(3)?,
-                        thread_id: row.get(4)?,
-                        created_at,
-                        updated_at,
-                        message_count: row.get::<_, i64>(7)? as u64,
-                        last_message_content: row.get(8)?,
-                        metadata,
-                    })
-                })?;
-                let mut result = Vec::new();
-                for row in rows {
-                    result.push(row?);
-                }
-                Ok(result)
-            })?
-        })
-        .await??;
-
+        let key = thread_key(platform, user_id, chat_id, thread_id);
         let mut sessions = self.sessions.write().await;
-        for session in rows {
-            sessions.insert(session.session_key(), session);
+        if let Some(current) = sessions.get_mut(&key) {
+            let mut next = current.clone();
+            next.metadata = metadata;
+            next.updated_at = Utc::now();
+            self.save(next.clone(), None).await?;
+            *current = next;
         }
-
         Ok(())
     }
+}
 
-    async fn persist_session(&self, session: &SessionContext) -> Result<()> {
-        let db = self.db.clone();
-        let session_clone = session.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let metadata_str = serde_json::to_string(&session_clone.metadata).unwrap_or_default();
-            db.with_conn(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    "INSERT INTO im_sessions 
-                     (session_key, platform, user_id, chat_id, thread_id, created_at, updated_at, message_count, last_message_content, metadata) 
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                     ON CONFLICT(session_key) DO UPDATE SET
-                     updated_at = excluded.updated_at,
-                     message_count = excluded.message_count,
-                     last_message_content = excluded.last_message_content,
-                     metadata = excluded.metadata"
-                )?;
-                stmt.execute(rusqlite::params![
-                    session_clone.session_key(),
-                    session_clone.platform,
-                    session_clone.user_id,
-                    session_clone.chat_id,
-                    session_clone.thread_id,
-                    session_clone.created_at.to_rfc3339(),
-                    session_clone.updated_at.to_rfc3339(),
-                    session_clone.message_count as i64,
-                    session_clone.last_message_content,
-                    metadata_str,
-                ])?;
-                Ok::<(), anyhow::Error>(())
-            })??;
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
-    }
-
-    async fn persist_message(&self, session: &SessionContext, msg: &UnifiedMessage) -> Result<()> {
-        let db = self.db.clone();
-        let session_key = session.session_key();
-        let raw_data = msg.raw_data.clone();
-        let content = msg.content.clone();
-        let msg_type = msg.message_type.as_str().to_string();
-        let timestamp = msg.timestamp;
-
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let raw_data_str = Some(raw_data.to_string());
-            db.with_conn(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    "INSERT INTO im_session_messages 
-                     (id, session_key, role, content, message_type, timestamp, raw_data) 
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-                )?;
-                stmt.execute(rusqlite::params![
-                    uuid::Uuid::new_v4().to_string(),
-                    session_key,
-                    "user",
-                    content,
-                    msg_type,
-                    timestamp.to_rfc3339(),
-                    raw_data_str,
-                ])?;
-                Ok::<(), anyhow::Error>(())
-            })??;
-            Ok(())
-        })
-        .await??;
-
-        Ok(())
+fn thread_key(platform: &str, user: &str, chat: &str, thread: Option<&str>) -> String {
+    match thread {
+        Some(t) => format!("{platform}:{user}:{chat}:{t}"),
+        None => format!("{platform}:{user}:{chat}"),
     }
 }

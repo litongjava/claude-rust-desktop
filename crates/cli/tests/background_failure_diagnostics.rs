@@ -1,6 +1,9 @@
 //! The background-task chain: a real supervisor process starts a real CLI
 //! worker against a local fault service, and the evidence is compared between
 //! the server, the task output, the SQLite request snapshot and `tasks show`.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::services::background_sessions::{self, Launch, CONTROL_ENV};
 use serde_json::{json, Value};
 use std::{
@@ -243,7 +246,7 @@ fn persisted_snapshot(data: &Path, session: &str) -> Value {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
     let snapshots = db
-        .with_conn(|conn| -> anyhow::Result<Value> {
+        .shard_sql(session, |conn| -> anyhow::Result<Value> {
             let message: String = conn.query_row(
                 "SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant' ORDER BY sort_order DESC LIMIT 1",
                 [session],

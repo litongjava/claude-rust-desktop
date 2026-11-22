@@ -1,5 +1,8 @@
 //! Real detached dcl members, local model, real temporary Git, exact PID/start identities.
 #![cfg(target_os = "linux")]
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use axum::{routing::post, Json, Router};
 use deepseek_code_core::{
     native_engine::provider_manager::ResolvedProvider,
@@ -299,7 +302,7 @@ impl Fixture {
             // barrier. Kill only after the completed output is persisted.
             for attempt in 0..400 {
                 let session = f.task().coder.session_id.unwrap();
-                let saved: bool = f.host.context.db.with_conn(|c| c.query_row(
+                let saved: bool = f.host.context.db.shard_sql(&session, |c| c.query_row(
                     "SELECT EXISTS(SELECT 1 FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.name='Bash' AND t.output IS NOT NULL AND t.is_error=0)",
                     [&session], |r| r.get(0),
                 )).unwrap().unwrap();
@@ -671,7 +674,7 @@ async fn watcher_recovery_limit_blocks_and_notifies_router_once() {
     watch_once(&f.reopened(), &f.router).await.unwrap();
     assert_eq!(f.count(EventType::TaskBlocked), 1);
     assert_eq!(f.count(EventType::SessionResumed), 1);
-    let notices:i64=f.host.context.db.with_conn(|c|c.query_row("SELECT count(*) FROM session_inbox WHERE recipient=?1 AND content LIKE 'Super Agent Watcher blocked task%'",[&f.router],|r|r.get(0))).unwrap().unwrap();
+    let notices=f.host.context.db.open_session(&f.router).unwrap().inbox(false).unwrap().into_iter().filter(|msg|msg.content.starts_with("Super Agent Watcher blocked task")).count();
     assert_eq!(notices, 1);
 }
 
@@ -862,7 +865,7 @@ async fn watcher_blocks_unknown_side_effect_after_observing_real_commit() {
     let old = f.kill_child().await;
     // Simulate a crash before the completed Bash output reached the transcript.
     // Git already contains its commit; replaying the compound command is unsafe.
-    let changed = f.host.context.db.with_conn(|c| c.execute(
+    let changed = f.host.context.db.shard_sql(&session, |c| c.execute(
         "UPDATE tool_calls SET output=NULL WHERE name='Bash' AND message_id IN (SELECT id FROM messages WHERE conversation_id=?1)",
         [&session],
     )).unwrap().unwrap();

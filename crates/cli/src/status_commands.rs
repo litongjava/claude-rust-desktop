@@ -83,11 +83,8 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
     let title = session
         .store
         .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::conversation_repo::get_conversation(conn, &session.id)
-        })
+        .conversation_metadata(&session.id)
         .ok()
-        .and_then(Result::ok)
         .flatten()
         .and_then(|row| row.title)
         .filter(|title| !title.trim().is_empty())
@@ -97,26 +94,8 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         .iter()
         .filter(|row| row["installed"] == true)
         .count();
-    let usage = crate::display_commands::usage(session)?;
-    let mut input = session.store.db.with_conn(|conn| conn.query_row(
-        "SELECT COALESCE(SUM(CASE WHEN json_valid(usage_json) AND json_extract(usage_json,'$.input_tokens') IS NOT NULL AND json_extract(usage_json,'$.prompt_tokens') IS NULL THEN COALESCE(input_tokens,0)+COALESCE(cache_read_tokens,0)+COALESCE(cache_write_tokens,0) ELSE COALESCE(input_tokens,0) END),0) FROM model_requests WHERE conversation_id=?1",
-        [&session.id], |row| row.get::<_, u64>(0),
-    ))??;
-    let mut output = usage["output_tokens"].as_u64().unwrap_or(0);
     let live = crate::session_commands::live_requests(session)?;
-    for snapshot in &live {
-        let saved = session.store.db.with_conn(|conn| {
-            conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM model_requests WHERE id=?1 AND conversation_id=?2)",
-                [snapshot["id"].as_str().unwrap_or_default(), &session.id],
-                |row| row.get::<_, bool>(0),
-            )
-        })??;
-        if !saved {
-            input = input.saturating_add(snapshot["inputTokens"].as_u64().unwrap_or(0));
-            output = output.saturating_add(snapshot["outputTokens"].as_u64().unwrap_or(0));
-        }
-    }
+    let (_,input,output) = session.selected_session()?.repository().usage_totals(&live)?;
     let boundary = deepseek_code_core::services::context_usage::latest_boundary(
         &session.store.db,
         &session.id,
@@ -128,13 +107,13 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         &session.store.db,
         &session.id,
         boundary_id,
-        &session.model,
-        Some(&session.provider_id),
+        &session.binding_state().model,
+        Some(&session.binding_state().provider_id),
     )?;
     let same_context = |snapshot: &serde_json::Value| {
         (snapshot["source"] == "native_engine" || snapshot.get("source").is_none())
-            && snapshot["model"] == session.model
-            && snapshot["providerId"] == session.provider_id
+            && snapshot["model"] == session.binding_state().model
+            && snapshot["providerId"] == session.binding_state().provider_id
             && match boundary_id {
                 Some(id) => snapshot["contextBoundary"].as_str() == Some(id),
                 None => snapshot
@@ -175,8 +154,8 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         deepseek_code_core::services::context_usage::estimated_after_compaction(
             &session.store,
             &session.id,
-            &session.model,
-            Some(&session.provider_id),
+            &session.binding_state().model,
+            Some(&session.binding_state().provider_id),
         )?
     } else {
         None
@@ -185,11 +164,11 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
         let saved = deepseek_code_core::services::context_usage::last_reported_request(
             &session.store.db,
             &session.id,
-            &session.model,
+            &session.binding_state().model,
         )?;
         let reported = live.iter().rev().find(|snapshot| {
             (snapshot["source"] == "native_engine" || snapshot.get("source").is_none())
-                && snapshot["model"] == session.model
+                && snapshot["model"] == session.binding_state().model
                 && snapshot["inputTokens"].is_u64()
                 && snapshot["startedAt"].as_i64().unwrap_or(0)
                     >= saved.as_ref().and_then(|r| r.started_at_ms).unwrap_or(0)
@@ -274,12 +253,12 @@ pub async fn text(session: &Session, argument: &str) -> Result<String> {
                 format!(
                     "{} ({})",
                     runtime_status::label(&provider.provider.name),
-                    runtime_status::label(&session.provider_id)
+                    runtime_status::label(&session.binding_state().provider_id)
                 ),
             ),
             (
                 "Model",
-                format!("{} \u{b7} /model", runtime_status::label(&session.model)),
+                format!("{} \u{b7} /model", runtime_status::label(&session.binding_state().model)),
             ),
             (
                 "API endpoint",

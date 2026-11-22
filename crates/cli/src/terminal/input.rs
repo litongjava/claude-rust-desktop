@@ -69,10 +69,7 @@ impl WatchRequest {
         if crossterm::terminal::enable_raw_mode().is_err() {
             return;
         }
-        loop {
-            if self.stop.load(Ordering::Acquire) {
-                break;
-            }
+        while !self.stop.load(Ordering::Acquire) && !crate::signals::terminating() {
             match crossterm::event::poll(std::time::Duration::from_millis(50)) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(crossterm::event::Event::Key(key))
@@ -140,7 +137,7 @@ enum Message {
     Background(usize, usize),
     BackgroundCounter(Box<dyn Fn() -> (usize, usize) + Send>),
     Subagents(deepseek_code_core::services::ServiceContext, String),
-    AgentDetails(Box<dyn Fn(&str) -> String + Send>),
+    AgentDetails(Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>),
     AgentRows(Box<dyn Fn() -> Vec<crate::background_commands::Agent> + Send>),
     Todos(Box<dyn Fn() -> Vec<(String, String)> + Send>),
     Vim(bool),
@@ -165,7 +162,7 @@ struct PendingRead {
 
 pub struct TerminalInput {
     notices: std::sync::mpsc::Sender<String>,
-    suggestions: std::sync::mpsc::Sender<String>,
+    suggestions: std::sync::mpsc::Sender<Option<crate::prompt_suggestion::Ghost>>,
     requests: std::sync::mpsc::Sender<Message>,
     pending: Option<PendingRead>,
     fixture: Option<mpsc::UnboundedReceiver<String>>,
@@ -396,7 +393,7 @@ impl TerminalInput {
         let _ = self.requests.send(Message::Subagents(context, session));
     }
 
-    pub fn set_agent_details(&self, details: Box<dyn Fn(&str) -> String + Send>) {
+    pub fn set_agent_details(&self, details: Box<dyn Fn(&crate::background_commands::HistoryAddress) -> String + Send>) {
         let _ = self.requests.send(Message::AgentDetails(details));
     }
 
@@ -416,9 +413,8 @@ impl TerminalInput {
         let _ = self.requests.send(Message::Workspace(workspace.to_owned()));
     }
 
-    /// Where a background task delivers the suggested next prompt.
-    pub fn suggestion_sender(&self) -> std::sync::mpsc::Sender<String> {
-        self.suggestions.clone()
+    pub fn set_suggestion(&self, suggestion: Option<crate::prompt_suggestion::Ghost>) {
+        let _ = self.suggestions.send(suggestion);
     }
 
     pub fn set_details(&self, details: Vec<(String, String)>) {
@@ -661,7 +657,7 @@ fn map_readline(result: rustyline::Result<String>) -> io::Result<Option<String>>
 
 fn read_plain(reader: &mut impl BufRead, prompt: &str) -> io::Result<Option<String>> {
     eprint!("{prompt}");
-    io::stderr().flush()?;
+    crate::terminal_output::stderr().flush()?;
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Ok(None);

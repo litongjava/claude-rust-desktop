@@ -1,12 +1,28 @@
 //! Run-local agent definitions. Never written to the installed agent registry.
-use super::provider_manager::ResolvedProvider;
+use super::provider_manager::{ProviderManager, ResolvedProvider};
 use crate::services::agents::Definition;
 use std::sync::Arc;
+
+/// Keep the selector across SDK turns. Credentials are resolved at invocation.
+#[derive(Clone)]
+pub struct AgentModel {
+    pub provider_id: String,
+    pub model: String,
+}
+
+impl AgentModel {
+    pub fn resolve(&self, providers: &ProviderManager) -> anyhow::Result<ResolvedProvider> {
+        if providers.binding.read().is_some() { return providers.binding.resolve(Some((&self.provider_id, &self.model))).ok_or_else(|| anyhow::anyhow!("SDK agent model is not configured")); }
+        providers
+            .resolve_selected(&self.provider_id, &self.model)
+            .ok_or_else(|| anyhow::anyhow!("SDK agent model is not configured"))
+    }
+}
 
 #[derive(Clone)]
 pub struct RuntimeAgent {
     pub definition: Definition,
-    pub provider: Option<ResolvedProvider>,
+    pub provider: Option<AgentModel>,
     pub disallowed_tools: Vec<String>,
     pub max_turns: Option<u32>,
     /// Named MCP servers this agent may use; `mcpServers` string entries.

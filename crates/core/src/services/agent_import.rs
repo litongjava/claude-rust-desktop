@@ -3,8 +3,8 @@ use super::{
     agents::{self, Definition},
     ServiceContext,
 };
+use crate::db::session_store::AgentCatalog;
 use anyhow::{ensure, Context, Result};
-use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -32,7 +32,12 @@ pub struct Report {
     pub notes: Vec<String>,
 }
 
-pub fn import(context: &ServiceContext, source: &Path, id: &str, preview: bool) -> Result<Report> {
+pub fn import(
+    context: &ServiceContext<impl AgentCatalog>,
+    source: &Path,
+    id: &str,
+    preview: bool,
+) -> Result<Report> {
     ensure!(
         std::fs::metadata(source)?.len() <= 1024 * 1024,
         "Agent definition exceeds 1 MiB"
@@ -74,27 +79,15 @@ pub fn import(context: &ServiceContext, source: &Path, id: &str, preview: bool) 
     let backup = if preview {
         None
     } else {
-        let directory = context.paths.data_dir.join("backups");
-        std::fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("agents-{}.sqlite3", uuid::Uuid::new_v4()));
-        context
-            .db
-            .with_conn(|c| c.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()]))??;
-        Some(path.to_string_lossy().into_owned())
+        Some(
+            context
+                .db
+                .backup_definitions(&context.paths.data_dir)?
+                .to_string_lossy()
+                .into_owned(),
+        )
     };
-    context.db.with_conn(|c| -> Result<Report> {
-        let tx = rusqlite::Transaction::new_unchecked(c, TransactionBehavior::Immediate)?;
-        let raw: Option<String> = tx.query_row("SELECT value FROM peripheral_settings WHERE key='agent-definitions'", [], |r| r.get(0)).optional()?;
-        let mut definitions: Vec<Definition> = raw.map(|v| serde_json::from_str(&v)).transpose()?.unwrap_or_default();
-        let skipped = if let Some(prior) = definitions.iter().find(|d| d.id == definition.id) {
-            ensure!(prior == &definition, "Agent ID {} conflicts with an existing definition", definition.id);
-            true
-        } else { definitions.push(definition.clone()); false };
-        if !preview && !skipped {
-            tx.execute("INSERT INTO peripheral_settings(key,value) VALUES('agent-definitions',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&definitions)?])?;
-        }
-        if preview { tx.rollback()?; } else { tx.commit()?; }
-        Ok(Report { definition, preview, imported: !preview && !skipped, skipped, backup,
+    let skipped = !context.db.save_definition(&definition, false, preview)?;
+    Ok(Report { definition, preview, imported: !preview && !skipped, skipped, backup,
             notes: vec!["Legacy model/source/base_dir are preserved as provenance. Execution uses the explicitly selected host model and trusted project, as the old executor did not apply those fields.".into(), "Mapped tools are a strict allowlist, including an empty list; import does not execute an agent.".into()] })
-    })?
 }

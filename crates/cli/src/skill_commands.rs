@@ -1,4 +1,6 @@
 //! Discover only enabled, unambiguous skills that the shared engine can execute.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use deepseek_code_core::{runtime::RuntimePaths, skills::SkillsManager};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,7 +55,7 @@ pub async fn finish_background(
                                 object.insert("task_id".into(),serde_json::json!(job.id));
                             }
                             command_println!("{}",serde_json::to_string(&event)?);
-                            std::io::stdout().flush()?;
+                            crate::terminal_output::stdout().flush()?;
                         }
                     }
                     if let Some(question)=background_sessions::pending_question(&session.paths.data_dir,&job.id,&session.id)? {
@@ -98,7 +100,7 @@ pub async fn finish_background(
     } else {
         command_println!("{}", serde_json::to_string(&result)?);
     }
-    std::io::stdout().flush()?;
+    crate::terminal_output::stdout().flush()?;
     if let Some(error) = error {
         if cli.output_format != OutputFormat::Text {
             return Err(crate::output::ReportedError(error).into());
@@ -131,6 +133,7 @@ pub async fn prepare_invocation(
     };
     let (name, arguments) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
     let context = crate::services::context(&session.paths)?;
+    SkillsManager::with_path(session.paths.data_dir.join("skills")).ensure_installed()?;
     let mut commands = deepseek_code_core::services::plugins::skill_commands(&context)?;
     commands.extend(deepseek_code_core::skills::discovery::discover(
         &session.paths.data_dir,
@@ -139,21 +142,28 @@ pub async fn prepare_invocation(
     let Some(skill) = commands.get(name) else {
         return Ok(PreparedInvocation::NotHandled);
     };
-    if skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__")) {
-        if let Some(prepared) = deepseek_code_core::skills::code_review::prepare_named(name, &session.workspace, arguments.trim()).await {
+    let bundled =
+        deepseek_code_core::skills::discovery::is_bundled_path(&skill.path, &session.paths.data_dir);
+    if bundled {
+        if let Some(prepared) = deepseek_code_core::skills::code_review::prepare_named(
+            name,
+            &session.workspace,
+            arguments.trim(),
+            &skill.content,
+        )
+        .await
+        {
             return Ok(PreparedInvocation::Inline(prepared?));
         }
     }
-    if name == "doctor" && skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__")) {
+    if name == "doctor" && bundled {
         let instructions = skill.render_template(arguments.trim(), &session.id)?;
         let snapshot = crate::doctor_commands::snapshot(&session.workspace, &session.paths);
         return Ok(PreparedInvocation::Inline(
             deepseek_code_core::services::doctor::attach_snapshot(&instructions, &snapshot),
         ));
     }
-    if deepseek_code_core::skills::bundled_resources::supports(name)
-        && skill.path.parent() == Some(std::path::Path::new("__embedded_cli_skills__"))
-    {
+    if deepseek_code_core::skills::bundled_resources::supports(name) && bundled {
         // The engine owns resources so they live in the worker that reads them.
         return Ok(PreparedInvocation::NotHandled);
     }
@@ -175,7 +185,7 @@ pub async fn prepare_invocation(
         .permissions
         .set_session_rules(&session.id, crate::permission_commands::load(session)?);
     let hooks = HookRunner::load_with_plugins(&context, &session.workspace)?
-        .with_prompt_provider(session.sdk_resolve_model(&session.model).await?)?;
+        .with_prompt_provider(session.sdk_resolve_model(&session.binding_state().model).await?)?;
     let mut expanded = String::new();
     for segment in segments {
         match segment {
@@ -273,7 +283,13 @@ pub async fn prepare_invocation(
     if !fork {
         return Ok(PreparedInvocation::Inline(format!("Execute the explicitly selected skill below. Shell context has already been collected; do not execute it again.\n\n{expanded}")));
     }
-    let child_id = isolated_child(&session.store, &session.id, &context)?;
+    let _parent = session
+        .binding
+        .selected_session(&session.id)?
+        .hold_incarnation()?;
+    let child = isolated_child(&session.store, &session.id, &context)?;
+    let _target = child.hold_incarnation()?;
+    let child_id = child.id().to_owned();
     if let Some(agent) = &skill.agent {
         let mut definition = deepseek_code_core::services::agents::resolve(&context, agent)?;
         if let Some(parent) =
@@ -297,7 +313,7 @@ pub async fn prepare_invocation(
     std::io::Write::write_all(&mut file, expanded.as_bytes())?;
     let instructions = directory.join(format!("{child_id}.md"));
     file.persist(&instructions)?;
-    let provider = session.selected_provider().await?;
+    let provider = session.launch_provider().await?;
     let mut arguments = crate::background_commands::arguments(cli, &session.paths, session, &child_id, "Execute the selected skill in the appended instructions. Report the result concisely. Shell context was already expanded; do not rerun it.", &provider)?;
     let position = arguments
         .iter()
@@ -332,20 +348,19 @@ pub async fn prepare_invocation(
 fn isolated_child(
     store: &deepseek_code_core::runtime::SessionStore,
     parent: &str,
-    context: &deepseek_code_core::services::ServiceContext,
-) -> anyhow::Result<String> {
-    let child = store.clear(parent)?;
-    deepseek_code_core::services::permission_authority::inherit(&store.db, parent, &child)?;
-    crate::session_commands::copy_settings(&store.db, parent, &child)?;
-    // A parent autonomous goal must not turn a bounded skill into unrelated work.
-    let setting = format!("cli.session.{child}");
-    if let Some(mut settings) = context.setting::<serde_json::Value>(&setting)? {
-        if let Some(object) = settings.as_object_mut() {
-            object.remove("goal");
-        }
-        context.save_setting(&setting, &settings)?;
+    _context: &deepseek_code_core::services::ServiceContext,
+) -> anyhow::Result<deepseek_code_core::db::session_store::SessionDb> {
+    use deepseek_code_core::db::session_store::{settings, SessionAccess};
+    let owner = store.db.open_session(parent)?;
+    let child = uuid::Uuid::new_v4().to_string();
+    let destination = owner.derive_owned_child(&child, &owner.workspace()?)?;
+    owner.copy_preferences_to(&destination)?;
+    let preferences = destination.select_session(&child)?;
+    if let Some(mut value) = preferences.preference(settings::PREFERENCES)? {
+        value.goal = None;
+        preferences.set_preference(settings::PREFERENCES, Some(&value))?;
     }
-    Ok(child)
+    Ok(destination)
 }
 
 pub async fn load_for_workspace(
@@ -388,18 +403,28 @@ pub async fn state_command(
     state: Option<&str>,
 ) -> anyhow::Result<String> {
     use deepseek_code_core::skills::{discovery, states};
+    SkillsManager::with_path(paths.data_dir.join("skills")).ensure_installed()?;
     let stored = states::load(&paths.data_dir);
+    let installed = discovery::installed_bundled_skills(&paths.data_dir);
+    let discovered = discovery::discover(&paths.data_dir, workspace)?;
+    let is_bundled = |name: &str| {
+        discovered.get(name).map_or_else(
+            || installed.contains_key(name),
+            |command| discovery::is_bundled_path(&command.path, &paths.data_dir),
+        )
+    };
     let line = |name: &str| {
-        let value = states::effective(&stored, name);
+        let value = states::effective_in(&stored, name, is_bundled(name));
         format!("{name}  {}", value.label())
     };
     match (skill, state) {
         (None, _) => {
             let context = crate::services::context(paths)?;
-            // `off` skills are removed by the resolver, so keep the names the
-            // states file already knows.
+            // `off` skills are removed by the resolver, so keep the installed
+            // built-ins and the names the states file already knows.
             let mut names: BTreeSet<String> = stored.keys().cloned().collect();
-            names.extend(discovery::discover(&paths.data_dir, workspace)?.into_keys());
+            names.extend(installed.keys().cloned());
+            names.extend(discovered.keys().cloned());
             names.extend(
                 deepseek_code_core::services::plugins::skill_commands(&context)?.into_keys(),
             );
@@ -413,7 +438,8 @@ pub async fn state_command(
         (Some(name), Some(label)) => {
             let update: states::SkillState = label.parse()?;
             let known = stored.contains_key(name)
-                || discovery::discover(&paths.data_dir, workspace)?.contains_key(name)
+                || installed.contains_key(name)
+                || discovered.contains_key(name)
                 || crate::services::context(paths)
                     .and_then(|context| {
                         deepseek_code_core::services::plugins::skill_commands(&context)
@@ -528,28 +554,30 @@ mod tests {
         store
             .append(&parent, "user", "private parent history")
             .unwrap();
-        context.save_setting(&format!("cli.session.{parent}"), &serde_json::json!({"effort":"high","goal":{"text":"parent-only","completed":false}})).unwrap();
+        context.db.seed_preference(&parent, deepseek_code_core::db::session_store::settings::PREFERENCES, &serde_json::json!({"effort":"high","goal":{"text":"parent-only","completed":false}})).unwrap();
         context
-            .save_setting(
-                &format!("cli.permissions.{parent}"),
-                &serde_json::json!({"deny":["Bash(*)"]}),
+            .db.seed_preference(&parent, deepseek_code_core::db::session_store::settings::PERMISSIONS,
+                &serde_json::json!({"Bash(*)":"Deny"}),
             )
             .unwrap();
-        let child = isolated_child(&store, &parent, &context).unwrap();
+        let child = isolated_child(&store, &parent, &context)
+            .unwrap()
+            .id()
+            .to_owned();
         assert!(store.history(&child).unwrap().is_empty());
         assert_eq!(store.history(&parent).unwrap().len(), 1);
         let child_settings: serde_json::Value = context
-            .setting(&format!("cli.session.{child}"))
+            .db.fixture_preference(&child, deepseek_code_core::db::session_store::settings::PREFERENCES)
             .unwrap()
             .unwrap();
         assert_eq!(child_settings["effort"], "high");
-        assert!(child_settings.get("goal").is_none());
+        assert!(child_settings["goal"].is_null());
         assert_eq!(
             context
-                .setting::<serde_json::Value>(&format!("cli.permissions.{child}"))
+                .db.fixture_preference(&child, deepseek_code_core::db::session_store::settings::PERMISSIONS)
                 .unwrap(),
             context
-                .setting::<serde_json::Value>(&format!("cli.permissions.{parent}"))
+                .db.fixture_preference(&parent, deepseek_code_core::db::session_store::settings::PERMISSIONS)
                 .unwrap()
         );
         store
@@ -624,13 +652,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_command_reports_user_only_default_for_translation_skills() {
+    async fn state_command_reports_builtin_translation_skills_off_by_default() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
 
-        // No states file yet: the bundled translation skills are user-only.
+        // No states file yet: bundled built-in skills are off by default.
+        let shown = state_command(&paths, &workspace, Some("translate-zh-en"), None)
+            .await
+            .unwrap();
+        assert_eq!(shown, "translate-zh-en  off");
+
+        // An explicit user choice is still reported as chosen.
+        state_command(
+            &paths,
+            &workspace,
+            Some("translate-zh-en"),
+            Some("user-only"),
+        )
+        .await
+        .unwrap();
         let shown = state_command(&paths, &workspace, Some("translate-zh-en"), None)
             .await
             .unwrap();

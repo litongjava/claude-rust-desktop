@@ -1,4 +1,6 @@
 //! One terminal owner while a model turn runs. The idle editor is inactive.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use super::change_view;
 use super::tool_view::Gathering;
 use crossterm::{
@@ -71,7 +73,7 @@ enum Update {
     ),
     /// The session's working directory, shown in the footer.
     Workspace(String),
-    ShellContext(std::path::PathBuf, String),
+    ShellContext(std::path::PathBuf, String, Option<deepseek_code_core::db::session_store::SessionDb>),
     /// The model and reasoning effort, shown in the footer.
     ModelLabel(String),
     Activity(String),
@@ -92,7 +94,7 @@ enum Update {
     Shells(usize),
     /// Background agents still running when the turn ends.
     Agents(usize),
-    AgentProgress(String, String, String),
+    AgentProgress(Option<crate::background_commands::HistoryAddress>, String, String, String),
     /// The todo list ctrl+t shows, as (content, status).
     Todos(Vec<(String, String)>),
     /// The conversation before this turn, for the Ctrl+O transcript.
@@ -150,7 +152,7 @@ impl LiveTurn {
         let worker = thread::spawn(move || {
             let result = terminal::enable_raw_mode()
                 // Capture tool disclosure clicks and drag selection.
-                .and_then(|_| execute!(io::stderr(), EnableBracketedPaste, EnableMouseCapture));
+                .and_then(|_| execute!(crate::terminal_output::stderr(), EnableBracketedPaste, EnableMouseCapture));
             if result.is_err() {
                 let _ = terminal::disable_raw_mode();
                 let _ = ready.send(false);
@@ -177,7 +179,14 @@ impl LiveTurn {
                 aligned,
                 ..Frame::default()
             };
-            let _ = run(&mut state, &mut screen, receiver, actions);
+            // Publish terminal loss before dropping the action and answer senders.
+            let result = run(&mut state, &mut screen, &receiver, &actions);
+            #[cfg(unix)]
+            if result.is_err() {
+                crate::signals::check_terminal_hangup();
+            }
+            #[cfg(not(unix))]
+            let _ = result;
             let _ = screen.clear();
             // The prompt that follows starts right below these lines.
             std::mem::take(&mut screen.scrollback).save();
@@ -290,7 +299,7 @@ impl Drop for LiveTurn {
 struct RawGuard;
 impl Drop for RawGuard {
     fn drop(&mut self) {
-        let _ = execute!(io::stderr(), DisableBracketedPaste, DisableMouseCapture);
+        let _ = execute!(crate::terminal_output::stderr(), DisableBracketedPaste, DisableMouseCapture);
         let _ = terminal::disable_raw_mode();
     }
 }
@@ -518,14 +527,14 @@ struct State {
     inspection_title: String,
     inspection_scroll: usize,
     subagents_open: bool,
-    agent_detail: Option<String>,
+    agent_detail: Option<crate::background_commands::HistoryAddress>,
     transcript: Vec<change_view::Line>,
     shells: usize,
     /// When ctrl+x was pressed, for the ctrl+x ctrl+s chord.
     chord: Option<Instant>,
     todos: Vec<(String, String)>,
     agents: usize,
-    foreground_agents: Vec<(String, String)>,
+    foreground_agents: Vec<(crate::background_commands::HistoryAddress, String)>,
     agent_panel: Vec<crate::background_commands::Agent>,
     /// Draft states before each edit, for ctrl+_.
     undo: Vec<(Vec<char>, usize)>,
@@ -2172,7 +2181,7 @@ fn choice_lines(choice: &Choice, kept: &str, typeahead: &str, status: &str, mode
 }
 
 fn write(text: &str) -> io::Result<()> {
-    let mut output = io::stderr().lock();
+    let mut output = crate::terminal_output::stderr_locked();
     // Synchronized output: terminals that support it present the whole update
     // at once; others ignore the private mode.
     output.write_all(b"\x1b[?2026h")?;
@@ -2183,8 +2192,8 @@ fn write(text: &str) -> io::Result<()> {
 fn run(
     state: &mut State,
     screen: &mut Frame,
-    updates: mpsc::Receiver<Update>,
-    actions: async_mpsc::UnboundedSender<Action>,
+    updates: &mpsc::Receiver<Update>,
+    actions: &async_mpsc::UnboundedSender<Action>,
 ) -> io::Result<()> {
     let _alternate_cleanup = AlternateCleanup;
     let mut selection = super::mouse_selection::Selection::default();
@@ -2234,7 +2243,7 @@ fn run(
                         state.copy_feedback = Some(text);
                     } else if command.trim() == "/status" || command.trim().starts_with("/tasks") {
                         if state.status_page.is_none() {
-                            execute!(io::stderr(), terminal::EnterAlternateScreen)?;
+                            execute!(crate::terminal_output::stderr(), terminal::EnterAlternateScreen)?;
                         }
                         state.inspection_scroll = 0;
                         state.inspection_title = if command.trim().starts_with("/tasks") { "Tasks" } else { "Status" }.into();
@@ -2310,7 +2319,15 @@ fn run(
                     }
                     dirty = true;
                 }
-                Ok(Update::ShellContext(root, session)) => { state.shell_context = Some((root, session)); }
+                Ok(Update::ShellContext(root, session, owner)) => {
+                    agent_context = owner.and_then(|owner| {
+                        let paths = deepseek_code_core::runtime::RuntimePaths::new(root.clone()).ok()?;
+                        let mut context = crate::services::context(&paths).ok()?;
+                        context.db = std::sync::Arc::new(owner.scoped_stores());
+                        Some(context)
+                    });
+                    state.shell_context = Some((root, session));
+                }
                 Ok(Update::Workspace(path)) => {
                     state.workspace = path;
                     dirty = true;
@@ -2377,11 +2394,11 @@ fn run(
                 Ok(Update::PinnedPrompt(text)) => { screen.pinned.text = text; dirty = true; },
                 Ok(Update::Shells(count)) => state.shells = count,
                 Ok(Update::Agents(count)) => state.agents = count,
-                Ok(Update::AgentProgress(id, kind, status)) => {
+                Ok(Update::AgentProgress(address, id, kind, status)) => {
                     if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
-                        state.foreground_agents.retain(|(key, _)| *key != id);
-                    } else if !state.foreground_agents.iter().any(|(key, _)| *key == id) {
-                        state.foreground_agents.push((id, kind));
+                        state.foreground_agents.retain(|(key, _)| Some(key) != address.as_ref());
+                    } else if let Some(address) = address.filter(|a| a.session == id && !state.foreground_agents.iter().any(|(key, _)| key == a)) {
+                        state.foreground_agents.push((address, kind));
                     }
                     last_agents = Instant::now() - Duration::from_secs(1);
                     dirty = true;
@@ -2448,7 +2465,7 @@ fn run(
                     drop(subagents.take());
                     state.subagents_open = false;
                     if state.status_page.take().is_some() {
-                        execute!(io::stderr(), terminal::LeaveAlternateScreen)?;
+                        execute!(crate::terminal_output::stderr(), terminal::LeaveAlternateScreen)?;
                     }
                     state.agent_detail = None;
                     screen.history_view.close()?;
@@ -2581,7 +2598,7 @@ fn run(
                 if matches!(&event, Event::Key(key) if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) || key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c'))
                 {
                     state.status_page = None;
-                    execute!(io::stderr(), terminal::LeaveAlternateScreen)?;
+                    execute!(crate::terminal_output::stderr(), terminal::LeaveAlternateScreen)?;
                     screen.lines.clear();
                     screen.draw(state)?;
                 }
@@ -2651,7 +2668,7 @@ fn run(
                     }
                     // With a menu open, shift+tab belongs to the menu.
                     if crate::keybindings::is_cycle_permission(key) && state.choice.is_none() {
-                        state.cycle_permission(&actions);
+                        state.cycle_permission(actions);
                         continue;
                     }
                     let control = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2661,7 +2678,7 @@ fn run(
                     let before: String = state.draft.characters.iter().collect();
                     if state.choice_key(key) || state.menu_key(key) {
                     } else if control && matches!(key.code, KeyCode::Char('y' | 'n')) && state.goal_proposal.is_some() && state.answer.is_none() {
-                        state.decide_goal(key.code == KeyCode::Char('y'), &actions);
+                        state.decide_goal(key.code == KeyCode::Char('y'), actions);
                     } else if crate::images::is_image_paste_key(key) && state.answer.is_none() {
                         // As at the prompt: an image on the clipboard joins the
                         // message being written as [Image #N].
@@ -2798,10 +2815,10 @@ fn run(
                                 state.draft.insert("\n");
                             }
                             KeyCode::Tab if state.answer.is_none() => {
-                                state.queue_message(&actions);
+                                state.queue_message(actions);
                             }
                             KeyCode::Enter => {
-                                if let Some(message) = state.submit(&actions) {
+                                if let Some(message) = state.submit(actions) {
                                     screen.log(&message)?;
                                 }
                             }
@@ -2892,7 +2909,7 @@ fn run(
                                 old == index && when.elapsed() < Duration::from_millis(500)
                             }) {
                                 state.agent_detail =
-                                    Some(state.agent_panel[index].session_id.clone());
+                                    Some(state.agent_panel[index].address.clone());
                                 last_agents = Instant::now() - Duration::from_secs(1);
                                 state.inspection_scroll = 0;
                                 agent_click = None;
@@ -3159,11 +3176,7 @@ fn run(
         }
         if last_agents.elapsed() >= Duration::from_secs(1) {
             last_agents = Instant::now();
-            if let Some((root, session)) = &state.shell_context {
-                if agent_context.is_none() {
-                    agent_context = deepseek_code_core::runtime::RuntimePaths::new(root.clone()).ok()
-                        .and_then(|paths| crate::services::context(&paths).ok());
-                }
+            if let Some((_, session)) = &state.shell_context {
                 if let Some(context) = &agent_context {
                     state.agent_panel = crate::background_commands::running_agents(&context.paths, &context.db, session);
                     super::title::background(!state.agent_panel.is_empty());
@@ -3228,7 +3241,7 @@ fn flush_notices(state: &mut State, screen: &mut Frame) -> io::Result<()> {
 struct AlternateCleanup;
 impl Drop for AlternateCleanup {
     fn drop(&mut self) {
-        let _ = execute!(io::stderr(), terminal::LeaveAlternateScreen);
+        let _ = execute!(crate::terminal_output::stderr(), terminal::LeaveAlternateScreen);
     }
 }
 
@@ -3258,7 +3271,7 @@ pub(crate) fn show_inspection(title: &str, text: &str) -> io::Result<()> {
         terminal::enable_raw_mode()?;
     }
     let _raw = (!was_raw).then(|| RawGuard);
-    execute!(io::stderr(), terminal::EnterAlternateScreen)?;
+    execute!(crate::terminal_output::stderr(), terminal::EnterAlternateScreen)?;
     let _screen = AlternateCleanup;
     let mut reader = super::paste_input::Reader::new()?;
     let title = format!("{title} · ↑/↓ scroll · Esc to close");
@@ -3378,14 +3391,15 @@ mod tests {
         let paths =
             deepseek_code_core::runtime::RuntimePaths::new(temp.path().to_path_buf()).unwrap();
         let context = crate::services::context(&paths).unwrap();
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","preview":"CHILD_DETAIL_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
+        context.db.create("child",Default::default()).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","preview":"CHILD_DETAIL_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
         context
-            .save_setting("agent-description.child", &"Child fixture")
+            .db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Child fixture")
             .unwrap();
         let keys = temp.path().join("keys.json");
         let mut display = TurnDisplay::new(true, "ask", &keys, vec![]).unwrap();
         display.set_shell_context(&paths.data_dir, "parent");
-        display.agent_progress("child", "general", "started", None);
+        display.agent_progress(Some(context.db.open_session("child").unwrap().address()), "child", "general", "started", None);
         display.before_text(
             &(0..100)
                 .map(|index| format!("HISTORY_{index:03} text\n\n"))
@@ -3426,7 +3440,7 @@ mod tests {
         display.finish(None);
         let mut editor = super::super::input::editor::PromptEditor::default();
         let agent =
-            crate::background_commands::foreground_agent(&context, "child", "general").unwrap();
+            crate::background_commands::foreground_agent(&context, &context.db.open_session("child").unwrap().address(), "general").unwrap();
         editor.set_agent_rows(Box::new(move || vec![agent.clone()]));
         editor.set_subagents(context.clone(), "parent".into());
         editor.set_agent_details(Box::new(move |id| {
@@ -3438,10 +3452,10 @@ mod tests {
     #[test]
     fn foreground_wait_is_explicit_and_unknown_usage_is_not_zero() {
         let mut state = State::new("ask".into());
-        state.foreground_agents.push(("child".into(), "general".into()));
+        state.foreground_agents.push((crate::background_commands::HistoryAddress {session:"child".into(),store:String::new(),incarnation:String::new()}, "general".into()));
         assert!(state.status_line().contains("Waiting for foreground agent"));
         let agent = crate::background_commands::Agent {
-            session_id: "child".into(),
+            address: crate::background_commands::HistoryAddress {session: "child".into(), store: String::new(), incarnation: String::new()},
             agent_type: "general".into(),
             description: "Inspect".into(),
             started_ms: 0,
@@ -3633,14 +3647,15 @@ mod tests {
         let paths =
             deepseek_code_core::runtime::RuntimePaths::new(temp.path().to_path_buf()).unwrap();
         let context = crate::services::context(&paths).unwrap();
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","preview":"CHILD_EXECUTION_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
+        context.db.create("child",Default::default()).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","preview":"CHILD_EXECUTION_SENTINEL","started_at":chrono::Utc::now().to_rfc3339()})).unwrap();
         context
-            .save_setting("agent-description.child", &"Inspect fixture")
+            .db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Inspect fixture")
             .unwrap();
         let mut display =
             TurnDisplay::new(true, "ask", &temp.path().join("keys.json"), vec![]).unwrap();
         display.set_shell_context(&paths.data_dir, "parent");
-        display.agent_progress("child", "general", "started", None);
+        display.agent_progress(Some(crate::background_commands::HistoryAddress {session:"child".into(),store:String::new(),incarnation:String::new()}), "child", "general", "started", None);
         display.tool_started(
             "agent-call",
             "Agent",
@@ -3691,7 +3706,7 @@ mod tests {
         .iter()
         .enumerate()
         .map(|(i, description)| crate::background_commands::Agent {
-            session_id: format!("fixture-{i}"),
+            address: crate::background_commands::HistoryAddress {session: format!("fixture-{i}"), store: String::new(), incarnation: String::new()},
             agent_type: "explore".into(),
             description: (*description).into(),
             started_ms: chrono::Utc::now().timestamp_millis() as u64 - [66000, 57000, 52000][i],
@@ -4478,11 +4493,11 @@ impl TurnDisplay {
         })
     }
     pub fn restore_numbers(&mut self, session: &crate::session::Session) -> anyhow::Result<()> {
-        self.numbers = session.store.db.with_conn(|conn| -> anyhow::Result<_> {
+        self.numbers = session.selected_session()?.read(|history| {
             let mut numbers = std::collections::HashMap::new();
             let mut next = 0usize;
-            for message in deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &session.id)? {
-                for tool in deepseek_code_core::db::message_repo::get_tool_calls_for_message(conn, &message.id)? {
+            for message in history.messages()? {
+                for tool in history.tools(&message.id)? {
                     // Count every saved row, not just distinct map keys: old
                     // records may repeat a raw provider id across messages, and
                     // a later live call must not reuse an already shown number.
@@ -4493,16 +4508,22 @@ impl TurnDisplay {
                 }
             }
             Ok(numbers)
-        })??;
+        })?;
         self.fallback.restore_numbers(self.numbers.clone());
         Ok(())
     }
     pub fn is_live(&self) -> bool {
         self.live.is_some()
     }
+    #[cfg(test)]
     pub fn set_shell_context(&self, root: &std::path::Path, session: &str) {
         if let Some(live) = &self.live {
-            let _ = live.updates.send(Update::ShellContext(root.to_path_buf(), session.to_owned()));
+            let _ = live.updates.send(Update::ShellContext(root.to_path_buf(), session.to_owned(), deepseek_code_core::db::session_store::Stores::open(root).ok().and_then(|s| s.open_session(session).ok())));
+        }
+    }
+    pub fn set_session_context(&self, root: &std::path::Path, session: deepseek_code_core::db::session_store::SessionDb) {
+        if let Some(live) = &self.live {
+            let _ = live.updates.send(Update::ShellContext(root.to_owned(), session.id().into(), Some(session)));
         }
     }
     pub fn with_workspace(mut self, workspace: &std::path::Path) -> Self {
@@ -4804,9 +4825,9 @@ impl TurnDisplay {
             let _ = live.updates.send(Update::SetDraft(text.into()));
         }
     }
-    pub fn agent_progress(&mut self, id: &str, kind: &str, status: &str, tool: Option<&str>) {
+    pub fn agent_progress(&mut self, address: Option<crate::background_commands::HistoryAddress>, id: &str, kind: &str, status: &str, tool: Option<&str>) {
         if let Some(live) = &self.live {
-            let _ = live.updates.send(Update::AgentProgress(id.into(), kind.into(), status.into()));
+            let _ = live.updates.send(Update::AgentProgress(address, id.into(), kind.into(), status.into()));
         } else {
             self.fallback.agent_progress(id, kind, status, tool);
         }
@@ -4925,13 +4946,14 @@ mod completion_tests {
         let store = SessionStore::new(paths.open_database().unwrap());
         let id = store.create(root.path(), "fixture", "fixture").unwrap();
         let session = crate::session::Session::open(&cli, &paths, selection, Some(&id)).await.unwrap();
-        session.store.db.with_conn(|conn| -> anyhow::Result<()> {
+        session.store.db.shard_sql(&session.id, |conn| -> anyhow::Result<()> {
             for (index, message) in ["answer-1", "answer-2"].iter().enumerate() {
                 message_repo::insert_message(conn, message, &id, "assistant", "", None, "2026-11-02T00:00:00Z", false, index as i64)?;
                 // Old records may repeat the provider raw id across messages.
                 message_repo::insert_tool_call(conn, &format!("{message}:same-raw"), message, "Read", Some("{}"), Some("ok"), false, 0)?;
             }
-            Ok(())
+            conn.execute("UPDATE manifest SET message_count=(SELECT count(*) FROM messages),content_revision=content_revision+1",[])?;
+                Ok(())
         }).unwrap().unwrap();
         let mut display = TurnDisplay::new(false, "ask", &paths.data_dir.join("keybindings.json"), vec![]).unwrap();
         display.restore_numbers(&session).unwrap();
@@ -5145,13 +5167,14 @@ mod mcp_started_tests {
         let paths =
             deepseek_code_core::runtime::RuntimePaths::new(temp.path().to_path_buf()).unwrap();
         let context = crate::services::context(&paths).unwrap();
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":125,"output_tokens_estimated":true})).unwrap();
+        context.db.create("child",Default::default()).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":125,"output_tokens_estimated":true})).unwrap();
         context
-            .save_setting("agent-description.child", &"Streaming fixture")
+            .db.seed_preference("child", deepseek_code_core::db::session_store::settings::AGENT_DESCRIPTION, &"Streaming fixture")
             .unwrap();
         let mut display = TurnDisplay::new(true, "plan", &keys, vec![]).unwrap();
         display.set_shell_context(temp.path(), "parent");
-        display.agent_progress("child", "general", "started", None);
+        display.agent_progress(Some(crate::background_commands::HistoryAddress {session:"child".into(),store:String::new(),incarnation:String::new()}), "child", "general", "started", None);
         let name = "mcp__codegraph__codegraph_explore";
         let input = serde_json::json!({"query":"chat theme composer streaming animation CSS","projectPath":"../fixture","maxFiles":4});
         display.tool_started("mcp-one", name, &input);
@@ -5159,10 +5182,10 @@ mod mcp_started_tests {
         let output = serde_json::json!([{"type":"text","text":"MCP_BODY_SENTINEL\nSecond body line\nThird body line\nFourth body line\nLAST_BODY_SENTINEL"}]).to_string();
         display.tool_finished("mcp-one", name, &input, &output, false);
         display.tool_finished("mcp-one", name, &input, &output, false);
-        context.save_setting("delegation.child", &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":1500,"output_tokens_estimated":false})).unwrap();
+        context.db.seed_preference("child", deepseek_code_core::db::session_store::settings::CHILD_PROGRESS, &serde_json::json!({"status":"running","started_at":chrono::Utc::now().to_rfc3339(),"output_tokens":1500,"output_tokens_estimated":false})).unwrap();
         display.before_text("MCP_FIXTURE_DONE\n");
         std::thread::sleep(Duration::from_secs(24));
-        display.agent_progress("child", "general", "completed", None);
+        display.agent_progress(Some(crate::background_commands::HistoryAddress {session:"child".into(),store:String::new(),incarnation:String::new()}), "child", "general", "completed", None);
         display.finish(None);
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {

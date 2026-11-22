@@ -1,6 +1,6 @@
 //! Explicit, session-local repair of saved project trust.
 use crate::{
-    db::{conversation_repo, project_repo, DbManager},
+    db::{conversation_repo, project_repo, session_store::SessionAccess},
     native_engine::workspace,
 };
 use anyhow::{ensure, Context, Result};
@@ -8,8 +8,9 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-fn project(conn: &Connection, id: &str) -> Result<project_repo::ProjectRow> {
-    let session = conversation_repo::get_conversation(conn, id)?.context("Session not found")?;
+pub(crate) fn project(conn: &Connection, id: &str) -> Result<project_repo::ProjectRow> {
+    let session =
+        conversation_repo::conversation_metadata(conn, id)?.context("Session not found")?;
     ensure!(
         session.workspace_mode == "code",
         "Only Code sessions can be trusted in CLI"
@@ -28,8 +29,8 @@ fn project(conn: &Connection, id: &str) -> Result<project_repo::ProjectRow> {
 }
 
 /// Unlike resume, inspection must remain usable when trust is invalid.
-pub fn inspect(db: &DbManager, id: &str) -> Result<project_repo::ProjectRow> {
-    db.with_conn(|conn| project(conn, id))?
+pub fn inspect(db: &impl SessionAccess, id: &str) -> Result<project_repo::ProjectRow> {
+    db.select_session(id)?.inspect_project_trust()
 }
 
 #[derive(Debug, Serialize)]
@@ -42,7 +43,13 @@ pub struct Repaired {
 
 /// Every existing project root must be explicitly selected. This is not a
 /// relocation command: missing source folders and unrelated roots are rejected.
-pub fn repair(db: &DbManager, data_root: &Path, id: &str, folders: &[PathBuf]) -> Result<Repaired> {
+pub fn repair(
+    db: &impl SessionAccess,
+    data_root: &Path,
+    id: &str,
+    folders: &[PathBuf],
+) -> Result<Repaired> {
+    let owner = db.select_session(id)?;
     let requested = project_repo::normalize_folders(
         &folders
             .iter()
@@ -55,54 +62,109 @@ pub fn repair(db: &DbManager, data_root: &Path, id: &str, folders: &[PathBuf]) -
     let _claim = super::background_sessions::SessionClaim::acquire(data_root, id, &uuid::Uuid::new_v4().to_string())
         .context("Cannot repair trust while a session worker owns this session; stop its tasks and shut down the worker first")?;
     ensure!(
-        !super::background_sessions::list(data_root, None)?
+        !super::background_sessions::possible_executions(data_root, id)?
             .iter()
             .any(|job| job.session_id == id
                 && matches!(job.status.as_str(), "starting" | "running" | "unresponsive")),
         "Cannot repair trust while this session has an active task; stop it first"
     );
-    db.with_conn(|conn| -> Result<Repaired> {
-        let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-        let original = project(&tx, id)?;
-        let original_paths = original.folders.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
-        let expected = project_repo::normalize_folders(&original_paths)
-            .context("A saved project folder is unavailable; restore that folder before repairing trust")?;
-        ensure!(requested.len() == expected.len() && requested.iter().all(|p| expected.contains(p)),
+    owner.repair_project_trust(data_root, &requested)
+}
+
+pub(crate) fn repair_in(
+    tx: &Connection,
+    data_root: &Path,
+    id: &str,
+    requested: &[String],
+) -> Result<Repaired> {
+    let original = project(&tx, id)?;
+    let original_paths = original
+        .folders
+        .iter()
+        .map(|f| f.path.clone())
+        .collect::<Vec<_>>();
+    let expected = project_repo::normalize_folders(&original_paths).context(
+        "A saved project folder is unavailable; restore that folder before repairing trust",
+    )?;
+    ensure!(requested.len() == expected.len() && requested.iter().all(|p| expected.contains(p)),
             "Supply every current project folder with --folder; missing or unrelated folders are not accepted. Expected: {}", expected.join("; "));
-        let source = original.workspace_path.as_deref().context("Project has no working directory")?;
-        let normalized_source = project_repo::normalize_folders(&[source.to_owned()])?.remove(0);
-        let readable_source = source.strip_prefix("\\\\?\\UNC\\").map(|p| format!("\\\\{p}"))
-            .unwrap_or_else(|| source.strip_prefix("\\\\?\\").unwrap_or(source).to_owned());
-        let saved_source = Path::new(&readable_source).components().collect::<Vec<_>>();
-        let current_source = Path::new(&normalized_source).components().collect::<Vec<_>>();
-        ensure!(saved_source.len() == current_source.len() && saved_source.iter().zip(&current_source).all(|(a,b)| {
+    let source = original
+        .workspace_path
+        .as_deref()
+        .context("Project has no working directory")?;
+    let normalized_source = project_repo::normalize_folders(&[source.to_owned()])?.remove(0);
+    let readable_source = source
+        .strip_prefix("\\\\?\\UNC\\")
+        .map(|p| format!("\\\\{p}"))
+        .unwrap_or_else(|| source.strip_prefix("\\\\?\\").unwrap_or(source).to_owned());
+    let saved_source = Path::new(&readable_source).components().collect::<Vec<_>>();
+    let current_source = Path::new(&normalized_source)
+        .components()
+        .collect::<Vec<_>>();
+    ensure!(saved_source.len() == current_source.len() && saved_source.iter().zip(&current_source).all(|(a,b)| {
             if cfg!(windows) { a.as_os_str().to_string_lossy().eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()) } else { a == b }
         }), "Project source folder changed; restore its original identity or start a new session in the new folder");
-        ensure!(expected.first() == Some(&normalized_source), "Project source is not its primary folder; restore its source identity first");
-        let mismatched_mapping: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversation_worktrees WHERE conversation_id=?1 AND project_id<>?2)", params![id, original.id], |row| row.get(0))?;
-        ensure!(!mismatched_mapping, "Session worktree project identity changed; restore its original mapping before repairing trust");
-        // Validate the existing mapping against the ORIGINAL source before
-        // copying project metadata. Never replace a source with a worktree path.
-        let managed = crate::worktree::session::resolve(&tx, id, &original.id, Path::new(source))?;
-        let project_id = uuid::Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().to_rfc3339();
-        project_repo::insert_project(&tx, &project_id, &original.name, original.description.as_deref(), original.instructions.as_deref(), Some(&normalized_source), false, &now, &now)?;
-        project_repo::set_folders(&tx, &project_id, &expected)?;
-        project_repo::trust_folders(&tx, &project_id, &expected)?;
-        // Preserve attached project references without changing the shared project.
-        for file in project_repo::list_project_files(&tx, &original.id)? {
-            project_repo::insert_project_file(&tx, &uuid::Uuid::new_v4().to_string(), &project_id, file.file_name.as_deref(), file.file_path.as_deref(), file.file_size, file.mime_type.as_deref())?;
-        }
-        tx.execute("UPDATE conversations SET project_id=?1, updated_at=?2 WHERE id=?3", params![project_id, now, id])?;
-        tx.execute("UPDATE conversation_worktrees SET project_id=?1 WHERE conversation_id=?2", params![project_id, id])?;
-        let (resolved, _) = workspace::resolve_workspace(&tx, &data_root.join("workspaces"), id, None)?;
-        if let Some(managed) = managed {
-            ensure!(resolved == managed, "Trust repair changed the managed workspace");
-        }
-        tx.execute("UPDATE conversations SET workspace_path=?1 WHERE id=?2", params![resolved.to_string_lossy(), id])?;
-        tx.commit()?;
-        Ok(Repaired { session_id: id.into(), project_id, folders: expected, workspace: resolved })
-    })?
+    ensure!(
+        expected.first() == Some(&normalized_source),
+        "Project source is not its primary folder; restore its source identity first"
+    );
+    let mismatched_mapping: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM conversation_worktrees WHERE conversation_id=?1 AND project_id<>?2)", params![id, original.id], |row| row.get(0))?;
+    ensure!(!mismatched_mapping, "Session worktree project identity changed; restore its original mapping before repairing trust");
+    // Validate the existing mapping against the ORIGINAL source before
+    // copying project metadata. Never replace a source with a worktree path.
+    let managed = crate::worktree::session::resolve(&tx, id, &original.id, Path::new(source))?;
+    let project_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    project_repo::insert_project(
+        &tx,
+        &project_id,
+        &original.name,
+        original.description.as_deref(),
+        original.instructions.as_deref(),
+        Some(&normalized_source),
+        false,
+        &now,
+        &now,
+    )?;
+    project_repo::set_folders(&tx, &project_id, &expected)?;
+    project_repo::trust_folders(&tx, &project_id, &expected)?;
+    // Preserve attached project references without changing the shared project.
+    for file in project_repo::list_project_files(&tx, &original.id)? {
+        project_repo::insert_project_file(
+            &tx,
+            &uuid::Uuid::new_v4().to_string(),
+            &project_id,
+            file.file_name.as_deref(),
+            file.file_path.as_deref(),
+            file.file_size,
+            file.mime_type.as_deref(),
+        )?;
+    }
+    tx.execute(
+        "UPDATE conversations SET project_id=?1, updated_at=?2 WHERE id=?3",
+        params![project_id, now, id],
+    )?;
+    tx.execute(
+        "UPDATE conversation_worktrees SET project_id=?1 WHERE conversation_id=?2",
+        params![project_id, id],
+    )?;
+    let (resolved, _) = workspace::resolve_workspace(&tx, &data_root.join("workspaces"), id, None)?;
+    if let Some(managed) = managed {
+        ensure!(
+            resolved == managed,
+            "Trust repair changed the managed workspace"
+        );
+    }
+    tx.execute(
+        "UPDATE conversations SET workspace_path=?1 WHERE id=?2",
+        params![resolved.to_string_lossy(), id],
+    )?;
+    Ok(Repaired {
+        session_id: id.into(),
+        project_id,
+        folders: expected,
+        workspace: resolved,
+    })
 }
 
 #[cfg(test)]
@@ -129,7 +191,7 @@ mod tests {
         let project = inspect(&store.db, id).unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE project_folders SET trusted=0 WHERE project_id=?1",
                     [&project.id],
@@ -148,7 +210,7 @@ mod tests {
         let original = inspect(&store.db, &id).unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 project_repo::set_folders(
                     conn,
                     &original.id,
@@ -194,7 +256,7 @@ mod tests {
         assert!(store.resume(&other).is_err());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 assert_eq!(
                     project_repo::list_project_files(conn, &fixed.project_id)
                         .unwrap()
@@ -225,7 +287,7 @@ mod tests {
         let ambiguous = source.join("..").join(source.file_name().unwrap());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "UPDATE projects SET workspace_path=?1 WHERE id=?2",
                     params![ambiguous.to_string_lossy(), original.id],
@@ -234,7 +296,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let error = repair(&store.db, &paths.data_dir, &id, &[source]).unwrap_err();
-        assert!(error.to_string().contains("source folder changed"));
+        assert!(format!("{error:#}").contains("source folder changed"));
         assert_eq!(inspect(&store.db, &id).unwrap().id, original.id);
         assert!(!paths
             .data_dir
@@ -277,7 +339,7 @@ mod tests {
         let original = inspect(&store.db, &id).unwrap();
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 project_repo::set_folders(
                     conn,
                     &original.id,
@@ -326,7 +388,7 @@ mod tests {
         let original = inspect(&store.db, &id).unwrap();
         store
             .db
-            .with_conn(|conn| prepared.save(conn, &id, &original.id, source.to_str().unwrap()))
+            .fixture_directory(|conn| prepared.save(conn, &id, &original.id, source.to_str().unwrap()))
             .unwrap()
             .unwrap();
         let fork = store.fork(&id).unwrap();
@@ -342,7 +404,7 @@ mod tests {
         assert!(store.resume(&id).is_err());
         store
             .db
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 let source_saved: String = conn
                     .query_row(
                         "SELECT source_path FROM conversation_worktrees WHERE conversation_id=?1",

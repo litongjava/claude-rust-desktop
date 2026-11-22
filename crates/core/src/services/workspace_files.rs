@@ -38,7 +38,7 @@ pub struct Root {
 
 pub fn roots(conn: &Connection, private_root: &Path, scope: &Scope) -> Result<Vec<Root>> {
     let (primary, project) = if let Some(id) = &scope.conversation_id {
-        let conversation = crate::db::conversation_repo::get_conversation(conn, id)?
+        let conversation = crate::db::conversation_repo::conversation_metadata(conn, id)?
             .context("Conversation not found")?;
         if let Some(project_id) = &scope.project_id {
             ensure!(

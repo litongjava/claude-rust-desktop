@@ -229,6 +229,8 @@ async fn transport_matrix(channel: &str) {
                         );
                         assert_eq!(headers["content-type"], "application/json");
                         assert!(headers.contains_key("x-request-id"));
+                        assert_eq!(headers["x-client-request-id"], headers["x-request-id"]);
+                        assert_eq!(headers["x-dcl-request-kind"], "turn");
                         assert_eq!(headers["x-dcl-retry-count"], "0");
                         if *api == "anthropic-messages" {
                             assert_eq!(headers["anthropic-version"], "2023-06-01");
@@ -300,6 +302,7 @@ async fn summary_fragments_merges_and_truncation_recovery_keep_session_headers()
             .unwrap()
             .open_database()
             .unwrap();
+        db.create("Original-Compaction-Session", Default::default()).unwrap();
         let mut checkpoint =
             Checkpoint::open(&db, "Original-Compaction-Session", &p, "Summarize").unwrap();
         let input = (0..30_000)
@@ -323,6 +326,9 @@ async fn summary_fragments_merges_and_truncation_recovery_keep_session_headers()
                 "Original-Compaction-Session"
             );
             assert_eq!(headers["x-deepseek-harness-compact"], "1");
+            assert_eq!(headers["x-dcl-request-kind"], "compaction");
+            assert_eq!(headers["x-client-request-id"], headers["x-request-id"]);
+            assert_eq!(headers["x-dcl-session-id"], "Original-Compaction-Session");
         }
         let first = requests[0].1.to_string();
         assert!(first.contains("Summarize this consecutive fragment"));
@@ -407,13 +413,13 @@ async fn auxiliary_generation_search_and_native_compaction_use_explicit_session(
     server.abort();
     let requests = requests.lock().unwrap();
     assert_eq!(requests.len(), 6);
-    for (index, session) in [
-        Some("Title-Session"),
-        None,
-        Some("Search-Session"),
-        Some("Compact-Session"),
-        Some("Classifier-Session"),
-        Some("Classifier-Session"),
+    for (index, (session, kind)) in [
+        (Some("Title-Session"), "turn"),
+        (Some("Ambient-Session"), "turn"),
+        (Some("Search-Session"), "web-search"),
+        (Some("Compact-Session"), "compaction"),
+        (Some("Classifier-Session"), "classifier"),
+        (Some("Classifier-Session"), "classifier"),
     ]
     .into_iter()
     .enumerate()
@@ -422,7 +428,7 @@ async fn auxiliary_generation_search_and_native_compaction_use_explicit_session(
             requests[index]
                 .get("x-deepseek-harness-session-id")
                 .map(|h| h.to_str().unwrap()),
-            session
+            if index == 1 { None } else { session }
         );
         assert_eq!(
             requests[index]
@@ -430,7 +436,64 @@ async fn auxiliary_generation_search_and_native_compaction_use_explicit_session(
                 .map(|h| h.to_str().unwrap()),
             (index == 3).then_some("1")
         );
+        assert_eq!(
+            requests[index]["x-dcl-session-id"].to_str().unwrap(),
+            session.unwrap(),
+            "request {index}"
+        );
+        assert_eq!(requests[index]["x-dcl-request-kind"], kind, "request {index}");
+        assert_eq!(
+            requests[index]["x-client-request-id"], requests[index]["x-request-id"],
+            "request {index}"
+        );
+        assert!(requests[index].contains_key("originator"));
+        assert!(requests[index].contains_key("user-agent"));
     }
+}
+
+#[tokio::test]
+async fn native_compaction_inside_a_turn_keeps_the_turn_identity() {
+    let requests: Requests = Default::default();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let p = provider(
+        Some("deepseek"),
+        &format!("http://{}", listener.local_addr().unwrap()),
+        "openai-completions",
+    );
+    let app = Router::new()
+        .fallback(post(capture))
+        .with_state(requests.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let session = "Compacted-Session";
+    let failed = crate::native_engine::request_identity::TurnIdentity::new(
+        Some(session.into()),
+        None,
+    )
+    .scope(async {
+        crate::services::compaction::native::generate_messages(
+            &p,
+            Some(session),
+            vec![],
+            "summarize",
+        )
+        .await
+        .is_err()
+    })
+    .await;
+    assert!(failed);
+    server.abort();
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let headers = &requests[0];
+    assert_eq!(headers["x-dcl-session-id"], session);
+    assert!(!headers["x-dcl-turn-id"].to_str().unwrap().is_empty());
+    assert_eq!(headers["x-dcl-request-kind"], "compaction");
+    assert_eq!(headers["x-client-request-id"], headers["x-request-id"]);
+    assert_eq!(headers["x-dcl-retry-count"], "0");
+    assert!(!headers["originator"].is_empty());
+    assert!(headers.contains_key("user-agent"));
+    assert_eq!(headers["x-deepseek-harness-session-id"], session);
+    assert_eq!(headers["x-deepseek-harness-compact"], "1");
 }
 
 /// A buffered model request keeps its own total deadline. The streaming idle

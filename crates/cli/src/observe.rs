@@ -5,9 +5,10 @@
 //! terminal may resume the same session; it must show that progress without
 //! taking the lease, submitting input, running tools, or cancelling the owner.
 use crate::session::Session;
+use deepseek_code_core::db::session_store::{SessionAccess,SessionRepository};
 use anyhow::Result;
 use deepseek_code_core::{
-    db::{message_repo, turn_repo, DbManager},
+    db::{message_repo, turn_repo},
     services::session_messages,
 };
 use std::{
@@ -56,24 +57,18 @@ pub struct Observer {
 /// Whether some process holds execution ownership, whether a managed worker or
 /// a direct print/json run. This only probes the lease; it never acquires it.
 pub fn execution_lease_active(session: &Session) -> Result<bool> {
-    session_messages::execution_active(&session.paths.data_dir, &session.id)
+    session.selected_session()?.repository().execution_active(&session.paths.data_dir)
 }
 
 /// The truthful resume notice for a turn owned elsewhere.
 pub fn running_notice(session: &Session) -> Result<String> {
-    let turn = session
-        .store
-        .db
-        .with_conn(|conn| turn_repo::running_turn(conn, &session.id))??;
+    let turn = session.selected_session()?.repository().running_turn()?;
     Ok(running_notice_for(turn.as_ref()))
 }
 
 /// Whether the last turn ended because its owner disappeared.
 pub fn latest_interrupted(session: &Session) -> Result<bool> {
-    let latest = session
-        .store
-        .db
-        .with_conn(|conn| turn_repo::latest_turn(conn, &session.id))??;
+    let latest = session.selected_session()?.repository().latest_turn()?;
     Ok(latest.is_some_and(|turn| turn.interrupted()))
 }
 
@@ -105,16 +100,17 @@ impl Observer {
     pub(crate) fn poll_at(
         &mut self,
         root: &Path,
-        db: &Arc<DbManager>,
+        db: &impl SessionAccess,
         session_id: &str,
     ) -> Result<(State, Vec<String>)> {
         let mut lines = Vec::new();
         // A resumed different session starts from a clean view.
-        if self.session.as_deref() != Some(session_id) {
-            self.reset(Some(session_id.to_owned()));
+        let selected=db.select_session(session_id)?;
+        if self.session.as_deref() != Some(selected.observation_identity()) {
+            self.reset(Some(selected.observation_identity().into()));
         }
-        if session_messages::execution_active(root, session_id)? {
-            let turn = db.with_conn(|conn| turn_repo::running_turn(conn, session_id))??;
+        if selected.execution_active(root)? {
+            let turn = selected.running_turn()?;
             self.idle_since = None;
             if !self.announced {
                 self.announced = true;
@@ -128,7 +124,7 @@ impl Observer {
                     self.turn = Some(turn.turn_id.clone());
                     self.segments.clear();
                 }
-                self.render(db, &turn.turn_id, &mut lines)?;
+                self.render(&selected, &turn.turn_id, &mut lines)?;
             }
             return Ok((State::Running, lines));
         }
@@ -138,18 +134,10 @@ impl Observer {
         // Drain whatever the owner published between the last active poll and
         // its lease disappearing; those final lines are otherwise lost.
         if let Some(turn) = self.turn.clone() {
-            self.render(db, &turn, &mut lines)?;
+            self.render(&selected, &turn, &mut lines)?;
             self.flush_all(&mut lines);
         }
-        let turn = self
-            .turn
-            .as_deref()
-            .and_then(|id| {
-                db.with_conn(|conn| turn_repo::get_turn(conn, id))
-                    .ok()?
-                    .ok()
-            })
-            .flatten();
+        let turn=self.turn.as_deref().map(|id|selected.observed_turn(id)).transpose()?.flatten();
         let running = turn
             .as_ref()
             .is_some_and(|record| record.status == turn_repo::TurnStatus::Running);
@@ -161,7 +149,7 @@ impl Observer {
             if since.elapsed() < SETTLE_GRACE {
                 return Ok((State::Running, lines));
             }
-            match settle_if_abandoned(root, db, session_id) {
+            match selected.settle_observed_turn(root).ok().flatten() {
                 Some(settled) => finished_notice(Some(&settled)),
                 None => return Ok((State::Running, lines)),
             }
@@ -186,22 +174,11 @@ impl Observer {
 
     fn render(
         &mut self,
-        db: &Arc<DbManager>,
+        selected: &SessionRepository<'_>,
         turn_id: &str,
         lines: &mut Vec<String>,
     ) -> Result<()> {
-        let segments = db.with_conn(
-            |conn| -> Result<Vec<(message_repo::MessageRow, Vec<message_repo::ToolCallRow>)>> {
-                let mut segments = Vec::new();
-                for id in turn_repo::turn_messages(conn, turn_id)? {
-                    if let Some(row) = message_repo::get_message(conn, &id)? {
-                        let tools = message_repo::get_tool_calls_for_message(conn, &id)?;
-                        segments.push((row, tools));
-                    }
-                }
-                Ok(segments)
-            },
-        )??;
+        let segments = selected.observed_segments(turn_id)?;
         let mut present = BTreeSet::new();
         for (row, tools) in segments {
             present.insert(row.id.clone());
@@ -301,23 +278,6 @@ impl Cursor {
 
 /// Settles a turn whose owner vanished. The lease is acquired first, so a live
 /// owner is never marked interrupted, and released immediately after.
-fn settle_if_abandoned(
-    root: &Path,
-    db: &Arc<DbManager>,
-    session_id: &str,
-) -> Option<turn_repo::TurnRecord> {
-    let lease = session_messages::ExecutionLease::acquire(root, session_id).ok()??;
-    let settled = db
-        .with_conn(|conn| -> Result<Option<turn_repo::TurnRecord>> {
-            turn_repo::settle_interrupted(conn, session_id)?;
-            Ok(turn_repo::latest_turn(conn, session_id)?)
-        })
-        .ok()?
-        .ok()?;
-    drop(lease);
-    settled
-}
-
 /// A one-line hint from the public tool input; never the whole payload.
 fn tool_hint(input: Option<&str>) -> String {
     let Some(input) = input else {
@@ -404,35 +364,37 @@ fn duration(ms: Option<u64>) -> String {
 mod tests {
     use super::*;
 
-    fn fixture() -> (tempfile::TempDir, Arc<DbManager>, String) {
+    use crate::fixture_sql::FixtureSql;
+    use deepseek_code_core::db::session_store::Stores;
+
+    fn fixture() -> (tempfile::TempDir, Arc<Stores>, String) {
         let temp = tempfile::tempdir().unwrap();
-        let db = Arc::new(DbManager::new(temp.path().join("obs.sqlite")).unwrap());
-        db.init().unwrap();
+        let db = Arc::new(Stores::open(temp.path()).unwrap());
         let store = deepseek_code_core::runtime::SessionStore::new(db.clone());
         let session = store.create(temp.path(), "model", "provider").unwrap();
         (temp, db, session)
     }
 
-    fn write_text(db: &Arc<DbManager>, message: &str, content: &str) {
-        db.with_conn(|conn| message_repo::update_message_content(conn, message, content))
+    fn write_text(db: &Arc<Stores>, session: &str, message: &str, content: &str) {
+        db.shard_sql(session, |conn| message_repo::update_message_content(conn, message, content))
             .unwrap()
             .unwrap();
     }
 
     fn save_tool(
-        db: &Arc<DbManager>,
+        db: &Arc<Stores>,
         session: &str,
         message: &str,
         id: &str,
         output: Option<&str>,
     ) {
         let content = db
-            .with_conn(|conn| message_repo::get_message(conn, message))
+            .shard_sql(session, |conn| message_repo::get_message(conn, message))
             .unwrap()
             .unwrap()
             .unwrap()
             .content;
-        db.with_conn(|conn| {
+        db.shard_sql(session, |conn| {
             message_repo::save_stream_tool_result(
                 conn,
                 session,
@@ -457,14 +419,12 @@ mod tests {
     fn published_progress_is_rendered_once_and_completion_reports_the_measured_turn() {
         let (temp, db, session_id) = fixture();
         let root = temp.path();
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &session_id).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
         let message = timer.ensure_segment().unwrap();
-        write_text(&db, &message, "first line\nsecond");
+        write_text(&db, &session_id, &message, "first line\nsecond");
         save_tool(&db, &session_id, &message, "read-1", None);
         // The owner's lease: the observer only probes it.
-        let lease = session_messages::ExecutionLease::acquire(root, &session_id)
-            .unwrap()
-            .unwrap();
+        let lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
         let mut observer = Observer::default();
         let (state, lines) = observer.poll_at(root, &db, &session_id).unwrap();
         assert_eq!(state, State::Running);
@@ -479,7 +439,7 @@ mod tests {
         );
 
         // Growing text and a finished tool appear on the next poll only.
-        write_text(&db, &message, "first line\nsecond line\n");
+        write_text(&db, &session_id, &message, "first line\nsecond line\n");
         save_tool(
             &db,
             &session_id,
@@ -505,7 +465,7 @@ mod tests {
         drop(lease);
         timer.finish(turn_repo::TurnStatus::Completed).unwrap();
         let turn_id = timer.record().turn_id.clone();
-        db.with_conn(|conn| {
+        db.shard_sql(&session_id, |conn| {
             conn.execute(
                 "UPDATE execution_turns SET elapsed_ms=128000 WHERE id=?1",
                 [&turn_id],
@@ -528,17 +488,15 @@ mod tests {
     fn multiple_segments_keep_their_own_cursors_and_never_replay() {
         let (temp, db, session_id) = fixture();
         let root = temp.path();
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &session_id).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
         let first = timer.ensure_segment().unwrap();
-        write_text(&db, &first, "first segment\n");
+        write_text(&db, &session_id, &first, "first segment\n");
         save_tool(&db, &session_id, &first, "read-1", Some("one\n"));
         // A recovery replaced the answer with a second segment of the same turn.
         let second = timer.new_segment().unwrap();
-        write_text(&db, &second, "second segment\n");
+        write_text(&db, &session_id, &second, "second segment\n");
         save_tool(&db, &session_id, &second, "read-2", None);
-        let lease = session_messages::ExecutionLease::acquire(root, &session_id)
-            .unwrap()
-            .unwrap();
+        let lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
 
         let mut observer = Observer::default();
         let (_, lines) = observer.poll_at(root, &db, &session_id).unwrap();
@@ -555,7 +513,7 @@ mod tests {
         }
 
         // New progress in the current segment appears exactly once.
-        write_text(&db, &second, "second segment\nthird line\n");
+        write_text(&db, &session_id, &second, "second segment\nthird line\n");
         save_tool(&db, &session_id, &second, "read-2", Some("two\n"));
         let (_, lines) = observer.poll_at(root, &db, &session_id).unwrap();
         assert_eq!(
@@ -580,19 +538,17 @@ mod tests {
     fn completion_drains_the_final_text_and_tool_result_written_after_the_last_live_poll() {
         let (temp, db, session_id) = fixture();
         let root = temp.path();
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &session_id).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
         let message = timer.ensure_segment().unwrap();
-        write_text(&db, &message, "started\n");
-        let lease = session_messages::ExecutionLease::acquire(root, &session_id)
-            .unwrap()
-            .unwrap();
+        write_text(&db, &session_id, &message, "started\n");
+        let lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
         let mut observer = Observer::default();
         let (state, lines) = observer.poll_at(root, &db, &session_id).unwrap();
         assert_eq!(state, State::Running);
         assert!(lines.iter().any(|line| line.contains("started")));
 
         // Everything below is written after the last poll that saw a live owner.
-        write_text(&db, &message, "started\nfinal answer\n");
+        write_text(&db, &session_id, &message, "started\nfinal answer\n");
         save_tool(
             &db,
             &session_id,
@@ -603,7 +559,7 @@ mod tests {
         drop(lease);
         timer.finish(turn_repo::TurnStatus::Completed).unwrap();
         let turn_id = timer.record().turn_id.clone();
-        db.with_conn(|conn| {
+        db.shard_sql(&session_id, |conn| {
             conn.execute(
                 "UPDATE execution_turns SET elapsed_ms=42000 WHERE id=?1",
                 [&turn_id],
@@ -629,12 +585,10 @@ mod tests {
     fn a_dead_owner_observed_live_becomes_interrupted_without_replay() {
         let (temp, db, session_id) = fixture();
         let root = temp.path();
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &session_id).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
         let message = timer.ensure_segment().unwrap();
-        write_text(&db, &message, "partial answer\n");
-        let lease = session_messages::ExecutionLease::acquire(root, &session_id)
-            .unwrap()
-            .unwrap();
+        write_text(&db, &session_id, &message, "partial answer\n");
+        let lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
         let mut observer = Observer::default();
         let (state, _) = observer.poll_at(root, &db, &session_id).unwrap();
         assert_eq!(state, State::Running);
@@ -668,7 +622,7 @@ mod tests {
         assert_eq!(state, State::Idle, "never stays running");
         assert!(lines.is_empty(), "never replays: {lines:?}");
         let record = db
-            .with_conn(|conn| turn_repo::latest_turn(conn, &session_id))
+            .shard_sql(&session_id, |conn| turn_repo::latest_turn(conn, &session_id))
             .unwrap()
             .unwrap()
             .unwrap();
@@ -680,18 +634,16 @@ mod tests {
     fn a_live_turn_is_never_settled_while_its_lease_is_held() {
         let (temp, db, session_id) = fixture();
         let root = temp.path();
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &session_id).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
         let message = timer.ensure_segment().unwrap();
-        write_text(&db, &message, "working\n");
-        let lease = session_messages::ExecutionLease::acquire(root, &session_id)
-            .unwrap()
-            .unwrap();
+        write_text(&db, &session_id, &message, "working\n");
+        let lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
         let mut observer = Observer::default();
         observer.poll_at(root, &db, &session_id).unwrap();
         observer.idle_since = Some(Instant::now() - SETTLE_GRACE - Duration::from_millis(1));
         // The owner is alive: the probe must not settle its turn.
         assert!(
-            session_messages::execution_active(root, &session_id).unwrap(),
+            db.select_session(&session_id).unwrap().execution_active(root).unwrap(),
             "the owner holds the lease"
         );
         drop(lease);
@@ -707,13 +659,11 @@ mod tests {
     fn a_long_unterminated_line_still_shows_progress() {
         let (temp, db, session_id) = fixture();
         let root = temp.path();
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &session_id).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
         let message = timer.ensure_segment().unwrap();
         let long = "x".repeat(LONG_LINE + 50);
-        write_text(&db, &message, &long);
-        let _lease = session_messages::ExecutionLease::acquire(root, &session_id)
-            .unwrap()
-            .unwrap();
+        write_text(&db, &session_id, &message, &long);
+        let _lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
         let mut observer = Observer::default();
         let (_, lines) = observer.poll_at(root, &db, &session_id).unwrap();
         assert!(
@@ -722,7 +672,7 @@ mod tests {
                 .any(|line| line.starts_with("  xxxx") && line.ends_with('…')),
             "long text is buffered forever: {lines:?}"
         );
-        write_text(&db, &message, &format!("{long}\nsecond"));
+        write_text(&db, &session_id, &message, &format!("{long}\nsecond"));
         let (_, lines) = observer.poll_at(root, &db, &session_id).unwrap();
         assert!(
             lines.iter().any(|line| line.contains("xxxxxxxx")),
@@ -740,12 +690,10 @@ mod tests {
         let root = temp.path();
         let store = deepseek_code_core::runtime::SessionStore::new(db.clone());
         let second = store.create(temp.path(), "model", "provider").unwrap();
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &first).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&first).unwrap()).unwrap();
         let message = timer.ensure_segment().unwrap();
-        write_text(&db, &message, "first session text\n");
-        let lease = session_messages::ExecutionLease::acquire(root, &first)
-            .unwrap()
-            .unwrap();
+        write_text(&db, &first, &message, "first session text\n");
+        let lease = db.open_session(&first).unwrap().acquire_execution().unwrap();
         let mut observer = Observer::default();
         let (_, lines) = observer.poll_at(root, &db, &first).unwrap();
         assert!(lines.iter().any(|line| line.contains("first session text")));
@@ -779,10 +727,10 @@ mod tests {
         assert_eq!(state, State::Idle);
         assert!(lines.is_empty());
 
-        let mut timer = turn_repo::TurnTimer::start(db.clone(), &session_id).unwrap();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
         let message = timer.ensure_segment().unwrap();
         // Process loss: no Drop, no duration, no live owner.
-        db.with_conn(|conn| {
+        db.shard_sql(&session_id, |conn| {
             assert_eq!(
                 turn_repo::settle_interrupted(conn, &session_id)
                     .unwrap()
@@ -800,7 +748,7 @@ mod tests {
         .unwrap();
         std::mem::forget(timer);
         let turn = db
-            .with_conn(|conn| turn_repo::get_message_turn(conn, &message))
+            .shard_sql(&session_id, |conn| turn_repo::get_message_turn(conn, &message))
             .unwrap()
             .unwrap()
             .unwrap();

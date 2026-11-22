@@ -10,18 +10,9 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 fn scoped_path(app: &tauri::AppHandle, scope: &Scope, file: &FileRef) -> Result<PathBuf> {
     let db = app
-        .try_state::<Arc<crate::db::DbManager>>()
+        .try_state::<Arc<crate::db::session_store::Stores>>()
         .context("Database is unavailable")?;
-    let roots = db.with_conn(|conn| -> Result<_> {
-        let database = conn
-            .path()
-            .context("Workspace database path is unavailable")?;
-        let private_root = Path::new(database)
-            .parent()
-            .context("Workspace database has no parent")?
-            .join("workspaces");
-        files::roots(conn, &private_root, scope)
-    })??;
+    let roots = db.workspace_roots(scope)?;
     files::resolve(&roots, file, false)
 }
 

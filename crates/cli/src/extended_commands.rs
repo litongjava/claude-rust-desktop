@@ -1,7 +1,9 @@
 ﻿//! Local commands backed by the shared conversation store and OS clipboard.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
-use deepseek_code_core::{db::conversation_repo, runtime::RuntimePaths};
+use deepseek_code_core::runtime::RuntimePaths;
 use serde_json::Value;
 use std::{
     fs::OpenOptions,
@@ -120,7 +122,7 @@ pub async fn handle(
                             selected = index;
                             if let Some(title) = crate::terminal::picker::text_input("Rename session:", &found[index].1.title)?.filter(|title| !title.is_empty()) {
                                 let title: String = title.chars().take(200).collect();
-                                session.store.db.with_conn(|conn| conversation_repo::update_conversation_title(conn, &found[index].0, &title))??;
+                                session.store.db.rename_session(&found[index].0, &title)?;
                             }
                         }
                         Picked::Key(..) => {}
@@ -134,7 +136,7 @@ pub async fn handle(
                 let sessions = session
                     .store
                     .db
-                    .with_conn(conversation_repo::list_conversations)??;
+                    .conversations()?;
                 command_println!("{}", serde_json::to_string_pretty(&sessions)?);
                 command_eprintln!("Use /resume ID to switch conversations.");
             } else {
@@ -175,7 +177,10 @@ pub async fn handle(
                 .split_once(char::is_whitespace)
                 .unwrap_or((argument, ""));
             match verb {
-                "" => command_eprintln!("{}", active_agents_text(paths, &session.id)?),
+                "" => command_eprintln!(
+                    "{}",
+                    active_agents_for(paths, &session.selected_session()?)?
+                ),
                 "definitions" if rest.trim().is_empty() => {
                     for agent in
                         deepseek_code_core::services::agents::list(&crate::services::context(paths)?)?
@@ -203,6 +208,8 @@ pub async fn handle(
                     command_println!("{}: {}", agent.id, agent.description);
                 }
             } else {
+                let owner = session.selected_session()?;
+                let _owner = owner.hold_incarnation()?;
                 let peers = peer_sessions(
                     &session.store,
                     &paths.data_dir,
@@ -218,6 +225,8 @@ pub async fn handle(
                         let mut observed=peers.clone();
                         for peer in &mut observed {
                             let id=peer["id"].as_str().unwrap_or_default();
+                            let peer_session = session.store.db.open_recorded(id,peer["incarnation"].as_str().context("Missing peer incarnation")?)?;
+                            let _peer = peer_session.hold_incarnation()?;
                             let runtime=deepseek_code_core::services::session_worker::runtime_status(&paths.data_dir,id).await;
                             peer["worker"]=serde_json::to_value(runtime)?;
                         }
@@ -293,23 +302,40 @@ pub(crate) fn peer_sessions(
 }
 
 /// Show runtime activity, not merely saved agent definitions or old session rows.
+#[cfg(test)]
 pub(crate) fn active_agents_text(paths: &RuntimePaths, current: &str) -> Result<String> {
+    active_agents_for(paths, &paths.open_database()?.open_session(current)?)
+}
+
+pub(crate) fn active_agents_for(
+    paths: &RuntimePaths,
+    owner: &deepseek_code_core::db::session_store::SessionDb,
+) -> Result<String> {
+    let _owner = owner.hold_incarnation()?;
+    let current = owner.id();
     use deepseek_code_core::services::{background_sessions, session_messages};
     let context = crate::services::context(paths)?;
     let peers = session_messages::session_peers(&context, current)?;
-    let jobs = background_sessions::list(&paths.data_dir, None)?;
+
     let mut rows = Vec::new();
     for peer in peers {
         let id = peer["id"].as_str().unwrap_or_default();
+        let peer_session = context.db.open_recorded(
+            id,
+            peer["incarnation"]
+                .as_str()
+                .context("Missing peer incarnation")?,
+        )?;
+        let _peer = peer_session.hold_incarnation()?;
+        let jobs = background_sessions::executing_in_session(&paths.data_dir, &peer_session)?;
         let job = jobs.iter().find(|job| {
-            job.session_id == id
-                && matches!(job.status.as_str(), "starting" | "running")
+            matches!(job.status.as_str(), "starting" | "running")
         });
         if peer["receiver_active"] != true && job.is_none() {
             continue;
         }
         let delegation = context
-            .setting::<Value>(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .unwrap_or_default();
         let title = delegation["description"]
             .as_str()
@@ -570,19 +596,19 @@ mod tests {
 
     #[test]
     fn active_agents_require_live_execution_and_exclude_unrelated_sessions() {
-        use deepseek_code_core::services::session_messages::{Consumer, PresenceLease};
+        use deepseek_code_core::services::session_messages::Consumer;
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
         let parent = store.create(dir.path(), "test", "cli-runtime").unwrap();
         let child = store.create(dir.path(), "test", "cli-runtime").unwrap();
+        crate::fixture_sql::register_child(&store.db,&parent,&child);
         let unrelated = store.create(dir.path(), "test", "cli-runtime").unwrap();
-        crate::services::context(&paths).unwrap().save_setting(
-            &format!("delegation.{child}"),
+        crate::services::context(&paths).unwrap().db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS,
             &json!({"session_id":child,"parent_session_id":parent,"description":"Inspect resume","current_tool":"Read","status":"running"}),
         ).unwrap();
         // Persisted running metadata and an open terminal are not active execution.
-        let _presence = PresenceLease::acquire(&paths.data_dir, &child).unwrap();
+        let _presence = store.db.acquire_presence(&child).unwrap();
         let _unrelated = Consumer::attach(&paths.data_dir, &unrelated)
             .unwrap()
             .unwrap();
@@ -614,11 +640,11 @@ mod tests {
         std::fs::create_dir_all(&other).unwrap();
         let parent = store.create(&project, "test", "cli-runtime").unwrap();
         let child = store.create(&project, "test", "cli-runtime").unwrap();
+        crate::fixture_sql::register_child(&store.db,&parent,&child);
         let unrelated = store.create(&project, "test", "cli-runtime").unwrap();
         crate::services::context(&paths)
             .unwrap()
-            .save_setting(
-                &format!("delegation.{child}"),
+            .db.seed_preference(&child, deepseek_code_core::db::session_store::settings::CHILD_PROGRESS,
                 &json!({"session_id":child,"parent_session_id":parent}),
             )
             .unwrap();
@@ -709,12 +735,7 @@ pub(crate) fn record_branch(session: &Session) {
     let Some(branch) = git_branch(&session.workspace) else {
         return;
     };
-    let _ = session.store.db.with_conn(|conn| {
-        conn.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [format!("cli.git-branch.{}", session.id), branch],
-        )
-    });
+    let _ = session.store.db.record_git_branch(&session.id,&branch);
 }
 
 /// `168KB` or `167.2KB`, as the reference CLI shows a session's size.
@@ -744,51 +765,16 @@ fn resume_title(title: &str, latest: Option<&str>) -> String {
 }
 
 fn resumable(session: &Session, all: bool) -> Result<Vec<(String, Resumable)>> {
-    let here = session.workspace.canonicalize().unwrap_or_else(|_| session.workspace.clone());
-    session.store.db.with_conn(|conn| -> Result<Vec<(String, Resumable)>> {
-        let mut found = Vec::new();
-        for row in conversation_repo::list_conversations(conn)? {
-            let same = row.workspace_path.as_deref().map(|path| Path::new(path).canonicalize().unwrap_or_else(|_| Path::new(path).to_path_buf())) == Some(here.clone());
-            if row.id == session.id || row.archived || !(same || all) || row.message_count == 0 {
-                continue;
-            }
-            let named = row.title.clone().filter(|title| !title.trim().is_empty() && title != "CLI session");
-            let title = match named {
-                Some(title) => title,
-                None => deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &row.id)?
-                    .into_iter()
-                    .find(|message| message.role == "user" && !crate::background_commands::is_notification(&message.content))
-                    .map(|message| message.content.lines().next().unwrap_or_default().to_owned())
-                    .unwrap_or_else(|| "(no prompt)".into()),
-            };
-            let latest_prompt: Option<String> = conn.query_row(
-                "SELECT content FROM messages WHERE conversation_id=?1 AND role='user' ORDER BY created_at DESC LIMIT 1",
-                [&row.id], |r| r.get(0),
-            ).ok();
-            let title = resume_title(&title, latest_prompt.as_deref());
-            // No row: the session was never used in a git repository.
-            let branch: Option<String> = conn
-                .query_row("SELECT value FROM peripheral_settings WHERE key=?1", [format!("cli.git-branch.{}", row.id)], |r| r.get(0))
-                .ok();
-            let size: i64 = conn.query_row(
-                "SELECT (SELECT COALESCE(SUM(length(CAST(content AS BLOB)) + COALESCE(length(CAST(thinking AS BLOB)),0)),0) FROM messages WHERE conversation_id=?1)
-                      + (SELECT COALESCE(SUM(COALESCE(length(CAST(t.input AS BLOB)),0) + COALESCE(length(CAST(t.output AS BLOB)),0)),0) FROM tool_calls t JOIN messages m ON t.message_id=m.id WHERE m.conversation_id=?1)
-                      + (SELECT COALESCE(SUM(length(CAST(r.requests_json AS BLOB))),0) FROM message_trajectory r JOIN messages m ON r.message_id=m.id WHERE m.conversation_id=?1)",
-                [&row.id],
-                |r| r.get(0),
-            )?;
-            let mut detail = ago(&row.updated_at);
-            detail.push_str(&format!(" \u{b7} {}", branch.as_deref().unwrap_or("HEAD")));
-            detail.push_str(&format!(" \u{b7} {}", short_size(size)));
-            if all {
-                if let Some(path) = &row.workspace_path {
-                    detail.push_str(&format!(" \u{b7} {}", path));
-                }
-            }
-            found.push((row.id, Resumable { title, detail, branch }));
+    let entries = session.store.db.resume_entries(&session.id, (!all).then_some(&session.workspace))?;
+    Ok(entries.into_iter().map(|entry| {
+        let row = entry.conversation;
+        let title = resume_title(row.title.as_deref().filter(|s| !s.trim().is_empty() && *s!="CLI session").unwrap_or("(no prompt)"),entry.latest.as_deref());
+        let mut detail = format!("{} · {} · {}",ago(&row.updated_at),entry.branch.as_deref().unwrap_or("HEAD"),short_size(entry.bytes));
+        if let Some(path)=row.workspace_path.filter(|_| all) {
+            detail.push_str(&format!(" · {path}"));
         }
-        Ok(found)
-    })?
+        (row.id,Resumable {title,detail,branch:entry.branch})
+    }).collect())
 }
 
 #[cfg(test)]

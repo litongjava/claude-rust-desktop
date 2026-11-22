@@ -19,6 +19,7 @@ use std::{
 pub(crate) type OwnedChildren = Arc<Mutex<HashMap<String, OwnedChild>>>;
 pub(crate) struct OwnedChild {
     executor: Box<ToolLoopExecutor>,
+    owner_provider: crate::native_engine::provider_manager::ResolvedProvider,
     pub(in crate::native_engine) parent: String,
     pub(in crate::native_engine) owner_budget: Arc<std::sync::atomic::AtomicUsize>,
     pub(in crate::native_engine) idle_ready: bool,
@@ -28,6 +29,25 @@ pub(crate) struct OwnedChild {
 }
 
 impl OwnedChild {
+    pub(in crate::native_engine) fn retained_session(&self) -> Option<crate::db::session_store::SessionDb> {
+        match self.executor.executor_history.as_ref()? {
+            crate::db::session_store::ExecutorHistory::Session(shard) => Some(shard.clone()),
+            _ => None,
+        }
+    }
+
+    pub(in crate::native_engine) fn binding_is_current(
+        &self,
+        manager: &crate::native_engine::provider_manager::ProviderManager,
+    ) -> bool {
+        // Session bindings are per owner. A retained child owns its launch
+        // snapshot. A shared provider catalog can still revoke the child itself.
+        let held = &self.executor.provider;
+        manager.binding.read().is_some() || manager
+            .resolve_selected(&held.provider.id, &held.model.id)
+            .is_some_and(|live| held.same_binding(&live) && held.model.api == live.model.api)
+    }
+
     pub(in crate::native_engine) fn permission_target(
         &self,
     ) -> Result<(
@@ -47,13 +67,13 @@ impl OwnedChild {
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: "Agent".into(),
-        description: "Launch a new agent to handle complex, multi-step tasks. Each agent type has specific capabilities and tools available to it.\n\nSpecify a subagent_type to select an agent definition; omitting it starts a general-purpose agent. subagent_type: \"fork\" forks this session instead: the fork inherits the full conversation history, runs in the background on this session's model, and takes prompt as its directive, so the prompt does not need to repeat context. Use it for a side task that needs what this session already knows; use another type when a fresh context is better. A fork cannot start another fork.\n\n## When to use\n\nReach for this when the task matches an available agent type, when you have independent work to run in parallel, or when answering would mean reading across several files — delegate it and you keep the conclusion, not the file dumps. For a single-fact lookup where you already know the file, symbol, or value, search directly. Once you've delegated a search, don't also run it yourself — wait for the result.\n\nSubagents run in the background; you'll be notified when one completes. Continue independent work while an agent runs. If nothing independent remains, return control to the user and let completion notification wake the session; do not poll TaskGet or sleep repeatedly just to keep the parent turn open. A single sequential task is usually cheaper to execute directly than to delegate and wait. Never fabricate or predict a pending agent's results — the notification is never something you write yourself; if the user asks before it arrives, say it's still running. Pass run_in_background: false when you need the result before continuing.\n\n- The agent's final report is not shown to the user — relay what matters.\n- Use SendMessage with the agent's ID or name to continue a previously spawned agent with its context intact; a new Agent call starts fresh.\n- Each agent type's prompt and tools come from its definition (`.claude/agents/*.md` or SDK `agents`).\n- `isolation: \"worktree\"` gives the agent its own git worktree.".into(),
+        description: "Start a child agent on one task. Pick a subagent_type from the runtime list; leaving it out starts a general-purpose agent, whose prompt and tools come from its definition.\n\nA fork branches this session instead: it keeps the full history, runs in the background on this session's model and takes prompt as its directive, and it cannot start another fork.\n\nMain-session children run in the background by default and send a completion notification, so keep working rather than polling; pass run_in_background: false to get the result before you continue. isolation: \"worktree\" puts the child in its own git worktree. The user does not see a child's report, so relay what matters; SendMessage continues the same child with its context, while a new Agent call starts fresh.".into(),
         input_schema: json!({"type":"object","properties":{
-            "description":{"description":"A short (3-5 word) description of the task","type":"string"},
-            "prompt":{"description":"The task for the agent to perform","type":"string"},
-            "subagent_type":{"description":"The type of specialized agent to use for this task. Use \"fork\" to fork this session.","type":"string"},
+            "description":{"description":"Short label (about 3-5 words) for the task.","type":"string"},
+            "prompt":{"description":"What the child agent should do.","type":"string"},
+            "subagent_type":{"description":"Agent definition to use; choose from the runtime list, or \"fork\" to branch this session.","type":"string"},
             "model":{"description":"Optional model override for this agent: a model ID configured for the current provider. If omitted, the agent uses the parent's model.","type":"string"},
-            "effort":{"description":"Reasoning effort for this agent. Set this ONLY when the user, or instructions such as AGENTS.md or a skill, explicitly ask that this agent or delegated work run at a specific effort level, never on your own judgment; otherwise omit it and the agent runs at its usual effort.","type":"string","enum":["low","medium","high","xhigh","max"]},
+            "effort":{"description":"Overrides the child's reasoning effort. Pass it only when the user, AGENTS.md or a skill explicitly names a level for this work; omit it to use the agent type's normal setting.","type":"string","enum":["low","medium","high","xhigh","max"]},
             "isolation":{"description":"Optional isolation. Omit or use null for the current workspace. Use worktree only when the task requests an isolated copy.","type":["string","null"],"enum":["worktree",null]},
             "run_in_background":{"description":"Defaults to true. Set to false to wait for the agent's result in this turn.","type":"boolean"}
         },"required":["description","prompt"],"additionalProperties":false})
@@ -126,8 +146,7 @@ fn fill_default_model(input: &mut Value, data_dir: &std::path::Path) -> Option<S
 }
 
 struct ChildState {
-    context: ServiceContext,
-    key: String,
+    history: crate::db::session_store::ExecutorHistory,
     value: Value,
     event_tx: tokio::sync::mpsc::Sender<EngineEvent>,
     request_id: String,
@@ -156,14 +175,7 @@ impl Drop for TeamTaskGuard {
 }
 impl ChildState {
     fn snapshot(&mut self, snapshot: &Value, assistant: &str) -> Result<()> {
-        let session = self.value["session_id"]
-            .as_str()
-            .context("Child session missing")?;
-        let total = self.context.db.with_conn(|conn| -> Result<u64> {
-            conn.execute("INSERT OR IGNORE INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES(?1,?2,'assistant','',?3,(SELECT COALESCE(MAX(sort_order),-1)+1 FROM messages WHERE conversation_id=?2))", rusqlite::params![assistant,session,chrono::Utc::now().to_rfc3339()])?;
-            crate::db::request_repo::save_request(conn, assistant, snapshot)?;
-            Ok(conn.query_row("SELECT COALESCE(SUM(output_tokens),0) FROM model_requests WHERE conversation_id=?1", [session], |row| row.get(0))?)
-        })??;
+        let total=self.history.child_request(assistant,snapshot)?;
         let id = snapshot["id"].as_str().unwrap_or_default();
         if self.request_id != id {
             self.request_id = id.to_owned();
@@ -174,7 +186,7 @@ impl ChildState {
             self.value["output_tokens"] = json!(total);
             self.value["output_tokens_estimated"] = json!(false);
         }
-        self.context.save_setting(&self.key, &self.value)
+        self.history.save_child_state(&self.value)
     }
 
     fn usage(&mut self, usage: &Value) {
@@ -200,6 +212,7 @@ impl ChildState {
 
     fn progress(&self, status: &str, tool_name: Option<String>) -> EngineEvent {
         EngineEvent::AgentProgress {
+            address: self.history.address(),
             session_id: self.value["session_id"].as_str().unwrap_or_default().into(),
             agent_type: self.value["agent_type"].as_str().unwrap_or_default().into(),
             status: status.into(),
@@ -214,7 +227,7 @@ impl Drop for ChildState {
             let _ = self.event_tx.try_send(self.progress("cancelled", None));
         }
         self.value["finished_at"] = json!(chrono::Utc::now().to_rfc3339());
-        if self.context.save_setting(&self.key, &self.value).is_err() {
+        if self.history.save_child_state(&self.value).is_err() {
             tracing::warn!("Could not persist child task state");
         }
     }
@@ -226,27 +239,7 @@ fn owned_binding(
     child: &str,
     expected: &str,
 ) -> Result<Value> {
-    context.db.with_conn(|conn| -> Result<Value> {
-        let parent_row=crate::db::conversation_repo::get_conversation(conn,parent)?.context("Owner missing")?;
-        let child_row=crate::db::conversation_repo::get_conversation(conn,child)?.context("Child missing")?;
-        ensure!(!parent_row.archived && !child_row.archived,"Owner or child archived");
-        let root=if child_row.project_id.as_deref().is_none_or(str::is_empty) {std::path::Path::new(expected).parent().context("Private root missing")?.to_path_buf()} else {context.paths.data_dir.join("workspaces")};
-        let actual=crate::native_engine::workspace::resolve_workspace(conn,&root,child,None)?.0.canonicalize()?;
-        let owner=crate::native_engine::workspace::resolve_workspace(conn,&root,parent,None)?.0.canonicalize()?;
-        let isolated = if actual != owner && parent_row.project_id == child_row.project_id {
-            use rusqlite::OptionalExtension;
-            let saved: Option<(String, String)> = conn.query_row(
-                "SELECT source_path,path FROM conversation_worktrees WHERE conversation_id=?1",
-                [child], |row| Ok((row.get(0)?, row.get(1)?)),
-            ).optional()?;
-            saved.is_some_and(|(source, path)| {
-                std::path::Path::new(&source).canonicalize().ok().as_ref() == Some(&owner)
-                    && std::path::Path::new(&path).canonicalize().ok().as_ref() == Some(&actual)
-            })
-        } else { false };
-        ensure!((actual==owner || isolated) && actual==std::path::Path::new(expected).canonicalize()?,"Owner/child workspace no longer matches");
-        Ok(json!({"runtime":context.paths.data_dir.canonicalize()?,"parent_project":parent_row.project_id,"parent_mode":parent_row.workspace_mode,"child_project":child_row.project_id,"child_mode":child_row.workspace_mode,"owner_cwd":owner,"cwd":actual,"provider":child_row.provider,"model":child_row.model}))
-    })?
+    context.db.owned_workspace_binding(parent,child,std::path::Path::new(expected))
 }
 
 /// Loads agent memory Markdown from the upstream scope directories.
@@ -350,7 +343,7 @@ impl ToolLoopExecutor {
             .context("Original child runtime is unavailable; needs_resume")?;
         ensure!(entry.parent == owner, "Child belongs to another owner");
         let mut host = Self::new(
-            entry.executor.provider.clone(),
+            entry.owner_provider.clone(),
             Vec::new(),
             None,
             entry.executor.max_tokens,
@@ -358,6 +351,7 @@ impl ToolLoopExecutor {
             entry.executor.workspace_cwd.clone(),
             entry.executor.reasoning_mode.clone(),
         );
+        host.provider_manager = entry.executor.provider_manager.clone();
         host.conv_id = Some(owner.into());
         host.search_config_path = entry.executor.search_config_path.clone();
         host.child_resumes = entry.owner_budget.clone();
@@ -474,7 +468,7 @@ impl ToolLoopExecutor {
             .context("Runtime unavailable")?;
         let context = crate::services::session_messages::context(root)?;
         let saved: Value = context
-            .setting(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .context("Child ownership record unavailable; needs_resume")?;
         ensure!(
             saved["parent_session_id"] == parent,
@@ -488,12 +482,24 @@ impl ToolLoopExecutor {
             !crate::services::session_messages::receiver_active(root, id)?,
             "Child already has an active receiver"
         );
+        // The owner must still be admitted to dispatch a continuation, even
+        // though the retained child uses its own launch-time transport.
+        self.provider.current()?;
         let policy = self.child_owner_policy();
         let mut entry = {
+            let manager = match &self.provider_manager {
+                Some(manager) => Some(manager.lock().await),
+                None => None,
+            };
             let mut registry = self
                 .owned_children
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            if registry.get(id).is_some_and(|entry| entry.parent == parent &&
+                manager.as_ref().is_some_and(|catalog| !entry.binding_is_current(catalog))
+            ) {
+                registry.remove(id);
+            }
             let retained = registry
                 .get(id)
                 .context("Original child configuration is no longer resident; needs_resume")?;
@@ -517,14 +523,12 @@ impl ToolLoopExecutor {
             .map_err(|_| anyhow::anyhow!("Owned child resume budget exhausted"))?;
         // Original provider/model, tool bounds, permissions and hooks stay with this executor.
         // Only event routing and durable transcript are refreshed for the current owner turn.
+        let child_history=entry.executor.executor_history.clone().context("Missing retained child history")?;
         entry.executor.execution_lease =
-            crate::services::session_messages::ExecutionLease::acquire(
-                &context.paths.data_dir,
-                id,
-            )?
+            child_history.execution_lease()?
             .map(std::sync::Arc::new);
         let current: Value = context
-            .setting(&format!("delegation.{id}"))?
+            .child_progress(&id)?
             .context("Child ownership disappeared")?;
         ensure!(
             current["parent_session_id"] == parent && current["status"] == "completed",
@@ -532,7 +536,11 @@ impl ToolLoopExecutor {
         );
         // Refresh verified owner constraints on every resume, without promoting
         // the model-generated resume prompt or peer inbox data to user authority.
-        crate::services::permission_authority::inherit(&context.db, &parent, id)?;
+        let parent_history=match self.executor_history.clone() {
+            Some(history)=>history,
+            None=>context.db.executor_history(&parent)?,
+        };
+        child_history.inherit_child_authority(&parent_history)?;
         let sessions = SessionStore::new(context.db.clone());
         if let Some(prompt) = prompt {
             sessions.append(id, "user", prompt)?;
@@ -545,7 +553,6 @@ impl ToolLoopExecutor {
         entry.executor.answer_waiters = self.answer_waiters.clone();
         entry.executor.permission_mailbox = self.permission_mailbox.clone();
         entry.executor.permission_host_available = self.permission_host_available;
-        entry.executor.message_inbox = None;
         entry.executor.require_pending_peer_message = automatic;
         entry.executor.stop_hook_active = false;
         if let Some(manager) = &entry.executor.permission_manager {
@@ -644,6 +651,7 @@ impl ToolLoopExecutor {
             child,
             input["description"].as_str().unwrap_or("Agent"),
             tool_use_id,
+            self.parent_message_id.as_deref(),
             mode,
         )
     }
@@ -716,7 +724,7 @@ impl ToolLoopExecutor {
                 .context("Runtime unavailable")?;
             let context = crate::services::session_messages::context(root)?;
             let saved: Value = context
-                .setting(&format!("delegation.{id}"))?
+                .child_progress(&id)?
                 .context("Child ownership record unavailable")?;
             ensure!(
                 saved["parent_session_id"].as_str() == self.conv_id.as_deref(),
@@ -789,6 +797,7 @@ impl ToolLoopExecutor {
             .unwrap_or("ask");
         Ok(crate::native_engine::child_session::child_cli_arguments(
             &self.provider,
+            &self.model_selector,
             mode,
             root,
         ))
@@ -828,9 +837,7 @@ impl ToolLoopExecutor {
         let fork = is_fork(input);
         if fork {
             ensure!(
-                context
-                    .setting::<Value>(&format!("fork-of.{parent}"))?
-                    .is_none(),
+                !context.db.is_agent_fork(&parent)?,
                 "A fork cannot start another fork"
             );
         }
@@ -891,6 +898,7 @@ impl ToolLoopExecutor {
                 executable_override: None,
                 invocation: tool_use_id.map(|tool_use_id| {
                     crate::native_engine::child_session::ChildInvocation {
+                        parent_message_id:self.parent_message_id.clone(),
                         tool_use_id: tool_use_id.into(),
                         description: description.clone(),
                         mode: "background".into(),
@@ -904,8 +912,8 @@ impl ToolLoopExecutor {
             },
         )
         .await?;
-        context.save_setting(
-            &format!("background-agent.{}", handle.job_id),
+        context.db.register_background_agent(
+            &handle.job_id,
             &json!({"agent_type":handle.agent_type,"description":handle.description,"parent":parent,"session_id":handle.session_id,"started_at":chrono::Utc::now().to_rfc3339()}),
         )?;
         Ok(json!({
@@ -958,10 +966,13 @@ impl ToolLoopExecutor {
             Some(agent) => agent.definition.clone(),
             None => agents::resolve(&context, agent_type)?,
         };
-        let mut provider = runtime
-            .as_ref()
-            .and_then(|agent| agent.provider.clone())
-            .unwrap_or_else(|| self.provider.clone());
+        let mut provider = match runtime.as_ref().and_then(|agent| agent.provider.as_ref()) {
+            Some(selector) => {
+                let manager = self.provider_manager.as_ref().context("Agent provider manager unavailable")?.lock().await;
+                selector.resolve(&manager)?
+            }
+            None => self.provider.clone(),
+        };
         if let Some(effort) = runtime.as_ref().and_then(|agent| agent.effort.clone()) {
             provider.model.effort = Some(effort);
         }
@@ -1083,7 +1094,7 @@ impl ToolLoopExecutor {
             // Creating from actual cwd would incorrectly trust a worktree as a new project.
             let parent_row = context
                 .db
-                .with_conn(|conn| crate::db::conversation_repo::get_conversation(conn, parent))??
+                .conversation_metadata(parent)?
                 .context("Parent session not found")?;
             let workspaces_root = if parent_row.project_id.as_deref().is_none_or(str::is_empty) {
                 // The engine may use a private root outside data_dir/workspaces.
@@ -1099,12 +1110,8 @@ impl ToolLoopExecutor {
                 &workspaces_root,
                 std::path::Path::new(&self.workspace_cwd),
             )?;
-            context.db.with_conn(|conn| {
-                conn.execute(
-                    "UPDATE conversations SET model=?2,provider=?3 WHERE id=?1",
-                    rusqlite::params![child, provider.model.id, provider.provider.id],
-                )
-            })??;
+            use crate::db::session_store::SessionAccess;
+            context.db.select_session(&child)?.initialize_child_model(&provider.model.id,&provider.provider.id)?;
             child
         } else {
             sessions.create(
@@ -1152,10 +1159,7 @@ impl ToolLoopExecutor {
         } else {
             agents::bind(&context.db, &id, &definition)?;
         }
-        context.save_setting(
-            &format!("agent-description.{id}"),
-            &input["description"].as_str().unwrap_or(prompt),
-        )?;
+        context.set_child_description(&id,input["description"].as_str().unwrap_or(prompt))?;
         sessions.append(&id, "user", prompt)?;
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         let mut system = format!(
@@ -1201,13 +1205,14 @@ impl ToolLoopExecutor {
             child_workspace,
             self.reasoning_mode.clone(),
         )
+        .with_provider_manager(self.provider_manager.clone())
         .with_runtime_agents(self.runtime_agents.clone())
         .with_allowed_tools(definition.tools)
         .with_read_only_shell(read_only_shell)
         .with_prompt_profile(self.prompt_profile)
         .with_context_reminders(self.context_reminders.clone())
-        .with_transcript_db(context.db.clone())
         .with_conv_id(id.clone())
+        .with_executor_history(context.db.executor_history(&id)?)?
         .with_answer_waiters(self.answer_waiters.clone())
         .with_permission_mailbox(self.permission_mailbox.clone())
         .with_permission_host(self.permission_host_available)
@@ -1469,6 +1474,12 @@ impl ToolLoopExecutor {
         policy: Value,
     ) -> futures::future::BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
+            // The initial turn follows live rebindings until it completes. Keep
+            // the exact launch selection and account for later, independent resumes.
+            let launch_provider = child.provider.clone();
+            let launch_model = child.model_selector.clone();
+            let launch_state = launch_provider.binding_snapshot();
+            launch_provider.ensure_current()?;
             let binding = owned_binding(
                 &context,
                 self.conv_id.as_deref().context("Child owner unavailable")?,
@@ -1476,26 +1487,23 @@ impl ToolLoopExecutor {
                 &child.workspace_cwd,
             )?;
             if child.execution_lease.is_none() {
-                child.execution_lease = crate::services::session_messages::ExecutionLease::acquire(
-                    &context.paths.data_dir,
-                    &id,
-                )?
+                child.execution_lease = context.db.executor_history(&id)?.execution_lease()?
                 .map(std::sync::Arc::new);
             }
             let state = ChildState {
-                context: context.clone(),
-                key: format!("delegation.{id}"),
+                history: context.db.executor_history(&id)?,
                 event_tx: self.event_tx.clone(),
                 value: json!({"session_id":id,"parent_session_id":self.conv_id,"agent_type":agent_type,"status":"running","started_at":chrono::Utc::now().to_rfc3339()}),
                 request_id: String::new(),
                 request_base: 0,
                 streamed_bytes: 0,
             };
-            context.save_setting(&state.key, &state.value)?;
+            state.history.save_child_state(&state.value)?;
             let _ = self.event_tx.send(state.progress("started", None)).await;
             let collect_web_evidence = child.response_schema.is_some();
             let mut transcript =
                 child_transcript::ChildTranscript::new(state, receiver, collect_web_evidence)?;
+            child.parent_message_id=Some(transcript.assistant_id.clone());
             // The tool loop scopes the child's shells and monitors to the
             // data root, the parent directory of the search config path.
             let cleanup_root = self
@@ -1600,6 +1608,21 @@ impl ToolLoopExecutor {
                         );
                     }
                     if !collect_web_evidence {
+                        if let Some(state) = launch_state {
+                            let mut state = (*state).clone();
+                            state.provider_id = launch_provider.provider.id.clone();
+                            state.model = launch_provider.model.id.clone();
+                            let manager = crate::native_engine::provider_manager::ProviderManager::in_memory(
+                                Vec::new(), context.paths.data_dir.join("providers.json"),
+                            );
+                            manager.binding.install(state)?;
+                            let mut retained = launch_provider;
+                            retained.provider.lease = manager.binding.resolve(None)
+                                .context("Missing retained child provider")?.provider.lease;
+                            child.provider = retained;
+                            child.model_selector = launch_model;
+                            child.provider_manager = Some(Arc::new(tokio::sync::Mutex::new(manager)));
+                        }
                         // Retain configuration/capabilities, not the last turn's transcript or handles.
                         child.messages.clear();
                         child.messages.shrink_to_fit();
@@ -1607,7 +1630,6 @@ impl ToolLoopExecutor {
                         child.auto_history.shrink_to_fit();
                         child.streaming_tool_args.clear();
                         child.streaming_tool_args.shrink_to_fit();
-                        child.message_inbox = None;
                         child.execution_lease = None;
                         child.answer_waiters = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
                         child.permission_mailbox = Default::default();
@@ -1630,6 +1652,7 @@ impl ToolLoopExecutor {
                             id.clone(),
                             OwnedChild {
                                 executor: Box::new(child),
+                                owner_provider: self.provider.clone(),
                                 parent: self.conv_id.clone().unwrap_or_default(),
                                 owner_budget: self.child_resumes.clone(),
                                 idle_ready: false,
@@ -1849,8 +1872,7 @@ fn child_usage_accumulates_requests_without_counting_repeated_snapshots_or_paren
     let id = sessions.create(temp.path(), "fixture", "fixture").unwrap();
     let (event_tx, _) = tokio::sync::mpsc::channel(32);
     let mut state = ChildState {
-        context: context.clone(),
-        key: format!("delegation.{id}"),
+        history: context.db.executor_history(&id).unwrap(),
         value: json!({"session_id":id,"status":"completed"}),
         event_tx,
         request_id: String::new(),
@@ -1883,7 +1905,7 @@ fn child_usage_accumulates_requests_without_counting_repeated_snapshots_or_paren
     assert_eq!(state.value["output_tokens_estimated"], false);
     let count = context
         .db
-        .with_conn(|conn| {
+        .fixture_shard(&id, |conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM model_requests WHERE conversation_id=?1",
                 [&id],

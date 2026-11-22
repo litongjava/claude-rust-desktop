@@ -138,6 +138,7 @@ async fn run_case(cancel: bool, team: bool) {
             provider_id: Some("local".into()),
             effort: None,
             system_prompt: None,
+            standalone_frontend: false,
             max_tokens: Some(1000),
             workspace_path: Some(workspace),
             temperature: None,
@@ -157,21 +158,10 @@ async fn run_case(cancel: bool, team: bool) {
         engine.cancel_turn(&id).await;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(!dir.path().join("child-finished.txt").exists());
-        let raw: String = context
-            .db
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT value FROM peripheral_settings WHERE key LIKE 'delegation.%'",
-                    [],
-                    |r| r.get(0),
-                )
-            })
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<Value>(&raw).unwrap()["status"],
-            "cancelled"
-        );
+        assert!(context.db.conversations().unwrap().iter()
+            .filter_map(|row| context.child_progress(&row.id).unwrap())
+            .any(|progress|progress["status"]=="cancelled"));
+
         if team {
             let record = deepseek_code_core::tools::coordination::execute(
                 "team",
@@ -196,7 +186,7 @@ async fn run_case(cancel: bool, team: bool) {
                 session_id,
                 agent_type,
                 status,
-                tool_name,
+                tool_name, ..
             } = &event
             {
                 progress.push((
@@ -253,23 +243,11 @@ async fn run_case(cancel: bool, team: bool) {
         definition.tools.unwrap(),
         [if team { "team" } else { "Agent" }, "Read"]
     );
-    let rows = context
-        .db
-        .with_conn(|conn| {
-            deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, &child_id)
-        })
-        .unwrap()
-        .unwrap();
+    let rows = context.db.open_session(&child_id).unwrap().read(|r|r.messages()).unwrap();
     let mut results = Vec::new();
     for row in rows {
         results.extend(
-            context
-                .db
-                .with_conn(|conn| {
-                    deepseek_code_core::db::message_repo::get_tool_calls_for_message(conn, &row.id)
-                })
-                .unwrap()
-                .unwrap(),
+            context.db.open_session(&child_id).unwrap().read(|r|r.tools(&row.id)).unwrap(),
         );
     }
     assert!(results.iter().any(|r| r.name == "Read"
@@ -278,7 +256,7 @@ async fn run_case(cancel: bool, team: bool) {
     assert!(results.iter().any(|r| r.name == "Write" && r.is_error));
     assert_eq!(
         context
-            .setting::<Value>(&format!("delegation.{child_id}"))
+            .child_progress(&child_id)
             .unwrap()
             .unwrap()["status"],
         "completed"

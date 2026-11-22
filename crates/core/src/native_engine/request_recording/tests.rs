@@ -321,8 +321,8 @@ async fn disabled_and_disk_failure_do_not_change_output() {
     }
 }
 
-#[test]
-fn header_filter_and_url_remove_authentication() {
+#[tokio::test]
+async fn header_filter_and_url_remove_authentication() {
     assert!(secret_header("x-deepseek-harness-extra", "sk-hidden"));
     assert!(secret_header(
         "x-deepseek-harness-extra",
@@ -359,6 +359,7 @@ fn header_filter_and_url_remove_authentication() {
         &request,
         false,
     )
+    .await
     .unwrap()
     .unwrap();
     assert_eq!(record.meta["url"], "http://localhost/v1");
@@ -378,13 +379,13 @@ fn concurrent_sequences_and_reopen_never_collide() {
                     .body("{}")
                     .build()
                     .unwrap();
-                let _record = Attempt::start(
+                let _record = futures::executor::block_on(Attempt::start(
                     &options(&root),
                     &provider("http://localhost", false),
                     "openai",
                     &request,
                     false,
-                )
+                ))
                 .unwrap()
                 .unwrap();
             });
@@ -407,7 +408,7 @@ fn retention_uses_latest_file_and_excludes_active_sessions() {
     let now = SystemTime::now() + Duration::from_secs(15 * 86400);
     let mut active = None;
     for session in ["old", "new", "active", "recent-file"] {
-        let (dir, lease, lock) = acquire(&root, session).unwrap();
+        let (dir, lease, lock) = acquire(&root, session, root_lock(&root).unwrap()).unwrap();
         crate::fs::unlock_file(&lock).unwrap();
         write_new(&dir.join("data"), b"{}").unwrap();
         if session == "new" || session == "recent-file" {
@@ -466,41 +467,29 @@ async fn nonstream_response_is_unformatted_bytes() {
 fn launch_policy_is_session_scoped_and_inherited_by_explicit_parent() {
     let temp = tempfile::tempdir().unwrap();
     let paths = crate::runtime::RuntimePaths::new(temp.path().into()).unwrap();
-    let db = paths.open_database().unwrap();
-    db.set_request_recording_policy("parent-test", true, false);
-    assert!(RequestOptions::from_db(&db, Some("parent-test"), "main")
-        .recording
-        .is_some());
-    assert!(RequestOptions::from_db(&db, Some("unrelated"), "main")
-        .recording
-        .is_none());
-    db.with_conn(|c| {
-        c.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-            rusqlite::params!["delegation.child", r#"{"parent_session_id":"parent-test"}"#],
-        )
-    })
-    .unwrap()
-    .unwrap();
+    let db = paths.open_stores().unwrap();
+    let parent = db.create("parent-test",Default::default()).unwrap();
+    let workspace = parent.workspace().unwrap();
+    let owned = parent.derive_owned_child("child",&workspace).unwrap();
+    owned.derive_owned_child("grandchild",&workspace).unwrap();
+    db.set_request_recording_policy("parent-test", true, false).unwrap();
+    assert!(RequestOptions::from_db(&db, Some("parent-test"), "main").recording.is_some());
+    assert!(RequestOptions::from_db(&db, Some("unrelated"), "main").recording.is_none());
     let child = RequestOptions::from_db(&db, Some("child"), "main");
     assert_eq!(child.purpose, "subagent");
     assert_eq!(
         child.recording.unwrap().parent_session_id.as_deref(),
         Some("parent-test")
     );
-    db.with_conn(|c| {
-        c.execute(
-            "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
-            rusqlite::params!["delegation.grandchild", r#"{"parent_session_id":"child"}"#],
-        )
-    })
-    .unwrap()
-    .unwrap();
     let grandchild = RequestOptions::from_db(&db, Some("grandchild"), "main");
     assert_eq!(
         grandchild.recording.unwrap().parent_session_id.as_deref(),
         Some("child")
     );
+    parent.delete().unwrap();
+    db.create("parent-test",Default::default()).unwrap();
+    db.set_request_recording_policy("parent-test",true,false).unwrap();
+    assert!(RequestOptions::from_db(&db, Some("child"),"main").recording.is_none());
     assert!(!temp.path().join("request-records").exists());
 }
 
@@ -528,8 +517,8 @@ async fn compatible_openai_finish_reason_without_done_is_complete() {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn disk_full_during_a_chunk_does_not_change_completion() {
+#[tokio::test]
+async fn disk_full_during_a_chunk_does_not_change_completion() {
     let temp = tempfile::tempdir().unwrap();
     let request = reqwest::Client::new()
         .post("http://localhost")
@@ -543,6 +532,7 @@ fn disk_full_during_a_chunk_does_not_change_completion() {
         &request,
         true,
     )
+    .await
     .unwrap()
     .unwrap();
     record.meta["http_status"] = json!(200);

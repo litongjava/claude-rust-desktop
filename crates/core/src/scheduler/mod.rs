@@ -1,4 +1,4 @@
-use crate::db::DbManager;
+use crate::db::session_store::Schedules;
 use crate::db::task_repo::ScheduledTaskRow;
 use anyhow::Result;
 use cron::Schedule;
@@ -19,7 +19,7 @@ pub struct TaskExecutionResult {
 }
 
 pub struct ScheduledTaskScheduler {
-    db_manager: Arc<DbManager>,
+    db_manager: Arc<dyn Schedules>,
     running_tasks: Arc<Mutex<HashMap<String, TaskState>>>,
     should_stop: Arc<Mutex<bool>>,
     /// Where saved providers live; prompt and report tasks need a model.
@@ -70,7 +70,7 @@ struct TaskState {
 }
 
 impl ScheduledTaskScheduler {
-    pub fn new(db_manager: Arc<DbManager>) -> Self {
+    pub fn new(db_manager: Arc<dyn Schedules>) -> Self {
         Self {
             db_manager,
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -141,9 +141,7 @@ impl ScheduledTaskScheduler {
         let run_id_clone = run_id.to_string();
         let task_id_clone = task.id.clone();
         let insert_result = tokio::task::spawn_blocking(move || {
-            db.with_conn(|conn| {
-                crate::db::task_repo::insert_task_run(conn, &run_id_clone, &task_id_clone, &now)
-            })
+            db.insert_task_run(&run_id_clone, &task_id_clone, &now)
         }).await;
 
         if let Err(e) = insert_result {
@@ -177,17 +175,13 @@ impl ScheduledTaskScheduler {
         let duration_clone = duration_ms as i64;
 
         let _ = tokio::task::spawn_blocking(move || {
-            db2.with_conn(|conn| {
-                crate::db::task_repo::update_task_run_status(
-                    conn,
-                    &run_id_clone2,
+            db2.update_task_run_status(&run_id_clone2,
                     status,
                     output.as_deref(),
                     error_msg.as_deref(),
                     &finished_at_clone,
                     duration_clone,
                 )
-            })
         }).await;
 
         let next_run_at = crate::task::cron::calc_next_run_local(&task.cron_expression, &chrono::Utc::now())
@@ -196,16 +190,12 @@ impl ScheduledTaskScheduler {
         let db3 = self.db_manager.clone();
         let task_id_clone3 = task.id.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            db3.with_conn(|conn| {
-                crate::db::task_repo::update_task_run_result(
-                    conn,
-                    &task_id_clone3,
+            db3.update_task_run_result(&task_id_clone3,
                     &finished_at,
                     status,
                     output2.as_deref(),
                     next_run_at.as_deref(),
                 )
-            })
         }).await;
 
         TaskExecutionResult {
@@ -361,11 +351,9 @@ impl ScheduledTaskScheduler {
                 }
 
                 let now = chrono::Utc::now().to_rfc3339();
-                let due_tasks = match db.with_conn(|conn| {
-                    crate::db::task_repo::get_due_tasks(conn, &now)
-                }) {
-                    Ok(Ok(tasks)) => tasks,
-                    Ok(Err(e)) | Err(e) => {
+                let due_tasks = match db.get_due_tasks(&now) {
+                    Ok(tasks) => tasks,
+                    Err(e) => {
                         error!("[Scheduler] Failed to get due tasks: {}", e);
                         continue;
                     }
@@ -409,9 +397,7 @@ impl ScheduledTaskScheduler {
     }
 
     async fn load_enabled_tasks(&self) -> Result<Vec<ScheduledTaskRow>> {
-        let tasks = self.db_manager.with_conn(|conn| {
-            crate::db::task_repo::get_enabled_tasks(conn)
-        })??;
+        let tasks = self.db_manager.get_enabled_tasks()?;
         Ok(tasks)
     }
 
@@ -482,19 +468,19 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         std::fs::write(dir.path().join("providers.json"), json!([provider("p", true, &format!("{url}/v1"), &[("m", true)])]).to_string()).unwrap();
         let paths = crate::runtime::RuntimePaths::new(dir.path().to_path_buf()).unwrap();
-        let db = paths.open_database().unwrap();
+        let db=Arc::new(paths.open_stores().unwrap());
         let past = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
         let insert = |id: &str, kind: &str, config: &str| {
-            db.with_conn(|conn| crate::db::task_repo::insert_scheduled_task(conn, id, id, None, "0 9 * * *", kind, config, None, true, Some(&past), &past, &past)).unwrap().unwrap();
+            db.insert_scheduled_task(id, id, None, "0 9 * * *", kind, config, None, true, Some(&past), &past, &past).unwrap();
         };
         insert("good", "prompt", "summarize the day");
         insert("report", "report", "summarize the day");
         insert("empty", "prompt", "   ");
         let scheduler = ScheduledTaskScheduler::new(db.clone()).with_data_dir(dir.path().to_path_buf());
         for (id, expected) in [("good", "success"), ("report", "success"), ("empty", "failed")] {
-            let task = db.with_conn(|conn| crate::db::task_repo::get_scheduled_task(conn, id)).unwrap().unwrap().unwrap();
+            let task = db.get_scheduled_task(id).unwrap().unwrap();
             let result = scheduler.execute_task(&task).await;
-            let task = db.with_conn(|conn| crate::db::task_repo::get_scheduled_task(conn, id)).unwrap().unwrap().unwrap();
+            let task = db.get_scheduled_task(id).unwrap().unwrap();
             assert_eq!(task.last_run_status.as_deref(), Some(expected), "{result:?}");
             assert!(task.next_run_at.unwrap() > chrono::Utc::now().to_rfc3339(), "the task moved to its next run");
             if expected == "success" {
@@ -504,9 +490,10 @@ mod tests {
                 assert!(result.error.unwrap().contains("no prompt"));
             }
         }
-        let due = db.with_conn(|conn| crate::db::task_repo::get_due_tasks(conn, &chrono::Utc::now().to_rfc3339())).unwrap().unwrap();
+        let due = db.get_due_tasks(&chrono::Utc::now().to_rfc3339()).unwrap();
         assert!(due.is_empty());
         server.abort();
+        let _=server.await;
     }
 
     #[tokio::test]
@@ -527,6 +514,7 @@ mod tests {
         let scheduler = ScheduledTaskScheduler::new(paths.open_database().unwrap()).with_data_dir(dir.path().to_path_buf());
         assert_eq!(scheduler.request_generation("hello", "system").await.unwrap(), "ANSWER");
         server.abort();
+        let _=server.await;
     }
 
     #[tokio::test]

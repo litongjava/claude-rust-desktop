@@ -1,5 +1,7 @@
 //! An attachable frontend for a turn owned by an independent supervisor/worker.
 //! Only the worker submits the prompt, executes tools, and persists the transcript.
+#[cfg(test)]
+use crate::fixture_sql::FixtureSql;
 use crate::{
     args::Cli,
     session::Session,
@@ -8,6 +10,7 @@ use crate::{
         live::{Action, TurnDisplay},
     },
 };
+use anyhow::Context;
 use anyhow::{ensure, Result};
 use deepseek_code_core::services::background_sessions::{self as jobs, Launch};
 use serde_json::Value;
@@ -83,10 +86,11 @@ pub async fn turn(
     input: &mut Option<TerminalInput>,
 ) -> Result<()> {
     let mut next = prompt.to_owned();
-    loop {
+    while !crate::signals::terminating() {
         let Some(kickoff) = Box::pin(single_turn(cli, session, &next, input)).await? else { return Ok(()) };
         next = kickoff;
     }
+    Ok(())
 }
 
 /// A frontend that was killed cannot release its lease, which then expires
@@ -131,18 +135,8 @@ async fn single_turn(
     if let Some(job) = settle_session(session)? {
         anyhow::bail!("{} The current prompt was not submitted.", active_worker_message(&job));
     }
-    let provider = session.selected_provider().await?;
+    let provider = session.launch_provider().await?;
     let executable = std::env::current_exe()?;
-    let arguments = crate::background_commands::arguments(
-        cli,
-        &session.paths,
-        session,
-        &session.id,
-        prompt,
-        &provider,
-    )?;
-    let environment =
-        crate::background_commands::worker_environment(session.auto_route, &provider)?;
     // Validate interactive configuration before launching a request that must survive us.
     let history = session
         .store
@@ -160,7 +154,7 @@ async fn single_turn(
         history,
     )?.with_workspace(&session.workspace);
     display.restore_numbers(session)?;
-    display.set_shell_context(root, &session.id);
+    display.set_session_context(root, session.selected_session()?);
     display.set_pinned_prompt(prompt);
     display.set_model_label(&crate::session_commands::model_label(session).await);
     if display.is_live() {
@@ -170,7 +164,12 @@ async fn single_turn(
     let proposal_frontend = if display.live.is_some() {
         Some(acquire_proposal_frontend(session).await?)
     } else { None };
+    let owner = session.binding.selected_session(&session.id)?;
+    let _admission = owner.hold_incarnation()?;
     let job = if std::env::var("DEEPSEEK_CODE_SINGLE_TURN_WORKER").as_deref() == Ok("1") {
+        let arguments = crate::background_commands::arguments(cli, &session.paths, session, &session.id, prompt, &provider)?;
+        let mut environment = crate::background_commands::worker_environment(session.auto_route, &provider)?;
+        environment.push((jobs::WORKER_GENERATION_ENV.into(), format!("{}:{}", session.id, session.binding_state().generation)));
         jobs::spawn_foreground(
             root,
             &executable,
@@ -185,9 +184,17 @@ async fn single_turn(
         )?
     } else {
         use deepseek_code_core::services::session_worker::{self, Request};
-        let worker =
+        let mut worker =
             session_worker::ensure_worker(root, &executable, &session.id, &session.workspace)
                 .await?;
+        let arguments = crate::background_commands::turn_arguments(cli, &session.paths, session, &session.id, prompt, &provider)?;
+        let mut environment = vec![("DEEPSEEK_CODE_WORKER_AUTO_ROUTE".to_owned(),session.auto_route.to_string())];
+        if session_worker::call(&worker, &Request::Ping).await?.generation_supported != Some(true) {
+            session_worker::shutdown_worker(&worker).await.context("Provider switch pending; observe the legacy job with /continue")?;
+            worker = session_worker::ensure_worker(root, &executable, &session.id, &session.workspace).await?;
+        }
+        let state = session.binding.read().context("Missing session binding")?;
+        environment.push((crate::worker_binding::SNAPSHOT_ENV.into(), serde_json::to_string(state.as_ref())?));
         let id = uuid::Uuid::new_v4().to_string();
         let response = session_worker::call(
             &worker,
@@ -208,6 +215,7 @@ async fn single_turn(
             }
         }
     };
+    drop(_admission);
     present(session, &job, input, &mut display, true, proposal_frontend.as_ref()).await?;
     if jobs::get(root, &job.id)?.status == "completed" { activate_goal_proposal(session, &job.id) } else { Ok(None) }
 }
@@ -221,7 +229,7 @@ fn activate_goal_proposal(session: &Session, job: &str) -> Result<Option<String>
 /// Attach to durable events only: never submit or recreate a worker request.
 pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<TerminalInput>) -> Result<()> {
     let job = jobs::get(&session.paths.data_dir, id)?;
-    authorize_attachment(&job, &session.id)?;
+    let _participants = jobs::hold_attachment(&session.paths.data_dir, &job, &session.selected_session()?)?;
     let workspace = session.store.workspace(&job.session_id, &session.paths.data_dir.join("workspaces"))?;
     let mut display = TurnDisplay::new(
         true,
@@ -230,7 +238,7 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
         Vec::new(),
     )?.with_workspace(&workspace);
     display.restore_numbers(session)?;
-    display.set_shell_context(&session.paths.data_dir, &job.session_id);
+    display.set_session_context(&session.paths.data_dir, jobs::participant_execution(&session.paths.data_dir, &session.selected_session()?, &job)?);
     display.set_model_label(&crate::session_commands::model_label(session).await);
     display.notice(&format!(
         "Attached to task {id}. Esc cancels; Ctrl+B or /background detaches without restarting."
@@ -249,19 +257,16 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
     Ok(())
 }
 
-fn authorize_attachment(job: &jobs::Job, session: &str) -> Result<()> {
-    ensure!(
-        job.parent_session_id == session || job.session_id == session,
-        "Task belongs to another session"
-    );
-    Ok(())
-}
-
 fn is_main_execution(root: &std::path::Path, job: &jobs::Job, session: &str) -> Result<bool> {
     Ok(job.session_id == session && deepseek_code_core::services::session_worker::job_execution_session(root, job)? == session)
 }
 
 pub(crate) fn cancel_job(session: &Session, id: &str) -> Result<()> {
+    let _participants = jobs::hold_attachment(
+        &session.paths.data_dir,
+        &jobs::get(&session.paths.data_dir, id)?,
+        &session.selected_session()?,
+    )?;
     let job = jobs::cancel(&session.paths.data_dir, id)?;
     let execution_session = deepseek_code_core::services::session_worker::job_execution_session(
         &session.paths.data_dir,
@@ -282,7 +287,8 @@ async fn present(
     sync_plan_mode: bool,
     proposal_frontend: Option<&deepseek_code_core::services::goal_proposals::Frontend>,
 ) -> Result<()> {
-    authorize_attachment(job, &session.id)?;
+    let _participants =
+        jobs::hold_attachment(&session.paths.data_dir, job, &session.selected_session()?)?;
     let root = &session.paths.data_dir;
     let result = observe(session, &job.id, &job.parent_session_id, input, display, sync_plan_mode, proposal_frontend).await;
     let still_running = result.is_err()
@@ -413,6 +419,7 @@ async fn observe(
     // loop keeps watching after cancelling, so the branch rearms.
     let mut interrupt = crate::signals::interrupt_scope();
     let mut termination_handled = false;
+    let mut terminal_actions_open = true;
     loop {
         tokio::select! {
             hooks = local_hooks.changed() => {
@@ -504,7 +511,7 @@ async fn observe(
                     display.set_activity("Working");
                 }
                 if pending.is_none() && plain_pending.is_none() && agent_pending.is_none() && question.is_none() {
-                    if let (Some(live), Some((job, description, agent))) = (&display.live, crate::background_commands::agent_question(&session.paths, &session.id)) {
+                    if let (Some(live), Some((job, description, agent))) = (&display.live, crate::background_commands::agent_question(&session.paths, session)) {
                         let (lines, heading, options) = crate::background_commands::agent_approval(&session.workspace, &description, &agent);
                         agent_pending = Some((job, agent.request_id.clone(), live.choice(lines, heading, options)));
                     }
@@ -548,9 +555,6 @@ async fn observe(
                     }
                 }
                 if drained && !matches!(job.status.as_str(), "starting"|"running") {
-                    if let Some(reader) = input.as_mut() {
-                        if let Err(error) = crate::session::requeue_unread(session, reader) { display.notice(&format!("Could not restore queued messages: {error:#}")); }
-                    }
                     if job.session_id == owner && matches!(job.status.as_str(),"completed"|"failed"|"cancelled") {jobs::acknowledge_foreground(root,id,owner)?;}
                     ensure!(job.status == "completed", "Worker {}: {}{}", id, job.status, job.error.map(|error|format!(" - {error}")).unwrap_or_default());
                     if side.is_none() && !has_proposal { return Ok(false); }
@@ -601,6 +605,7 @@ async fn observe(
             },
             answer = async { match pending.as_mut() { Some((_, answer)) => answer.await, None => std::future::pending().await } } => {
                 let (request, _) = pending.take().unwrap();
+                if crate::signals::terminating() { continue; }
                 let mut answer = answer?;
                 if let Some((plan, path)) = pending_plan.take() {
                     if answer == "edit" {
@@ -625,11 +630,17 @@ async fn observe(
                 } else { std::future::pending().await }
             } => {
                 let (request, _) = plain_pending.take().unwrap();
+                #[cfg(unix)]
+                if answer.is_err() { crate::signals::check_terminal_hangup(); }
+                if crate::signals::terminating() { continue; }
                 if let Some(answer) = answer? { answer_if_current(root, id, owner, &request, &answer)?; }
                 answered.insert(request);
                 display.set_activity("Working");
             },
-            action = display.action() => {
+            action = display.action(), if terminal_actions_open => {
+                // A closed action channel remains ready forever. Cancel once
+                // and let the observer sleep between worker status checks.
+                terminal_actions_open = action.is_some();
                 match action {
                     Some(Action::GoalDecision { id, approved }) => {
                         if let Some(frontend) = proposal_frontend {
@@ -703,7 +714,7 @@ async fn observe(
                                     // As in the reference CLI the running turn reads it after its
                                     // next tool results; unread messages become the next prompt.
                                     crate::images::share(&session.id, &prompt);
-                                    deepseek_code_core::services::input_queue::push(&session.store.db, &session.id, &prompt)?;
+                                    session.selected_session()?.enqueue_cli_prompt(&prompt)?;
                                     queued_inputs.push(prompt);
                                     display.queued(queued_inputs.clone());
                                 } else {
@@ -947,6 +958,7 @@ fn render(display: &mut TurnDisplay, event: &Value) {
             event["is_error"].as_bool().unwrap_or(false),
         ),
         "agent_progress" => display.agent_progress(
+            serde_json::from_value(event["address"].clone()).ok(),
             text("session_id"),
             text("agent_type"),
             text("status"),
@@ -1109,6 +1121,21 @@ fn result_text(event: &Value, streamed: bool) -> Option<&str> {
 #[cfg(test)]
 mod failure_tests {
     use super::*;
+    fn record_fixture_owners(paths: &deepseek_code_core::runtime::RuntimePaths, job: &jobs::Job) {
+        let stores = paths.open_database().unwrap();
+        let parent = stores.open_session(&job.parent_session_id).unwrap();
+        let target = stores.open_session(&job.session_id).unwrap();
+        let dir = paths.data_dir.join("background-tasks").join(&job.id);
+        std::fs::write(
+            dir.join("session-owners.json"),
+            serde_json::json!({
+                "parent":parent.incarnation(), "execution":target.incarnation()
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn removed_plan_mode_tool_results_do_not_change_mode() {
         for output in [
@@ -1197,7 +1224,8 @@ mod failure_tests {
         source_job.id = source_id.clone(); source_job.status = "running".into(); source_job.finished_ms = None;
         source_job.heartbeat_ms = chrono::Utc::now().timestamp_millis() as u64;
         std::fs::write(source_directory.join("state.json"), serde_json::to_vec(&source_job).unwrap()).unwrap();
-        session.store.db.with_conn(|conn| -> anyhow::Result<()> {
+        record_fixture_owners(&paths, &source_job);
+        session.store.db.shard_sql(&parent, |conn| -> anyhow::Result<()> {
             let key = format!("session.goal-proposals.{parent}");
             let text: String = conn.query_row("SELECT value FROM peripheral_settings WHERE key=?1", [&key], |row| row.get(0))?;
             let mut value: Value = serde_json::from_str(&text)?;
@@ -1206,7 +1234,8 @@ mod failure_tests {
             Ok(())
         }).unwrap().unwrap();
         std::fs::write(directory.join("state.json"), serde_json::to_vec(&job).unwrap()).unwrap();
-        std::fs::write(directory.join("owned-child.json"), serde_json::to_vec(&child).unwrap()).unwrap();
+        record_fixture_owners(&paths, &job);
+        deepseek_code_core::services::session_worker::record_job_child(&paths.data_dir,&id,&store.db.open_session(&child).unwrap()).unwrap();
         std::fs::write(directory.join("output.jsonl"), "").unwrap();
         assert!(!is_main_execution(&paths.data_dir, &job, &parent).unwrap());
         tokio::time::timeout(std::time::Duration::from_secs(3), attach(&cli, &session, &id, &mut None)).await.unwrap().unwrap();
@@ -1216,7 +1245,7 @@ mod failure_tests {
         assert!(is_main_execution(&paths.data_dir, &job, &parent).unwrap());
         tokio::time::timeout(std::time::Duration::from_secs(3), attach(&cli, &session, &id, &mut None)).await.unwrap().unwrap();
         assert!(session_goals::active(&session.store.db, &parent).unwrap().is_none());
-        std::fs::write(directory.join("owned-child.json"), serde_json::to_vec(&child).unwrap()).unwrap();
+        deepseek_code_core::services::session_worker::record_job_child(&paths.data_dir,&id,&store.db.open_session(&child).unwrap()).unwrap();
         // Cancelling an idle child also leaves the parent's separate approval intact.
         job.status = "running".into(); job.finished_ms = None; job.heartbeat_ms = chrono::Utc::now().timestamp_millis() as u64;
         std::fs::write(directory.join("state.json"), serde_json::to_vec(&job).unwrap()).unwrap();
@@ -1260,13 +1289,17 @@ mod failure_tests {
             error: None,
             launched: true,
         };
-        assert!(authorize_attachment(&job, &parent).is_ok());
-        assert!(authorize_attachment(&job, &child).is_ok());
-        assert!(authorize_attachment(&job, "unrelated").is_err());
         let directory = paths.data_dir.join("background-tasks").join(&id);
         std::fs::create_dir_all(&directory).unwrap();
         let state = serde_json::to_vec(&job).unwrap();
         std::fs::write(directory.join("state.json"), &state).unwrap();
+        assert!(jobs::list(&paths.data_dir, Some(&parent)).unwrap().is_empty(),
+            "A session list requires a published ownership record");
+        record_fixture_owners(&paths, &job);
+        assert_eq!(jobs::list(&paths.data_dir, Some(&parent)).unwrap().len(), 1);
+        assert!(jobs::authorize_attachment(&paths.data_dir, &job, &parent).is_ok());
+        assert!(jobs::authorize_attachment(&paths.data_dir, &job, &child).is_ok());
+        assert!(jobs::authorize_attachment(&paths.data_dir, &job, "unrelated").is_err());
         let events = concat!(
             "{\"type\":\"thinking\",\"delta\":\"thought\"}\n",
             "{\"type\":\"text\",\"delta\":\"existing answer\"}\n",
@@ -1280,7 +1313,7 @@ mod failure_tests {
             );
             provider.id = "fixture".into();
             provider.base_url = "http://127.0.0.1:1".into();
-            let session = Session::open(
+            let mut session = Session::open(
                 &cli,
                 &paths,
                 crate::config::Selection {
@@ -1292,6 +1325,55 @@ mod failure_tests {
             )
             .await
             .unwrap();
+            if session_id == &parent {
+                let marker = directory.join("session-owners.json");
+                let original = std::fs::read(&marker).unwrap();
+                let parent_inc = store
+                    .db
+                    .open_session(&parent)
+                    .unwrap()
+                    .incarnation()
+                    .to_owned();
+                let child_inc = store
+                    .db
+                    .open_session(&child)
+                    .unwrap()
+                    .incarnation()
+                    .to_owned();
+                let stale = uuid::Uuid::new_v4().to_string();
+                for (owner, target) in [(&stale, &child_inc), (&parent_inc, &stale)] {
+                    std::fs::write(
+                        &marker,
+                        serde_json::to_vec(&serde_json::json!({
+                            "parent":owner, "execution":target
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let show = format!("show {id}");
+                    assert!(crate::background_commands::handle(
+                        &cli,
+                        "/tasks",
+                        &show,
+                        &paths,
+                        &mut session,
+                        &mut None
+                    )
+                    .await
+                    .is_err());
+                    assert!(crate::background_commands::live_tasks(
+                        &session,
+                        &format!("/tasks {show}")
+                    )
+                    .await
+                    .is_err());
+                    assert!(!crate::background_commands::live_tasks(&session, "/tasks")
+                        .await
+                        .unwrap()
+                        .contains(&id));
+                }
+                std::fs::write(marker, original).unwrap();
+            }
             let before = session.store.history(session_id).unwrap();
             tokio::time::timeout(
                 std::time::Duration::from_secs(3),
@@ -1309,6 +1391,18 @@ mod failure_tests {
         );
         assert!(!directory.join("cancel").exists());
         assert!(!paths.data_dir.join("session-workers").exists());
+        let expected = store.db.open_session(&parent).unwrap();
+        let other = uuid::Uuid::new_v4().to_string();
+        std::fs::write(
+            directory.join("session-owners.json"),
+            serde_json::json!({
+                "parent":expected.incarnation(),"execution":other
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(jobs::authorize_attachment(&paths.data_dir, &job, &parent).is_err());
+        assert!(jobs::authorize_attachment(&paths.data_dir, &job, &child).is_err());
     }
 
     #[tokio::test]
@@ -1354,6 +1448,7 @@ mod failure_tests {
             error: None,
             launched: true,
         };
+        record_fixture_owners(&paths, &job);
         std::fs::write(
             directory.join("state.json"),
             serde_json::to_vec(&job).unwrap(),
@@ -1686,6 +1781,7 @@ mod failure_tests {
             error: None,
             launched: true,
         };
+        record_fixture_owners(&paths, &job);
         std::fs::write(
             directory.join("state.json"),
             serde_json::to_vec(&job).unwrap(),

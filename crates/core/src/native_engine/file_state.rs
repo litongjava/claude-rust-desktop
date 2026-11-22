@@ -10,7 +10,12 @@ type Stamp = (u128, u64);
 
 fn stamp(path: &Path) -> Option<Stamp> {
     let metadata = path.metadata().ok()?;
-    let modified = metadata.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
     Some((modified, metadata.len()))
 }
 
@@ -18,6 +23,7 @@ fn stamp(path: &Path) -> Option<Stamp> {
 pub(super) struct FileState {
     seen: HashMap<String, Stamp>,
     loaded: bool,
+    pub(super) session: Option<crate::db::session_store::SessionDb>,
 }
 
 pub(super) fn store(root: &Path, session: &str) -> PathBuf {
@@ -60,6 +66,26 @@ impl FileState {
             }
             if line.starts_with("```") {
                 if let Some(path) = path.take() {
+                    if let Some(session) = &self.session {
+                        let result = session.render_tracked_file(&path, |bytes| {
+                            let text = std::str::from_utf8(&bytes)?;
+                            let disk: Vec<_> = text.lines().collect();
+                            anyhow::ensure!(
+                                !lines.is_empty()
+                                    && lines.iter().all(|(number, shown)| number
+                                        .checked_sub(1)
+                                        .and_then(|n| disk.get(n))
+                                        .is_some_and(|actual| *actual == shown)),
+                                "CodeGraph source changed"
+                            );
+                            Ok(())
+                        });
+                        if let Err(error) = result {
+                            tracing::debug!(%error,"CodeGraph source did not grant edit access");
+                        }
+                        fence = false;
+                        continue;
+                    }
                     let before = stamp(&path);
                     if !lines.is_empty() {
                         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -88,21 +114,38 @@ impl FileState {
     }
 
     fn load(&mut self, store: Option<&Path>) {
-        if self.loaded { return; }
+        if self.loaded {
+            return;
+        }
         self.loaded = true;
-        if let Some(saved) = store.and_then(|path| std::fs::read(path).ok()).and_then(|bytes| serde_json::from_slice::<HashMap<String, Stamp>>(&bytes).ok()) {
-            for (path, stamp) in saved { self.seen.entry(path).or_insert(stamp); }
+        if let Some(saved) = store
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<HashMap<String, Stamp>>(&bytes).ok())
+        {
+            for (path, stamp) in saved {
+                self.seen.entry(path).or_insert(stamp);
+            }
         }
     }
 
     fn save(&self, store: Option<&Path>) {
         let Some(store) = store else { return };
-        if let Some(parent) = store.parent() { let _ = std::fs::create_dir_all(parent); }
-        if let Ok(bytes) = serde_json::to_vec(&self.seen) { let _ = std::fs::write(store, bytes); }
+        if let Some(parent) = store.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(&self.seen) {
+            let _ = std::fs::write(store, bytes);
+        }
     }
 
     /// The model has now seen this file as it is on disk.
     pub fn record(&mut self, path: &Path, store: Option<&Path>) {
+        if let Some(session) = &self.session {
+            if let Err(error) = session.read_tracked_file(path) {
+                tracing::debug!(%error,"Could not record file state after write");
+            }
+            return;
+        }
         self.load(store);
         if let Some(stamp) = stamp(path) {
             self.seen.insert(path.to_string_lossy().into_owned(), stamp);
@@ -112,8 +155,19 @@ impl FileState {
 
     /// Why an Edit or overwriting Write of `path` must not run, if it must not.
     /// `history` lists files read in transcripts saved before stamps existed.
-    pub fn check(&mut self, tool_name: &str, path: &Path, store: Option<&Path>, history: impl FnOnce() -> Vec<PathBuf>) -> Option<String> {
-        if !path.is_file() { return None; }
+    pub fn check(
+        &mut self,
+        tool_name: &str,
+        path: &Path,
+        store: Option<&Path>,
+        history: impl FnOnce() -> Vec<PathBuf>,
+    ) -> Option<String> {
+        if let Some(session) = &self.session {
+            return session.check_file_write(path).err().map(|e| e.to_string());
+        }
+        if !path.is_file() {
+            return None;
+        }
         self.load(store);
         let key = path.to_string_lossy().into_owned();
         match self.seen.get(&key) {
@@ -161,21 +215,31 @@ mod tests {
         std::fs::write(&file, "one").unwrap();
         let saved = store(dir.path(), "s1");
         let mut state = FileState::default();
-        assert!(state.check("Edit", &file, Some(&saved), Vec::new).unwrap().contains("not been read"));
+        assert!(state
+            .check("Edit", &file, Some(&saved), Vec::new)
+            .unwrap()
+            .contains("not been read"));
         state.record(&file, Some(&saved));
         assert!(state.check("Edit", &file, Some(&saved), Vec::new).is_none());
 
         // A later turn's executor loads the saved state and sees the outside change.
         std::fs::write(&file, "changed by the user").unwrap();
         let mut next = FileState::default();
-        assert!(next.check("Write", &file, Some(&saved), Vec::new).unwrap().contains("modified since read"));
+        assert!(next
+            .check("Write", &file, Some(&saved), Vec::new)
+            .unwrap()
+            .contains("modified since read"));
         next.record(&file, Some(&saved));
         assert!(next.check("Write", &file, Some(&saved), Vec::new).is_none());
 
         // New files and reads from older transcripts are allowed.
-        assert!(next.check("Write", &dir.path().join("new.txt"), Some(&saved), Vec::new).is_none());
+        assert!(next
+            .check("Write", &dir.path().join("new.txt"), Some(&saved), Vec::new)
+            .is_none());
         let other = dir.path().join("b.txt");
         std::fs::write(&other, "x").unwrap();
-        assert!(FileState::default().check("Edit", &other, None, || vec![other.clone()]).is_none());
+        assert!(FileState::default()
+            .check("Edit", &other, None, || vec![other.clone()])
+            .is_none());
     }
 }

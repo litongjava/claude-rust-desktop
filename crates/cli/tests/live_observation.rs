@@ -4,6 +4,9 @@
 //! observes the same session. They check the durable publication of intermediate
 //! progress, settlement after the owner dies, and that observing never requests
 //! a model response or re-executes a tool.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
 use deepseek_code_core::{
     db::{message_repo, turn_repo, DbManager},
     runtime::RuntimePaths,
@@ -133,7 +136,7 @@ impl Mock {
 
 struct Project {
     temp: tempfile::TempDir,
-    db: Arc<DbManager>,
+    db: Arc<deepseek_code_core::db::session_store::Stores>,
 }
 
 impl Project {
@@ -178,13 +181,13 @@ impl Project {
     fn assistant(&self, id: &str) -> Option<(String, String, usize, bool)> {
         let rows = self
             .db
-            .with_conn(|conn| message_repo::get_messages_by_conversation(conn, id))
+            .shard_sql(&id, |conn| message_repo::get_messages_by_conversation(conn, id))
             .ok()?
             .ok()?;
         let row = rows.iter().rev().find(|row| row.role == "assistant")?;
         let tools = self
             .db
-            .with_conn(|conn| message_repo::get_tool_calls_for_message(conn, &row.id))
+            .shard_sql(&id, |conn| message_repo::get_tool_calls_for_message(conn, &row.id))
             .ok()?
             .ok()?;
         let completed = tools.iter().any(|tool| tool.output.is_some());
@@ -331,7 +334,7 @@ async fn a_headless_turn_publishes_tool_and_text_progress_before_it_finishes() {
     );
     let rows = project
         .db
-        .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &id))
+        .shard_sql(&id, |conn| message_repo::get_messages_by_conversation(conn, &id))
         .unwrap()
         .unwrap();
     let assistant = rows
@@ -347,7 +350,7 @@ async fn a_headless_turn_publishes_tool_and_text_progress_before_it_finishes() {
     assert!(assistant.content.contains("streamed23"));
     let tools = project
         .db
-        .with_conn(|conn| message_repo::get_tool_calls_for_message(conn, &assistant.id))
+        .shard_sql(&id, |conn| message_repo::get_tool_calls_for_message(conn, &assistant.id))
         .unwrap()
         .unwrap();
     assert_eq!(tools.len(), 1);
@@ -357,7 +360,7 @@ async fn a_headless_turn_publishes_tool_and_text_progress_before_it_finishes() {
         .is_some_and(|output| output.contains("fixture contents")));
     let turn = project
         .db
-        .with_conn(|conn| turn_repo::get_message_turn(conn, &assistant.id))
+        .shard_sql(&id, |conn| turn_repo::get_message_turn(conn, &assistant.id))
         .unwrap()
         .unwrap()
         .unwrap();
@@ -386,7 +389,7 @@ async fn a_killed_owner_is_settled_without_replay_and_only_an_explicit_continuat
 
     let running = project
         .db
-        .with_conn(|conn| turn_repo::running_turn(conn, &id))
+        .shard_sql(&id, |conn| turn_repo::running_turn(conn, &id))
         .unwrap()
         .unwrap()
         .expect("the killed turn is still running in the database");
@@ -401,7 +404,7 @@ async fn a_killed_owner_is_settled_without_replay_and_only_an_explicit_continuat
     );
     let settled = project
         .db
-        .with_conn(|conn| turn_repo::latest_turn(conn, &id))
+        .shard_sql(&id, |conn| turn_repo::latest_turn(conn, &id))
         .unwrap()
         .unwrap()
         .unwrap();
@@ -432,7 +435,7 @@ async fn a_killed_owner_is_settled_without_replay_and_only_an_explicit_continuat
     );
     let latest = project
         .db
-        .with_conn(|conn| turn_repo::latest_turn(conn, &id))
+        .shard_sql(&id, |conn| turn_repo::latest_turn(conn, &id))
         .unwrap()
         .unwrap()
         .unwrap();
@@ -442,14 +445,14 @@ async fn a_killed_owner_is_settled_without_replay_and_only_an_explicit_continuat
     // The killed call is not executed a second time.
     let rows = project
         .db
-        .with_conn(|conn| message_repo::get_messages_by_conversation(conn, &id))
+        .shard_sql(&id, |conn| message_repo::get_messages_by_conversation(conn, &id))
         .unwrap()
         .unwrap();
     let mut reads = 0;
     for row in rows.iter().filter(|row| row.role == "assistant") {
         let tools = project
             .db
-            .with_conn(|conn| message_repo::get_tool_calls_for_message(conn, &row.id))
+            .shard_sql(&id, |conn| message_repo::get_tool_calls_for_message(conn, &row.id))
             .unwrap()
             .unwrap();
         reads += tools.iter().filter(|tool| tool.name == "Read").count();
@@ -598,11 +601,11 @@ async fn ownership_survives_a_delayed_post_compact_hook() {
     // could settle it as interrupted while it is alive.
     for _ in 0..8 {
         assert!(
-            deepseek_code_core::services::session_messages::execution_active(&data, &id).unwrap(),
+            deepseek_code_core::db::session_store::SessionAccess::select_session(&store_db(&data),&id).unwrap().execution_active(&data).unwrap(),
             "the turn lost execution ownership during the compaction hook"
         );
         let record = store_db(&data)
-            .with_conn(|conn| turn_repo::latest_turn(conn, &id))
+            .shard_sql(&id, |conn| turn_repo::latest_turn(conn, &id))
             .unwrap()
             .unwrap()
             .unwrap();
@@ -630,7 +633,7 @@ async fn ownership_survives_a_delayed_post_compact_hook() {
         "one failed attempt plus one retry"
     );
     let record = store_db(&data)
-        .with_conn(|conn| turn_repo::latest_turn(conn, &id))
+        .shard_sql(&id, |conn| turn_repo::latest_turn(conn, &id))
         .unwrap()
         .unwrap()
         .unwrap();
@@ -641,7 +644,7 @@ async fn ownership_survives_a_delayed_post_compact_hook() {
     );
 }
 
-fn store_db(data: &std::path::Path) -> Arc<DbManager> {
+fn store_db(data: &std::path::Path) -> Arc<deepseek_code_core::db::session_store::Stores> {
     RuntimePaths::new(data.to_path_buf())
         .unwrap()
         .open_database()
@@ -666,14 +669,12 @@ async fn observing_a_dead_owner_keeps_queued_notifications_pending() {
     let _ = child.wait().await;
 
     // A finished background task left a notification for this session.
-    deepseek_code_core::services::input_queue::push(
-        &project.db,
-        &id,
+    project.db.open_session(&id).unwrap().enqueue_cli_notification(
         "<task-notification>background build finished</task-notification>",
     )
     .unwrap();
     let pending = |project: &Project, id: &str| {
-        deepseek_code_core::services::input_queue::any(&project.db, id, |_| true).unwrap()
+        project.db.pending_input(id, |_| true).unwrap()
     };
     assert!(pending(&project, &id));
 
@@ -696,7 +697,7 @@ async fn observing_a_dead_owner_keeps_queued_notifications_pending() {
     );
     let settled = project
         .db
-        .with_conn(|conn| turn_repo::latest_turn(conn, &id))
+        .shard_sql(&id, |conn| turn_repo::latest_turn(conn, &id))
         .unwrap()
         .unwrap()
         .unwrap();

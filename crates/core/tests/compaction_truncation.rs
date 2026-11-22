@@ -1,4 +1,7 @@
 //! Bounded recovery when a summary hits its output limit, against local fixtures.
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 use axum::{extract::DefaultBodyLimit, routing::post, Json, Router};
 use deepseek_code_core::{
     cache::FileCache,
@@ -520,7 +523,7 @@ fn attach_tool_result(fixture: &Fixture, name: &str, output: &str) {
     let message_id = fixture
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&fixture.id, |conn| {
             Ok::<String, anyhow::Error>(
                 conn.query_row(
                     "SELECT id FROM messages WHERE conversation_id=?1 AND role='assistant'",
@@ -535,7 +538,7 @@ fn attach_tool_result(fixture: &Fixture, name: &str, output: &str) {
     fixture
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&fixture.id, |conn| {
             deepseek_code_core::db::message_repo::insert_tool_call(
                 conn,
                 &format!("{message_id}:tool-1"),
@@ -1076,10 +1079,10 @@ async fn persistent_truncation_stops_within_each_fragment_allowance_and_never_ca
     let cached = fixture
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&fixture.id, |conn| {
             Ok::<Option<String>, anyhow::Error>(conn
                 .query_row(
-                    "SELECT value FROM peripheral_settings WHERE key LIKE 'compaction.checkpoint.%'",
+                    "SELECT group_concat(summary) FROM compaction_checkpoint HAVING count(*)>0",
                     [],
                     |row| row.get::<_, String>(0),
                 )
@@ -1204,10 +1207,10 @@ async fn a_failing_fragment_keeps_the_others_and_spends_only_its_own_allowance()
         let cache = fixture
             .store
             .db
-            .with_conn(|conn| {
+            .shard_sql(&fixture.id, |conn| {
                 Ok::<Option<String>, anyhow::Error>(conn
                     .query_row(
-                        "SELECT value FROM peripheral_settings WHERE key LIKE 'compaction.checkpoint.%'",
+                        "SELECT group_concat(summary) FROM compaction_checkpoint HAVING count(*)>0",
                         [],
                         |row| row.get::<_, String>(0),
                     )
@@ -1774,7 +1777,7 @@ async fn local_summary_recovery_handles_truncation() {
     let message_id = fixture
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&fixture.id, |conn| {
             conn.query_row(
                 "SELECT id FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC LIMIT 1",
                 [&fixture.id],
@@ -2068,10 +2071,10 @@ fn cached_checkpoint(fixture: &Fixture) -> Option<String> {
     fixture
         .store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&fixture.id, |conn| {
             Ok::<Option<String>, anyhow::Error>(conn
                 .query_row(
-                    "SELECT value FROM peripheral_settings WHERE key LIKE 'compaction.checkpoint.%'",
+                    "SELECT group_concat(summary) FROM compaction_checkpoint HAVING count(*)>0",
                     [],
                     |row| row.get::<_, String>(0),
                 )

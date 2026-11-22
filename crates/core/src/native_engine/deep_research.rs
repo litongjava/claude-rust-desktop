@@ -21,6 +21,7 @@ impl ProgressGuard {
     fn finish(&mut self, status: &str) {
         self.finished = true;
         let _ = self.sender.try_send(EngineEvent::AgentProgress {
+            address: None,
             session_id: self.id.clone(),
             agent_type: "deep-research".into(),
             status: status.into(),
@@ -286,6 +287,7 @@ impl ToolLoopExecutor {
         let _ = self
             .event_tx
             .send(EngineEvent::AgentProgress {
+                address: None,
                 session_id: guard.run.id.clone(),
                 agent_type: "deep-research".into(),
                 status: format!("phase:{phase}"),
@@ -747,6 +749,13 @@ mod tests {
         crate::config::OrchestrationConfig::init_global().unwrap();
         let temp = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(temp.path().join("data")).unwrap();
+        // Built-in skills default to off; this fixture opts deep-research in.
+        crate::skills::states::set(
+            &paths.data_dir,
+            "deep-research",
+            crate::skills::states::SkillState::User,
+        )
+        .unwrap();
         let context =
             ServiceContext::open(paths.clone(), Arc::new(EnvironmentCredentials)).unwrap();
         let sessions = crate::runtime::SessionStore::new(context.db.clone());
@@ -847,10 +856,10 @@ mod tests {
             events,
         }
     }
-    fn saved_runs(context: &ServiceContext) -> Vec<Run> {
+    fn saved_runs(context: &ServiceContext, parent: &str) -> Vec<Run> {
         context
             .db
-            .with_conn(|conn| {
+            .fixture_shard(parent, |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT value FROM peripheral_settings WHERE key LIKE 'workflow.research-%'",
                 )?;
@@ -873,7 +882,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.0.contains("Fixture summary"));
-        let stored = saved_runs(&run.context);
+        let stored = saved_runs(&run.context,run.executor.conv_id.as_deref().unwrap());
         assert_eq!(stored.len(), 1);
         let state = &stored[0];
         assert_eq!(state.status, RunStatus::Completed);
@@ -914,7 +923,7 @@ mod tests {
                 matches!(mode, "failed_vote" | "no_quorum" | "split_vote"),
                 "{mode}: {result:?}"
             );
-            let saved = saved_runs(&run.context);
+            let saved = saved_runs(&run.context,run.executor.conv_id.as_deref().unwrap());
             let state = &saved[0];
             match mode {
                 "failed_vote" | "no_quorum" | "split_vote" => {
@@ -958,7 +967,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(result.is_err(), "{mode}: {result:?}");
-            let saved = saved_runs(&run.context);
+            let saved = saved_runs(&run.context,run.executor.conv_id.as_deref().unwrap());
             assert_eq!(saved[0].status, RunStatus::Failed, "{mode}");
             assert!(
                 saved[0]
@@ -991,29 +1000,13 @@ mod tests {
             drop(future);
             tokio::task::yield_now().await;
             assert!(run.executor.answer_waiters.lock().await.is_empty());
-            let saved = saved_runs(&run.context);
+            let saved = saved_runs(&run.context,run.executor.conv_id.as_deref().unwrap());
             assert_eq!(saved.len(), 1);
             assert_eq!(saved[0].status, RunStatus::Cancelled);
-            let children = run
-                .context
-                .db
-                .with_conn(|conn| {
-                    let mut stmt = conn.prepare(
-                        "SELECT value FROM peripheral_settings WHERE key LIKE 'delegation.%'",
-                    )?;
-                    let rows = stmt
-                        .query_map([], |r| r.get::<_, String>(0))?
-                        .collect::<std::result::Result<Vec<_>, _>>()?;
-                    Ok::<_, rusqlite::Error>(rows)
-                })
-                .unwrap()
-                .unwrap();
-            assert!(children
-                .iter()
-                .any(|s| serde_json::from_str::<Value>(s).unwrap()["status"] == "cancelled"));
-            assert!(children
-                .iter()
-                .all(|s| serde_json::from_str::<Value>(s).unwrap()["status"] != "running"));
+            let children: Vec<_> = run.context.db.conversations().unwrap().iter()
+                .filter_map(|row| run.context.child_progress(&row.id).unwrap()).collect();
+            assert!(children.iter().any(|s| s["status"] == "cancelled"));
+            assert!(children.iter().all(|s| s["status"] != "running"));
         }
     }
     #[tokio::test]

@@ -14,7 +14,7 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         ("TodoRead", "Read the session's durable todo list.",json!({}),vec![]),
         // `TaskOutput` is not advertised. Its dispatch alias remains below for
         // old transcripts and is not discoverable through ToolLoad.
-        ("TaskStop", "\n- Stops a running background task by its ID\n- Takes a task_id parameter identifying the task to stop\n- Stops a background shell together with its descendant processes; for other task records it marks the record cancelled\n- Returns a success or failure status\n- Use this tool when you need to terminate a long-running task\n",json!({"task_id":{"description":"The ID of the background task to stop.","type":"string"},"shell_id":{"description":"Deprecated: use task_id instead","type":"string"}}),vec![]),
+        ("TaskStop", "Stop a task by ID. A managed shell, Monitor, Agent, Workflow or ToolScript job gets a cancellation request and stops through its owner; a shell's process tree is terminated with it. Any other task record is marked cancelled without touching a process. Cancellation is requested rather than confirmed, so use TaskGet to see the final status.",json!({"task_id":{"description":"ID of the task to stop, as returned when it started.","type":"string"},"shell_id":{"description":"Old alias for `task_id`; use `task_id`.","type":"string"}}),vec![]),
     ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).chain(std::iter::once(super::shell_input::definition())).collect()
 }
 
@@ -53,9 +53,7 @@ pub fn display_title(root: &Path, session: &str, input: &Value) -> Option<String
             .is_file()
     {
         let job = crate::services::background_sessions::get(root, id).ok()?;
-        if job.parent_session_id != session {
-            return None;
-        }
+        crate::services::background_sessions::authorize_job(root, &job, &session).ok()?;
         job.title
     } else {
         let db = rusqlite::Connection::open_with_flags(
@@ -167,15 +165,35 @@ pub async fn execute_for_session_async(
                     .exists()
             {
                 use crate::services::background_sessions;
+                let (block, timeout) = if name == "TaskStop" {
+                    (false, std::time::Duration::ZERO)
+                } else {
+                    super::background_shell::wait_policy(&input)?
+                };
+                let started = tokio::time::Instant::now();
+                let deadline = started + timeout;
+                // A poll may read an immediately available snapshot. All reads,
+                // including authorization, share the same bounded allowance.
+                let read_deadline = if !block || timeout.is_zero() {
+                    started + std::time::Duration::from_millis(100)
+                } else {
+                    deadline
+                };
                 let (read_root, read_id) = (root.to_owned(), id.to_owned());
-                let mut job = tokio::task::spawn_blocking(move || {
-                    background_sessions::get(&read_root, &read_id)
-                })
-                .await??;
-                ensure!(
-                    job.parent_session_id == session,
-                    "Task belongs to another session"
-                );
+                let read_owner = session.to_owned();
+                let admission = tokio::task::spawn_blocking(move || {
+                    let job = background_sessions::get(&read_root, &read_id)?;
+                    background_sessions::authorize_job(&read_root, &job, &read_owner)?;
+                    Ok::<_, anyhow::Error>(job)
+                });
+                let mut job = if name == "TaskStop" {
+                    admission.await??
+                } else {
+                    match tokio::time::timeout_at(read_deadline, admission).await {
+                        Ok(result) => result??,
+                        Err(_) => return Ok(json!({"task_id":id,"retrieval_status":"timeout"})),
+                    }
+                };
                 if name == "TaskStop" {
                     let (root, id) = (root.to_owned(), id.to_owned());
                     let mut value = tokio::task::spawn_blocking(move || {
@@ -191,8 +209,6 @@ pub async fn execute_for_session_async(
                     });
                     return Ok(value);
                 }
-                let (block, timeout) = super::background_shell::wait_policy(&input)?;
-                let deadline = tokio::time::Instant::now() + timeout;
                 let mut timed_out = false;
                 if block {
                     loop {
@@ -209,40 +225,35 @@ pub async fn execute_for_session_async(
                         )
                         .await;
                         let (root, id) = (root.to_owned(), id.to_owned());
-                        job = tokio::task::spawn_blocking(move || {
-                            background_sessions::get(&root, &id)
-                        })
-                        .await??;
+                        let refresh = tokio::task::spawn_blocking(move || background_sessions::get(&root, &id));
+                        match tokio::time::timeout_at(read_deadline, refresh).await {
+                            Ok(result) => job = result??,
+                            Err(_) => { timed_out = true; break; }
+                        }
                     }
                 }
                 // The output files and the optional SQLite report are read on
                 // the blocking pool. An explicit wait deadline bounds the whole
                 // retrieval, so a slow disk or busy database cannot outlive it.
-                // A wait that used its whole deadline still gets a short bounded
-                // read, so the caller sees output already written; a busy disk or
-                // database still cannot hold the call open for long. timeout:0
-                // likewise reads the current snapshot without waiting.
                 let page = super::output_page::PageRequest::parse(&input)?;
                 let (root, id) = (root.to_owned(), id.to_owned());
-                let snapshot = tokio::task::spawn_blocking(move || match page {
-                    super::output_page::PageRequest::Disabled => job_snapshot(&root, &id),
-                    page => job_page(&root, &id, &page),
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    super::bash_process::capture_sync(|| match page {
+                        super::output_page::PageRequest::Disabled => job_snapshot(&root, &id),
+                        page => job_page(&root, &id, &page),
+                    })
                 });
-                let snapshot = if block {
-                    let read_deadline = deadline
-                        .max(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
-                    match tokio::time::timeout_at(read_deadline, snapshot).await {
-                        Ok(result) => Some(result??),
-                        Err(_) => {
-                            timed_out = true;
-                            None
-                        }
+                let snapshot = match tokio::time::timeout_at(read_deadline, snapshot).await {
+                    Ok(result) => Some(result?),
+                    Err(_) => {
+                        timed_out = true;
+                        None
                     }
-                } else {
-                    Some(snapshot.await??)
                 };
                 let (status, mut value) = match snapshot {
-                    Some(value) => {
+                    Some((result, metadata)) => {
+                        let value = result?;
+                        super::bash_process::replace_metadata(metadata);
                         let status = value["status"].as_str().unwrap_or_default().to_owned();
                         (status, value)
                     }
@@ -279,7 +290,8 @@ pub async fn execute_for_session_async(
 fn job_snapshot(root: &Path, id: &str) -> Result<Value> {
     use crate::services::background_sessions;
     let job = background_sessions::get(root, id)?;
-    let (stdout, stderr) = background_sessions::output(root, id)?;
+    let ((stdout, event_size), (stderr, err_size)) =
+        background_sessions::output_snapshot(root, id)?;
     let mut stdout = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -291,9 +303,22 @@ fn job_snapshot(root: &Path, id: &str) -> Result<Value> {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let mut from_tail = event_size.from_tail;
     if let Some(report) = job_report(root, &job) {
         stdout = report;
+        from_tail = false;
     }
+    // stdout is a UTF-8 projection of event payloads (or a stored report).
+    // JSONL record metadata is not part of that stream.
+    let out_size = crate::performance::command_output::SnapshotSize {
+        read: stdout.len(),
+        from_tail,
+        ..Default::default()
+    };
+    super::bash_process::publish_snapshot(
+        [out_size, err_size],
+        [stdout.len(), stderr.len()],
+    );
     let id = job.id.clone();
     Ok(
         json!({"id":id,"task_id":job.id,"subject":job.title,"status":job.status,"stdout":stdout,"stderr":stderr,"exit_code":job.exit_code,"error":job.error}),
@@ -309,23 +334,9 @@ fn job_report(root: &Path, job: &crate::services::background_sessions::Job) -> O
     if !terminal_status(&job.status) {
         return None;
     }
-    if !root.join(crate::runtime::DATABASE_FILE).exists() {
-        return None;
-    }
-    let execution = crate::services::session_worker::job_execution_session(root, job).ok()?;
-    let conn = rusqlite::Connection::open_with_flags(
-        root.join(crate::runtime::DATABASE_FILE),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
-    conn.query_row(
-        "SELECT content FROM messages WHERE conversation_id=?1 AND role='assistant' AND content<>'' ORDER BY sort_order DESC, rowid DESC LIMIT 1",
-        [&execution],
-        |row| row.get(0),
-    )
-    .optional()
-    .ok()
-    .flatten()
+    let owners = crate::services::background_sessions::JobOwners::load(root, job).ok()??;
+    let stores = crate::db::session_store::Stores::open(root).ok()?;
+    owners.report(root, job, &stores).ok().flatten()
 }
 
 /// Head of a string on a UTF-8 character boundary.
@@ -405,6 +416,7 @@ fn job_page(root: &Path, id: &str, request: &super::output_page::PageRequest) ->
         let stdout = bounded_head(&report, *max_bytes);
         let remaining = max_bytes.saturating_sub(stdout.text.len() as u64);
         let stderr = output_page::read_stream_page(stderr_stream.as_mut(), err, remaining, done)?;
+        super::bash_process::publish_page(&stdout, &stderr);
         let truncated = stdout.truncated || stderr.truncated;
         value["stdout"] = json!(stdout.text);
         value["stderr"] = json!(stderr.text);
@@ -436,6 +448,7 @@ fn job_page(root: &Path, id: &str, request: &super::output_page::PageRequest) ->
     )
     .with_out_skip(stdout.skip)
     .with_out_join(stdout.joined);
+    super::bash_process::publish_page(&stdout, &stderr);
     let truncated = stdout.truncated || stderr.truncated;
     value["stdout"] = json!(stdout.text);
     value["stderr"] = json!(stderr.text);
@@ -1667,6 +1680,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_job_reads_require_recorded_incarnations() -> Result<()> {
+        use crate::db::session_store::Stores;
+        let root = tempfile::tempdir()?;
+        let stores = Stores::open(root.path())?;
+        let parent = uuid::Uuid::new_v4().to_string();
+        let child = uuid::Uuid::new_v4().to_string();
+        let owner = stores.create(&parent, Default::default())?;
+        let target = stores.create(&child, Default::default())?;
+        target.write(|w| w.append("assistant", "recorded history"))?;
+        let job = uuid::Uuid::new_v4().to_string();
+        let dir = crate::services::background_sessions::directory(root.path(), &job)?;
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(
+            dir.join("state.json"),
+            json!({
+                "id":job,"parent_session_id":parent,"session_id":child,"title":"fixture",
+                "status":"completed","started_ms":1,"heartbeat_ms":1
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            dir.join("session-owners.json"),
+            json!({
+                "parent":owner.incarnation(),"execution":target.incarnation()
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            dir.join("output.jsonl"),
+            "{\"type\":\"result\",\"result\":\"saved output\"}\n",
+        )?;
+        let get = |input| execute_for_session_async("TaskGet", input, root.path(), &parent);
+        assert_eq!(
+            get(json!({"task_id":job})).await?["stdout"],
+            "recorded history"
+        );
+        target.delete()?;
+        stores
+            .create(&child, Default::default())?
+            .write(|w| w.append("assistant", "new history"))?;
+        for input in [
+            json!({"task_id":job}),
+            json!({"task_id":job,"max_output_bytes":80}),
+        ] {
+            assert_eq!(get(input).await?["stdout"], "saved output");
+        }
+        owner.delete()?;
+        stores.create(&parent, Default::default())?;
+        assert!(get(json!({"task_id":job})).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn background_job_task_get_deadline_bounds_a_locked_report_database() {
         use std::time::{Duration, SystemTime, UNIX_EPOCH};
         let root = tempfile::tempdir().unwrap();
@@ -1689,9 +1755,24 @@ mod tests {
         // open beyond the wait deadline plus a short bounded read. The job's
         // own status is still reported; only the supplementary report remains
         // unavailable.
-        let lock =
-            rusqlite::Connection::open(root.path().join(crate::runtime::DATABASE_FILE)).unwrap();
-        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let child=job["session_id"].as_str().unwrap();
+        let stores=crate::db::session_store::Stores::open(root.path()).unwrap();
+        stores.create(child,Default::default()).unwrap();
+        stores.create(&session, Default::default()).unwrap();
+        crate::services::background_sessions::JobOwners::publish(
+            root.path(),
+            &serde_json::from_value(job.clone()).unwrap(),
+        )
+        .unwrap();
+        let lock = rusqlite::Connection::open_with_flags(
+            root.path().join("sessions").join(child).join("session.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        // In WAL, BEGIN EXCLUSIVE alone only excludes other writers.
+        // Exclusive connection locking holds the database file against readers too.
+        lock.execute_batch("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
         let started = tokio::time::Instant::now();
         let value = execute_for_session_async(
             "TaskGet",
@@ -1703,10 +1784,48 @@ mod tests {
         .unwrap();
         let elapsed = started.elapsed();
         lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
         assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
         assert_eq!(value["status"], "completed");
         assert_eq!(value["retrieval_status"], "timeout");
+    }
+
+    #[tokio::test]
+    async fn background_job_task_get_reads_committed_report_during_a_wal_write() {
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let job = job_fixture(root.path(), &session, "completed", Some("committed report"));
+        let path = root
+            .path()
+            .join("sessions")
+            .join(&session)
+            .join("session.db");
+        let writer = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        let journal: String = writer
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        writer
+            .execute_batch(
+                "BEGIN EXCLUSIVE; UPDATE messages SET content='uncommitted' WHERE role='assistant'",
+            )
+            .unwrap();
+        let result = execute_for_session_async(
+            "TaskGet",
+            json!({"task_id":job,"block":true,"timeout":400}),
+            root.path(),
+            &session,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["retrieval_status"], "success");
+        assert_eq!(result["stdout"], "committed report");
+        writer.execute_batch("ROLLBACK").unwrap();
     }
 
     #[tokio::test]
@@ -1723,8 +1842,20 @@ mod tests {
             .as_millis() as u64;
         let job = json!({"id":id,"foreground":false,"parent_session_id":session,"session_id":uuid::Uuid::new_v4().to_string(),"title":"Review changes","status":"running","supervisor_pid":null,"child_pid":null,"started_ms":now,"heartbeat_ms":now,"finished_ms":null,"exit_code":null,"error":null});
         std::fs::write(dir.join("state.json"), job.to_string()).unwrap();
-        let lock =
-            rusqlite::Connection::open(root.path().join(crate::runtime::DATABASE_FILE)).unwrap();
+        let child=job["session_id"].as_str().unwrap();
+        let stores=crate::db::session_store::Stores::open(root.path()).unwrap();
+        stores.create(child,Default::default()).unwrap();
+        stores.create(&session, Default::default()).unwrap();
+        crate::services::background_sessions::JobOwners::publish(
+            root.path(),
+            &serde_json::from_value(job.clone()).unwrap(),
+        )
+        .unwrap();
+        let lock = rusqlite::Connection::open_with_flags(
+            root.path().join("sessions").join(child).join("session.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
         lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
         // timeout:0 still reads the snapshot, bounded by a short read deadline.
         let started = tokio::time::Instant::now();
@@ -1962,23 +2093,9 @@ mod tests {
     fn insert_assistant(root: &Path, session: &str, id: &str, text: &str, order: i64) {
         let paths = crate::runtime::RuntimePaths::new(root.to_path_buf()).unwrap();
         let store = crate::runtime::SessionStore::new(paths.open_database().unwrap());
-        store
-            .db
-            .with_conn(|conn| {
-                crate::db::message_repo::insert_message(
-                    conn,
-                    id,
-                    session,
-                    "assistant",
-                    text,
-                    None,
-                    "2026-01-01T00:00:00Z",
-                    false,
-                    order,
-                )
-            })
-            .unwrap()
-            .unwrap();
+        store.db.fixture_history_write(session, |conn| crate::db::message_repo::insert_message(
+            conn,id,session,"assistant",text,None,"2026-01-01T00:00:00Z",false,order
+        )).unwrap();
     }
 
     fn set_job_status(root: &Path, id: &str, status: &str) {
@@ -2034,10 +2151,49 @@ mod tests {
         if let Some(stderr) = stderr {
             std::fs::write(directory.join("stderr.log"), stderr).unwrap();
         }
+        let stores = crate::db::session_store::Stores::open(root).unwrap();
+        if stores.global().conversation(session).unwrap().is_none() {
+            stores.create(session, Default::default()).unwrap();
+        }
+        crate::services::background_sessions::JobOwners::publish(root, &job).unwrap();
         if let Some(report) = report {
             insert_assistant(root, session, "report-1", report, 1);
         }
         id
+    }
+
+    #[tokio::test]
+    async fn job_task_get_keeps_raw_sizes_across_the_blocking_page_read() {
+        use crate::tools::bash_process::{with_capture, CommandMetadata};
+
+        let root = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        let id = job_fixture_with(root.path(), &session, "running", None, &[], None);
+        let directory = crate::services::background_sessions::directory(root.path(), &id).unwrap();
+        for size in [11_999, 12_000] {
+            let mut bytes = vec![b'x'; size];
+            bytes[0] = 0xff;
+            std::fs::write(directory.join("stderr.log"), bytes).unwrap();
+            let (value, metadata) = with_capture(execute_for_session_async(
+                "TaskGet",
+                json!({"task_id":id,"max_output_bytes":16_000,"block":false}),
+                root.path(),
+                &session,
+            ))
+            .await;
+            let value = value.unwrap();
+            let text = value["stderr"].as_str().unwrap();
+            assert_eq!(text.len(), size + 2);
+            let Some(CommandMetadata::Page { bytes, widths, .. }) = metadata else {
+                panic!("missing page metrics for {size} bytes")
+            };
+            assert_eq!(bytes, [0, size]);
+            assert_eq!(widths[1].raw_bytes(text.len()), size);
+            assert_eq!(
+                crate::performance::command_output::qualifies(bytes),
+                size >= 12_000
+            );
+        }
     }
 
     #[tokio::test]

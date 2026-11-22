@@ -230,6 +230,7 @@ impl OpenAIClient {
         tools: Vec<ToolDefinition>,
         max_tokens: u32,
     ) -> Result<OpenAIResponse> {
+        let provider = &provider.current()?;
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
             let mut stream = super::provider_runtime::stream_with_options(
@@ -360,9 +361,10 @@ impl OpenAIClient {
             }
         }
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(
+        let identity = super::request_identity::RequestIdentity::from_options(
             None,
-            super::request_identity::is_opencode(provider),
+            provider,
+            &self.request_options,
         );
         let request = || async {
             let request = self
@@ -481,6 +483,7 @@ impl OpenAIClient {
         Pin<Box<dyn Stream<Item = Result<String>> + Send>>,
         crate::performance::AttemptCounter,
     )> {
+        let provider = &provider.current()?;
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
             // The built-in transport returns the HTTP attempts it really made;
@@ -499,8 +502,6 @@ impl OpenAIClient {
             .await;
         }
         let base_url = crate::native_engine::provider_manager::ProviderManager::normalize_base_url(&provider.provider.base_url);
-        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-
         let mut body_messages = Vec::new();
         
         if let Some(system) = system_prompt {
@@ -548,9 +549,40 @@ impl OpenAIClient {
             }
         }
         if let Some(messages) = body["messages"].as_array_mut() { for message in messages { if let Some(object) = message.as_object_mut() { object.remove("provider_content"); } } }
-        if let Some(capture) = context_capture { capture.record("openai-completions", &body, provider.model.context_window, max_tokens).await; }
+        self.stream_body(provider, body, max_tokens, context_capture, budget).await
+    }
+
+    pub(super) async fn stream_body(
+        &self,
+        provider: &ResolvedProvider,
+        body: Value,
+        max_tokens: u32,
+        context_capture: Option<&super::request_context::ContextCapture>,
+        budget: crate::performance::AttemptBudget,
+    ) -> Result<(
+        super::provider_runtime::ProviderStream,
+        crate::performance::AttemptCounter,
+    )> {
+        let base_url = crate::native_engine::provider_manager::ProviderManager::normalize_base_url(
+            &provider.provider.base_url,
+        );
+        let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+
+        if let Some(capture) = context_capture {
+            capture
+                .record_transport(
+                    "openai-completions",
+                    &body,
+                    provider.model.context_window,
+                    max_tokens,
+                    None,
+                    &url,
+                    &provider.model.id,
+                )
+                .await;
+        }
         let harness_headers = self.request_options.headers(provider)?;
-        let identity = super::request_identity::RequestIdentity::new(context_capture, super::request_identity::is_opencode(provider));
+        let identity = super::request_identity::RequestIdentity::from_options(context_capture, provider, &self.request_options);
         let client = if budget.is_single_post() {
             self.single_post_client()?
         } else {

@@ -1,8 +1,10 @@
 //! Explicitly scoped document tracking, model previews, and optimistic atomic apply.
 use super::{generation::Generator, lifecycle::Lease, ServiceContext};
+use crate::db::session_store::{
+    magic::MagicHistory, DocumentCatalog, DocumentImport, Projects, ServiceLeases,
+};
 use crate::permissions::{PermissionContext, PermissionManager, PermissionResult};
 use anyhow::{ensure, Context, Result};
-use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
     io::Write,
@@ -58,7 +60,11 @@ fn header(text: &str) -> Result<&str> {
         .find(|line| pattern.is_match(line))
         .context("Missing # MAGIC DOC: title header")
 }
-pub fn check(context: &ServiceContext, root: &Path, path: &Path) -> Result<Document> {
+pub fn check(
+    context: &ServiceContext<impl DocumentCatalog>,
+    root: &Path,
+    path: &Path,
+) -> Result<Document> {
     let (root, path) = scoped(root, path)?;
     let content = std::fs::read_to_string(&path)?;
     let title = header(&content)?
@@ -67,54 +73,37 @@ pub fn check(context: &ServiceContext, root: &Path, path: &Path) -> Result<Docum
         .1
         .trim()
         .to_string();
-    context.db.with_conn(|c| c.execute("INSERT INTO magic_documents(id,root,path,title) VALUES(?1,?2,?3,?4)
-        ON CONFLICT(path) DO UPDATE SET title=excluded.title WHERE magic_documents.root=excluded.root",
-        params![uuid::Uuid::new_v4().to_string(),root.to_string_lossy(),path.to_string_lossy(),title]))??;
+    context.db.track_document(&root, &path, &title)?;
     list(context, &root)?
         .into_iter()
         .find(|d| Path::new(&d.path) == path)
         .context("Document is registered under a different project root")
 }
-pub fn list(context: &ServiceContext, root: &Path) -> Result<Vec<Document>> {
+pub fn list(context: &ServiceContext<impl DocumentCatalog>, root: &Path) -> Result<Vec<Document>> {
     let root = std::fs::canonicalize(root)?;
-    context.db.with_conn(|c| -> Result<_> {
-        let mut stmt = c.prepare("SELECT id,root,path,title,auto_update,updated_at,update_count FROM magic_documents WHERE root=?1 ORDER BY path")?;
-        let rows = stmt.query_map([root.to_string_lossy().as_ref()], |r| Ok(Document { id:r.get(0)?,root:r.get(1)?,path:r.get(2)?,title:r.get(3)?,auto_update:r.get(4)?,updated_at:r.get(5)?,update_count:r.get(6)? }))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })?
+    context.db.documents(&root)
 }
-pub fn clear(context: &ServiceContext, root: &Path) -> Result<usize> {
+pub fn clear(context: &ServiceContext<impl DocumentCatalog>, root: &Path) -> Result<usize> {
     let root = std::fs::canonicalize(root)?;
-    Ok(context.db.with_conn(|c| {
-        c.execute(
-            "DELETE FROM magic_documents WHERE root=?1",
-            [root.to_string_lossy().as_ref()],
-        )
-    })??)
+    context.db.forget_documents(&root)
 }
-pub fn previews(context: &ServiceContext, root: &Path) -> Result<Vec<Preview>> {
+pub fn previews(
+    context: &ServiceContext<impl DocumentCatalog>,
+    root: &Path,
+) -> Result<Vec<Preview>> {
     let root = std::fs::canonicalize(root)?;
-    context.db.with_conn(|c| -> Result<_> {
-        let mut stmt = c.prepare("SELECT p.id,p.document_id,p.original,p.proposed FROM magic_previews p JOIN magic_documents d ON d.id=p.document_id WHERE d.root=?1 ORDER BY p.created_at DESC")?;
-        let rows = stmt.query_map([root.to_string_lossy().as_ref()], |r| Ok(Preview {id:r.get(0)?,document_id:r.get(1)?,diff:diffy::create_patch(&r.get::<_,String>(2)?, &r.get::<_,String>(3)?).to_string(),original:r.get(2)?,proposed:r.get(3)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })?
+    context.db.document_previews(&root)
 }
-pub fn set_auto(context: &ServiceContext, root: &Path, id: &str, enabled: bool) -> Result<()> {
-    ensure!(
-        list(context, root)?.iter().any(|d| d.id == id),
-        "Document is not in selected project"
-    );
-    context.db.with_conn(|c| {
-        c.execute(
-            "UPDATE magic_documents SET auto_update=?1 WHERE id=?2",
-            params![enabled, id],
-        )
-    })??;
-    Ok(())
+pub fn set_auto(
+    context: &ServiceContext<impl DocumentCatalog>,
+    root: &Path,
+    id: &str,
+    enabled: bool,
+) -> Result<()> {
+    context.db.document_auto(&root.canonicalize()?, id, enabled)
 }
 pub async fn update(
-    context: &ServiceContext,
+    context: &ServiceContext<impl DocumentCatalog + ServiceLeases + 'static>,
     root: &Path,
     id: &str,
     new_context: &str,
@@ -148,12 +137,7 @@ pub async fn update(
             proposed,
         };
         ensure!(lease.renew()?, "Document update cancelled");
-        context.db.with_conn(|c| -> Result<()> {
-            let tx = crate::db::write_transaction(&c)?;
-            tx.execute("DELETE FROM magic_previews WHERE document_id=?1", [id])?;
-            tx.execute("INSERT INTO magic_previews(id,document_id,original,proposed,created_at) VALUES(?1,?2,?3,?4,?5)", params![preview.id,id,preview.original,preview.proposed,chrono::Utc::now().to_rfc3339()])?;
-            tx.commit()?; Ok(())
-        })??;
+        context.db.save_preview(&preview)?;
         Ok(preview)
     };
     tokio::pin!(operation);
@@ -175,7 +159,7 @@ pub async fn update(
 }
 
 pub fn apply(
-    context: &ServiceContext,
+    context: &ServiceContext<impl DocumentCatalog + ServiceLeases + 'static>,
     root: &Path,
     preview_id: &str,
     permissions: &PermissionManager,
@@ -220,41 +204,17 @@ pub fn apply(
             && std::fs::read_to_string(&path)? == preview.original,
         "Document changed before apply"
     );
-    context.db.with_conn(|c| -> Result<()> {
-        let tx = crate::db::write_transaction(&c)?;
-        ensure!(
-            tx.query_row(
-                "SELECT id FROM magic_previews WHERE id=?1",
-                [preview_id],
-                |r| r.get::<_, String>(0)
-            )
-            .optional()?
-            .is_some(),
-            "Preview was removed"
-        );
-        tx.execute(
-            "UPDATE magic_documents SET updated_at=?1,update_count=update_count+1 WHERE id=?2",
-            params![chrono::Utc::now().to_rfc3339(), document.id],
-        )?;
-        tx.execute(
-            "DELETE FROM magic_previews WHERE document_id=?1",
-            [&document.id],
-        )?;
-        temporary.persist(&path)?;
-        if let Err(error) = tx.commit() {
-            rollback
-                .persist(&path)
-                .context("Database failed and file rollback failed")?;
-            return Err(error.into());
-        }
-        Ok(())
-    })??;
-    Ok(())
+    rollback
+        .as_file()
+        .set_permissions(std::fs::metadata(&path)?.permissions())?;
+    context
+        .db
+        .apply_preview(&preview, &path, temporary, rollback)
 }
 
 /// Auto-update is explicitly enabled per document and hosted for one selected project.
 pub async fn host(
-    context: ServiceContext,
+    context: ServiceContext<impl DocumentCatalog + MagicHistory + ServiceLeases + 'static>,
     root: PathBuf,
     generator: Generator,
     interval: u64,
@@ -271,41 +231,48 @@ pub async fn host(
     loop {
         let operation = async {
             if let Some(id) = &project_id {
-                context
-                    .db
-                    .with_conn(|c| crate::db::project_repo::require_trusted(c, id))??;
+                context.db.trusted_project(id)?;
             }
             let memory = super::dream::client(&context);
             for document in list(&context, &root)?.into_iter().filter(|d| d.auto_update) {
                 let memories = memory.search(&document.title, Some(5)).await?;
-                let memory_contents: Vec<String> = memories.into_iter().map(|m| m.content).collect();
-                let Some(input) = super::magic_context::collect(&context, &root, project_id.as_deref(), memory_contents.clone())? else { continue; };
-                let previous: Option<String> = context.db.with_conn(|c| {
-                    c.query_row(
-                        "SELECT input FROM magic_auto_inputs WHERE document_id=?1",
-                        [&document.id],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                })??;
-                if previous.as_deref() == Some(&input) {
+                let memory_contents: Vec<String> =
+                    memories.into_iter().map(|m| m.content).collect();
+                let Some(input) = super::magic_context::collect(
+                    &context,
+                    &root,
+                    project_id.as_deref(),
+                    memory_contents.clone(),
+                )?
+                else {
+                    continue;
+                };
+                if !context.db.input_changed(&document.id, &input)? {
                     continue;
                 }
                 let preview = update(&context, &root, &document.id, &input, &generator).await?;
                 ensure!(lease.renew()?, "Magic Docs stopped");
                 if let Some(id) = &project_id {
-                    context
-                        .db
-                        .with_conn(|c| crate::db::project_repo::require_trusted(c, id))??;
+                    context.db.trusted_project(id)?;
                 }
-                if super::magic_context::collect(&context, &root, project_id.as_deref(), memory_contents)?.as_deref() != Some(&input) { continue; }
+                if super::magic_context::collect(
+                    &context,
+                    &root,
+                    project_id.as_deref(),
+                    memory_contents,
+                )?
+                .as_deref()
+                    != Some(&input)
+                {
+                    continue;
+                }
                 // Disabling a document during generation revokes automatic apply.
                 if list(&context, &root)?
                     .iter()
                     .any(|d| d.id == document.id && d.auto_update)
                 {
                     apply(&context, &root, &preview.id, &permissions)?;
-                    context.db.with_conn(|c|c.execute("INSERT INTO magic_auto_inputs(document_id,input) VALUES(?1,?2) ON CONFLICT(document_id) DO UPDATE SET input=excluded.input",params![document.id,input]))??;
+                    context.db.record_input(&document.id, &input)?;
                 }
             }
             Ok::<_, anyhow::Error>(())
@@ -337,7 +304,7 @@ pub struct ImportReport {
     pub backup: Option<String>,
 }
 pub fn import_legacy(
-    context: &ServiceContext,
+    context: &ServiceContext<impl DocumentCatalog>,
     root: &Path,
     source: &Path,
     preview: bool,
@@ -362,28 +329,16 @@ pub fn import_legacy(
         let (root, path) = scoped(root, Path::new(&entry.path))?;
         let text = std::fs::read_to_string(&path)?;
         let title = header(&text)?.split_once(':').unwrap().1.trim().to_string();
-        documents.push((root, path, title, entry, raw.to_string()));
+        documents.push(DocumentImport {
+            root,
+            path,
+            title,
+            updated: entry.last_updated,
+            count: entry.update_count,
+            source: raw.to_string(),
+        });
     }
-    let backup = if preview {
-        None
-    } else {
-        let dir = context.paths.data_dir.join("backups");
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join(format!("magic-docs-{}.sqlite3", uuid::Uuid::new_v4()));
-        context
-            .db
-            .with_conn(|c| c.execute("VACUUM INTO ?1", [path.to_string_lossy().as_ref()]))??;
-        Some(path.to_string_lossy().into_owned())
-    };
-    context.db.with_conn(|c|->Result<_>{let tx=crate::db::write_transaction(&c)?;tx.execute("UPDATE peripheral_migrations SET version=version WHERE version=9",[])?;
-        let mut report=ImportReport{imported:0,skipped:0,preview,backup};
-        for(root,path,title,entry,raw) in documents {
-            let path=path.to_string_lossy();let old:Option<String>=tx.query_row("SELECT payload FROM legacy_magic_imports WHERE path=?1",[path.as_ref()],|r|r.get(0)).optional()?;
-            if let Some(old)=old{ensure!(old==raw,"Legacy document changed since import");report.skipped+=1;continue;}
-            let id=uuid::Uuid::new_v4().to_string();
-            tx.execute("INSERT INTO magic_documents(id,root,path,title,auto_update,updated_at,update_count) VALUES(?1,?2,?3,?4,0,?5,?6)",params![id,root.to_string_lossy(),path,title,entry.last_updated,entry.update_count])?;
-            tx.execute("INSERT INTO legacy_magic_imports(path,payload,document_id) VALUES(?1,?2,?3)",params![path,raw,id])?;report.imported+=1;
-        }
-        if preview{tx.rollback()?;}else{tx.commit()?;}Ok(report)
-    })?
+    context
+        .db
+        .import_documents(&context.paths.data_dir, &documents, preview)
 }

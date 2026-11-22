@@ -139,19 +139,28 @@ pub(crate) fn read(
     selection: Selection<'_>,
 ) -> Result<Transcript> {
     let tx = conn.unchecked_transaction()?;
-    let mut page = Page::new(&tx)?;
-    let boundary = find_boundary(&tx, session, selection.boundary)?;
+    let result = read_snapshot(&tx, session, selection)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+pub(crate) fn read_snapshot(
+    tx: &Connection,
+    session: &str,
+    selection: Selection<'_>,
+) -> Result<Transcript> {
+    let mut page = Page::new(tx)?;
+    let boundary = find_boundary(tx, session, selection.boundary)?;
     page.transcript.boundary_id = boundary.as_ref().map(|(_, id)| id.clone());
     if selection.range != Range::Before || boundary.is_some() {
         read_page(
-            &tx,
+            tx,
             session,
             &selection,
             boundary.as_ref().map(|(key, _)| key),
             &mut page,
         )?;
     }
-    tx.commit()?;
     #[cfg(test)]
     {
         page.transcript.bytes_read = page.payload_read;

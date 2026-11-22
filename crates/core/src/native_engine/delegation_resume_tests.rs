@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Default)]
 struct Endpoint {
     requests: Mutex<Vec<Value>>,
+    keys: Mutex<Vec<String>>,
     block: AtomicBool,
     json_mode: AtomicBool,
     started: tokio::sync::Notify,
@@ -14,7 +15,8 @@ struct Endpoint {
 }
 async fn endpoint() -> (String, Arc<Endpoint>, tokio::task::JoinHandle<()>) {
     let state = Arc::new(Endpoint::default());
-    let app=Router::new().route("/v1/chat/completions",post(|State(state):State<Arc<Endpoint>>,Json(body):Json<Value>|async move {
+    let app=Router::new().route("/v1/chat/completions",post(|State(state):State<Arc<Endpoint>>,headers:axum::http::HeaderMap,Json(body):Json<Value>|async move {
+        state.keys.lock().unwrap().push(headers["authorization"].to_str().unwrap().into());
         state.requests.lock().unwrap().push(body);
         if state.block.swap(false,Ordering::SeqCst) {state.started.notify_one();state.release.notified().await;}
         ([("content-type","text/event-stream")],format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",json!({"choices":[{"index":0,"delta":{"content":if state.json_mode.load(Ordering::Relaxed){"{\"ok\":true}"}else{"child complete"}},"finish_reason":null}]}),json!({"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})))
@@ -150,11 +152,7 @@ async fn foreground_agent_executes_from_parent_on_default_worker_stack() {
                 .unwrap_or_default()
                 .contains("CHILD_IMPLEMENTED")
     }));
-    assert!(
-        mail::ExecutionLease::acquire(&context.paths.data_dir, child)
-            .unwrap()
-            .is_some()
-    );
+    drop(context.db.open_session(child).unwrap().acquire_execution().unwrap());
     drop(retained);
     server.abort();
     events.abort();
@@ -199,7 +197,7 @@ async fn foreground_agent_accepts_model_effort_and_worktree_without_backgroundin
     assert_ne!(result["backgrounded"], true);
     let retained = registry.lock().unwrap();
     let progress = context
-        .setting::<Value>(&format!("delegation.{child}"))
+        .child_progress(&child)
         .unwrap()
         .unwrap();
     assert_eq!(progress["preview"], "child complete");
@@ -225,7 +223,7 @@ async fn foreground_agent_accepts_model_effort_and_worktree_without_backgroundin
     assert_eq!(api.requests.lock().unwrap().len(), 2);
     context
         .db
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "UPDATE conversation_worktrees SET source_path=?1 WHERE conversation_id=?2",
                 rusqlite::params![context.paths.data_dir.to_string_lossy(), child],
@@ -250,7 +248,6 @@ async fn foreground_agent_accepts_model_effort_and_worktree_without_backgroundin
 async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provider() {
     let (_temp, context, store, parent, cwd) = fixture();
     let (a, api_a, server_a) = endpoint().await;
-    let (b, api_b, server_b) = endpoint().await;
     let registry: OwnedChildren = Default::default();
     let first = owner(&context, &parent, &cwd, &a, registry.clone());
     let result = first
@@ -263,10 +260,10 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
         let retained = registry.lock().unwrap();
         let entry = retained.get(&child).unwrap();
         assert!(entry.executor.messages.is_empty());
-        assert!(entry.executor.message_inbox.is_none());
+        assert!(entry.executor.turn_delivery.upgrade().is_none());
         assert!(entry.executor.execution_lease.is_none());
     }
-    let mut next = owner(&context, &parent, &cwd, &b, registry.clone());
+    let mut next = owner(&context, &parent, &cwd, &a, registry.clone());
     let resumed = next
         .execute_delegated(&json!({"resume":child,"prompt":"explicit continuation"}))
         .await
@@ -289,8 +286,7 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
     let peer = store.fork(&parent).unwrap();
     mail::send(&context, &peer, &child, "BOUNDARY_WAKE_MARKER").unwrap();
     next.execute().await.unwrap();
-    assert_eq!(api_a.requests.lock().unwrap().len(), 4);
-    assert_eq!(api_b.requests.lock().unwrap().len(), 1);
+    assert_eq!(api_a.requests.lock().unwrap().len(), 5);
     let requests = api_a.requests.lock().unwrap();
     assert!(requests[1].to_string().contains("original child"));
     assert!(requests[1].to_string().contains("explicit continuation"));
@@ -309,13 +305,74 @@ async fn explicit_resume_sendmessage_and_safe_boundary_keep_original_child_provi
         1
     );
     let resumed: Value = context
-        .setting(&format!("delegation.{child}"))
+        .child_progress(&child)
         .unwrap()
         .unwrap();
     assert_eq!(resumed["status"], "completed");
     server_a.abort();
+}
+#[tokio::test]
+async fn retained_child_keeps_its_launch_binding_and_new_children_use_the_owner_selection() {
+    use crate::native_engine::{provider_manager::ProviderManager, session_binding::BindingSnapshot};
+    let (_temp, context, _store, parent, cwd) = fixture();
+    let (a, first, server_a) = endpoint().await;
+    let (b, second, server_b) = endpoint().await;
+    let mut host = owner(&context, &parent, &cwd, &a, Default::default());
+    let manager = ProviderManager::in_memory(Vec::new(), context.paths.data_dir.join("providers.json"));
+    let binding = manager.binding.clone();
+    let snapshot = |generation, url: String, key: &str| {
+        let mut provider = host.provider.provider.clone();
+        provider.models = vec![host.provider.model.clone()];
+        provider.base_url = url;
+        provider.api_key = key.into();
+        BindingSnapshot {
+            generation, provider_id: provider.id.clone(), model: provider.models[0].id.clone(),
+            providers: vec![provider], environment: Default::default(), observation_only: false,
+        }
+    };
+    let old = snapshot(1, a, "local-first");
+    let next = snapshot(2, b, "local-second");
+    binding.install(old).unwrap();
+    host.provider = binding.resolve(None).unwrap();
+    host.provider_manager = Some(Arc::new(tokio::sync::Mutex::new(manager)));
+    let child = host.execute_delegated(&json!({"prompt":"create first child"})).await.unwrap();
+    binding.install(next).unwrap();
+    host.provider = binding.resolve(None).unwrap();
+    let resumed = host.execute_delegated(&json!({"resume":child["session_id"],"prompt":"resume on first"})).await.unwrap();
+    assert_eq!(resumed["session_id"], child["session_id"]);
+    host.execute_delegated(&json!({"prompt":"create second child"})).await.unwrap();
+    assert_eq!(*first.keys.lock().unwrap(), ["Bearer local-first", "Bearer local-first"]);
+    assert_eq!(*second.keys.lock().unwrap(), ["Bearer local-second"]);
+    // A retained transport does not grant a stale owner a new admission.
+
+    binding.track_session(context.db.open_session(&parent).unwrap());
+    let error = host.resume_owned_child(child["session_id"].as_str().unwrap(), Some("stale owner"), false)
+        .await.unwrap_err();
+    assert!(error.to_string().contains("Provider binding changed"));
+    assert_eq!(first.keys.lock().unwrap().len(), 2);
+    server_a.abort();
     server_b.abort();
 }
+
+#[tokio::test]
+async fn retained_child_keeps_native_model_transport_after_owner_switch() {
+    let (_temp, context, _store, parent, cwd) = fixture();
+    let (url, api, server) = endpoint().await;
+    let registry: OwnedChildren = Default::default();
+    let mut first = owner(&context, &parent, &cwd, &format!("{url}/v1"), registry.clone());
+    first.provider.provider.builtin_id = Some("openai".into());
+    first.provider.model.api = Some("openai-completions".into());
+    let child = first.execute_delegated(&json!({"prompt":"original"})).await.unwrap();
+    first.provider.model.id = "responses-model".into();
+    first.provider.model.api = Some("openai-responses".into());
+    first.resume_owned_child(child["session_id"].as_str().unwrap(), Some("keep native route"), false)
+        .await.unwrap();
+    let requests = api.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1]["model"], "fixture");
+    server.abort();
+}
+
 #[tokio::test]
 async fn resume_cancellation_releases_ownership_and_never_automatically_restarts() {
     let (_temp, context, _store, parent, cwd) = fixture();
@@ -346,12 +403,12 @@ async fn resume_cancellation_releases_ownership_and_never_automatically_restarts
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     let saved: Value = context
-        .setting(&format!("delegation.{child}"))
+        .child_progress(&child)
         .unwrap()
         .unwrap();
     assert_eq!(saved["status"], "cancelled");
     assert!(!mail::receiver_active(&context.paths.data_dir, &child).unwrap());
-    drop(mail::ExecutionLease::acquire(&context.paths.data_dir, &child).unwrap());
+    drop(context.db.open_session(&child).unwrap().acquire_execution().unwrap());
     mail::send(&context, &parent, &child, "must remain queued").unwrap();
     other.resume_pending_owned_children().await;
     assert!(other
@@ -392,7 +449,7 @@ async fn foreign_owner_changed_policy_changed_trust_and_lost_configuration_make_
         .unwrap_err()
         .to_string()
         .contains("needs_resume"));
-    context.db.with_conn(|conn|conn.execute("UPDATE project_folders SET trusted=0 WHERE project_id=(SELECT project_id FROM conversations WHERE id=?1)",[&child])).unwrap().unwrap();
+    context.db.fixture_directory(|conn|conn.execute("UPDATE project_folders SET trusted=0 WHERE project_id=(SELECT project_id FROM conversations WHERE id=?1)",[&child])).unwrap().unwrap();
     assert!(first
         .resume_owned_child(&child, Some("trust revoked"), false)
         .await
@@ -548,7 +605,7 @@ fn private_session_execution_lease_rejects_other_engine_until_drop() {
     let (_temp, context, _store, parent, _cwd) = fixture();
     context
         .db
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "UPDATE conversations SET workspace_mode='chat',project_id=NULL WHERE id=?1",
                 [&parent],
@@ -556,16 +613,11 @@ fn private_session_execution_lease_rejects_other_engine_until_drop() {
         })
         .unwrap()
         .unwrap();
-    let lease = mail::ExecutionLease::acquire(&context.paths.data_dir, &parent)
-        .unwrap()
-        .unwrap();
-    assert!(mail::ExecutionLease::acquire(&context.paths.data_dir, &parent).is_err());
+    let session = context.db.open_session(&parent).unwrap();
+    let lease = session.acquire_execution().unwrap();
+    assert!(session.acquire_execution().is_err());
     drop(lease);
-    assert!(
-        mail::ExecutionLease::acquire(&context.paths.data_dir, &parent)
-            .unwrap()
-            .is_some()
-    );
+    drop(session.acquire_execution().unwrap());
 }
 
 fn plan_child_stream(format: &str, call: Option<(&str, &str, Value)>) -> String {

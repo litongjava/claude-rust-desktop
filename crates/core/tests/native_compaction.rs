@@ -1,3 +1,6 @@
+#[path = "support/session_sql.rs"]
+mod session_sql;
+use session_sql::FixtureSql;
 use axum::{
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -235,9 +238,13 @@ async fn running_responses_turn_uses_native_compaction_before_local_truncation()
 #[tokio::test]
 async fn model_invokes_image_tool_and_receives_persisted_actual_image() {
     let Fixture { dir, store, id, engine, seen, server, .. } = fixture(4).await;
-    let assistant_id = uuid::Uuid::new_v4().to_string();
-    let request: ChatRequest = serde_json::from_value(json!({"conversation_id":id,"messages":store.model_history(&id,&ApiFormat::OpenAI).unwrap(),"model":"gpt-6-astra","provider_id":"gateway","workspace_path":dir.path()})).unwrap();
-    let mut events = engine.send_message(request).await.unwrap();
+    let messages = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+    let assistant_id = store.append(&id, "assistant", "").unwrap();
+    let request: ChatRequest = serde_json::from_value(json!({
+        "conversation_id":id, "messages":messages, "assistant_message_id":assistant_id,
+        "model":"gpt-6-astra", "provider_id":"gateway", "workspace_path":dir.path()
+    })).unwrap();
+    let mut events = engine.send_message_with_history(request, false).await.unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while let Some(event) = events.recv().await {
             assert!(!format!("{event:?}").starts_with("Error"), "{event:?}");
@@ -253,7 +260,7 @@ async fn model_invokes_image_tool_and_receives_persisted_actual_image() {
                 // Use the same host persistence entrypoint as CLI streaming results.
                 store
                     .db
-                    .with_conn(|conn| {
+                    .shard_sql(&id, |conn| {
                         deepseek_code_core::db::message_repo::save_stream_tool_result(
                             conn,
                             &id,
@@ -351,12 +358,12 @@ async fn native_window_survives_reload_fork_and_actual_next_request_without_rewr
     server.abort();
 }
 
-fn opaque_state_count(store: &SessionStore) -> i64 {
+fn opaque_state_count(store: &SessionStore,id:&str) -> i64 {
     store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&id, |conn| {
             conn.query_row(
-                "SELECT COUNT(*) FROM peripheral_settings WHERE key LIKE 'compaction.native.%'",
+                "SELECT COUNT(*) FROM native_boundaries",
                 [],
                 |r| r.get::<_, i64>(0),
             )
@@ -373,7 +380,7 @@ async fn failure_and_cancellation_never_commit_opaque_state() {
         let Fixture { dir: _dir, store, id, engine, seen, server, .. } = fixture(1).await;
         let data = _dir.path().join("data");
         assert!(data.is_dir());
-        assert!(data.join(deepseek_code_core::runtime::DATABASE_FILE).is_file());
+        assert!(data.join("global.db").is_file());
         let before = store.history(&id).unwrap();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -387,8 +394,8 @@ async fn failure_and_cancellation_never_commit_opaque_state() {
         assert!(!message.contains("Elapsed"), "unexpected timeout: {message}");
         assert_eq!(store.history(&id).unwrap(), before);
         assert_eq!(seen.lock().unwrap().len(), 1);
-        assert_eq!(opaque_state_count(&store), 0);
-        assert!(data.join(deepseek_code_core::runtime::DATABASE_FILE).is_file());
+        assert_eq!(opaque_state_count(&store,&id), 0);
+        assert!(data.join("global.db").is_file());
         server.abort();
     }
 
@@ -398,7 +405,7 @@ async fn failure_and_cancellation_never_commit_opaque_state() {
         let Fixture { dir: _dir, store, id, engine, seen, arrived, server, .. } = fixture(2).await;
         let data = _dir.path().join("data");
         assert!(data.is_dir());
-        assert!(data.join(deepseek_code_core::runtime::DATABASE_FILE).is_file());
+        assert!(data.join("global.db").is_file());
         let before = store.history(&id).unwrap();
         let mut request = Box::pin(compaction::compact(
             &engine,
@@ -419,8 +426,8 @@ async fn failure_and_cancellation_never_commit_opaque_state() {
         drop(request);
         assert_eq!(store.history(&id).unwrap(), before);
         assert_eq!(seen.lock().unwrap().len(), 1);
-        assert_eq!(opaque_state_count(&store), 0);
-        assert!(data.join(deepseek_code_core::runtime::DATABASE_FILE).is_file());
+        assert_eq!(opaque_state_count(&store,&id), 0);
+        assert!(data.join("global.db").is_file());
         server.abort();
     }
 }
@@ -434,7 +441,7 @@ async fn an_error_response_slower_than_200ms_would_misjudge_the_old_window() {
         fixture(6).await;
     let data = _dir.path().join("data");
     assert!(data.is_dir());
-    assert!(data.join(deepseek_code_core::runtime::DATABASE_FILE).is_file());
+    assert!(data.join("global.db").is_file());
     let before = store.history(&id).unwrap();
     let mut request = Box::pin(compaction::compact(
         &engine,
@@ -464,8 +471,8 @@ async fn an_error_response_slower_than_200ms_would_misjudge_the_old_window() {
     assert!(error.to_string().contains("HTTP 502"), "{error}");
     assert_eq!(store.history(&id).unwrap(), before);
     assert_eq!(seen.lock().unwrap().len(), 1);
-    assert_eq!(opaque_state_count(&store), 0);
-    assert!(data.join(deepseek_code_core::runtime::DATABASE_FILE).is_file());
+    assert_eq!(opaque_state_count(&store,&id), 0);
+    assert!(data.join("global.db").is_file());
     server.abort();
 }
 
@@ -480,7 +487,7 @@ async fn a_compacted_search_record_cannot_authorize_and_a_fresh_search_restores_
     store.append(&id, "assistant", "").unwrap();
     store
         .db
-        .with_conn(|conn| {
+        .shard_sql(&id, |conn| {
             deepseek_code_core::db::message_repo::save_stream_tool_result(
                 conn,
                 &id,
@@ -608,11 +615,23 @@ async fn context_search_hint_requires_persisted_compaction_without_host_provenan
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     let hint = "After compaction, load ContextSearch with ToolLoad";
-    let fresh = seen[0]["instructions"].as_str().unwrap();
-    assert!(fresh.contains("- `ContextSearch`"), "{fresh}");
+    let fresh_system = seen[0]["instructions"].as_str().unwrap();
+    assert!(!fresh_system.contains("Tools you can load with ToolLoad"), "{fresh_system}");
+    let fresh = seen[0]["input"].to_string();
+    assert!(fresh.contains("Tools you can load with ToolLoad"), "{fresh}");
+    assert!(fresh.contains("- ContextSearch:"), "{fresh}");
     assert!(!fresh.contains(hint), "{fresh}");
-    let compacted = seen[1]["instructions"].as_str().unwrap();
-    assert!(compacted.contains(hint), "{compacted}");
+    assert!(
+        fresh.find("Tools you can load with ToolLoad").unwrap()
+            < fresh.find("Today's date is").unwrap(),
+        "the loadable tools reminder opens before the date: {fresh}"
+    );
+    let compacted_system = seen[1]["instructions"].as_str().unwrap();
+    assert!(!compacted_system.contains(hint), "{compacted_system}");
+    let compacted = seen[1]["input"].to_string();
+    // The frozen first message still carries the same list after compaction.
+    assert!(compacted.contains("- ContextSearch:"), "{compacted}");
+    assert!(!compacted.contains(hint), "{compacted}");
     assert!(seen[1]["input"]
         .to_string()
         .contains("Host continuation summary"));

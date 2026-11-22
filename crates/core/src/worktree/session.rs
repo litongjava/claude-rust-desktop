@@ -77,6 +77,7 @@ pub fn branches(cwd: &Path) -> Result<Branches> {
     })
 }
 
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct PreparedWorkspace {
     pub path: PathBuf,
     worktree: Option<(PathBuf, String)>,

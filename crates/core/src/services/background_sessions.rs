@@ -1,5 +1,6 @@
 //! Detached CLI jobs with an owning supervisor, durable results and liveness leases.
 //! Credentials are inherited through the environment, never serialized in job files.
+use crate::db::session_store::SessionAccess as _;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -17,7 +18,10 @@ pub const CONTROL_ENV: &str = "DEEPSEEK_CODE_BACKGROUND_CONTROL";
 /// arguments, and a deliberately forwarded snapshot arrives through the
 /// explicit `environment` after inherited values have been stripped.
 pub const WORKER_MODEL_ENV: &str = "DEEPSEEK_CODE_WORKER_MODEL";
+pub const WORKER_GENERATION_ENV: &str = "DEEPSEEK_CODE_WORKER_GENERATION";
 pub const WORKER_AUTO_ROUTE_ENV: &str = "DEEPSEEK_CODE_WORKER_AUTO_ROUTE";
+/// A credential staged for one explicit child launch.
+pub const CHILD_API_KEY_ENV: &str = "DEEPSEEK_CODE_CHILD_API_KEY";
 /// The exclusive-execution token of a reserved job. The host publishes it in
 /// the worker claim before spawning and passes it to that supervisor only, so
 /// a duplicate supervisor cannot execute the same job.
@@ -29,10 +33,11 @@ pub const WORKER_TOKEN_ENV: &str = "DEEPSEEK_CODE_BACKGROUND_TOKEN";
 /// rejected by its own ownership check, or silently join the parent's job. A
 /// managed worker additionally inherits the parent's model snapshot, which its
 /// own launch then rejects as a mismatch.
-pub const INTERNAL_ENV: [&str; 5] = [
+pub const INTERNAL_ENV: [&str; 6] = [
     WORKER_ENV,
     CONTROL_ENV,
     WORKER_MODEL_ENV,
+    WORKER_GENERATION_ENV,
     WORKER_AUTO_ROUTE_ENV,
     WORKER_TOKEN_ENV,
 ];
@@ -89,6 +94,145 @@ pub struct Job {
     /// authorization was observed when this record was read.
     #[serde(default)]
     pub launched: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct JobOwners {
+    pub(crate) parent: String,
+    pub(crate) execution: String,
+}
+
+impl JobOwners {
+    fn path(root: &Path, job: &Job) -> Result<PathBuf> {
+        Ok(directory(root, &job.id)?.join("session-owners.json"))
+    }
+
+    pub(crate) fn load(root: &Path, job: &Job) -> Result<Option<Self>> {
+        Self::load_for_id(root, &job.id)
+    }
+
+    pub(crate) fn load_for_id(root: &Path, id: &str) -> Result<Option<Self>> {
+        match fs::read(directory(root, id)?.join("session-owners.json")) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub(crate) fn publish(root: &Path, job: &Job) -> Result<()> {
+        if !root.join("global.db").try_exists()? {
+            return Ok(());
+        }
+        let stores = crate::db::session_store::Stores::open(root)?;
+        let owner = stores.open_session(&job.parent_session_id)?;
+        let target = if job.session_id == job.parent_session_id {
+            owner.clone()
+        } else {
+            stores.open_session(&job.session_id)?
+        };
+        save(
+            &Self::path(root, job)?,
+            &Self {
+                parent: owner.incarnation().into(),
+                execution: target.incarnation().into(),
+            },
+        )
+    }
+
+    pub(crate) fn report(
+        &self,
+        root: &Path,
+        job: &Job,
+        stores: &crate::db::session_store::Stores,
+    ) -> Result<Option<String>> {
+        use super::session_worker::{job_child, JobChild};
+        match job_child(root, job)? {
+            Some(JobChild::Bound { id, incarnation }) => {
+                stores.recorded_assistant_report(&id, &incarnation)
+            }
+            Some(JobChild::Legacy(_)) => Ok(None),
+            None => stores.recorded_assistant_report(&job.session_id, &self.execution),
+        }
+    }
+}
+
+pub fn authorize_job(root: &Path, job: &Job, session: &str) -> Result<()> {
+    ensure!(
+        job.parent_session_id == session,
+        "Task belongs to another session"
+    );
+    let owners = JobOwners::load(root, job)?;
+    if owners.is_some() || root.join("global.db").try_exists()? {
+        let owners = owners.context("Task has no recorded parent incarnation")?;
+        let stores = crate::db::session_store::Stores::open(root)?;
+        ensure!(
+            stores.published_incarnation_matches(session, &owners.parent)?,
+            "Task belongs to another session incarnation"
+        );
+    }
+    Ok(())
+}
+
+pub fn authorize_owned_attachment(root: &Path, job: &Job, parent: &str) -> Result<()> {
+    ensure!(
+        job.parent_session_id == parent,
+        "Task belongs to another session"
+    );
+    authorize_attachment(root, job, parent)
+}
+
+/// Interactive controls may address the parent or the execution session. Both
+/// endpoints and any separately recorded idle child must still be current.
+pub fn authorize_attachment(root: &Path, job: &Job, session: &str) -> Result<()> {
+    ensure!(job.parent_session_id == session || job.session_id == session, "Task belongs to another session");
+    let Some(owners) = JobOwners::load(root, job)? else {
+        ensure!(
+            !root.join("global.db").try_exists()?,
+            "Task has no recorded parent incarnation"
+        );
+        return Ok(());
+    };
+    let child = super::session_worker::bound_child_for_job(root, job)?;
+    let stores = crate::db::session_store::Stores::open(root)?;
+    stores.check_job_participants(
+        (&job.parent_session_id, &owners.parent),
+        (&job.session_id, &owners.execution),
+        child.as_ref(),
+    )
+}
+
+/// Keep every recorded participant live across an interactive read or control.
+pub fn hold_attachment(
+    root: &Path,
+    job: &Job,
+    selected: &crate::db::session_store::SessionDb,
+) -> Result<impl Drop> {
+    ensure!(
+        selected.id() == job.session_id || selected.id() == job.parent_session_id,
+        "Task belongs to another session"
+    );
+    let stores = crate::db::session_store::Stores::open(root)?;
+    let owners = JobOwners::load(root, job)?.context("Task lacks recorded participants")?;
+    let child = super::session_worker::bound_child_for_job(root, job)?;
+    let guards = stores.hold_job_participants(
+        (&job.parent_session_id, &owners.parent),
+        (&job.session_id, &owners.execution),
+        child.as_ref(),
+    )?;
+    stores.resume_history(&selected.address())?;
+    Ok(guards)
+}
+
+pub fn hold_owned_attachment(
+    root: &Path,
+    job: &Job,
+    selected: &crate::db::session_store::SessionDb,
+) -> Result<impl Drop> {
+    ensure!(
+        selected.id() == job.parent_session_id,
+        "Task belongs to another session"
+    );
+    hold_attachment(root, job, selected)
 }
 
 /// Durable view of a reserved job, used by hosts that reconcile after a crash.
@@ -531,6 +675,34 @@ pub fn spawn_reserved(
     )
 }
 
+/// Keep the ancestry scan and worktree removal atomic with new job publication.
+pub(crate) struct PublicationFence(fs::File);
+
+impl Drop for PublicationFence {
+    fn drop(&mut self) {
+        let _ = crate::fs::unlock_file(&self.0);
+    }
+}
+
+pub(crate) fn job_publication_fence(root: &Path, cleanup: bool) -> Result<PublicationFence> {
+    fs::create_dir_all(root)?;
+    let file = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("background-task-publication.lock"))?;
+    if cleanup {
+        crate::fs::try_lock_file(&file).context("Background job publication in progress")?;
+    } else {
+        #[cfg(target_os = "android")]
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)?;
+        #[cfg(not(target_os = "android"))]
+        file.lock_shared()?;
+    }
+    Ok(PublicationFence(file))
+}
+
 fn spawn_at(
     root: &Path,
     supervisor: &Path,
@@ -542,6 +714,7 @@ fn spawn_at(
     foreground: bool,
     reserved: Option<&str>,
 ) -> Result<Job> {
+    let _publication = job_publication_fence(root, false)?;
     let id = match reserved {
         Some(id) => {
             // Validates the reserved identity before touching the filesystem.
@@ -605,6 +778,7 @@ fn spawn_at(
             job.session_id == session,
             "Reserved background task {id} belongs to another child session"
         );
+        authorize_attachment(root, &job, parent)?;
         let stored = launch_of(root, &id)?
             .with_context(|| format!("Reserved background task {id} has no launch record"))?;
         ensure!(
@@ -667,6 +841,7 @@ fn spawn_at(
             error: None,
             launched: false,
         };
+        JobOwners::publish(root, &job)?;
         save(&dir.join("launch.json"), &launch)?;
         save(&dir.join("state.json"), &job)?;
         job
@@ -747,8 +922,19 @@ fn spawn_at(
     }
 }
 
+// Only the supervised CLI can attest that its main work and shutdown succeeded.
+const FOREGROUND_COMPLETION_ENV: &str = "DEEPSEEK_CODE_FOREGROUND_COMPLETION";
+static FOREGROUND_COMPLETION: std::sync::OnceLock<uuid::Uuid> = std::sync::OnceLock::new();
+
 /// Returns true only in the dedicated supervisor process.
 pub fn run_worker_from_env() -> Result<bool> {
+    if let Ok(token) = std::env::var(FOREGROUND_COMPLETION_ENV) {
+        // Consume before any tools or subprocesses can inherit the handoff.
+        std::env::remove_var(FOREGROUND_COMPLETION_ENV);
+        if let Ok(token) = uuid::Uuid::parse_str(&token) {
+            let _ = FOREGROUND_COMPLETION.set(token);
+        }
+    }
     let Some(dir) = std::env::var_os(WORKER_ENV) else {
         return Ok(false);
     };
@@ -780,11 +966,14 @@ fn run_worker(dir: &Path) -> Result<()> {
         return Ok(());
     }
     let mut job = read_job(dir)?;
-    let outcome = supervise(dir, &mut job);
-    if let Err(error) = outcome {
-        job.status = "failed".into();
-        job.error = Some(format!("{error:#}"));
-    }
+    let remaining_child = match supervise(dir, &mut job) {
+        Ok(child) => child,
+        Err(error) => {
+            job.status = "failed".into();
+            job.error = Some(format!("{error:#}"));
+            None
+        }
+    };
     job.heartbeat_ms = now();
     job.finished_ms = Some(now());
     if job.foreground {
@@ -794,17 +983,43 @@ fn run_worker(dir: &Path) -> Result<()> {
             .context("Invalid job root")?;
         SessionClaim::release(root, &job.session_id, &job.id)?;
     }
-    save(&dir.join("state.json"), &job)
+    save(&dir.join("state.json"), &job)?;
+    if let Some(mut child) = remaining_child {
+        // All main work and shutdown succeeded. Reap the optional follow-up
+        // without occupying the foreground slot or changing the published job.
+        child.wait()?;
+    }
+    Ok(())
 }
 
-fn supervise(dir: &Path, job: &mut Job) -> Result<()> {
+/// The foreground CLI calls this only after successful turn and session shutdown.
+pub fn finish_before_suggestion(root: &Path, session: &str) -> Result<()> {
+    let dir = worker_directory(root, session)?.context("Missing foreground worker")?;
+    let job = read_job(&dir)?;
+    ensure!(
+        job.foreground && job.parent_session_id == session && job.session_id == session,
+        "Expected foreground session"
+    );
+    let token = FOREGROUND_COMPLETION
+        .get()
+        .context("Missing foreground completion token")?;
+    fs::write(dir.join(format!("main-finished-{token}")), [])?;
+    Ok(())
+}
+
+fn supervise(dir: &Path, job: &mut Job) -> Result<Option<std::process::Child>> {
     let launch: Launch = serde_json::from_slice(&fs::read(dir.join("launch.json"))?)?;
     job.supervisor_pid = Some(std::process::id());
     if dir.join("cancel").exists() {
         job.status = "cancelled".into();
-        return Ok(());
+        return Ok(None);
     }
     let mut command = Command::new(&launch.executable);
+    let completion = job.foreground.then(|| {
+        let token = uuid::Uuid::new_v4();
+        command.env(FOREGROUND_COMPLETION_ENV, token.to_string());
+        dir.join(format!("main-finished-{token}"))
+    });
     command
         .args(&launch.arguments)
         .current_dir(&launch.cwd)
@@ -880,6 +1095,11 @@ fn supervise(dir: &Path, job: &mut Job) -> Result<()> {
             job.status = "cancelled".into();
             break;
         }
+        if cancel_started.is_none() && completion.as_ref().is_some_and(|path| path.exists()) {
+            job.status = "completed".into();
+            job.exit_code = Some(0);
+            return Ok(Some(child));
+        }
         job.heartbeat_ms = now();
         if let Err(error) = save(&dir.join("state.json"), job) {
             let _ = child.kill();
@@ -888,10 +1108,14 @@ fn supervise(dir: &Path, job: &mut Job) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    Ok(())
+    Ok(None)
 }
 
 pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
+    list_matching(root, |job| parent.is_none_or(|id| authorize_job(root, job, id).is_ok()))
+}
+
+fn list_matching(root: &Path, include: impl Fn(&Job) -> bool) -> Result<Vec<Job>> {
     let directory = root.join("background-tasks");
     if !directory.exists() {
         return Ok(Vec::new());
@@ -923,13 +1147,54 @@ pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
             }
             Err(error) => return Err(error),
         };
-        if parent.map_or(true, |id| job.parent_session_id == id) {
+        if include(&job) {
             jobs.push(published(&entry.path(), job)?);
         }
     }
     jobs.sort_by_key(|job| job.started_ms);
     Ok(jobs)
 }
+/// Conservative liveness checks must also block on an active legacy job with
+/// a missing owner marker, while ignoring other sessions' publication files.
+pub(crate) fn possible_executions(root: &Path, session: &str) -> Result<Vec<Job>> {
+    list_matching(root, |job| job.session_id == session)
+}
+
+/// Jobs whose parent and execution targets still match this CLI view.
+pub fn owned_jobs(root: &Path, parent: &str) -> Result<Vec<Job>> {
+    list_matching(root, |job| authorize_owned_attachment(root, job, parent).is_ok())
+}
+
+pub fn owned_by_session(root: &Path, parent: &crate::db::session_store::SessionDb) -> Result<Vec<Job>> {
+    let _guard = parent.hold_incarnation()?;
+    owned_jobs(root, parent.id())
+}
+
+pub fn executing_in_session(root: &Path, session: &crate::db::session_store::SessionDb) -> Result<Vec<Job>> {
+    let _guard = session.hold_incarnation()?;
+    executing_in(root, session.id())
+}
+
+/// Jobs that can currently execute in the selected session.
+pub fn executing_in(root: &Path, session: &str) -> Result<Vec<Job>> {
+    list_matching(root, |job| job.session_id == session && authorize_attachment(root, job, session).is_ok())
+}
+
+/// Select the recorded execution endpoint for an interactive parent operation.
+pub fn owned_execution(root: &Path, parent: &crate::db::session_store::SessionDb, job: &Job) -> Result<crate::db::session_store::SessionDb> {
+    ensure!(job.parent_session_id == parent.id(), "Task belongs to another parent");
+    participant_execution(root, parent, job)
+}
+
+pub fn participant_execution(root: &Path, participant: &crate::db::session_store::SessionDb, job: &Job) -> Result<crate::db::session_store::SessionDb> {
+    let _guard = participant.hold_incarnation()?;
+    let owners = JobOwners::load(root, job)?.context("Task lacks recorded participants")?;
+    let stores = crate::db::session_store::Stores::open(root)?;
+    stores.resume_history(&participant.address())?;
+    authorize_attachment(root, job, participant.id())?;
+    stores.open_recorded(&job.session_id, &owners.execution)
+}
+
 pub fn get(root: &Path, id: &str) -> Result<Job> {
     let dir = directory(root, id)?;
     published(&dir, read_job(&dir)?)
@@ -1004,21 +1269,21 @@ fn read_worker_failure(dir: &Path) -> Option<String> {
 }
 
 pub fn output(root: &Path, id: &str) -> Result<(String, String)> {
+    let ((stdout, _), (stderr, _)) = output_snapshot(root, id)?;
+    Ok((stdout, stderr))
+}
+
+type LogSnapshot = (String, crate::performance::command_output::SnapshotSize);
+
+pub(crate) fn output_snapshot(root: &Path, id: &str) -> Result<(LogSnapshot, LogSnapshot)> {
     let dir = directory(root, id)?;
     read_job(&dir)?;
-    let read = |name: &str| -> Result<String> {
-        let path = dir.join(name);
-        if !path.exists() {
-            return Ok(String::new());
-        }
-        let mut file = fs::File::open(path)?;
-        let size = file.metadata()?.len();
-        // Read a bounded tail even when a tool produces very large output.
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(size.saturating_sub(256 * 1024)))?;
-        let mut bytes = Vec::new();
-        file.take(256 * 1024).read_to_end(&mut bytes)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    let read = |name| {
+        crate::performance::command_output::SnapshotSize::read_log(
+            &dir.join(name),
+            256 * 1024,
+            true,
+        )
     };
     Ok((read("output.jsonl")?, read("stderr.log")?))
 }
@@ -1036,10 +1301,7 @@ pub struct PendingQuestion {
 
 pub fn pending_question(root: &Path, id: &str, parent: &str) -> Result<Option<PendingQuestion>> {
     let job = get(root, id)?;
-    ensure!(
-        job.parent_session_id == parent,
-        "Task belongs to another session"
-    );
+    authorize_owned_attachment(root, &job, parent)?;
     if !matches!(job.status.as_str(), "starting" | "running") {
         return Ok(None);
     }
@@ -1326,10 +1588,7 @@ async fn wait_for_answer(
 
 pub fn detach(root: &Path, id: &str, parent: &str) -> Result<()> {
     let job = get(root, id)?;
-    ensure!(
-        job.parent_session_id == parent,
-        "Task belongs to another session"
-    );
+    authorize_owned_attachment(root, &job, parent)?;
     fs::write(directory(root, id)?.join("detached"), b"detached")?;
     Ok(())
 }
@@ -1344,10 +1603,7 @@ pub fn events_since(
 ) -> Result<(Job, u64, Vec<serde_json::Value>)> {
     use std::io::{Seek, SeekFrom};
     let job = get(root, id)?;
-    ensure!(
-        job.parent_session_id == parent,
-        "Task belongs to another session"
-    );
+    authorize_owned_attachment(root, &job, parent)?;
     let path = directory(root, id)?.join("output.jsonl");
     if !path.exists() {
         return Ok((job, cursor, vec![]));
@@ -1410,6 +1666,8 @@ pub fn collect_completed(
     root: &Path,
     parent: &str,
 ) -> Result<Vec<String>> {
+    let shard = store.db.open_session(parent)?;
+    let owner = shard.select_session(parent)?;
     let mut notices = Vec::new();
     for job in list(root, Some(parent))? {
         if job.session_id == parent
@@ -1423,15 +1681,17 @@ pub fn collect_completed(
         if !matches!(job.status.as_str(), "completed" | "failed" | "cancelled") {
             continue;
         }
-        let message_id = format!("background-report:{}:{}", parent, job.id);
-        let exists = store
-            .db
-            .with_conn(|conn| crate::db::message_repo::get_message(conn, &message_id))??
-            .is_some();
-        if exists {
+        let Some(owners) = JobOwners::load(root, &job)? else {
+            continue;
+        };
+        if owners.parent != shard.incarnation() {
             continue;
         }
-        let execution_session = super::session_worker::job_execution_session(root, &job)?;
+        let message_id = format!("background-report:{}:{}", parent, job.id);
+        if owner.has_worker_report(&message_id)? {
+            continue;
+        }
+        let execution_session = super::session_worker::recorded_job_target(root, &job)?;
         let (output, errors) = output(root, &job.id)?;
         let result = output
             .lines()
@@ -1440,16 +1700,7 @@ pub fn collect_completed(
             .find(|event| event["type"] == "result")
             .and_then(|event| event["result"].as_str().map(str::to_owned));
         let result = if execution_session != job.session_id {
-            store
-                .db
-                .with_conn(|conn| {
-                    crate::db::message_repo::get_messages_by_conversation(conn, &execution_session)
-                })??
-                .into_iter()
-                .rev()
-                .find(|message| message.role == "assistant" && !message.content.trim().is_empty())
-                .map(|message| message.content)
-                .or(result)
+            owners.report(root, &job, &store.db)?.or(result)
         } else if job.session_id == parent {
             Some(if job.status == "completed" {
                 "The worker completed and stored its answer directly in this session. This notice does not duplicate that answer.".to_owned()
@@ -1470,36 +1721,7 @@ pub fn collect_completed(
         });
         let excerpt: String = body.chars().take(16384).collect();
         let report = format!("[Background task report]\nTask: {}\nSource session: {}\nStatus: {}\nTitle: {}\n\n{}{}\n[End background task report]", job.id, execution_session, job.status, job.title, excerpt, if excerpt.len()<body.len() { "\n[Excerpt truncated; use /tasks show for details.]" } else { "" });
-        let inserted = store.db.with_conn(|conn| -> Result<bool> {
-            let tx = rusqlite::Transaction::new_unchecked(
-                conn,
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
-            if crate::db::message_repo::get_message(&tx, &message_id)?.is_some() {
-                return Ok(false);
-            }
-            let order: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM messages WHERE conversation_id = ?1",
-                [parent],
-                |row| row.get(0),
-            )?;
-            let now = chrono::Utc::now().to_rfc3339();
-            crate::db::message_repo::insert_message(
-                &tx,
-                &message_id,
-                parent,
-                "system",
-                &report,
-                None,
-                &now,
-                false,
-                order,
-            )?;
-            crate::db::conversation_repo::increment_message_count(&tx, parent)?;
-            crate::db::conversation_repo::update_conversation_timestamp(&tx, parent, &now)?;
-            tx.commit()?;
-            Ok(true)
-        })??;
+        let inserted=owner.record_worker_report(&message_id,&report)?;
         if inserted {
             notices.push(report);
         }
@@ -2183,6 +2405,11 @@ mod tests {
             b"{\"type\":\"result\",\"result\":\"child answer\"}\n",
         )
         .unwrap();
+        store
+            .db
+            .create(&job.session_id, Default::default())
+            .unwrap();
+        JobOwners::publish(root.path(), &job).unwrap();
         let notices = collect_completed(&store, root.path(), &parent).unwrap();
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("child answer"));
@@ -2221,6 +2448,7 @@ mod tests {
             b"{\"type\":\"error\",\"error\":\"original full diagnostic\"}\n",
         )
         .unwrap();
+        JobOwners::publish(root.path(), &job).unwrap();
         acknowledge_foreground(root.path(), &id, &parent).unwrap();
         detach(root.path(), &id, &parent).unwrap();
         assert!(collect_completed(&store, root.path(), &parent)

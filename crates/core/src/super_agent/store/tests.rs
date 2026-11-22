@@ -9,6 +9,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, TaskStore) {
     let data = temp.path().join("data");
     let paths = crate::runtime::RuntimePaths::new(data.clone()).unwrap();
     let store = TaskStore::new(paths.open_database().unwrap(), data.clone());
+    store.db.create("router", Default::default()).unwrap();
     (temp, data, store)
 }
 
@@ -63,11 +64,6 @@ fn repo(task_id: &str) -> RepoTarget {
 }
 
 fn finalizing(store: &TaskStore) -> TaskRecord {
-    let policy = StatePolicy::default();
-    let task = store
-        .create_task("router", spec("Fix login"), "create")
-        .unwrap();
-    store.save_repo(&repo(&task.task_id)).unwrap();
     // Sessions must exist in the durable store; a nonempty string is not proof.
     let sessions = crate::runtime::SessionStore::new(store.db().clone());
     let coder = sessions
@@ -83,8 +79,20 @@ fn finalizing(store: &TaskStore) -> TaskRecord {
     sessions
         .append(&reviewer, "user", "review the task")
         .unwrap();
+    finalizing_with_members(store, &coder, &reviewer)
+}
+fn finalizing_with_members<D: TaskDatabase>(
+    store: &TaskStore<D>,
+    coder: &str,
+    reviewer: &str,
+) -> TaskRecord {
+    let policy = StatePolicy::default();
+    let task = store
+        .create_task("router", spec("Fix login"), "create")
+        .unwrap();
+    store.save_repo(&repo(&task.task_id)).unwrap();
     store
-        .set_sessions(&task.task_id, Some(&coder), Some(&reviewer))
+        .set_sessions(&task.task_id, Some(coder), Some(reviewer))
         .unwrap();
     for (event_type, operation, payload) in [
         (EventType::DiscoveryCompleted, "discovery", json!({})),
@@ -258,8 +266,7 @@ fn transitions_persist_and_invalid_events_are_rejected_without_writing() {
     assert_eq!(record.status, Status::Running);
 
     // Reopening the database sees the committed transition and event.
-    let reopened = crate::db::DbManager::new(data.join("deepseek_code.db")).unwrap();
-    reopened.init().unwrap();
+    let reopened = crate::db::session_store::Stores::open(&data).unwrap();
     let reopened = TaskStore::new(Arc::new(reopened), data.clone());
     let persisted = reopened.get_task(&task.task_id).unwrap().unwrap();
     assert_eq!(persisted.phase, Phase::Planning);
@@ -324,9 +331,24 @@ fn spec_updates_invalidate_old_reports_and_expire_old_approvals() {
 
 #[test]
 fn completion_requires_the_gate_and_records_the_event() {
-    let (_temp, data, store) = fixture();
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data");
+    let paths = crate::runtime::RuntimePaths::new(data.clone()).unwrap();
+    let roots = Arc::new(paths.open_stores().unwrap());
+    let store = TaskStore::new(roots.clone(), data.clone());
+    let sessions = crate::runtime::SessionStore::new(roots.clone());
+    let coder = sessions.create(temp.path(), "m", "p").unwrap();
+    let reviewer = sessions.create(temp.path(), "m", "p").unwrap();
+    sessions.append(&coder, "user", "implementation").unwrap();
+    sessions.append(&reviewer, "user", "review").unwrap();
     let policy = StatePolicy::default();
-    let record = finalizing(&store);
+    let record = finalizing_with_members(&store, &coder, &reviewer);
+    let member = roots.open_session(&coder).unwrap();
+    member.set_archived(true).unwrap();
+    assert!(store
+        .complete_task(&record.task_id, "complete", &policy)
+        .is_err());
+    member.set_archived(false).unwrap();
     let completed = store
         .complete_task(&record.task_id, "complete", &policy)
         .unwrap();
@@ -334,9 +356,12 @@ fn completion_requires_the_gate_and_records_the_event() {
     assert_eq!(completed.phase, Phase::Finalizing);
     let events = store.events(&record.task_id).unwrap();
     assert_eq!(events.last().unwrap().event_type, EventType::TaskCompleted);
-    let reopened = crate::db::DbManager::new(data.join("deepseek_code.db")).unwrap();
-    reopened.init().unwrap();
-    let reopened = TaskStore::new(Arc::new(reopened), data.clone());
+    let captured=store.run_read(|c| Ok(c.query_row(
+        "SELECT content_revision FROM sa_completion_evidence WHERE session_id=?1 AND incarnation=?2",
+        [&coder,member.incarnation()],|r|r.get::<_,i64>(0))?)).unwrap();
+    assert_eq!(captured, member.read(|r| r.projection()).unwrap().revision);
+    drop(store);
+    let reopened = TaskStore::new(Arc::new(paths.open_stores().unwrap()), data.clone());
     assert_eq!(
         reopened.get_task(&record.task_id).unwrap().unwrap().status,
         Status::Completed
@@ -874,7 +899,7 @@ fn completion_requires_durable_sessions_and_trace() {
         .unwrap();
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "DELETE FROM sa_events WHERE task_id=?1 AND event_type=?2",
                 rusqlite::params![record.task_id, "HARNESS_ANALYSIS_COMPLETED"],
@@ -1059,7 +1084,7 @@ fn record_plan(store: &TaskStore, plan: &crate::super_agent::delivery::DeliveryP
     let encoded = serde_json::to_string(plan).unwrap();
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "INSERT INTO sa_delivery_plans(operation_id,task_id,spec_version,review_round,created_at,plan_json) VALUES(?1,?2,?3,?4,?5,?6)",
                 rusqlite::params![
@@ -1084,7 +1109,7 @@ fn record_observation(
     for target in &plan.repositories {
         store
             .db()
-            .with_conn(|conn| {
+            .fixture_directory(|conn| {
                 conn.execute(
                     "INSERT INTO sa_repository_delivery_observations(task_id,plan_operation_id,repository_id,spec_version,review_round,coder_session_id,old_oid,new_oid,target_ref,attempt,observed_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
                     rusqlite::params![
@@ -1233,7 +1258,7 @@ fn completion_rejects_a_malformed_current_delivery_plan() {
     let record = finalizing_with_a_merge_commit(&store);
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "INSERT INTO sa_delivery_plans(operation_id,task_id,spec_version,review_round,created_at,plan_json) VALUES(?1,?2,?3,?4,?5,?6)",
                 rusqlite::params![
@@ -1263,7 +1288,7 @@ fn completion_rejects_a_malformed_current_delivery_plan() {
     // into a completion or silently replaced by an older plan.
     let count: i64 = store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.query_row(
                 "SELECT COUNT(*) FROM sa_delivery_plans WHERE task_id=?1",
                 [&record.task_id],
@@ -1638,8 +1663,7 @@ fn completion_with_a_real_pinned_non_git_target_requires_the_reviewed_bytes() {
 }
 
 fn separate_store(data: &std::path::Path) -> TaskStore {
-    let db = crate::db::DbManager::new(data.join(crate::runtime::DATABASE_FILE)).unwrap();
-    db.init().unwrap();
+    let db = crate::db::session_store::Stores::open(&data).unwrap();
     TaskStore::new(Arc::new(db), data.to_path_buf())
 }
 
@@ -1840,7 +1864,7 @@ fn completion_rejects_an_empty_session_row_and_historical_round_events() {
     // to round 0 and must no longer satisfy the trace requirement.
     store
         .db()
-        .with_conn(|conn| {
+        .fixture_directory(|conn| {
             conn.execute(
                 "UPDATE sa_tasks SET review_round=1 WHERE task_id=?1",
                 [&record.task_id],
@@ -1932,6 +1956,9 @@ fn ingested_events_stay_pending_until_processed_exactly_once() {
 #[test]
 fn a_pending_event_for_another_router_is_not_processed() {
     let (_temp, _data, store) = fixture();
+    for router in ["router-a", "router-b"] {
+        store.db.create(router, Default::default()).unwrap();
+    }
     let policy = StatePolicy::default();
     let task = store
         .create_task("router-a", spec("Scoped"), "create")
@@ -1989,4 +2016,45 @@ fn a_rejected_transition_keeps_earlier_pending_events_unapplied() {
         .iter()
         .filter(|event| event.event_type != EventType::TaskCreated)
         .all(|event| !event.processed));
+}
+
+#[test]
+fn isolated_members_require_the_original_router_and_member_incarnations() -> anyhow::Result<()> {
+    use crate::db::session_store::{CreateOptions, ProjectSelection, Stores};
+    let root = tempfile::tempdir()?;
+    let stores = Stores::open(root.path())?;
+    let tasks = TaskStore::new(Arc::new(stores.clone()), root.path().to_owned());
+    let options = |project: &str| -> anyhow::Result<CreateOptions> {
+        let dir = root.path().join(project);
+        std::fs::create_dir_all(&dir)?;
+        Ok(CreateOptions {
+            project: Some(ProjectSelection::Workspace(dir)),
+            workspace_mode: Some("code".into()),
+            ..Default::default()
+        })
+    };
+    let id = uuid::Uuid::new_v4().to_string();
+    let router = stores.create(&id, options("router")?)?;
+    let coder = stores.create(&uuid::Uuid::new_v4().to_string(), options("coder")?)?;
+    assert!(router.send_peer(&coder, "before", "unrelated").is_err());
+    let task = tasks.create_task(&id, spec("Route isolated work"), "create")?;
+    tasks.set_sessions(&task.task_id, Some(coder.id()), None)?;
+    let mailbox = crate::services::ServiceContext::from_stores(
+        crate::runtime::RuntimePaths::new(root.path().into())?,
+        Arc::new(crate::services::EnvironmentCredentials),
+    )?;
+    use crate::services::session_messages as mail;
+    let first = mail::send_once(&mailbox, "dispatch", &id, coder.id(), "implement")?;
+    assert_eq!(mail::send_once(&mailbox, "dispatch", &id, coder.id(), "implement")?.id, first.id);
+    assert_eq!(mail::pending_count(&mailbox, coder.id())?, 1);
+    let notices = mail::notices(&mailbox, coder.id())?;
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].ends_with("implement"));
+    assert!(mail::notices(&mailbox, coder.id())?.is_empty());
+    assert!(coder.delivery_owner()?.next_peer()?.unwrap().applied);
+    coder.send_peer(&router, "reply", "finished")?;
+    router.delete()?;
+    let replacement = stores.create(&id, options("router")?)?;
+    assert!(replacement.send_peer(&coder, "after", "reused").is_err());
+    Ok(())
 }

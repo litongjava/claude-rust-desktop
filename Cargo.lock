@@ -1448,8 +1448,6 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crossterm"
 version = "0.28.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "829d955a0bb380ef178a640b91779e3987da38c9aea133b20614cfed8cdea9c6"
 dependencies = [
  "bitflags 2.11.1",
  "crossterm_winapi",
@@ -1662,6 +1660,7 @@ dependencies = [
  "deepseek-code-core",
  "dirs 5.0.1",
  "futures",
+ "libc",
  "png 0.18.1",
  "portable-pty",
  "pulldown-cmark",
@@ -1671,6 +1670,7 @@ dependencies = [
  "rustyline",
  "serde",
  "serde_json",
+ "signal-hook",
  "tempfile",
  "tokio",
  "tracing",
@@ -1712,7 +1712,6 @@ dependencies = [
  "pdf-extract",
  "portable-pty",
  "prometheus",
- "qrcode",
  "r2d2",
  "r2d2_sqlite",
  "regex",
@@ -5337,12 +5336,6 @@ name = "pxfm"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
-
-[[package]]
-name = "qrcode"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "quick-error"

@@ -410,3 +410,23 @@ fn test_fs_read_preview_limits_and_detects_binary() {
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+async fn mobile_local_bridge_reopens_history_from_its_app_directory() -> anyhow::Result<()> {
+    crate::config::OrchestrationConfig::init_global()?;
+    let app = tempfile::tempdir()?;
+    let root = app.path();
+    let id = uuid::Uuid::new_v4().to_string();
+    {
+        let bridge = super::BridgeServer::open_mobile(root.to_owned())?;
+        let session = bridge.db_manager.create(&id, Default::default())?;
+        session.write(|w| w.append("user", "mobile history"))?;
+    }
+    assert!(root.join("global.db").is_file());
+    assert!(root.join("sessions").join(&id).join("session.db").is_file());
+    let reopened = super::BridgeServer::open_mobile(root.to_owned())?;
+    let messages = reopened.db_manager.open_session(&id)?.read(|r| r.messages())?;
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].content, "mobile history");
+    Ok(())
+}

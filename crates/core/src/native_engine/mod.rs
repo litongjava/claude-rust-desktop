@@ -4,13 +4,14 @@ pub mod anthropic_client;
 pub mod openai_client;
 pub mod engine_core;
 pub mod provider_manager;
+pub mod session_binding;
 pub mod session_manager;
 pub mod tool_loop;
 // The durable owner path depends on the embedded QuickJS bridge.
 #[cfg(not(target_os = "android"))]
 pub mod toolscript_job;
 pub mod request_trace;
-mod request_identity;
+pub(crate) mod request_identity;
 pub mod request_options;
 pub mod token_counter;
 pub mod task_context;
@@ -35,3 +36,5 @@ pub mod child_session;
 pub(crate) mod mcp_output;
 
 pub mod request_recording;
+
+pub mod suggestion;

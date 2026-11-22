@@ -157,7 +157,7 @@ impl SuperAgentConfig {
         let config: Self = match from_file {
             Some(value) => serde_json::from_value(value)
                 .context("Invalid superAgent configuration in settings.json")?,
-            None => context.setting(SETTINGS_KEY)?.unwrap_or_default(),
+            None => context.global_setting(crate::db::session_store::GlobalSetting::MachinePreference(SETTINGS_KEY))?.unwrap_or_default(),
         };
         config.validate()?;
         Ok(config)

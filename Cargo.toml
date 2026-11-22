@@ -2,7 +2,11 @@
 resolver = "2"
 members = ["crates/core", "crates/cli", "src-tauri", "src-tauri/worker"]
 default-members = ["crates/core", "crates/cli"]
-exclude = ["legacy/claude-code-cli"]
+exclude = ["legacy/claude-code-cli", "vendor/crossterm"]
+
+[patch.crates-io]
+# The Unix event reader must return on a disconnected terminal.
+crossterm = { path = "vendor/crossterm" }
 
 [workspace.package]
 version = "3.1.0"

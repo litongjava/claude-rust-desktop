@@ -37,6 +37,15 @@ async fn wait_for(mut ready: impl FnMut() -> bool) {
 
 #[tokio::test]
 async fn idle_worker_rewakes_once_and_never_records_feedback_as_user_authority() {
+    exercise_idle_rewake(false).await;
+}
+
+#[tokio::test]
+async fn changed_frontend_binding_fences_pending_hook_before_next_submission() {
+    exercise_idle_rewake(true).await;
+}
+
+async fn exercise_idle_rewake(change_binding: bool) {
     let temp = tempfile::tempdir().unwrap();
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).unwrap();
@@ -77,7 +86,20 @@ clearInterval(t);console.log('STDOUT_NOT_PREFERRED');console.error('IDLE_REWAKE_
     .await;
     assert_eq!(requests.lock().unwrap().len(), 1);
     // The hook cannot finish until AFTER the foreground turn has completed.
+    if change_binding {
+        worker::call(&host, &worker::Request::Bind { identity: "different-frontend-binding".into() }).await.unwrap();
+    }
     std::fs::write(workspace.join("release"), "").unwrap();
+    if change_binding {
+        wait_for(|| deepseek_code_core::services::async_hooks::has_pending_wake(&paths.data_dir, &session)).await;
+        // The worker inspects pending wakes once per second.
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(deepseek_code_core::services::async_hooks::has_pending_wake(&paths.data_dir, &session));
+        worker::shutdown(&paths.data_dir, &session).await.unwrap();
+        server.abort();
+        return;
+    }
     wait_for(|| requests.lock().unwrap().len() == 2).await;
     wait_for(|| {
         jobs::list(&paths.data_dir, Some(&session))

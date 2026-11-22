@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { AlertTriangle, ShieldCheck, ShieldX, ShieldPlus, X } from 'lucide-react';
 
 export interface ApprovalInfo {
+  conversation_id?: string;
   id: string;
   tool_name: string;
   action: string;

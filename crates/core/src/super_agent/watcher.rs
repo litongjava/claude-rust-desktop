@@ -1,6 +1,7 @@
 //! One bounded Router-host supervision pass. No scheduler or UI lives here.
 //! Recovery never replays a stored tool command. It resumes the same member
 //! through Launcher/child_session after durable ownership and Git checks.
+use crate::db::session_store::{SessionAccess,TaskState};
 use super::{
     model::*, orchestrator::Orchestrator, role::MemberRole, state::StatePolicy, store::TaskStore,
 };
@@ -61,6 +62,8 @@ impl Drop for WatchLock {
 /// Hosts call this once per tick/notification. Different processes contend on
 /// the same OS lock; the durable ledger survives a host crash at every step.
 pub async fn watch_once(host: &Orchestrator, router: &str) -> Result<WatchReport> {
+    let (pass, _guard) = host.router_pass(router)?;
+    let host = &pass;
     let Some(_lock) = lock_router(host, router)? else {
         return Ok(WatchReport {
             deferred_tasks: TaskStore::from_context(&host.context)
@@ -312,6 +315,14 @@ async fn watch_member(
     let Some(session) = member.session_id.as_deref() else {
         return Ok(());
     };
+    // The member slot can outlive the session it names. Fence the recorded
+    // incarnation through inspection, stop requests, lease probes and resume.
+    let incarnation = host
+        .context
+        .db
+        .recorded_task_member(&task.task_id, role, session)?;
+    let member_session = host.context.db.open_recorded(session, &incarnation)?;
+    let _member = member_session.hold_incarnation()?;
     let store = TaskStore::from_context(&host.context);
     let key = format!(
         "super-agent.watcher.{}.{}.{}",
@@ -319,7 +330,7 @@ async fn watch_member(
         task.spec_version,
         role.as_str()
     );
-    let mut ledger: RecoveryLedger = host.context.setting(&key)?.unwrap_or_default();
+    let mut ledger: RecoveryLedger = host.context.db.task_state(&key)?.unwrap_or_default();
     if let Some(recovery) = ledger
         .active
         .clone()
@@ -486,7 +497,7 @@ async fn watch_member(
             resumed_job: None,
             checkpoint_id: None,
         });
-        host.context.save_setting(&key, &ledger)?;
+        host.context.db.save_task_state(&key, &ledger)?;
     }
     let mut recovery = ledger.active.clone().context("Missing recovery journal")?;
     ensure!(
@@ -546,13 +557,15 @@ async fn watch_member(
         return Ok(());
     }
     if !processes_gone(&job)
-        || session_messages::execution_active(&host.context.paths.data_dir, session)?
+        || member_session
+            .repository()
+            .execution_active(&host.context.paths.data_dir)?
     {
         if !terminal {
             if !recovery.stop_requested {
                 recovery.stop_requested = true;
                 ledger.active = Some(recovery.clone());
-                host.context.save_setting(&key, &ledger)?;
+                host.context.db.save_task_state(&key, &ledger)?;
             }
             // Reissue the idempotent signal after a crash between intent and write.
             request_stop(&host.context.paths.data_dir, &job)?;
@@ -576,7 +589,7 @@ async fn watch_member(
         Ok(claim) => claim,
         Err(_) => return Ok(()),
     };
-    let lease = session_messages::ExecutionLease::acquire(&host.context.paths.data_dir, session)?;
+    let lease = member_session.acquire_execution()?;
     if recovery.prompt.is_none() {
         let observation = reconcile_git(task, &pending)?;
         let checkpoints =
@@ -587,7 +600,7 @@ async fn watch_member(
             task.task_id, task.phase, task.spec_version, task.review_round, recovery.checkpoint_id, observation, serde_json::to_string(&pending)?
         ));
         ledger.active = Some(recovery.clone());
-        host.context.save_setting(&key, &ledger)?;
+        host.context.db.save_task_state(&key, &ledger)?;
     }
     // The shared resume path rechecks execution ownership. Keep the Router
     // lock across admission; the engine takes its own lifetime execution lease.
@@ -610,21 +623,8 @@ fn job_phase(
     {
         return Ok(Some(r.phase));
     }
-    let operations = host.context.db.with_conn(|conn| -> Result<Vec<String>> {
-        let mut stmt = conn.prepare("SELECT value FROM peripheral_settings WHERE key LIKE ?1")?;
-        let rows = stmt
-            .query_map(
-                [format!(
-                    "super-agent.launch-op.{}.{}.%",
-                    task.task_id,
-                    role.as_str()
-                )],
-                |r| r.get(0),
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })??;
-    for raw in operations {
+    let prefix=format!("super-agent.launch-op.{}.{}.",task.task_id,role.as_str());
+    for (_,raw) in host.context.db.task_state_rows(&prefix)? {
         let op: super::launcher::LaunchOperation = serde_json::from_str(&raw)?;
         if op.job_id != job.id {
             continue;
@@ -686,7 +686,7 @@ async fn finish_resume(
             }
             recovery.resumed_job = Some(outcome.job_id);
             ledger.active = Some(recovery);
-            host.context.save_setting(key, &ledger)?;
+            host.context.db.save_task_state(key, &ledger)?;
         }
         Ok(_) => {}
         Err(error) => {
@@ -699,7 +699,7 @@ async fn finish_resume(
             recovery.next_attempt_ms =
                 jobs::now().saturating_add(backoff_ms(host, recovery.launch_errors));
             ledger.active = Some(recovery.clone());
-            host.context.save_setting(key, &ledger)?;
+            host.context.db.save_task_state(key, &ledger)?;
             if recovery.launch_errors >= host.config.watcher.max_recovery_attempts {
                 block(
                     host,
@@ -776,9 +776,8 @@ fn waiting_reason(
     {
         return Ok(Some("waiting for user/permission/plan answer".into()));
     }
-    let pending: bool = host.context.db.with_conn(|conn| conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM permission_approvals WHERE conversation_id=?1 AND status='pending') OR EXISTS(SELECT 1 FROM sa_approvals WHERE task_id=?2 AND status='PENDING')",
-        [&job.session_id, &task.task_id], |r| r.get(0)))??;
+    let pending=!host.context.db.select_session(&job.session_id)?.pending_approvals()?.is_empty()
+        || TaskStore::from_context(&host.context).approvals(&task.task_id)?.iter().any(|approval|approval.status==ApprovalStatus::Pending);
     Ok(pending.then(|| "waiting for approval".into()))
 }
 
@@ -802,22 +801,18 @@ impl PendingTool {
     }
 }
 fn pending_tools(host: &Orchestrator, session: &str) -> Result<Vec<PendingTool>> {
-    let rows = host.context.db.with_conn(|conn| -> Result<Vec<(String,String,Option<String>)>> {
-        let mut stmt = conn.prepare("SELECT t.id,t.name,t.input FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE m.conversation_id=?1 AND t.output IS NULL ORDER BY m.sort_order,m.rowid,t.sort_order,t.rowid")?;
-        let rows = stmt.query_map([session], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
-    })??;
+    let rows=host.context.db.select_session(session)?.pending_tool_inputs()?;
     rows.into_iter()
         .map(|(id, name, input)| {
             // tool_calls has no exact start timestamp. A persisted first-observed
             // deadline is conservative: never cancel a live tool early by using
             // the assistant message's older creation time as its start.
             let key = format!("super-agent.watcher-tool.{}", digest(&json!([session, id])));
-            let started = match host.context.setting::<u64>(&key)? {
+            let started = match host.context.db.task_state::<u64>(&key)? {
                 Some(t) => t,
                 None => {
                     let t = jobs::now();
-                    host.context.save_setting(&key, &t)?;
+                    host.context.db.save_task_state(&key, &t)?;
                     t
                 }
             };

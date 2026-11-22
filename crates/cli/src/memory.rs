@@ -1,3 +1,4 @@
+use deepseek_code_core::db::session_store::GlobalSetting;
 use crate::args::MemoryCommands;
 use anyhow::{ensure, Result};
 use deepseek_code_core::{memory::MemExClient, runtime::RuntimePaths};
@@ -119,14 +120,14 @@ pub async fn run(cli: &crate::args::Cli, paths: &RuntimePaths, action: &MemoryCo
         }
         MemoryCommands::DreamStatus => {
             let context = crate::services::context(paths)?;
-            crate::services::print(&serde_json::json!({"memory":client.dream_status().await?, "config":context.setting::<deepseek_code_core::services::dream::DreamConfig>("auto-dream")?.unwrap_or_default(), "services":deepseek_code_core::services::lifecycle::status(&context)?}))
+            crate::services::print(&serde_json::json!({"memory":client.dream_status().await?, "config":context.global_setting::<deepseek_code_core::services::dream::DreamConfig>(GlobalSetting::MachinePreference("auto-dream"))?.unwrap_or_default(), "services":deepseek_code_core::services::lifecycle::status(&context)?}))
         }
         MemoryCommands::DreamConfig { enabled, min_hours, min_memories } => {
             let selected = crate::config::select(cli, paths, None, None)?;
             let config = deepseek_code_core::services::dream::DreamConfig { enabled:*enabled, provider:selected.provider_id, model:selected.model, min_hours:*min_hours, min_memories:*min_memories };
             config.validate()?;
             deepseek_code_core::services::generation::Generator::saved(paths, &config.provider, &config.model)?;
-            crate::services::context(paths)?.save_setting("auto-dream", &config)?;
+            crate::services::context(paths)?.save_global_setting(GlobalSetting::MachinePreference("auto-dream"), &config)?;
             crate::services::print(&config)
         }
         MemoryCommands::Status => crate::services::print(&client.stats().await?),

@@ -1,4 +1,9 @@
 //! End-to-end SDK tests run the actual CLI process against local model servers.
+#[path = "../../core/tests/support/session_sql.rs"]
+mod fixture_sql;
+use fixture_sql::FixtureSql;
+#[path = "sdk/prompt_suggestion.rs"]
+mod prompt_suggestion;
 #[path = "sdk/toolscript_approval.rs"]
 mod toolscript_approval;
 #[path = "sdk/interrupt_usage.rs"]
@@ -573,9 +578,15 @@ fn responses_tool_call(id: &str, name: &str, arguments: Value) -> String {
 }
 
 fn responses_text(text: &str) -> String {
+    responses_text_with_usage(
+        text,
+        json!({"input_tokens":20,"output_tokens":10,"total_tokens":30}),
+    )
+}
+fn responses_text_with_usage(text: &str, usage: Value) -> String {
     [
         json!({"type":"response.output_text.delta","delta":text}),
-        json!({"type":"response.completed","response":{"id":"r2","model":"fixture-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":{"input_tokens":20,"output_tokens":10,"total_tokens":30}}}),
+        json!({"type":"response.completed","response":{"id":"r2","model":"fixture-model","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":text}]}],"usage":usage}}),
     ]
     .into_iter()
     .map(responses_frame)
@@ -934,7 +945,7 @@ async fn output_limit_is_incomplete_retains_partial_and_never_replays_tools() {
             if matches!(mode, Mode::TruncatedThinking) {
                 let retained = store
                     .db
-                    .with_conn(|conn| {
+                    .shard_sql(id, |conn| {
                         deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, id)
                     })
                     .unwrap()
@@ -947,7 +958,7 @@ async fn output_limit_is_incomplete_retains_partial_and_never_replays_tools() {
             }
             let snapshots = store
                 .db
-                .with_conn(|conn| -> anyhow::Result<Vec<Value>> {
+                .shard_sql(id, |conn| -> anyhow::Result<Vec<Value>> {
                     let messages =
                         deepseek_code_core::db::message_repo::get_messages_by_conversation(conn, id)?;
                     Ok(messages
@@ -1013,7 +1024,7 @@ async fn one_million_suffix_is_selection_metadata_not_api_model() {
         );
         store
             .db
-            .with_conn(|conn| -> anyhow::Result<()> {
+            .shard_sql(result["session_id"].as_str().unwrap(), |conn| -> anyhow::Result<()> {
                 let messages = deepseek_code_core::db::message_repo::get_messages_by_conversation(
                     conn,
                     result["session_id"].as_str().unwrap(),
@@ -1373,7 +1384,7 @@ fn write_stream_timeout_policy(root: &Path, idle_secs: u64, retries: u32, backof
 fn turn_rows(data: &Path, session: &str) -> Vec<(String, String)> {
     let paths = deepseek_code_core::runtime::RuntimePaths::new(data.to_path_buf()).unwrap();
     let db = paths.open_database().unwrap();
-    db.with_conn(|conn| -> anyhow::Result<Vec<(String, String)>> {
+    db.shard_sql(session, |conn| -> anyhow::Result<Vec<(String, String)>> {
         let mut statement = conn.prepare(
             "SELECT id,status FROM execution_turns WHERE conversation_id=?1 ORDER BY started_at, rowid",
         )?;
@@ -1856,9 +1867,9 @@ async fn sdk_initialize_applies_runtime_overrides_and_reports_real_resources() {
         .unwrap();
         deepseek_code_core::services::agents::install(&context,serde_json::from_value(json!({"id":"sdk-fixture-agent","description":"Actual configured agent","system_prompt":"Use local fixtures","tools":["Read"]})).unwrap()).unwrap();
         let session = uuid::Uuid::new_v4().to_string();
+        context.db.create_code_session(root.path(),"fixture-model","sdk-fixture",&session).unwrap();
         context
-            .save_setting(
-                &format!("cli.display.{session}"),
+            .db.seed_preference(&session, deepseek_code_core::db::session_store::settings::DISPLAY,
                 &json!({"output_style":"learning"}),
             )
             .unwrap();
@@ -1889,7 +1900,7 @@ async fn sdk_initialize_applies_runtime_overrides_and_reports_real_resources() {
             root.path(),
             &server,
             &[
-                "--session-id",
+                "--resume",
                 &session,
                 "--system-prompt",
                 "CLI_BASE_REPLACED",
@@ -2141,10 +2152,10 @@ async fn typed_sdk_approval_rewrites_both_provider_histories_and_empty_input_pre
             }
             drop(requests);
             assert!(client.finish().await.0.success());
-            let db = deepseek_code_core::db::DbManager::new(root.path().join("data").join(deepseek_code_core::runtime::DATABASE_FILE))
-                .unwrap();
+            let db = deepseek_code_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap().open_database().unwrap();
+            let session = &db.conversations().unwrap()[0].id;
             let persisted: String = db
-                .with_conn(|connection| {
+                .shard_sql(session, |connection| {
                     connection.query_row(
                         "SELECT input FROM tool_calls WHERE name = 'Write'",
                         [],
@@ -2390,10 +2401,13 @@ async fn sdk_initialize_agents_execute_with_bounded_tools_and_run_local_catalog(
                 .unwrap()
                 .iter()
                 .any(|agent| agent.id == "sdk-child"));
-            let bindings: Vec<String> = context.db.with_conn(|conn| {
-                conn.prepare("SELECT definition FROM session_agents WHERE definition LIKE '%sdk-runtime-boundary%'")?
-                    .query_map([], |row| row.get(0))?.collect::<Result<Vec<_>, _>>()
-            }).unwrap().unwrap();
+            let mut bindings = Vec::new();
+            for row in context.db.conversations().unwrap() {
+                bindings.extend(context.db.shard_sql(&row.id, |conn| {
+                    conn.prepare("SELECT definition FROM session_agents WHERE definition LIKE '%sdk-runtime-boundary%'")?
+                        .query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()
+                }).unwrap().unwrap());
+            }
             assert_eq!(bindings.len(), 1);
             let binding: Value = serde_json::from_str(&bindings[0]).unwrap();
             assert!(!bindings[0].contains("SDK_CHILD_PROMPT_SENTINEL"));
@@ -2545,9 +2559,9 @@ SKILL_SENTINEL",
 
 #[tokio::test]
 async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
-    let server = Server::start(false, Mode::Text).await;
+    let server = prompt_suggestion::Endpoint::start("chat").await;
     let root = tempfile::tempdir().unwrap();
-    let mut client = Client::start(root.path(), &server, &[]);
+    let mut client = server.client(root.path(), &[]);
     client
         .send(initialize_request(
             "init",
@@ -2571,11 +2585,11 @@ async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
     let result = client.result().await;
     assert_eq!(result["is_error"], false, "{result}");
     let suggestion = client.frame("prompt_suggestion").await;
-    assert_eq!(suggestion["suggestion"], "suggested-next");
+    assert_eq!(suggestion["suggestion"], "run the checks");
     assert_eq!(suggestion["session_id"], result["session_id"]);
     {
-        let requests = server.fixture.requests.lock().unwrap();
-        let first = requests[0].to_string();
+        let requests = server.requests.lock().unwrap();
+        let first = &requests[0].1;
         assert!(first.contains("MAIN_AGENT_SYSTEM_SENTINEL"), "{first}");
         assert!(first.contains("INITIAL_PROMPT_SENTINEL"), "{first}");
     }

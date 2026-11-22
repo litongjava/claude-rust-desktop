@@ -20,83 +20,94 @@ pub fn estimate_tokens(text: &str) -> u64 {
 
 /// Per skill name, from all Skill tool calls in the database.
 pub fn skill_usage(db: &DbManager, now: DateTime<Utc>) -> Result<BTreeMap<String, Usage>> {
-    let usage = db.with_conn(|conn| -> Result<BTreeMap<String, Usage>> {
-        let mut statement = conn.prepare(
-            "SELECT t.input, t.output, m.created_at FROM tool_calls t \
+    db.with_conn(|c| skill_snapshot(c, now, &|| false))?
+}
+
+pub(crate) fn skill_snapshot(
+    conn: &rusqlite::Connection,
+    now: DateTime<Utc>,
+    cancelled: &impl Fn() -> bool,
+) -> Result<BTreeMap<String, Usage>> {
+    let mut statement = conn.prepare(
+        "SELECT t.input, t.output, m.created_at FROM tool_calls t \
              JOIN messages m ON m.id = t.message_id WHERE t.name = 'Skill'",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, Option<String>>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        let since = now - chrono::Duration::days(7);
-        let mut usage = BTreeMap::<String, Usage>::new();
-        for row in rows {
-            let (input, output, created_at) = row?;
-            // Rows from other writers or older versions may hold malformed data;
-            // one bad row must not hide the rest of the history.
-            let Some(name) = input
-                .as_deref()
-                .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
-                .and_then(|input| input.get("skill")?.as_str().map(str::to_owned))
-            else {
-                continue;
-            };
-            let Ok(created_at) =
-                DateTime::parse_from_rfc3339(&created_at).map(|time| time.with_timezone(&Utc))
-            else {
-                continue;
-            };
-            let entry = usage.entry(name).or_default();
-            entry.uses += 1;
-            if entry.last_used.is_none_or(|last| created_at > last) {
-                entry.last_used = Some(created_at);
-            }
-            if created_at >= since {
-                entry.tokens_7d += estimate_tokens(output.as_deref().unwrap_or(""));
-            }
-        }
-        Ok(usage)
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+        ))
     })?;
-    usage
+    let since = now - chrono::Duration::days(7);
+    let mut usage = BTreeMap::<String, Usage>::new();
+    for row in rows {
+        anyhow::ensure!(!cancelled(), "Usage scan cancelled");
+        let (input, output, created_at) = row?;
+        // Rows from other writers or older versions may hold malformed data;
+        // one bad row must not hide the rest of the history.
+        let Some(name) = input
+            .as_deref()
+            .and_then(|input| serde_json::from_str::<serde_json::Value>(input).ok())
+            .and_then(|input| input.get("skill")?.as_str().map(str::to_owned))
+        else {
+            continue;
+        };
+        let Ok(created_at) =
+            DateTime::parse_from_rfc3339(&created_at).map(|time| time.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let entry = usage.entry(name).or_default();
+        entry.uses += 1;
+        if entry.last_used.is_none_or(|last| created_at > last) {
+            entry.last_used = Some(created_at);
+        }
+        if created_at >= since {
+            entry.tokens_7d += estimate_tokens(output.as_deref().unwrap_or(""));
+        }
+    }
+    Ok(usage)
 }
 
 /// Per MCP server name, the last time any of its tools ran.
 pub fn mcp_last_used(db: &DbManager) -> Result<BTreeMap<String, DateTime<Utc>>> {
-    let usage = db.with_conn(|conn| -> Result<BTreeMap<String, DateTime<Utc>>> {
-        let mut statement = conn.prepare(
-            "SELECT t.name, m.created_at FROM tool_calls t \
+    db.with_conn(|c| mcp_snapshot(c, &|| false))?
+}
+
+pub(crate) fn mcp_snapshot(
+    conn: &rusqlite::Connection,
+    cancelled: &impl Fn() -> bool,
+) -> Result<BTreeMap<String, DateTime<Utc>>> {
+    let mut statement = conn.prepare(
+        "SELECT t.name, m.created_at FROM tool_calls t \
               JOIN messages m ON m.id = t.message_id \
               WHERE t.name LIKE 'mcp\\_\\_%' ESCAPE '\\'",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut usage = BTreeMap::new();
-        for row in rows {
-            let (name, created_at) = row?;
-            let Some((server, _tool)) = name
-                .strip_prefix("mcp__")
-                .and_then(|rest| rest.split_once("__"))
-            else {
-                continue;
-            };
-            let Ok(created_at) =
-                DateTime::parse_from_rfc3339(&created_at).map(|time| time.with_timezone(&Utc))
-            else {
-                continue;
-            };
-            let entry = usage.entry(server.to_owned()).or_insert(created_at);
-            if created_at > *entry {
-                *entry = created_at;
-            }
-        }
-        Ok(usage)
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    usage
+    let mut usage = BTreeMap::new();
+    for row in rows {
+        anyhow::ensure!(!cancelled(), "Usage scan cancelled");
+        let (name, created_at) = row?;
+        let Some((server, _tool)) = name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.split_once("__"))
+        else {
+            continue;
+        };
+        let Ok(created_at) =
+            DateTime::parse_from_rfc3339(&created_at).map(|time| time.with_timezone(&Utc))
+        else {
+            continue;
+        };
+        let entry = usage.entry(server.to_owned()).or_insert(created_at);
+        if created_at > *entry {
+            *entry = created_at;
+        }
+    }
+    Ok(usage)
 }
 
 /// Tokens the skill's line in the model listing costs every turn; 0 when the

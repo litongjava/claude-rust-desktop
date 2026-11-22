@@ -4,7 +4,7 @@
 //! authorized from the durable records at execution time: a forged router tool
 //! name, a stale member session or a task owned by another Router is rejected
 //! even if it reaches the dispatcher.
-use crate::db::DbManager;
+use crate::db::session_store::Stores;
 use crate::services::{EnvironmentCredentials, ServiceContext};
 use crate::super_agent::role::{self, MemberRole, Role};
 use crate::super_agent::store::{EventAppend, StoreError, TaskStore};
@@ -34,7 +34,7 @@ pub const ROUTER_FORBIDDEN_EDIT_TOOLS: [&str; 5] =
 
 #[derive(Clone)]
 pub struct ToolRuntime {
-    pub db: Arc<DbManager>,
+    pub db: Arc<Stores>,
     pub data_dir: PathBuf,
     pub session_id: String,
 }
@@ -370,16 +370,18 @@ pub fn execute(
 }
 
 fn require_router(runtime: &ToolRuntime) -> Result<TaskStore> {
-    let role = role::load(&runtime.db, &runtime.session_id)?;
+    let router = runtime.db.open_session(&runtime.session_id)?;
+    let role = role::load(&router, router.id())?;
     ensure!(
         role.is_router(),
         "Super Agent tool {name} requires a Router session",
         name = "Crp"
     );
-    Ok(runtime.store())
+    Ok(runtime.store().for_router(&router))
 }
 
-fn owned_task(store: &TaskStore, router: &str, task_id: &str) -> Result<TaskRecord> {
+fn owned_task(store: &mut TaskStore, router: &str, task_id: &str) -> Result<TaskRecord> {
+    store.select_router_task(task_id).map_err(store_error)?;
     let task = store
         .get_task(task_id)
         .map_err(store_error)?
@@ -452,9 +454,9 @@ fn list(runtime: &ToolRuntime, input: Value) -> Result<Value> {
 }
 
 fn show(runtime: &ToolRuntime, input: Value) -> Result<Value> {
-    let store = require_router(runtime)?;
+    let mut store = require_router(runtime)?;
     let task_id = input["task_id"].as_str().context("task_id is required")?;
-    let task = owned_task(&store, &runtime.session_id, task_id)?;
+    let task = owned_task(&mut store, &runtime.session_id, task_id)?;
     let approvals = store.approvals(task_id).map_err(store_error)?;
     let pending: Vec<Value> = approvals
         .iter()
@@ -522,9 +524,9 @@ fn send(
     input: Value,
     tool_use_id: &str,
 ) -> Result<Value> {
-    let store = require_router(runtime)?;
+    let mut store = require_router(runtime)?;
     let task_id = input["task_id"].as_str().context("task_id is required")?;
-    let task = owned_task(&store, &runtime.session_id, task_id)?;
+    let task = owned_task(&mut store, &runtime.session_id, task_id)?;
     let to = input["to"].as_str().context("to is required")?;
     let recipient = match to {
         "coder" => task
@@ -577,9 +579,9 @@ fn parse_spec(value: &Value) -> Result<TaskSpec> {
 }
 
 fn update_spec(runtime: &ToolRuntime, input: Value, tool_use_id: &str) -> Result<Value> {
-    let store = require_router(runtime)?;
+    let mut store = require_router(runtime)?;
     let task_id = input["task_id"].as_str().context("task_id is required")?;
-    let task = owned_task(&store, &runtime.session_id, task_id)?;
+    let task = owned_task(&mut store, &runtime.session_id, task_id)?;
     let spec = parse_spec(&input["spec"])?;
     let append = store
         .ingest_event(
@@ -603,7 +605,7 @@ fn update_spec(runtime: &ToolRuntime, input: Value, tool_use_id: &str) -> Result
 }
 
 fn answer(runtime: &ToolRuntime, input: Value, tool_use_id: &str) -> Result<Value> {
-    let store = require_router(runtime)?;
+    let mut store = require_router(runtime)?;
     let approval_id = input["approval_id"]
         .as_str()
         .context("approval_id is required")?;
@@ -611,7 +613,7 @@ fn answer(runtime: &ToolRuntime, input: Value, tool_use_id: &str) -> Result<Valu
         .approval(approval_id)
         .map_err(store_error)?
         .with_context(|| format!("Approval not found: {approval_id}"))?;
-    let task = owned_task(&store, &runtime.session_id, &approval.task_id)?;
+    let task = owned_task(&mut store, &runtime.session_id, &approval.task_id)?;
     if approval.status == ApprovalStatus::Pending {
         // A current approval may only be answered while it still describes the
         // active contract. A replay of an earlier answer is handled by
