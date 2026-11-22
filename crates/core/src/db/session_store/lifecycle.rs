@@ -598,7 +598,7 @@ impl Stores {
                             .is_some_and(|s| s.provider_selection.is_some()),
                     )?,
                     Seed::Import(session) => session.populate(tx)?,
-                    Seed::Sync(s) => s.populate(tx)?,
+                    Seed::Sync(s) => s.populate(tx, &memory)?,
                 }
                 self.step(Phase::BeforeSeal)
             })?;

@@ -865,6 +865,42 @@ mod tests {
         prompt::replay(shard, boundary.as_deref(), &history).unwrap()
     }
 
+    #[test]
+    fn memory_sync_boundary_freezes_the_current_scope() {
+        let (_root, memory) = fixture();
+        memory.store(false).unwrap();
+        let path = memory.directory.join("MEMORY.md");
+        let shard = memory.session.as_ref().unwrap();
+        std::fs::write(&path, "SESSION_INDEX").unwrap();
+        shard.admit_prompt("initial", None, "typed").unwrap();
+        let mut row = shard.read(|r| r.messages()).unwrap().remove(0);
+        for promote in [false, true] {
+            row.id = uuid::Uuid::new_v4().to_string();
+            row.sort_order += 1;
+            row.content = format!("sync {promote}");
+            let sync = |row| {
+                memory
+                    .context
+                    .db
+                    .sync_conversation(shard.id(), None, &[row])
+                    .unwrap()
+            };
+            if promote {
+                row.is_compact_boundary = false;
+                sync(row.clone());
+            }
+            let index = format!("SYNC_INDEX_{promote}");
+            std::fs::write(&path, &index).unwrap();
+            row.is_compact_boundary = true;
+            sync(row.clone());
+            assert!(replay(shard).0.unwrap_or_default().contains(&index));
+            std::fs::write(&path, "UNADMITTED_EDIT").unwrap();
+            row.content.push('!');
+            sync(row.clone());
+            assert!(replay(shard).0.unwrap_or_default().contains(&index));
+        }
+    }
+
     fn compact(shard: &SessionDb) {
         let prepared = crate::services::compaction::prepare(shard, shard.id()).unwrap();
         crate::services::compaction::commit(shard, prepared, "same summary").unwrap();

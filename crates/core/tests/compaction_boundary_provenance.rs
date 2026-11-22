@@ -375,6 +375,7 @@ async fn restored_and_reset_histories_bind_the_requests_they_send() {
 fn new_memory_boundaries_have_one_writer() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let patterns = [
+        r"(?i)\bis_compact_boundary\s*=\s*(?:excluded\.|\?\d+)",
         r"(?i)\bset\s+is_compact_boundary\s*=\s*(?:1|true)",
         r#"(?s)\binsert_message\([^;]{0,1000}?,\s*(?:true|boundary|is_boundary)\s*,"#,
         r#"set_prompt_origin\([^;]*?,\s*"(?:approved_plan|compaction)""#,
@@ -396,11 +397,23 @@ fn new_memory_boundaries_have_one_writer() {
             let mut production = production_source.as_ref();
             let mut outside_writer = String::new();
             if path.ends_with("db/session_store/boundary.rs") {
-                let (before, writer) = production.split_once("pub(crate) fn create(").unwrap();
+                let (before, writer) = production.split_once("pub(crate) fn seal(").unwrap();
                 let (_, after) = writer.split_once("\n}").unwrap();
                 outside_writer.push_str(before);
                 outside_writer.push_str(after);
                 production = &outside_writer;
+            }
+            // A parameterized flag in a sync INSERT bypasses origin and snapshot
+            // writes even if its ON CONFLICT clause never mentions the flag.
+            if path.ends_with("lifecycle/sync.rs") {
+                let direct = regex::Regex::new(
+                    r"(?is)insert\s+(?:or\s+\w+\s+)?into\s+messages\s*\([^)]*is_compact_boundary",
+                )
+                .unwrap();
+                assert!(
+                    !direct.is_match(production),
+                    "Sync inserts boundary flags directly"
+                );
             }
             for pattern in &patterns {
                 for hit in pattern.find_iter(production) {
