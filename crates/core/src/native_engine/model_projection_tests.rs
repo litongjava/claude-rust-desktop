@@ -46,6 +46,24 @@ fn check_view(label: &str, root: &Path, original: &str, view: &str, encoded: boo
     }
 }
 
+fn check_raw_references(label: &str, root: &Path, raw: &str, view: &str) {
+    assert!(view.contains("base64 data omitted"), "{label}");
+    assert!(base64_collapse::runs(view).is_empty(), "{label}");
+    let hash = format!("{:x}", Sha256::digest(raw));
+    for reference in view.split("; full text: ").skip(1) {
+        let (file, rest) = reference.split_once(", line ").unwrap();
+        let line: usize = rest.split_once(']').unwrap().0.parse().unwrap();
+        let file = Path::new(file);
+        assert!(file.starts_with(root.join("tool-outputs")));
+        assert_eq!(file.file_stem().unwrap().to_str().unwrap(), hash);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), raw);
+        assert!(
+            raw.lines().nth(line - 1).unwrap().contains("QUJD")
+                || raw.lines().nth(line - 1).unwrap().contains("QQQQ")
+        );
+    }
+}
+
 fn check_tool(
     label: &str,
     engine: &mut ToolLoopExecutor,
@@ -62,17 +80,23 @@ fn check_tool(
         engine.summary_enabled(Some(root)),
     );
     let live = engine.retained_tool_output(name, raw);
-    check_view(label, root, &original, &live, encoded);
+    if encoded {
+        check_raw_references(label, root, raw, &live);
+    } else {
+        assert_eq!(live, original, "{label}");
+    }
     engine.messages = vec![
         json!({"role":"assistant","content":"","tool_calls":[{"id":"old","type":"function","function":{"name":name,"arguments":"{}"}}]}),
         json!({"role":"tool","tool_call_id":"old","content":raw}),
     ];
+    engine.prepare_model_input().unwrap();
     let replay = serde_json::to_value(engine.build_openai_messages().unwrap()).unwrap();
     assert_eq!(replay[1]["content"], live, "{label}: OpenAI replay");
     engine.messages = vec![
         json!({"role":"assistant","content":[{"type":"tool_use","id":"old","name":name,"input":{}}]}),
         json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":raw}]}),
     ];
+    engine.prepare_model_input().unwrap();
     let replay = serde_json::to_value(engine.build_anthropic_messages().unwrap()).unwrap();
     assert_eq!(
         replay[1]["content"][0]["content"], live,
@@ -268,15 +292,16 @@ async fn base64_model_boundary_matrix() {
             let queued = engine.queued_model_content(vec![input]);
             check_view(label, &root, &notice, queued[0].as_str().unwrap(), encoded);
             engine.messages = vec![json!({"role":"user","content":notice})];
+            engine.prepare_model_input().unwrap();
             let replay = serde_json::to_value(engine.build_openai_messages().unwrap()).unwrap();
             assert_eq!(replay[0]["content"], queued[0]);
-            assert_eq!(engine.messages[0]["content"], notice);
+            assert_eq!(engine.messages[0]["content"], queued[0]);
         }
     }
 }
 
 #[test]
-fn base64_i6_cut_references_the_exact_preview_and_full_result() {
+fn base64_i6_cut_references_the_complete_result_and_preserves_counts() {
     let temp = tempfile::tempdir().unwrap();
     // Arrange a canonical quartet on each edge of the actual retained preview.
     let root = temp.path();
@@ -285,7 +310,7 @@ fn base64_i6_cut_references_the_exact_preview_and_full_result() {
     let raw = json!({"stdout":format!("!{data}!"),"exit_code":0}).to_string();
     let original = command_preview("Bash", &raw, Some(root), None, true);
     let view = engine.retained_tool_output("Bash", &raw);
-    check_view("I6", root, &original, &view, true);
+    check_raw_references("I6", root, &raw, &view);
     let path = original
         .lines()
         .find(|line| line.starts_with("Saved tool result ("))
@@ -295,7 +320,7 @@ fn base64_i6_cut_references_the_exact_preview_and_full_result() {
         .1;
     assert!(view.contains(path));
     assert!(std::fs::read_to_string(path).unwrap().contains(&data));
-    assert!(view.contains("(partial at output cut)"));
+    assert!(view.contains("base64: 1 block collapsed (40000 encoded bytes)"));
     assert!(view.contains("Omitted output:"));
 }
 
@@ -317,10 +342,11 @@ fn base64_model_boundary_preserves_the_other_stream_and_every_visible_reference(
     assert!(ordinary.contains("LAST-ORDINARY-DIAGNOSTIC!"));
     let live = engine.retained_tool_output_for_id("Bash", &raw, Some(id));
     assert!(live.contains("LAST-ORDINARY-DIAGNOSTIC!"));
-    check_view("mixed streams", temp.path(), &ordinary, &live, true);
+    check_raw_references("mixed streams", temp.path(), &raw, &live);
     let many = format!("!{}!\n", stderr).repeat(140);
-    let projected =
-        super::super::project_for_model("TaskGet", &many, Some(temp.path()), "session").unwrap();
+    let projected = super::super::project_for_model("TaskGet", &many, Some(temp.path()), "session")
+        .unwrap()
+        .text;
     assert_eq!(projected.matches("; full text: ").count(), 140);
     check_view("140 historical runs", temp.path(), &many, &projected, true);
 }
@@ -371,7 +397,11 @@ fn base64_model_boundary_replays_plaintext_in_native_windows() {
         {"role":"user","content":[{"type":"input_text","text":notice}]},
         {"type":"compaction","encrypted_content":payload}
     ]}})];
-    super::project_stored_history(&mut messages, dir.path(), "window");
+    super::prepare_native_window(
+        &mut messages[0]["provider_content"],
+        Some(dir.path()),
+        "window",
+    );
     let items = &messages[0]["provider_content"]["items"];
     check_view(
         "native stored page",
@@ -389,6 +419,131 @@ fn base64_model_boundary_replays_plaintext_in_native_windows() {
     );
     assert_eq!(items[3]["encrypted_content"], payload);
     let expected = messages.clone();
-    super::project_stored_history(&mut messages, dir.path(), "window");
+    super::prepare_native_window(
+        &mut messages[0]["provider_content"],
+        Some(dir.path()),
+        "window",
+    );
     assert_eq!(messages, expected);
+}
+
+#[test]
+fn base64_model_boundary_consumers_use_model_rows() {
+    // Storage owns the legacy fallback. Display, export and conflict hashing
+    // may use ToolCallRow. Model builders have no reason to obtain one.
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let raw = regex::Regex::new(
+        r"(?isx)
+        \b(?:get_tool_calls_for_message|ToolCallRow|user_content_for_display)\b
+        |\b\w+\s*\.\s*(?-i:output)\b
+        |\b\w+\s*(?:\[\s*\x22output\x22\s*\]|\.get\(\s*\x22output\x22\s*\))
+        |\b(?:r|reader|session)\s*\.\s*tools\s*\(
+        |\bselect\b[^\x22;]{0,1000}?\boutput\b[^\x22;]{0,250}?\bfrom\s+tool_calls\b
+    ",
+    )
+    .unwrap();
+    let test_modules = regex::Regex::new(r"(?ms)^#\[cfg\(test\)\]\s*mod\s+\w+\s*\{.*?^\}").unwrap();
+    let audit = |file: &Path, body: &str| {
+        if let Some(hit) = raw.find(body) {
+            panic!(
+                "{} reads a display row through {}",
+                file.display(),
+                hit.as_str()
+            );
+        }
+    };
+    for relative in [
+        "native_engine/engine_core.rs",
+        "native_engine/tool_loop.rs",
+        "native_engine/model_tool_output.rs",
+        "native_engine/provider_runtime.rs",
+        "native_engine/provider_runtime",
+        "native_engine/context_compressor.rs",
+        "services/compaction.rs",
+        "services/compaction",
+        "tools/context_search.rs",
+        "db/context_search_repo.rs",
+        "memory/mod.rs",
+    ] {
+        for entry in walkdir::WalkDir::new(src.join(relative)) {
+            let entry = entry.unwrap();
+            let file = entry.path();
+            if file.extension() != Some("rs".as_ref())
+                || file
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .ends_with("tests")
+            {
+                continue;
+            }
+            let text = std::fs::read_to_string(file).unwrap();
+            let production = test_modules.replace_all(&text, "");
+            // Protocol envelopes contain a gateway output array.
+            let production = if file.ends_with("compaction/native.rs") {
+                production.replace(r#"result["output"]"#, "gateway_items")
+            } else if file.ends_with("provider_runtime/events.rs") {
+                production.replace(r#"response["output"]"#, "gateway_items")
+            } else {
+                production.into_owned()
+            };
+            audit(file, &production);
+        }
+    }
+    // Mixed-purpose modules also contain legitimate display/export readers.
+    for (file, start, end) in [
+        (
+            "runtime.rs",
+            "pub(crate) fn replay_history(",
+            "impl SessionStore<DbManager>",
+        ),
+        (
+            "db/session_store/lifecycle/copy.rs",
+            "pub fn prepare_summary_part(",
+            "pub fn branch(",
+        ),
+    ] {
+        let path = src.join(file);
+        let body = std::fs::read_to_string(&path).unwrap();
+        audit(
+            &path,
+            body.split_once(start).unwrap().1.split_once(end).unwrap().0,
+        );
+    }
+}
+
+#[test]
+fn base64_model_boundary_typed_blocks_keep_image_and_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = executor(dir.path());
+    let payload = "QUJD".repeat(256);
+    let blocks = json!([
+        {"type":"text","text":format!("header\n{payload}\n"),"citation":"fixture"},
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":payload}},
+        {"type":"text","text":"ordinary"}
+    ]);
+    engine.messages = vec![
+        json!({"role":"assistant","content":[{"type":"tool_use","id":"call","name":"Bash","input":{}}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"call","content":blocks}]}),
+    ];
+    engine.prepare_model_input().unwrap();
+    let request = serde_json::to_value(engine.build_anthropic_messages().unwrap()).unwrap();
+    let view = &request[1]["content"][0]["content"];
+    assert_eq!(view[0]["citation"], "fixture");
+    assert_eq!(
+        view.as_array().unwrap()[1..],
+        blocks.as_array().unwrap()[1..]
+    );
+    let text = view[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("base64: 1 block collapsed (1024 encoded bytes)") && !text.contains(&payload)
+    );
+    let path = text
+        .split_once("; full text: ")
+        .unwrap()
+        .1
+        .rsplit_once(", line 1]")
+        .unwrap()
+        .0;
+    assert_eq!(std::fs::read_to_string(path).unwrap(), blocks.to_string());
 }

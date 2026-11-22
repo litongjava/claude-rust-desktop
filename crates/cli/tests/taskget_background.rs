@@ -425,7 +425,7 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
             .nth(line - 1)
             .unwrap()
             .contains(&"QUJD".repeat(256)));
-        let note = saved
+        let note = live
             .lines()
             .find(|line| line.starts_with("Saved tool result ("))
             .unwrap();
@@ -453,6 +453,7 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
             .unwrap();
         assert!(raw.contains(&"QUJD".repeat(256)));
         assert!(!raw.contains("[base64 data omitted"));
+        assert_eq!(saved, raw);
         drop(store);
 
         resume_fixture(&data, root.path(), &id, "Replay the fixture").await;

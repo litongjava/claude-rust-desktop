@@ -192,7 +192,16 @@ async fn base64_model_boundary_summary_newline() {
     add("nl", "Bash", &raw);
     f.store.append(&f.id, "user", "summarize").unwrap();
 
-    let _ = compaction::summarize_part(&f.engine,&f.store.db,&f.id,&msg,compaction::Part::From,"gateway","gpt-6-astra").await;
+    let _ = compaction::summarize_part(
+        &f.engine,
+        &f.store.db,
+        &f.id,
+        &msg,
+        compaction::Part::From,
+        "gateway",
+        "gpt-6-astra",
+    )
+    .await;
     let summary_request = f.seen.lock().unwrap().last().unwrap().clone();
     assert!(!summary_request.to_string().contains(&payload));
     assert!(summary_request.to_string().contains("base64 data omitted"));
@@ -302,9 +311,22 @@ fn base64_model_boundary_search_recovery_paths() {
         .unwrap();
         let excerpt = hit["matches"][0]["excerpt"].as_str().unwrap();
         assert!(excerpt.contains(", line 1]"), "{label} {excerpt}");
-        assert_eq!(
-            std::fs::read_to_string(hit["matches"][0]["recovery_path"].as_str().unwrap()).unwrap(),
-            raw
-        );
+        let path = hit["matches"][0]["recovery_path"].as_str().unwrap();
+        assert!(excerpt.contains(path));
+        let bytes = if label == "non_utf8" {
+            // Bash ANSI-C quoting round-trips the actual path bytes.
+            assert!(path.starts_with("$'") && path.ends_with('\''));
+            let encoded = path.trim_start_matches("$'").trim_end_matches('\'');
+            let bytes = encoded
+                .strip_prefix("\\x")
+                .unwrap()
+                .split("\\x")
+                .map(|hex| u8::from_str_radix(hex, 16).unwrap())
+                .collect::<Vec<_>>();
+            std::fs::read(std::ffi::OsString::from_vec(bytes)).unwrap()
+        } else {
+            std::fs::read(path).unwrap()
+        };
+        assert_eq!(bytes, raw.as_bytes());
     }
 }
