@@ -11,38 +11,25 @@ use serde_json::{json, Value};
 pub struct DeliveredInput {
     pub text: String,
     pub content: Value,
+    /// Delivery correlation used by SDK and Bridge events.
     pub origin: String,
+    /// Provenance persisted by the producer of the model message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_origin: Option<String>,
     /// Identifies a user row already committed by a durable delivery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
 }
 
 impl DeliveredInput {
-    pub fn resolve(data_dir: Option<&std::path::Path>, session: &str, text: String) -> Self {
-        let notification = text.starts_with(crate::tools::background_shell::NOTIFICATION_START);
-        // Internal notifications cannot name images from the user's clipboard registry.
-        let content = if notification {
-            None
-        } else {
-            data_dir.and_then(|root| content_with_images(root, session, &text))
-        }
-        .map(Value::Array)
-        .unwrap_or_else(|| json!(text));
-        Self {
-            message_id: None,
-            text,
-            content,
-            origin: if notification {
-                "task_notification"
-            } else {
-                "user"
-            }
-            .into(),
-        }
-    }
-
     pub fn model_message(&self) -> Value {
-        let origin = if self.origin.starts_with("queue-input-") { "user" } else { &self.origin };
+        let origin = self
+            .prompt_origin
+            .as_deref()
+            .unwrap_or(match self.origin.as_str() {
+                "user" => "typed",
+                other => other,
+            });
         let mut message = json!({"role":"user", "content":self.content, "origin":origin});
         if let Some(id) = &self.message_id { message["id"] = json!(id); }
         message

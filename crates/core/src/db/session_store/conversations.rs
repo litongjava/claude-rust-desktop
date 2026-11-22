@@ -58,7 +58,7 @@ impl Stores {
                 let shard = self.open_listed(&entry)?;
                 if let Some(content) = content {
                     let message = shard.new_message_id();
-                    shard.write(|w| w.append_user(&message, content))?;
+                    shard.admit_user(&message, content)?;
                 }
             }
             None => {

@@ -39,6 +39,10 @@ fn rows(conn: &Connection, id: &str, messages: &[MessageRow]) -> Result<()> {
             m.conversation_id == id,
             "Message belongs to another sync bucket"
         );
+        let changed_user = m.role == "user"
+            && !conn
+                .prepare_cached("SELECT 1 FROM messages WHERE id=?1 AND content=?2")?
+                .exists([&m.id, &m.content])?;
         // The typed payload is a rendering of the old user text. A replay or
         // a timestamp/order change preserves it and the other subordinate rows.
         conn.execute("DELETE FROM message_user_content WHERE message_id=?1 AND EXISTS(
@@ -57,6 +61,13 @@ fn rows(conn: &Connection, id: &str, messages: &[MessageRow]) -> Result<()> {
             ])? == 1,
             "Sync message owner or role changed"
         );
+        if changed_user {
+            conn.execute(
+                "INSERT INTO message_metadata VALUES(?1,?2) ON CONFLICT(message_id)
+                 DO UPDATE SET value=json_patch(message_metadata.value,excluded.value)",
+                [&m.id, r#"{"promptOrigin":"sync"}"#],
+            )?;
+        }
     }
     Ok(())
 }

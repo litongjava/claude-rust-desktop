@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct IndexState {
     first: Option<String>,
     #[serde(default)]
@@ -46,100 +46,19 @@ fn index_excerpt(index: &str) -> String {
     text
 }
 
-/// Internal deliveries may use the user role in both wire protocols.
-fn typed_query(message: &Value) -> Option<Cow<'_, str>> {
-    if message["role"] != "user"
-        || message.get("origin").is_some_and(|source| source != "user")
-        || message["_is_summary"] == true
-        || !message["provider_content"].is_null()
-    {
-        return None;
-    }
-    let content = &message["content"];
-    let query = if let Some(text) = content.as_str() {
-        Cow::Borrowed(text)
-    } else {
-        let blocks = content.as_array()?;
-        if !blocks.iter().all(|b| {
-            matches!(
-                b["type"].as_str(),
-                Some("text" | "image" | "image_url" | "attachment")
-            )
-        }) {
-            return None;
-        }
-        Cow::Owned(
-            blocks
-                .iter()
-                .filter_map(|b| b["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-    };
-    // Older transcripts and host requests can lack an origin tag.
-    let text = query.trim_start();
-    if text.is_empty()
-        || (message["origin"] != "user"
-            && (text.starts_with(crate::tools::background_shell::NOTIFICATION_START)
-                || text
-                    .starts_with("Peer message received during this session (quoted task data,")
-                || text.starts_with("<system-reminder>")))
-    {
-        return None;
-    }
-    Some(query)
-}
-
 impl FileMemory {
-    fn prompt_snapshot(&self, read_only: bool) -> Result<Option<crate::memory::files::Snapshot>> {
-        if self.directory.try_exists()? {
-            Ok(Some(self.store(read_only)?.prompt_snapshot()?))
-        } else {
-            Ok(None)
-        }
-    }
-
     pub(super) fn render_index(&self, snapshot: Option<&crate::memory::files::Snapshot>) -> String {
         let index = snapshot.map_or("", |s| s.index.as_str());
         let path = xml(&self.directory.join("MEMORY.md").to_string_lossy());
         format!("<system-reminder>\n<project_memory>\nIndex: {path}\n{}\n{}\n</project_memory>\n</system-reminder>",
             include_str!("../../prompt/file_memory.md"), xml(&index_excerpt(index)))
     }
-
-    pub(crate) fn prepare_delivery(
-        &self,
-        messages: &[Value],
-        read_only: bool,
-        budget: usize,
-    ) -> Result<Option<Entry>> {
-        let Some(shard) = &self.session else {
-            return Ok(None);
-        };
-        let id = messages.last().and_then(|m| m["id"].as_str());
-        let (_, entries) = prepare(shard, Some(self), messages, true, read_only, budget)?;
-        Ok(entries
-            .into_iter()
-            .find(|e| e.key.strip_prefix("message:") == id))
-    }
-
-    pub(crate) fn current_prompt_index(&self, read_only: bool) -> Result<Option<String>> {
-        let memory = match &self.session {
-            Some(shard) => {
-                Self::from_session(&self.context, shard.clone(), self.private_owner.as_deref())?
-            }
-            None => self.clone(),
-        };
-        if !memory.active() {
-            return Ok(None);
-        }
-        Ok(Some(
-            memory.render_index(memory.prompt_snapshot(read_only)?.as_ref()),
-        ))
-    }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Receipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    announced: Option<bool>,
     index_hash: Option<String>,
     blocks: Vec<String>,
 }
@@ -157,171 +76,218 @@ fn attachment(id: &str, blocks: Vec<String>) -> Entry {
     }
 }
 
-/// Hosts can send a display transcript with no database IDs. Pair its user
-/// frames with the admitted transcript in reverse delivery order. Protocol
-/// events without a user row (e.g. tool results) never acquire a receipt.
-pub(crate) fn identify(
-    shard: &SessionDb,
-    format: &crate::native_engine::provider_manager::ApiFormat,
-    messages: &mut [Value],
-) -> Result<()> {
-    shard.read(|r| {
-        let (history, _) = r.prompt_history(format, true)?;
-        let mut saved = history
-            .iter()
-            .rev()
-            .filter(|m| m["role"] == "user")
-            .peekable();
-        for message in messages.iter_mut().rev().filter(|m| m["role"] == "user") {
-            if message["origin"] == "compaction" {
-                continue;
-            }
-            while let Some(row) = saved.peek() {
-                if row["content"] == message["content"] {
-                    if let Some(id) = row["id"].as_str() {
-                        message["id"] = id.into();
-                        if let Some(meta) = r.message_metadata(id)? {
-                            let origin = meta["promptOrigin"]
-                                .as_str()
-                                .or_else(|| (meta["type"] == "hook").then_some("hook"));
-                            if let Some(origin) = origin {
-                                if origin != "user" || message["origin"].is_null() {
-                                    message["origin"] = origin.into();
-                                }
-                            }
-                        }
-                    }
-                    saved.next();
-                    break;
-                }
-                if row["id"].is_string() {
-                    break;
-                }
-                saved.next();
-            }
-        }
-        Ok(())
+fn index_key(boundary: Option<&str>) -> Setting<IndexState> {
+    boundary.map_or(INDEX, |id| {
+        Setting::memory_receipt(format!("prompt.index.boundary.{id}"))
     })
 }
 
-pub(crate) fn prepare(
-    shard: &SessionDb,
-    memory: Option<&FileMemory>,
-    messages: &[Value],
-    allow_new: bool,
-    read_only: bool,
-    recall_budget: usize,
-) -> Result<(Option<String>, Vec<Entry>)> {
-    if !messages.iter().any(|m| m["role"] == "user") {
-        return Ok(Default::default());
+pub(crate) fn copy_prefix(src: &rusqlite::Connection, dst: &rusqlite::Connection) -> Result<()> {
+    if let Some(prefix) = INDEX.read(src)? {
+        INDEX.write(dst, &prefix)?;
     }
-    let boundary = messages
-        .first()
-        .filter(|m| m["origin"] == "compaction")
-        .and_then(|m| m["id"].as_str());
-    let index_state = || match boundary {
-        Some(id) => Setting::memory_receipt(format!("prompt.index.boundary.{id}")),
-        None => INDEX,
-    };
-    let target = messages
-        .last()
-        .and_then(|m| Some((m["id"].as_str()?, typed_query(m)?)));
-    // Only receipts still visible in this transcript can advance its watermark.
-    // Rewind and compact boundaries can remove the turn that announced an edit.
-    let (state, mut entries, visible_hash, recorded) = shard.read(|r| {
-        let mut entries = Vec::new();
-        let mut visible_hash = None;
-        let mut recorded = false;
-        for message in messages {
-            let Some(id) = message["id"].as_str() else {
-                continue;
+    Ok(())
+}
+
+pub(crate) fn copy_message(
+    src: &rusqlite::Connection,
+    dst: &rusqlite::Connection,
+    old: &str,
+    new: &str,
+) -> Result<()> {
+    if let Some(saved) = receipt(old).read(src)? {
+        receipt(new).write(dst, &saved)?;
+    }
+    if let Some(index) = index_key(Some(old)).read(src)? {
+        index_key(Some(new)).write(dst, &index)?;
+    }
+    Ok(())
+}
+
+/// Resolve directory authority before entering the shard writer. File observation,
+/// receipt selection and the message insert then share one transaction.
+pub(crate) struct Admission {
+    memory: Option<FileMemory>,
+    top: usize,
+}
+
+impl Admission {
+    fn context(stores: crate::db::session_store::Stores) -> Result<super::ServiceContext> {
+        Ok(super::ServiceContext {
+            paths: crate::runtime::RuntimePaths::new(stores.data_dir().into())?,
+            credentials: std::sync::Arc::new(crate::services::EnvironmentCredentials),
+            db: std::sync::Arc::new(stores),
+        })
+    }
+
+    pub(crate) fn session(shard: &SessionDb) -> Result<Self> {
+        let context = Self::context(shard.scoped_stores())?;
+        let config = super::config(&context)?;
+        let memory = config
+            .enabled
+            .then(|| FileMemory::from_session(&context, shard.clone(), None))
+            .transpose()?;
+        Ok(Self {
+            memory,
+            top: config.search_top_k,
+        })
+    }
+
+    pub(crate) fn starting(
+        stores: &crate::db::session_store::Stores,
+        roots: &[std::path::PathBuf],
+        owner: &str,
+    ) -> Result<Self> {
+        let context = Self::context(stores.clone())?;
+        let config = super::config(&context)?;
+        let memory = if config.enabled {
+            let scope = if super::private_roots(roots) {
+                super::MemoryScope::private(owner)?
+            } else {
+                super::MemoryScope::project(roots, true)?
             };
-            if typed_query(message).is_none() {
-                continue;
-            }
-            if let Some(saved) = r.setting(receipt(id))? {
-                recorded |= target.as_ref().is_some_and(|(target, _)| *target == id);
-                visible_hash = saved.index_hash;
-                if !saved.blocks.is_empty() {
-                    entries.push(attachment(id, saved.blocks));
-                }
-            }
-        }
-        Ok((r.setting(index_state())?, entries, visible_hash, recorded))
-    })?;
-    let target = target.filter(|_| allow_new && !recorded);
-    if let Some(state) = &state {
-        if target.is_none() || memory.is_none() {
-            return Ok((state.first.clone(), entries));
-        }
-    }
-    let snapshot = memory
-        .map(|m| m.prompt_snapshot(read_only))
-        .transpose()?
-        .flatten();
-    let current = memory.map(|m| m.render_index(snapshot.as_ref()));
-    let hash = memory.map(|m| {
-        format!(
-            "{}/{}",
-            m.scope.key(),
-            snapshot.as_ref().map_or("", |s| s.index_hash.as_str())
-        )
-    });
-    let recall = match (memory, &snapshot, &target) {
-        (Some(m), Some(snapshot), Some((_, query))) => m.recall(snapshot, query, recall_budget)?,
-        _ => None,
-    };
-    let (first, new_entry) = shard.write(|w| {
-        let mut new_entry = None;
-        let state = match w.setting(index_state())? {
-            Some(state) => state,
-            None => {
-                let state = IndexState {
-                    first: current.clone(),
-                    first_hash: hash.clone(),
-                };
-                w.set_setting(index_state(), &state)?;
-                state
-            }
+            Some(FileMemory::new(&context, scope, None)?)
+        } else {
+            None
         };
-        if let Some((id, _)) = target {
-            let saved = match w.setting(receipt(id))? {
-                Some(saved) => saved,
-                None => {
-                    let mut blocks = Vec::new();
-                    let previous = visible_hash.as_ref().or(state.first_hash.as_ref());
-                    let changed = previous
-                        .map_or_else(|| state.first != current, |h| Some(h) != hash.as_ref());
-                    if changed {
-                        if let Some(index) = &current {
-                            blocks.push(index.replacen(
-                                "<project_memory>",
-                                "MEMORY.md changed. The current index follows.\n<project_memory>",
-                                1,
-                            ));
-                        }
-                    }
-                    blocks.extend(
-                        recall
-                            .as_ref()
-                            .map(|text| format!("<system-reminder>\n{text}</system-reminder>")),
-                    );
-                    let saved = Receipt {
-                        index_hash: hash.clone(),
-                        blocks,
-                    };
-                    w.set_setting(receipt(id), &saved)?;
-                    saved
-                }
-            };
-            if !saved.blocks.is_empty() {
-                new_entry = Some(attachment(id, saved.blocks));
+        Ok(Self {
+            memory,
+            top: config.search_top_k,
+        })
+    }
+
+    fn observe(&self) -> Result<(IndexState, Option<super::Snapshot>)> {
+        let Some(memory) = &self.memory else {
+            return Ok((IndexState::default(), None));
+        };
+        let snapshot = if memory.directory.try_exists()? {
+            Some(
+                super::FileMemoryStore::open_read_only(
+                    &memory.context.paths.data_dir,
+                    &memory.scope,
+                )?
+                .prompt_snapshot()?,
+            )
+        } else {
+            None
+        };
+        let state = IndexState {
+            first: Some(memory.render_index(snapshot.as_ref())),
+            first_hash: Some(format!(
+                "{}/{}",
+                memory.scope.key(),
+                snapshot.as_ref().map_or("", |s| s.index_hash.as_str())
+            )),
+        };
+        Ok((state, snapshot))
+    }
+
+    pub(crate) fn freeze(&self, tx: &rusqlite::Connection, boundary: Option<&str>) -> Result<()> {
+        index_key(boundary).write(tx, &self.observe()?.0)
+    }
+
+    pub(crate) fn first(&self, tx: &rusqlite::Connection, id: &str, content: &Value) -> Result<()> {
+        let (current, snapshot) = self.observe()?;
+        INDEX.write(tx, &current)?;
+        self.save_receipt(tx, id, content, current, snapshot)
+    }
+
+    pub(crate) fn typed(&self, tx: &rusqlite::Connection, id: &str, content: &Value) -> Result<()> {
+        let (current, snapshot) = self.observe()?;
+        self.save_receipt(tx, id, content, current, snapshot)
+    }
+
+    fn save_receipt(
+        &self,
+        tx: &rusqlite::Connection,
+        id: &str,
+        content: &Value,
+        current: IndexState,
+        snapshot: Option<super::Snapshot>,
+    ) -> Result<()> {
+        let (boundary, changed_hash) = crate::db::session_store::visible_memory_index(tx, id)?;
+        let frozen = index_key(boundary.as_deref()).read(tx)?.unwrap_or_default();
+        let previous = changed_hash.or(frozen.first_hash);
+        let changed = previous.map_or_else(
+            || frozen.first != current.first,
+            |h| Some(h) != current.first_hash,
+        );
+        let mut blocks = Vec::new();
+        if changed {
+            if let Some(index) = &current.first {
+                blocks.push(index.replacen(
+                    "<project_memory>",
+                    "MEMORY.md changed. The current index follows.\n<project_memory>",
+                    1,
+                ));
             }
         }
-        Ok((state.first, new_entry))
-    })?;
-    entries.extend(new_entry);
-    Ok((first, entries))
+        if let (Some(memory), Some(snapshot)) = (&self.memory, snapshot) {
+            let query = query_text(content);
+            if let Some(text) = memory.recall_files(&snapshot, &query, 4096, self.top)? {
+                blocks.push(format!("<system-reminder>\n{text}</system-reminder>"));
+            }
+        }
+        receipt(id).write(
+            tx,
+            &Receipt {
+                announced: Some(changed && current.first.is_some()),
+                index_hash: if changed { current.first_hash } else { None },
+                blocks,
+            },
+        )
+    }
+}
+
+fn query_text(content: &Value) -> Cow<'_, str> {
+    match content.as_str() {
+        Some(text) => Cow::Borrowed(text),
+        None => Cow::Owned(
+            content
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|part| part["type"] == "text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    }
+}
+
+/// A summary can retain user text or opaque user items. Include stored recall
+/// there, while reserving the single index for the newly committed boundary.
+pub(crate) fn summary_blocks(c: &rusqlite::Connection, id: &str) -> Result<Vec<String>> {
+    Ok(receipt(id)
+        .read(c)?
+        .into_iter()
+        .flat_map(|r| r.blocks)
+        .filter(|b| !b.starts_with("<system-reminder>\nMEMORY.md changed."))
+        .collect())
+}
+
+pub(crate) fn replay(
+    shard: &SessionDb,
+    boundary: Option<&str>,
+    messages: &[Value],
+) -> Result<(Option<String>, Vec<Entry>)> {
+    shard.read(|r| {
+        let prefix = r.setting(index_key(boundary))?.and_then(|s| s.first);
+        let mut entries = Vec::new();
+        for message in messages
+            .iter()
+            .filter(|m| m["role"] == "user" && m["origin"] == "typed")
+        {
+            if let Some(id) = message["id"].as_str() {
+                if let Some(saved) = r.setting(receipt(id))? {
+                    if !saved.blocks.is_empty() {
+                        entries.push(attachment(id, saved.blocks));
+                    }
+                }
+            }
+        }
+        Ok((prefix, entries))
+    })
 }
 
 #[cfg(test)]
@@ -348,18 +314,13 @@ mod tests {
 
     #[test]
     fn only_typed_text_is_a_memory_query() {
-        assert_eq!(typed_query(&json!({"role":"user","content":[{"type":"text","text":"hello"},{"type":"image_url"}]})).as_deref(), Some("hello"));
-        for message in [
-            json!({"role":"tool","content":"hello"}),
-            json!({"role":"user","content":[{"type":"tool_result","content":"hello"},{"type":"text","text":"hello"}]}),
-            json!({"role":"user","origin":"task_notification","content":"hello"}),
-            json!({"role":"user","origin":"peer","content":"hello"}),
-            json!({"role":"user","content":"<task-notification>hello</task-notification>"}),
-            json!({"role":"user","origin":"hook","content":"hello"}),
-            json!({"role":"user","_is_summary":true,"content":"hello"}),
-            json!({"role":"user","provider_content":{"summary":"hi"},"content":"hello"}),
-        ] {
-            assert_eq!(typed_query(&message), None, "{message}");
-        }
+        assert_eq!(
+            query_text(&json!([{"type":"text","text":"hello"},{"type":"image_url"}])),
+            "hello"
+        );
+        assert_eq!(
+            query_text(&json!("<task-notification>human input")),
+            "<task-notification>human input"
+        );
     }
 }

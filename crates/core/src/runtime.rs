@@ -219,7 +219,7 @@ pub(crate) fn replay_history_with_ids(
     id: &str,
     format: &ApiFormat,
     native: impl Fn(&str) -> Result<Option<Value>>,
-    identify: bool,
+    include_provenance: bool,
 ) -> Result<(Vec<Value>, Option<String>)> {
     let mut history = Vec::new();
     let messages = message_repo::get_messages_by_conversation(conn, id)?;
@@ -230,7 +230,13 @@ pub(crate) fn replay_history_with_ids(
         .map(|m| m.id.clone());
     for message in messages.into_iter().skip(start) {
         if let Some(native) = native(&message.id)? {
-            history.push(json!({"role":message.role,"content":message.content,"provider_content":native}));
+            let mut row =
+                json!({"role":message.role,"content":message.content,"provider_content":native});
+            if include_provenance {
+                row["id"] = json!(message.id);
+                row["origin"] = json!("compaction");
+            }
+            history.push(row);
             continue;
         }
         let mut calls = message_repo::get_tool_calls_for_message(conn, &message.id)?;
@@ -246,9 +252,15 @@ pub(crate) fn replay_history_with_ids(
                 ApiFormat::OpenAI => {
                     let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
                     history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
-                    for tool in &calls { history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)})); }
                     for tool in &calls {
-                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { history.push(json!({"role":"user","content":note})); }
+                        history.push(json!({"role":"tool","tool_call_id":tool.id,"content":tool.output.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)}));
+                    }
+                    for tool in &calls {
+                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? {
+                            history.push(
+                                json!({"role":"user","content":note,"origin":"approval_note"}),
+                            );
+                        }
                     }
                 }
                 ApiFormat::Anthropic => {
@@ -259,7 +271,7 @@ pub(crate) fn replay_history_with_ids(
                     for tool in &calls {
                         if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
                     }
-                    history.push(json!({"role":"user","content":results}));
+                    history.push(json!({"role":"user","content":results,"origin":"tool_result"}));
                 }
             }
             for tool in &calls {
@@ -271,11 +283,19 @@ pub(crate) fn replay_history_with_ids(
         use rusqlite::OptionalExtension;
         let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
         let row_at = history.len();
-        if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
-        else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
-        if identify && message.role == "user" {
+        if let Some(content) = structured {
+            history.push(
+                json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}),
+            );
+        } else if !message.content.is_empty() {
+            history.push(json!({"role":message.role,"content":message.content}));
+        }
+        if include_provenance && message.role == "user" {
             if let Some(row) = history.get_mut(row_at) {
                 row["id"] = json!(message.id);
+                if let Some(origin) = crate::db::session_store::message_origin(conn, &message.id)? {
+                    row["origin"] = json!(origin);
+                }
             }
         }
     }

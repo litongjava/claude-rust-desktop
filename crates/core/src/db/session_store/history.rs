@@ -320,6 +320,73 @@ impl SessionRead<'_> {
     }
 }
 
+/// Read the index actually announced in the surviving transcript. Tool-addressed
+/// inputs occupy their parent tool's position and disappear when it is rewound.
+pub(crate) fn visible_memory_index(
+    c: &rusqlite::Connection,
+    admitting_id: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    let boundary: Option<(String, i64)> = c.query_row(
+        "SELECT id,sort_order FROM messages WHERE is_compact_boundary ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+        [], |r| Ok((r.get(0)?, r.get(1)?))
+    ).optional()?;
+    let order = boundary.as_ref().map_or(-1, |b| b.1);
+    let hash = c.query_row(
+        "WITH visible(id,pos,tool,part) AS (
+            SELECT m.id,m.sort_order,-1,0 FROM messages m JOIN message_metadata meta ON meta.message_id=m.id
+            WHERE m.role='user' AND m.sort_order>?1 AND json_extract(meta.value,'$.promptOrigin') IN ('typed','user')
+            UNION ALL
+            SELECT json_extract(j.value,'$.message_id'),m.sort_order,t.sort_order,j.key
+            FROM messages m JOIN tool_calls t ON t.message_id=m.id
+            JOIN tool_queued_inputs q ON q.tool_call_id=t.id JOIN json_each(q.inputs_json) j
+            WHERE m.sort_order>?1 AND json_extract(j.value,'$.prompt_origin')='typed'
+         )
+         SELECT json_extract(p.value,'$.index_hash') FROM visible v
+         JOIN peripheral_settings p ON p.key='memory.prompt.message.'||v.id
+         WHERE v.id<>?2 AND json_extract(p.value,'$.index_hash') IS NOT NULL
+           AND coalesce(json_extract(p.value,'$.announced'),
+               json_extract(p.value,'$.blocks[0]') GLOB '<system-reminder>'||char(10)||'MEMORY.md changed.*')
+         ORDER BY v.pos DESC,v.tool DESC,v.part DESC LIMIT 1",
+        params![order, admitting_id], |r| r.get(0)
+    ).optional()?;
+    Ok((boundary.map(|b| b.0), hash))
+}
+
+impl super::SessionDb {
+    pub fn admit_user(&self, id: &str, content: &Value) -> Result<()> {
+        let _guard = self.hold_incarnation()?;
+        let memory = crate::services::memory_files::prompt::Admission::session(self)?;
+        self.write(|w| w.append_user(id, content, &memory))
+    }
+
+    /// Persist the producer's prompt and its memory receipt under one shard write.
+    pub fn admit_prompt(
+        &self,
+        display: &str,
+        content: Option<&Value>,
+        origin: &str,
+    ) -> Result<String> {
+        let _guard = self.hold_incarnation()?;
+        let memory = (origin == "typed")
+            .then(|| crate::services::memory_files::prompt::Admission::session(self))
+            .transpose()?;
+        self.write(|w| {
+            if origin == "hook" {
+                return w.append_hook_user(display);
+            }
+            let id = match content {
+                Some(content) => w.append_user_content(display, content, origin == "typed")?,
+                None => w.append("user", display)?,
+            };
+            w.set_prompt_origin(&id, origin)?;
+            if let Some(memory) = &memory {
+                memory.typed(w.0, &id, content.unwrap_or(&Value::String(display.into())))?;
+            }
+            Ok(id)
+        })
+    }
+}
+
 impl SessionWrite<'_> {
     pub(super) fn next_order(&self) -> Result<i64> {
         Ok(self.0.query_row(
@@ -346,10 +413,28 @@ impl SessionWrite<'_> {
             false,
             self.next_order()?,
         )?;
+        if role == "user" {
+            self.set_prompt_origin(&id, "generated")?;
+        }
         self.2.set(true);
         Ok(id)
     }
-    pub fn append_user(&self, id: &str, content: &Value) -> Result<()> {
+    pub(super) fn set_prompt_origin(&self, id: &str, origin: &str) -> Result<()> {
+        self.set_message_metadata(id, &serde_json::json!({"promptOrigin": origin}))
+    }
+    pub(super) fn append_user(
+        &self,
+        id: &str,
+        content: &Value,
+        memory: &crate::services::memory_files::prompt::Admission,
+    ) -> Result<()> {
+        ensure!(
+            !self
+                .0
+                .prepare("SELECT 1 FROM messages WHERE id=?1")?
+                .exists([id])?,
+            "User message ID already admitted"
+        );
         messages::save_user_message(
             self.0,
             id,
@@ -358,7 +443,8 @@ impl SessionWrite<'_> {
             &chrono::Utc::now().to_rfc3339(),
             self.next_order()?,
         )?;
-        self.set_message_metadata(id, &serde_json::json!({"promptOrigin":"user"}))?;
+        self.set_prompt_origin(id, "typed")?;
+        memory.typed(self.0, id, content)?;
         permission_authority::record_conn(
             self.0,
             self.1,
@@ -734,33 +820,57 @@ impl SessionRead<'_> {
             |r| r.get(0),
         )?)
     }
+    pub(crate) fn native_summary_history(
+        &self,
+        format: &crate::native_engine::provider_manager::ApiFormat,
+    ) -> Result<Vec<Value>> {
+        let (mut messages, _) = self.model_history(format)?;
+        for message in &mut messages {
+            if message["origin"] != "typed" {
+                continue;
+            }
+            if let Some(id) = message["id"].as_str() {
+                let blocks = crate::services::memory_files::prompt::summary_blocks(self.0, id)?;
+                if !blocks.is_empty() {
+                    let content = &mut message["content"];
+                    if !content.is_array() {
+                        *content = serde_json::json!([{"type":"text","text":content}]);
+                    }
+                    content.as_array_mut().unwrap().extend(
+                        blocks
+                            .into_iter()
+                            .map(|text| serde_json::json!({"type":"text","text":text})),
+                    );
+                }
+            }
+        }
+        Ok(messages)
+    }
     pub fn model_history(
         &self,
         format: &crate::native_engine::provider_manager::ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
-        self.prompt_history(format, false)
-    }
-
-    pub(crate) fn prompt_history(
-        &self,
-        format: &crate::native_engine::provider_manager::ApiFormat,
-        identify: bool,
-    ) -> Result<(Vec<Value>, Option<String>)> {
         let id: String = self
             .0
             .query_row("SELECT id FROM manifest", [], |r| r.get(0))?;
-        crate::runtime::replay_history_with_ids(self.0, &id, format, |message| {
-            let raw: Option<String> = self
-                .0
-                .query_row(
-                    "SELECT value FROM native_boundaries WHERE message_id=?1",
-                    [message],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            raw.map(|v| serde_json::from_str(&v).map_err(Into::into))
-                .transpose()
-        }, identify)
+        crate::runtime::replay_history_with_ids(
+            self.0,
+            &id,
+            format,
+            |message| {
+                let raw: Option<String> = self
+                    .0
+                    .query_row(
+                        "SELECT value FROM native_boundaries WHERE message_id=?1",
+                        [message],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                raw.map(|v| serde_json::from_str(&v).map_err(Into::into))
+                    .transpose()
+            },
+            true,
+        )
     }
 }
 impl SessionWrite<'_> {

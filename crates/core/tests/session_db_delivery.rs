@@ -322,7 +322,8 @@ fn history_nested_replay_full_partial_clear_and_worker_address() -> Result<()> {
     let root = tempdir()?;
     let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
-    let (turn,m)=a.write(|w|{w.append_user("first",&json!([{"type":"text","text":"user scope"}]))?;
+    a.admit_user("first", &json!([{"type":"text","text":"user scope"}]))?;
+    let (turn,m)=a.write(|w|{
         w.bind_agent("agent restrictions")?;let t=w.start_turn()?;let m=w.segment(&t)?;w.message_content(&m,"reply")?;
         let nested=format!("{m}:nested");
         w.tool(&tool("parent",&m,0),None)?;w.tool(&tool(&nested,&m,1),Some(("parent",1)))?;
@@ -712,6 +713,10 @@ fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result
     let a = stores.open_session(A)?;
     assert_eq!(a.address().incarnation, inc);
     assert_eq!(a.read(|r| r.messages())?[0].content, "old");
+    let (legacy, _) = a.read(|r| {
+        r.model_history(&deepseek_code_core::native_engine::provider_manager::ApiFormat::OpenAI)
+    })?;
+    assert!(legacy[0].get("origin").is_none());
     // The v10 migration publishes the refreshed prompt projection once.
     assert_eq!(a.read(|r| r.projection())?.revision, 2);
     a.save_mcp("assistant", "new", &wire(), false)?;

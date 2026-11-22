@@ -59,6 +59,13 @@ pub fn save_config(context: &ServiceContext, config: &crate::memory::MemoryConfi
     )
 }
 
+fn private_roots(roots: &[PathBuf]) -> bool {
+    roots.is_empty()
+        || (roots.len() == 1
+            && dirs::home_dir()
+                .is_some_and(|home| home.canonicalize().ok() == roots[0].canonicalize().ok()))
+}
+
 impl FileMemory {
     pub fn select(context: &ServiceContext, selection: &Selection) -> Result<Self> {
         ensure!(
@@ -109,10 +116,7 @@ impl FileMemory {
             .flat_map(|p| &p.folders)
             .map(|f| PathBuf::from(&f.path))
             .collect();
-        let private = roots.is_empty()
-            || (roots.len() == 1
-                && dirs::home_dir()
-                    .is_some_and(|home| home.canonicalize().ok() == roots[0].canonicalize().ok()));
+        let private = private_roots(&roots);
         let mut private_owner = None;
         let scope = if private {
             let saved = shard.read(|r| r.setting(settings::MEMORY_OWNER))?;
@@ -342,6 +346,16 @@ impl FileMemory {
     }
 
     fn recall(&self, snapshot: &Snapshot, query: &str, budget: usize) -> Result<Option<String>> {
+        self.recall_files(snapshot, query, budget, config(&self.context)?.search_top_k)
+    }
+
+    fn recall_files(
+        &self,
+        snapshot: &Snapshot,
+        query: &str,
+        budget: usize,
+        top: usize,
+    ) -> Result<Option<String>> {
         let mut ranked = snapshot
             .entries
             .iter()
@@ -352,7 +366,7 @@ impl FileMemory {
             b.0.total_cmp(&a.0)
                 .then_with(|| a.1.filename.cmp(&b.1.filename))
         });
-        let top = config(&self.context)?.search_top_k.min(5);
+        let top = top.min(5);
         ranked.truncate(top);
         let mut linked = Vec::new();
         for (_, entry) in &ranked {
@@ -799,111 +813,147 @@ mod tests {
         let (_root, memory) = fixture();
         memory.store(false).unwrap();
         let path = memory.directory.join("MEMORY.md");
+        let shard = memory.session.as_ref().unwrap();
+        std::fs::write(&path, "&".repeat(6000) + "TAIL-MARKER").unwrap();
+        shard.admit_prompt("small", None, "typed").unwrap();
+        let small = replay(shard).1.remove(0).blocks.remove(0);
+        assert!(small.contains("TAIL-MARKER"));
+        assert_eq!(small.matches("&amp;").count(), 6000);
+        assert!(!small.contains("[MEMORY.md truncated]"));
         let raw = "<".repeat(9 * 1024 * 1024);
         std::fs::write(&path, &raw).unwrap();
         let snapshot = memory.store(true).unwrap().prompt_snapshot().unwrap();
         let rendered = memory.render_index(Some(&snapshot));
         assert!(rendered.contains("[MEMORY.md truncated]"));
         assert!(rendered.matches("&lt;").count() > 25000);
+        shard.admit_prompt("large", None, "typed").unwrap();
+        assert!(replay(shard).1.last().unwrap().blocks[0].contains("[MEMORY.md truncated]"));
         std::fs::write(path, raw + "x").unwrap();
         assert_ne!(snapshot.index_hash, memory.store(true).unwrap().prompt_snapshot().unwrap().index_hash);
     }
 
     #[test]
+    fn memory_receipt_failure_rolls_back_the_admitted_row_and_authority() {
+        let (_root, memory) = fixture();
+        let shard = memory.session.as_ref().unwrap();
+        // A pending file journal cannot be read as an atomic memory snapshot.
+        memory.store(false).unwrap();
+        let journal = memory
+            .context
+            .paths
+            .data_dir
+            .join("memory/state")
+            .join(memory.scope.key())
+            .join("journal.json");
+        std::fs::write(&journal, b"invalid").unwrap();
+        assert!(shard
+            .admit_user("transaction-probe", &json!("preferences"))
+            .is_err());
+        assert!(shard.read(|r| r.messages()).unwrap().is_empty());
+        assert!(shard.read(|r| r.authority()).unwrap().is_empty());
+        std::fs::remove_file(journal).unwrap();
+        shard
+            .admit_user("transaction-probe", &json!("preferences"))
+            .unwrap();
+        assert_eq!(shard.read(|r| r.messages()).unwrap().len(), 1);
+    }
+
+    fn replay(shard: &SessionDb) -> (Option<String>, Vec<crate::services::turn_context::Entry>) {
+        let (history, boundary) = shard
+            .read(|r| r.model_history(&crate::native_engine::provider_manager::ApiFormat::OpenAI))
+            .unwrap();
+        prompt::replay(shard, boundary.as_deref(), &history).unwrap()
+    }
+
+    fn compact(shard: &SessionDb) {
+        let prepared = crate::services::compaction::prepare(shard, shard.id()).unwrap();
+        crate::services::compaction::commit(shard, prepared, "same summary").unwrap();
+    }
+
+    #[test]
     fn memory_text_boundary_rebuilds_the_current_scope_prefix() {
         let (root, first) = fixture();
+        let workspace = root.path().join("workspace");
+        first.store(false).unwrap();
+        std::fs::write(first.directory.join("MEMORY.md"), "SCOPE-A").unwrap();
+        let id = crate::runtime::SessionStore::new(first.context.db.clone())
+            .create(&workspace, "fixture", "fixture")
+            .unwrap();
+        let shard = first.context.db.open_session(&id).unwrap();
+        shard.admit_prompt("hello", None, "typed").unwrap();
         let second_root = root.path().join("other");
         std::fs::create_dir(&second_root).unwrap();
-        let second = FileMemory::workspace(&first.context, &second_root).unwrap();
-        let shard = first.session.as_ref().unwrap();
-        let prepare = |memory, messages: &[Value]| {
-            prompt::prepare(shard, Some(memory), messages, true, false, 4096).unwrap()
-        };
-        for (memory, marker) in [(&first, "SCOPE-A"), (&second, "SCOPE-B")] {
-            memory.store(false).unwrap();
-            std::fs::write(memory.directory.join("MEMORY.md"), marker).unwrap();
-        }
-        let typed = json!({"role":"user","content":"hello","id":"u1"});
-        assert!(prepare(&first, &[typed.clone()])
-            .0
-            .unwrap()
-            .contains("SCOPE-A"));
-        let before = prepare(
-            &second,
-            &[typed, json!({"role":"user","content":"next","id":"u2"})],
-        );
-        assert!(before.0.unwrap().contains("SCOPE-A"));
-        let (prefix, turns) = prepare(
-            &second,
-            &[
-                json!({"role":"user","origin":"compaction","content":"summary","id":"boundary"}),
-                json!({"role":"user","content":"continue","id":"u3"}),
-            ],
-        );
+        crate::services::session_workspace::change(
+            &first.context.db,
+            &id,
+            &workspace,
+            second_root.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
+        let second = FileMemory::session(&first.context, &id).unwrap();
+        assert_ne!(first.scope.key(), second.scope.key());
+        second.store(false).unwrap();
+        std::fs::write(second.directory.join("MEMORY.md"), "SCOPE-B").unwrap();
+        shard.admit_prompt("next", None, "typed").unwrap();
+        let (prefix, entries) = replay(&shard);
+        assert!(prefix.unwrap().contains("SCOPE-A"));
+        assert!(entries[0].blocks[0].contains("SCOPE-B"));
+        compact(&shard);
+        std::fs::write(second.directory.join("MEMORY.md"), "later edit").unwrap();
+        let (prefix, turns) = replay(&shard);
         let prefix = prefix.unwrap();
         assert!(prefix.contains("SCOPE-B") && !prefix.contains("SCOPE-A"));
-        assert!(turns
-            .iter()
-            .all(|e| e.blocks.iter().all(|b| !b.contains("SCOPE-B"))));
+        assert!(turns.is_empty());
     }
 
     #[test]
     fn memory_receipts_follow_message_ids_after_compaction_and_rewind() {
         let (_root, memory) = fixture();
         let shard = memory.session.as_ref().unwrap();
-        let prepare = |boundary, id| {
-            prompt::prepare(shard, Some(&memory), &[
-            json!({"role":"user","content":"same summary","origin":"compaction","id":boundary}),
-            json!({"role":"user","content":"preferences","id":id}),
-        ], true, false, 4096).unwrap()
-        };
         memory.put("note.md", &note("old fact"), None).unwrap();
-        prepare("b1", "u1");
+        shard.admit_prompt("preferences", None, "typed").unwrap();
+        shard.admit_prompt("preferences", None, "typed").unwrap();
+        compact(shard);
+        shard.admit_prompt("preferences", None, "typed").unwrap();
         std::fs::write(memory.directory.join("note.md"), note("new fact")).unwrap();
         std::fs::write(memory.directory.join("MEMORY.md"), "edited index").unwrap();
-        let (prefix, entries) = prepare("b2", "u2");
+        compact(shard);
+        shard.admit_prompt("preferences", None, "typed").unwrap();
+        let (index, entries) = replay(shard);
+        assert!(index.unwrap().contains("edited index"));
         assert!(entries[0].blocks.iter().any(|b| b.contains("new fact")));
-        assert!(prefix.unwrap().contains("edited index"));
         std::fs::write(memory.directory.join("MEMORY.md"), "after rewind").unwrap();
-        let (_, removed) = prepare("b2", "removed");
-        assert!(removed[0].blocks.iter().any(|b| b.contains("after rewind")));
-        let (_, replacement) = prepare("b2", "replacement");
-        assert!(replacement[0]
-            .blocks
-            .iter()
-            .any(|b| b.contains("after rewind")));
-        assert_eq!(replacement, prepare("b2", "replacement").1);
+        let removed = shard.admit_prompt("preferences", None, "typed").unwrap();
+        let entries = replay(shard).1;
+        assert!(entries.last().unwrap().blocks[0].contains("after rewind"));
+        shard.write(|w| w.rewind_from(&removed)).unwrap();
+        let replacement = shard.admit_prompt("preferences", None, "typed").unwrap();
+        let entries = replay(shard).1;
+        assert_ne!(removed, replacement);
+        assert!(entries.last().unwrap().blocks[0].contains("after rewind"));
+        assert_eq!(entries, replay(shard).1);
     }
 
     #[test]
     fn file_memory_zero_hit_receipts_survive_restart_without_user_text() {
         let (_root, memory) = fixture();
-        let first = json!({"role":"user","content":"preferences","id":"first"});
         let shard = memory.session.as_ref().unwrap();
-        let (_, turns) =
-            prompt::prepare(shard, Some(&memory), &[first.clone()], true, false, 4096).unwrap();
-        assert!(turns.is_empty());
+        shard.admit_prompt("preferences", None, "typed").unwrap();
+        assert!(replay(shard).1.is_empty());
         memory.put("test.md", &note("new body"), None).unwrap();
-        let reopened = FileMemory::session(&memory.context, shard.id()).unwrap();
-        let prepare = |messages: &[Value]| {
-            prompt::prepare(
-                reopened.session.as_ref().unwrap(),
-                Some(&reopened),
-                messages,
-                true,
-                false,
-                4096,
-            )
+        let reopened = memory
+            .context
+            .paths
+            .open_stores()
             .unwrap()
-        };
-        assert!(prepare(&[first.clone()]).1.is_empty());
-        let (_, turns) = prepare(&[
-            first.clone(),
-            json!({"role":"assistant","content":"ok"}),
-            json!({"role":"user","content":"preferences","id":"second"}),
-        ]);
+            .open_session(shard.id())
+            .unwrap();
+        assert!(replay(&reopened).1.is_empty());
+        let second = reopened.admit_prompt("preferences", None, "typed").unwrap();
+        let (_, turns) = replay(&reopened);
         assert_eq!(turns.len(), 1);
-        assert_eq!(turns[0].key, "message:second");
+        assert_eq!(turns[0].key, format!("message:{second}"));
         assert!(turns[0].blocks.iter().any(|b| b.contains("new body")));
         assert!(!memory.context.paths.data_dir.join("turn-context").exists());
     }
@@ -922,46 +972,41 @@ mod tests {
                 .unwrap();
         }
         let shard = memory.session.as_ref().unwrap();
-        let prepare = |messages: &[Value], allow| {
-            prompt::prepare(shard, Some(&memory), messages, allow, false, 4096).unwrap()
-        };
-        let typed = json!({"role":"user","content":"preferences","id":"first"});
-        let (index, entries) = prepare(&[typed.clone()], true);
-        assert!(index.unwrap().contains("note-6.md"));
+        let id = shard.admit_prompt("preferences", None, "typed").unwrap();
+        let entries = replay(shard).1;
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].blocks[0].matches("body-marker-").count(), 5);
-        let peer = json!({"role":"user","origin":"peer","content":"preferences","id":"first"});
-        assert!(prepare(&[peer], true).1.is_empty());
-        let mut history = vec![typed, json!({"role":"assistant","content":"done"})];
+        assert!(entries[0].blocks[0].contains("note-6.md"));
+        assert_eq!(
+            entries[0]
+                .blocks
+                .last()
+                .unwrap()
+                .matches("body-marker-")
+                .count(),
+            5
+        );
         std::fs::write(memory.directory.join("MEMORY.md"), "new index").unwrap();
-        for (allow, next) in [
-            (true, json!({"role":"tool","content":"preferences"})),
-            (
-                true,
-                json!({"role":"user","content":[{"type":"tool_result","content":"preferences"}]}),
-            ),
-            (
-                true,
-                json!({"role":"user","origin":"task_notification","content":"preferences"}),
-            ),
-            (
-                true,
-                json!({"role":"user","origin":"peer","content":"preferences","id":"first"}),
-            ),
-            (
-                false,
-                json!({"role":"user","content":"compaction or hook wake preferences"}),
-            ),
+        for origin in [
+            "peer",
+            "hook",
+            "task_notification",
+            "goal_continuation",
+            "error_resume",
+            "evaluator",
         ] {
-            history.push(next);
-            let (index, turns) = prepare(&history, allow);
-            assert!(!index.unwrap().contains("new index"));
-            assert_eq!(turns, entries);
+            shard.admit_prompt("preferences", None, origin).unwrap();
+            assert_eq!(replay(shard).1, entries);
         }
-        history.push(json!({"role":"user","content":"next preferences","id":"next"}));
-        let (_, turns) = prepare(&history, true);
+        let mixed = [
+            json!({"role":"tool","origin":"typed","id":id,"content":"preferences"}),
+            json!({"role":"user","id":id,"content":[{"type":"tool_result","content":"preferences"}]}),
+            json!({"role":"user","origin":"peer","id":id,"content":"preferences"}),
+        ];
+        assert!(prompt::replay(shard, None, &mixed).unwrap().1.is_empty());
+        shard.admit_prompt("preferences", None, "typed").unwrap();
+        let turns = replay(shard).1;
         assert!(turns.last().unwrap().blocks[0].contains("new index"));
-        assert_eq!(prepare(&history, true).1, turns);
+        assert_eq!(replay(shard).1, turns);
     }
 
     #[test]

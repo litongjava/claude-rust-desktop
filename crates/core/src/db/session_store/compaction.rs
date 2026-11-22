@@ -143,7 +143,7 @@ impl DeliveryOwner {
             if !has_target {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"missing compaction target"});
             }
-            let (fingerprint, transcript, count) = compaction::fingerprint(&tx, &s.id)?;
+            let (fingerprint, transcript, count) = compaction::transcript(&tx, &s.id, true)?;
             if count < 2 {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"not enough messages to compact"});
             }
@@ -239,7 +239,8 @@ impl SessionRepository<'_> {
                     .context("Session not found")?;
                 ensure!(!row.archived, "Session is archived");
             }
-            let (fingerprint, transcript, count) = compaction::fingerprint(c, id)?;
+            let (fingerprint, transcript, count) =
+                compaction::transcript(c, id, incarnation.is_some())?;
             ensure!(count >= 2, "Not enough messages to compact");
             let pending_request = if incarnation.is_some() {
                 c.query_row("SELECT id FROM compaction_request WHERE singleton=1",[],|r|r.get(0)).optional()?
@@ -274,6 +275,7 @@ impl SessionRepository<'_> {
                     "Compaction session was replaced"
                 );
                 let _locks = s.stores.key_lock(&s.key, false, false)?;
+                let memory = crate::services::memory_files::prompt::Admission::session(s)?;
                 s.require_active_compaction()?;
                 s.write_locked("commit compaction", |w| {
                     ensure!(
@@ -284,6 +286,8 @@ impl SessionRepository<'_> {
                         ensure!(w.0.execute("DELETE FROM compaction_request WHERE id=?1",[request])?==1,"Compaction request changed");
                     }
                     let message_id = w.commit_summary(generated)?;
+                    w.set_prompt_origin(&message_id, "compaction")?;
+                    memory.freeze(w.0, Some(&message_id))?;
                     if let Some(context) = context {
                         state::set_local(
                             w.0,

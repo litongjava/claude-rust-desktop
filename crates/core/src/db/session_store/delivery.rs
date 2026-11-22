@@ -284,14 +284,15 @@ impl SessionDb {
                 return admission(c, id, &self.id);
             }
             c.execute(
-                "INSERT INTO session_input_queue(session_id,request_id,admission_digest,payload,mode,delivery_id) VALUES(?1,?2,?3,?4,?5,?6)",
+                "INSERT INTO session_input_queue(session_id,request_id,admission_digest,payload,mode,delivery_id,prompt_origin) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![
                     self.id,
                     request,
                     original,
                     hash,
                     mode,
-                    if notification { format!("notice-{}", self.new_message_id()) } else { self.new_message_id() }
+                    if notification { format!("notice-{}", self.new_message_id()) } else { self.new_message_id() },
+                    if notification { "task_notification" } else { "typed" }
                 ],
             )?;
             admission(c, c.last_insert_rowid(), &self.id)
@@ -666,6 +667,7 @@ pub struct Handoff {
 }
 struct Claim {
     origin: String,
+    prompt_origin: String,
     id: String,
     hash: String,
     target: Option<String>,
@@ -791,9 +793,10 @@ impl DeliveryOwner {
                 authorize_queue(c, &s.id)?;
                 c.execute("UPDATE session_input_queue SET state='claimed',revision=revision+1,target=?2 WHERE id=?1", params![id, tool])?;
             }
-            Ok(Some(c.query_row("SELECT delivery_id,payload,target,revision,request_id FROM session_input_queue WHERE id=?1", [id], |r| {
+            Ok(Some(c.query_row("SELECT delivery_id,payload,target,revision,request_id,prompt_origin FROM session_input_queue WHERE id=?1", [id], |r| {
                 let request: String = r.get(4)?;
-                let origin = if request.starts_with("internal-cli:notice:") {
+                let prompt_origin: String = r.get(5)?;
+                let origin = if prompt_origin == "task_notification" {
                     "task_notification".into()
                 } else if request.starts_with("internal-cli:prompt:") {
                     "user".into()
@@ -802,6 +805,7 @@ impl DeliveryOwner {
                 };
                 Ok(Claim {
                     origin,
+                    prompt_origin,
                     id: r.get(0)?,
                     hash: r.get(1)?,
                     target: r.get(2)?,
@@ -864,7 +868,8 @@ impl DeliveryOwner {
                 .query_map([&s.id], |r| {
                     Ok((
                         Claim {
-                            origin:"peer".into(),
+                            origin: "peer".into(),
+                            prompt_origin: "peer".into(),
                             id: r.get(0)?,
                             hash: r.get(1)?,
                             target: None,
@@ -963,6 +968,7 @@ impl DeliveryOwner {
                         text: row.content,
                         content,
                         origin,
+                        prompt_origin: super::message_origin(c, &handoff.id)?,
                         message_id: Some(handoff.id.clone()),
                     }))
                 },
@@ -1007,6 +1013,10 @@ impl DeliveryOwner {
             } else {
                 None
             };
+            let typed = claim.prompt_origin == "typed";
+            let memory = typed
+                .then(|| crate::services::memory_files::prompt::Admission::session(s))
+                .transpose()?;
             let delivered = s.write_locked_with_deadline("deliver input", until.saturating_duration_since(std::time::Instant::now()), |tx| {
                 ensure!(claim.sender.is_none() || !tx.3.retiring_here,"Provider switch pending; inbox retained");
                 if let Some(tool) = &claim.target {
@@ -1039,24 +1049,30 @@ impl DeliveryOwner {
                         tx.0, &claim.id, &s.id, "user", &quoted, None,
                         &chrono::Utc::now().to_rfc3339(), false, tx.next_order()?,
                     )?;
+                    tx.set_prompt_origin(&claim.id, "peer")?;
                     tx.2.set(true);
                 } else if let Some(tool) = &claim.target {
                     let mut inputs = input_queue::load_delivered(tx.0, tool)?;
                     inputs.push(DeliveredInput {
-                        message_id: None,
+                        message_id: Some(claim.id.clone()),
                         text: payload.as_str().map(str::to_owned).unwrap_or_else(|| payload.to_string()),
                         content: payload.clone(),
-                        origin: if claim.id.starts_with("notice-") {"task_notification"}else{"user"}.into(),
+                        origin: claim.origin.clone(),
+                        prompt_origin: Some(claim.prompt_origin.clone()),
                     });
                     input_queue::save_delivered(tx.0, tool, &inputs)?;
-                    if !claim.id.starts_with("notice-") {
+                    if let Some(memory) = &memory {
+                        memory.typed(tx.0, &claim.id, &payload)?;
                         crate::services::permission_authority::record_conn(tx.0,&s.id,crate::services::permission_authority::Source::User,&payload)?;
                     }
                 } else {
-                    if claim.id.starts_with("notice-") {
+                    if let Some(memory) = &memory {
+                        tx.append_user(&claim.id, &payload, memory)?;
+                    } else {
                         crate::db::message_repo::save_user_message(tx.0,&claim.id,&s.id,&payload,&chrono::Utc::now().to_rfc3339(),tx.next_order()?)?;
+                        tx.set_prompt_origin(&claim.id, &claim.prompt_origin)?;
                         tx.2.set(true);
-                    } else { tx.append_user(&claim.id, &payload)?; }
+                    }
                     // The running loop consumes in-turn steers directly.
                     tx.0.execute(
                         "INSERT INTO delivery_generations(delivery_id)

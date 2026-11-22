@@ -188,6 +188,7 @@ impl SessionWrite<'_> {
         // removing that marker must never reactivate an older approval.
         self.0.execute("DELETE FROM approved_plan_boundaries", [])?;
         let message = self.append("user", content)?;
+        self.set_prompt_origin(&message, "approved_plan")?;
         self.0.execute(
             "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
             [&message],
@@ -199,12 +200,28 @@ impl SessionWrite<'_> {
         Ok(message)
     }
     pub fn set_message_metadata(&self, id: &str, value: &Value) -> Result<()> {
-        save_metadata(self.0, "message_metadata", "message_id", id, value)
+        let mut value = value.clone();
+        if let Some(object) = value.as_object_mut() {
+            if !object.contains_key("promptOrigin") {
+                if let Some(origin) = message_origin(self.0, id)? {
+                    object.insert("promptOrigin".into(), Value::String(origin));
+                }
+            }
+        }
+        save_metadata(self.0, "message_metadata", "message_id", id, &value)
     }
     pub fn set_request_metadata(&self, id: &str, value: &Value) -> Result<()> {
         save_metadata(self.0, "request_metadata", "request_id", id, value)
     }
 }
+pub(crate) fn message_origin(c: &Connection, id: &str) -> Result<Option<String>> {
+    let meta = read_metadata(c, "message_metadata", "message_id", id)?;
+    Ok(meta
+        .as_ref()
+        .and_then(|v| v["promptOrigin"].as_str())
+        .map(|s| if s == "user" { "typed" } else { s }.to_owned()))
+}
+
 fn read_metadata(c: &Connection, table: &str, key: &str, id: &str) -> Result<Option<Value>> {
     let raw: Option<String> = c
         .query_row(

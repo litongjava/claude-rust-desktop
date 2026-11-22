@@ -262,9 +262,11 @@ impl SessionRepository<'_> {
         };
         match &self.0 {
             Backend::Admitted(s) => {
+                let memory = reset.then(|| crate::services::memory_files::prompt::Admission::session(s)).transpose()?;
                 let _locks=s.stores.key_lock(&s.key,false,false)?;
                 s.write_locked_with_commit(label,super::WRITE_DEADLINE,false,|w|{
                     let message=reset.then(||w.plan_marker(text)).transpose()?;
+                    if let (Some(memory), Some(id)) = (&memory, &message) { memory.freeze(w.0, Some(id))?; }
                     policy(w.0,w.1)?;
                     Ok(message)
                 },commit)

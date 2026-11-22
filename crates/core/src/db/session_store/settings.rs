@@ -31,6 +31,12 @@ impl<T> Setting<T> {
             value: PhantomData,
         }
     }
+    pub(crate) fn write(&self, c: &rusqlite::Connection, value: &T) -> Result<()>
+    where
+        T: Serialize,
+    {
+        state::set_local(c, &self.name, &serde_json::to_string(value)?)
+    }
     fn workspace(name: &str, workspace: &Path) -> Self {
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(workspace.as_os_str().as_encoded_bytes());
@@ -44,7 +50,7 @@ impl<T> Setting<T> {
             value: PhantomData,
         }
     }
-    fn read(&self, c: &rusqlite::Connection) -> Result<Option<T>>
+    pub(crate) fn read(&self, c: &rusqlite::Connection) -> Result<Option<T>>
     where
         T: DeserializeOwned,
     {
@@ -64,7 +70,7 @@ impl SessionWrite<'_> {
         key.read(self.0)
     }
     pub fn set_setting<T: Serialize>(&self, key: Setting<T>, value: &T) -> Result<()> {
-        state::set_local(self.0, &key.name, &serde_json::to_string(value)?)
+        key.write(self.0, value)
     }
     pub fn clear_setting<T>(&self, key: Setting<T>) -> Result<()> {
         self.0.execute(

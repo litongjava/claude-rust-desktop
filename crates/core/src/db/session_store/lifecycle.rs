@@ -509,6 +509,18 @@ impl Stores {
     ) -> Result<()> {
         let id = &op.id;
         let created = &meta.created;
+        use crate::services::memory_files::prompt::Admission;
+        let roots: Vec<_> = match &meta.project {
+            Some(Project::Selected { folders, .. }) => folders.iter().map(PathBuf::from).collect(),
+            Some(Project::NewWorkspace(folder)) => vec![PathBuf::from(folder)],
+            None => Vec::new(),
+        };
+        let memory = match &seed {
+            Seed::Fork(parent, Branch::Child | Branch::AgentFork { .. }, _) => {
+                Admission::session(parent)?
+            }
+            _ => Admission::starting(self, &roots, &op.incarnation)?,
+        };
         let stage = op.stage(self);
         fs::create_dir(&stage)?;
         sync_dir(stage.parent().unwrap())?;
@@ -521,6 +533,9 @@ impl Stores {
                     "INSERT INTO manifest VALUES(1,?1,?2,?3,?4,?5,?5,?6,?6,NULL)",
                     params![op.store, id, op.incarnation, op.operation, created, n],
                 )?;
+                if first.is_none() {
+                    memory.freeze(tx, None)?;
+                }
                 if let Some(first) = first {
                     let content = first
                         .typed
@@ -535,6 +550,11 @@ impl Stores {
                     let message = crate::db::transcript::MessageIds::new(&op.incarnation).issue();
                     tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                         VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
+                    tx.execute(
+                        "INSERT INTO message_metadata VALUES(?1,?2)",
+                        params![message, r#"{"promptOrigin":"typed"}"#],
+                    )?;
+                    memory.first(tx, &message, &content)?;
                     if let Some(typed) = &first.typed {
                         tx.execute(
                             "INSERT INTO message_user_content VALUES(?1,?2)",
@@ -556,6 +576,7 @@ impl Stores {
                         &op.id,
                         boundary,
                         configuration,
+                        &memory,
                         meta.source
                             .as_ref()
                             .is_some_and(|s| s.provider_selection.is_some()),

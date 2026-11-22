@@ -19,9 +19,10 @@ impl LegacySession {
     pub(super) fn populate(&self, c: &Connection) -> Result<()> {
         let ids = crate::db::transcript::MessageIds::for_shard(c)?;
         for (i, m) in self.messages.iter().enumerate() {
+            let message = ids.issue();
             crate::db::message_repo::insert_message(
                 c,
-                &ids.issue(),
+                &message,
                 &self.id,
                 &m.role,
                 &m.content,
@@ -30,6 +31,12 @@ impl LegacySession {
                 false,
                 i as i64,
             )?;
+            if m.role == "user" {
+                c.execute(
+                    "INSERT INTO message_metadata VALUES(?1,?2)",
+                    [&message, r#"{"promptOrigin":"import"}"#],
+                )?;
+            }
         }
         c.execute(
             "UPDATE manifest SET updated_at=?1,message_count=?2,content_revision=?2",

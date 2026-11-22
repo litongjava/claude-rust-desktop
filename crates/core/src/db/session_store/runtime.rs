@@ -91,25 +91,35 @@ impl SessionDb {
 }
 
 impl SessionWrite<'_> {
-    pub fn append_user_content(&self, display: &str, content: &Value) -> Result<String> {
+    pub(super) fn append_user_content(
+        &self,
+        display: &str,
+        content: &Value,
+        typed: bool,
+    ) -> Result<String> {
         let content = crate::runtime::normalize_user_content(content)?;
         let message = self.append("user", display)?;
         self.0.execute(
             "INSERT INTO message_user_content(message_id,content_json) VALUES(?1,?2)",
             params![message, serde_json::to_string(&content)?],
         )?;
-        crate::services::permission_authority::record_conn(
-            self.0,
-            self.1,
-            crate::services::permission_authority::Source::User,
-            &content,
-        )?;
+        if typed {
+            crate::services::permission_authority::record_conn(
+                self.0,
+                self.1,
+                crate::services::permission_authority::Source::User,
+                &content,
+            )?;
+        }
         Ok(message)
     }
 
     pub fn append_hook_user(&self, text: &str) -> Result<String> {
         let message = self.append("user", text)?;
-        self.set_message_metadata(&message, &json!({"type":"hook","hookEvent":"SessionStart"}))?;
+        self.set_message_metadata(
+            &message,
+            &json!({"type":"hook","hookEvent":"SessionStart","promptOrigin":"hook"}),
+        )?;
         Ok(message)
     }
 }
