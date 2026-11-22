@@ -122,7 +122,7 @@ pub fn resolve(entries: &[Entry], messages: &[Value]) -> Vec<Vec<String>> {
                 .iter()
                 .filter(|entry| {
                     if let Some(id) = entry.key.strip_prefix("message:") {
-                        return message["id"].as_str() == Some(id);
+                        return message["origin"] == "typed" && message["id"].as_str() == Some(id);
                     }
                     entry.key == key && entry.occurrence == occurrence
                 })

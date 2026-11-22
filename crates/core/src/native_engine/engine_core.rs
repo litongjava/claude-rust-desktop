@@ -545,8 +545,8 @@ impl QueryEngine {
             .await
             .resolve_selected(provider_id, model)
             .ok_or_else(|| anyhow!("Provider/model is unavailable: {provider_id}::{model}"))?;
-        let history = crate::runtime::SessionStore::new(self.db_manager.clone())
-            .model_history(session, &provider.provider.api_format)?;
+        let shard = self.db_manager.open_session(session)?;
+        let history = shard.read(|r| r.native_summary_history(&provider.provider.api_format))?;
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
             return crate::services::compaction::native::generate(
@@ -1228,19 +1228,6 @@ impl QueryEngine {
         }
         .ok_or_else(|| anyhow!("No provider found for model: {}", request.model))?;
         crate::services::compaction::native::validate_history(&request.messages, &hook_provider)?;
-        let window = hook_provider
-            .model
-            .context_window
-            .map(|n| n as usize)
-            .unwrap_or_else(|| {
-                super::token_counter::TokenCounter::get_model_context_limit(&hook_provider.model.id)
-            });
-        let used = super::token_counter::TokenCounter::estimate(&request.messages)
-            .saturating_add(request.system_prompt.as_ref().map_or(0, String::len));
-        let recall_budget = (window / 10)
-            .min((window * 85 / 100).saturating_sub(used))
-            .min(4096);
-        let memory_format = hook_provider.provider.api_format.clone();
         let hooks = crate::services::tool_hooks::HookRunner::load_with_plugins(
             &plugin_context,
             &workspace,
@@ -1346,40 +1333,21 @@ impl QueryEngine {
         // whose message a compaction removed follow, as in the reference CLI.
         let (user_instructions, project_instructions) =
             crate::project_instructions::reminder_parts(&instructions);
-        let read_only =
-            self.permission_manager.get_mode() == crate::permissions::PermissionMode::PlanMode;
         let memory_session = selected.clone();
         let memory_context = plugin_context.clone();
-        let mut memory_messages = request.messages.clone();
-        if let Some(boundary_id) = &applied_compaction {
-            memory_messages[0]["id"] = serde_json::json!(boundary_id);
-            memory_messages[0]["origin"] = serde_json::json!("compaction");
-        }
-        let turn_id = request.assistant_message_id.clone();
-        let (file_memory, project_memory, memory_turns, identified_messages) =
-            tokio::task::spawn_blocking(move || -> Result<_> {
-                use crate::services::memory_files::{self, FileMemory};
-                let memory = memory_files::config(&memory_context)?
-                    .enabled
-                    .then(|| FileMemory::session(&memory_context, memory_session.id()))
-                    .transpose()?;
-                memory_files::prompt::identify(&memory_session, &memory_format, &mut memory_messages)?;
-                if let Some(last) = memory_messages.last_mut().filter(|m| m["role"] == "user" && m["id"].is_null()) {
-                    // An embedding can submit a turn before writing its user row.
-                    last["id"] = serde_json::json!(turn_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()));
-                }
-                let (index, turns) = memory_files::prompt::prepare(
-                    &memory_session,
-                    memory.as_ref(),
-                    &memory_messages,
-                    !hook_wake,
-                    read_only,
-                    recall_budget,
-                )?;
-                Ok((memory, index, turns, memory_messages))
-            })
-            .await??;
-        request.messages = identified_messages;
+        let (file_memory, project_memory, memory_turns) = {
+            use crate::services::memory_files::{self, FileMemory};
+            let memory = memory_files::config(&memory_context)?
+                .enabled
+                .then(|| FileMemory::session(&memory_context, memory_session.id()))
+                .transpose()?;
+            let (index, turns) = memory_files::prompt::replay(
+                &memory_session,
+                applied_compaction.as_deref(),
+                &request.messages,
+            )?;
+            (memory, index, turns)
+        };
         turn_context.extend(memory_turns);
         let context_reminders = crate::prompt::first_message_reminders(
             crate::prompt::SessionReminders {

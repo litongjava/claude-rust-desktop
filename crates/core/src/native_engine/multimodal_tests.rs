@@ -340,7 +340,7 @@ async fn queued_images_replay_after_file_removal_without_becoming_approval_notes
             let history = reopened.model_history(session, &format).unwrap();
             let queued = history
                 .iter()
-                .find(|message| message["origin"] == "user")
+                .find(|message| message["origin"] == "typed")
                 .unwrap();
             assert_eq!(queued["content"], inputs[0].content);
             assert!(history

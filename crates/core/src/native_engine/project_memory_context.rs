@@ -60,11 +60,22 @@ impl ToolLoopExecutor {
         });
     }
 
-    pub(super) fn refresh_compacted_memory(&mut self) -> Result<Option<String>> {
-        let Some(memory) = &self.file_memory else {
-            return Ok(None);
-        };
-        let current = memory.current_prompt_index(self.memory_read_only())?;
+    pub(super) fn refresh_compacted_memory(&mut self) -> Option<String> {
+        // In-flight compression has no durable boundary. Carry forward the most
+        // recently announced index from this request's immutable receipts.
+        let current = self
+            .turn_context
+            .iter()
+            .rev()
+            .flat_map(|entry| &entry.blocks)
+            .find(|block| is_index(block))
+            .map(|block| block.replacen("MEMORY.md changed. The current index follows.\n", "", 1))
+            .or_else(|| {
+                self.context_reminders
+                    .iter()
+                    .find(|block| is_index(block))
+                    .cloned()
+            });
         if let Some(at) = self.context_reminders.iter().position(|s| is_index(s)) {
             self.context_reminders.splice(at..=at, current.clone());
         } else {
@@ -73,17 +84,16 @@ impl ToolLoopExecutor {
         for entry in &mut self.turn_context {
             entry.blocks.retain(|s| !is_index(s));
         }
-        Ok(current)
+        current
     }
 
-    pub(super) fn add_compacted_memory(&mut self, messages: &mut Vec<Value>) -> Result<()> {
-        if let Some(index) = self.refresh_compacted_memory()? {
+    pub(super) fn add_compacted_memory(&mut self, messages: &mut Vec<Value>) {
+        if let Some(index) = self.refresh_compacted_memory() {
             let at = messages
                 .iter()
                 .take_while(|m| m["role"] == "system")
                 .count();
             messages.insert(at, json!({"role":"user","content":index}));
         }
-        Ok(())
     }
 }

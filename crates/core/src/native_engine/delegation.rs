@@ -543,7 +543,7 @@ impl ToolLoopExecutor {
         child_history.inherit_child_authority(&parent_history)?;
         let sessions = SessionStore::new(context.db.clone());
         if let Some(prompt) = prompt {
-            sessions.append(id, "user", prompt)?;
+            sessions.append_prompt(id, prompt, "delegation_resume")?;
         }
         (entry.executor.messages, entry.executor.context_boundary_id) = sessions
             .model_history_with_boundary(id, &entry.executor.provider.provider.api_format)?;
@@ -1159,8 +1159,8 @@ impl ToolLoopExecutor {
         } else {
             agents::bind(&context.db, &id, &definition)?;
         }
-        context.set_child_description(&id,input["description"].as_str().unwrap_or(prompt))?;
-        sessions.append(&id, "user", prompt)?;
+        context.set_child_description(&id, input["description"].as_str().unwrap_or(prompt))?;
+        sessions.append_prompt(&id, prompt, "delegation")?;
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         let mut system = format!(
             "{}\nChild task role:\n{}\nChild session ID: {}\nParent session ID: {}",

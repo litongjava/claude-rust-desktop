@@ -262,13 +262,73 @@ impl From<CommittedCompaction> for CompactionResult {
     }
 }
 
+pub(crate) fn summary_row(
+    c: &rusqlite::Connection,
+    row: &message_repo::MessageRow,
+) -> Result<Value> {
+    let mut tools = Vec::new();
+    for call in message_repo::get_tool_calls_for_message(c, &row.id)? {
+        let inputs = crate::services::input_queue::load_delivered(c, &call.id)?;
+        let mut tool = serde_json::to_value(call)?;
+        if !inputs.is_empty() {
+            tool["delivered_inputs"] =
+                Value::Array(inputs.iter().map(|i| i.model_message()).collect());
+        }
+        tools.push(tool);
+    }
+    Ok(json!({"message": row, "tools": tools}))
+}
+
+pub(crate) fn attach_summary_memory(c: &rusqlite::Connection, row: &mut Value) -> Result<()> {
+    fn attach(c: &rusqlite::Connection, id: &str, item: &mut Value) -> Result<()> {
+        let blocks = crate::services::memory_files::prompt::summary_blocks(c, id)?;
+        if !blocks.is_empty() {
+            item["memory_attachments"] = json!(blocks);
+        }
+        Ok(())
+    }
+    if row["message"]["role"] == "user" {
+        if let Some(id) = row["message"]["id"].as_str().map(str::to_owned) {
+            if crate::db::session_store::message_origin(c, &id)?.as_deref() == Some("typed") {
+                attach(c, &id, row)?;
+            }
+        }
+    }
+    for tool in row["tools"].as_array_mut().into_iter().flatten() {
+        for input in tool
+            .get_mut("delivered_inputs")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            if input["origin"] == "typed" {
+                if let Some(id) = input["id"].as_str().map(str::to_owned) {
+                    attach(c, &id, input)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn fingerprint(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<(String, String, usize)> {
+    transcript(conn, id, false)
+}
+
 // Include tools and attachment metadata in conflict detection, not just message count.
 //
 // Returns a digest instead of a second full copy of the history: `prepare`
 // already serializes the tail for the prompt, and a whole-session string cost
 // megabytes per commit. The digest is stable because every entry is serialized
 // in order with a separator.
-pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, String, usize)> {
+pub(crate) fn transcript(
+    conn: &rusqlite::Connection,
+    id: &str,
+    replay_memory: bool,
+) -> Result<(String, String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
     let start = rows
@@ -277,12 +337,13 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
         .unwrap_or(0);
     let mut all = Vec::new();
     for row in &rows {
-        let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
+        let mut item = summary_row(conn, row)?;
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        all.push(json!({"message": row, "tools": calls, "attachment_metadata": attachments}));
+        item["attachment_metadata"] = json!(attachments);
+        all.push(item);
     }
     let mut hasher = Sha256::new();
     for entry in &all {
@@ -296,6 +357,11 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
             text.push_str(&format!("{byte:02x}"));
             text
         });
+    if replay_memory {
+        for row in &mut all[start..] {
+            attach_summary_memory(conn, row)?;
+        }
+    }
     Ok((
         fingerprint,
         serde_json::to_string(&all[start..])?,
@@ -787,6 +853,9 @@ pub(crate) fn apply_persisted_boundary(
         let start = messages
             .iter()
             .rposition(|m| {
+                if let Some(id) = m["id"].as_str() {
+                    return id == message_id;
+                }
                 m["role"] == "user"
                     && (m["content"].as_str() == Some(content.as_str())
                         || m["content"].as_array().is_some_and(|blocks| {
@@ -797,6 +866,8 @@ pub(crate) fn apply_persisted_boundary(
             })
             .context("Session was compacted; reload its messages before sending again")?;
         messages.drain(..start);
+        messages[0]["id"] = serde_json::json!(message_id);
+        messages[0]["origin"] = serde_json::json!("compaction");
         if let Some(native) = native {
             messages[0]["provider_content"] = native;
         }

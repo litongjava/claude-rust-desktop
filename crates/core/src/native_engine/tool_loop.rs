@@ -3732,48 +3732,78 @@ impl ToolLoopExecutor {
 
     /// Messages queued during the turn; only read after tool results, so a
     /// final answer is never interrupted.
-    async fn deliver_queued_inputs(&mut self, after_tool_results: bool) -> Result<Vec<Value>> {
-        if !after_tool_results { return Ok(Vec::new()); }
-        let Some(owner) = self.turn_delivery.upgrade() else { return Ok(Vec::new()); };
-        let inputs = owner.lock().unwrap_or_else(|e|e.into_inner()).poll_turn(false, 8).unwrap_or_else(|error| {
-            tracing::warn!("Steer handoff retained for recovery: {error:#}");
-            Vec::new()
-        });
-        let mut rendered = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            let _ = self.event_tx.send(EngineEvent::QueuedInput(input.clone())).await;
-            let message = input.model_message();
-            let mut content = input.content;
-            if message["origin"] == "user" {
-                self.messages.push(message);
-                if let Some(memory) = &self.file_memory {
-                    let window = self.provider.model.context_window.map(|n| n as usize)
-                        .unwrap_or_else(|| TokenCounter::get_model_context_limit(&self.provider.model.id));
-                    let used = TokenCounter::estimate(&self.auto_history)
-                        .max(TokenCounter::estimate(&self.messages))
-                        .saturating_add(self.system_prompt.as_ref().map_or(0, String::len));
-                    let budget = (window / 10).min((window * 85 / 100).saturating_sub(used)).min(4096);
-                    if let Some(entry) = memory.prepare_delivery(&self.messages, self.memory_read_only(), budget)? {
-                        let separate = self.provider.provider.api_format == ApiFormat::Anthropic
-                            || super::provider_runtime::responses_api(&self.provider);
-                        if content.is_string() && !separate {
-                            content = json!(std::iter::once(content.as_str().unwrap())
-                                .chain(entry.blocks.iter().map(String::as_str)).collect::<Vec<_>>().join("\n\n"));
-                        } else {
-                            let mut parts = match content {
-                                Value::Array(parts) => parts,
-                                text => vec![json!({"type":"text","text":text})],
-                            };
-                            parts.extend(entry.blocks.iter().map(|block| json!({"type":"text","text":block})));
-                            content = Value::Array(parts);
-                        }
-                        self.turn_context.push(entry);
-                    }
-                }
-            }
-            rendered.push(content);
+    async fn deliver_queued_inputs(
+        &mut self,
+        after_tool_results: bool,
+    ) -> Vec<crate::services::input_queue::DeliveredInput> {
+        if !after_tool_results {
+            return Vec::new();
         }
-        Ok(rendered)
+        let Some(owner) = self.turn_delivery.upgrade() else {
+            return Vec::new();
+        };
+        let inputs = owner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poll_turn(false, 8)
+            .unwrap_or_else(|error| {
+                tracing::warn!("Steer handoff retained for recovery: {error:#}");
+                Vec::new()
+            });
+        for input in &inputs {
+            let _ = self
+                .event_tx
+                .send(EngineEvent::QueuedInput(input.clone()))
+                .await;
+        }
+        inputs
+    }
+
+    fn render_delivered_inputs(
+        &mut self,
+        inputs: &[crate::services::input_queue::DeliveredInput],
+    ) -> Result<Vec<Value>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let messages: Vec<_> = inputs.iter().map(|input| input.model_message()).collect();
+        let entries = match &self.executor_history {
+            Some(ExecutorHistory::Session(shard)) => {
+                crate::services::memory_files::prompt::replay(shard, None, &messages)?.1
+            }
+            _ => Vec::new(),
+        };
+        let separate = self.provider.provider.api_format == ApiFormat::Anthropic
+            || super::provider_runtime::responses_api(&self.provider);
+        let blocks = crate::services::turn_context::resolve(&entries, &messages);
+        self.turn_context.extend(entries);
+        self.messages.extend(messages);
+        Ok(inputs
+            .iter()
+            .zip(blocks)
+            .map(|(input, blocks)| {
+                if blocks.is_empty() {
+                    return input.content.clone();
+                }
+                if let Some(text) = input.content.as_str().filter(|_| !separate) {
+                    return json!(std::iter::once(text)
+                        .chain(blocks.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n\n"));
+                }
+                let mut parts = input
+                    .content
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_else(|| vec![json!({"type":"text","text":input.content})]);
+                parts.extend(
+                    blocks
+                        .into_iter()
+                        .map(|text| json!({"type":"text","text":text})),
+                );
+                Value::Array(parts)
+            })
+            .collect())
     }
 
     fn drain_approval_notes(&self) -> Vec<String> {
@@ -4111,7 +4141,7 @@ impl ToolLoopExecutor {
             let compressed = compressor.compress(&self.messages);
             let original_len = self.messages.len();
             if compressed != self.messages {
-                self.refresh_compacted_memory()?;
+                self.refresh_compacted_memory();
                 self.messages = compressed;
             }
             tracing::info!(
@@ -4196,7 +4226,7 @@ impl ToolLoopExecutor {
             });
 
             if compressed != self.messages {
-                self.refresh_compacted_memory()?;
+                self.refresh_compacted_memory();
                 self.messages = compressed;
             }
             let final_estimate = TokenCounter::estimate(&self.messages);
@@ -5308,7 +5338,8 @@ impl ToolLoopExecutor {
             self.resume_pending_owned_children().await;
             let queued = self
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
-                .await?;
+                .await;
+            let queued = self.render_delivered_inputs(&queued)?;
             for content in self
                 .drain_approval_notes()
                 .into_iter()
@@ -5382,7 +5413,7 @@ impl ToolLoopExecutor {
                             )
                             .await;
                         if metadata.was_compressed {
-                            self.add_compacted_memory(&mut compressed)?;
+                            self.add_compacted_memory(&mut compressed);
                             conversation_messages = compressed
                                 .into_iter()
                                 .map(serde_json::from_value)
@@ -6075,7 +6106,8 @@ impl ToolLoopExecutor {
             self.resume_pending_owned_children().await;
             let queued = self
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
-                .await?;
+                .await;
+            let queued = self.render_delivered_inputs(&queued)?;
             for content in self
                 .drain_approval_notes()
                 .into_iter()
@@ -6166,8 +6198,10 @@ impl ToolLoopExecutor {
                             reasoning_content: None,
                             provider_content: compacted.native,
                         }];
-                        if let Some(index) = self.refresh_compacted_memory()? {
-                            conversation_messages.push(serde_json::from_value(json!({"role":"user","content":index}))?);
+                        if let Some(index) = self.refresh_compacted_memory() {
+                            conversation_messages.push(serde_json::from_value(
+                                json!({"role":"user","content":index}),
+                            )?);
                         }
                     } else {
                         let compressor = ContextCompressor::new(None);
@@ -6191,7 +6225,7 @@ impl ToolLoopExecutor {
                                 )
                                 .await;
                             if metadata.was_compressed {
-                            self.add_compacted_memory(&mut compressed)?;
+                                self.add_compacted_memory(&mut compressed);
                                 conversation_messages = compressed
                                     .into_iter()
                                     .map(serde_json::from_value)
