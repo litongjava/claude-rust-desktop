@@ -460,15 +460,15 @@ impl ToolLoopExecutor {
         let context = crate::services::session_messages::context(&root)?;
         if clear {
             let message = format!("Implement the following approved plan:\n\n{plan}\n\nPrior conversation context has been cleared. Its transcript remains archived locally in session {session}. Execute under the approved {mode_name} permission mode.", mode_name = crate::services::session_permission_mode::name(mode));
-            let boundary = plan_approval::commit_approved_boundary_mode(
-                &context,
-                &session,
-                &message,
-                &manager,
-                expected_mode,
-                mode,
-            )?;
-            self.pending_plan_reset = Some((boundary, context.db.open_session(&session)?));
+            let shard = match &self.executor_history {
+                Some(ExecutorHistory::Session(shard)) => shard.clone(),
+                _ => context.db.open_session(&session)?,
+            };
+            anyhow::ensure!(shard.id() == session, "Plan approval belongs to another session");
+            let boundary = shard.repository()
+                .accept_plan(&message, true, Some((&manager, expected_mode, mode)))?
+                .context("Missing approved boundary")?;
+            self.pending_plan_reset = Some((boundary, shard));
         }
         if !clear {
             plan_approval::commit_approved_mode(

@@ -1,6 +1,7 @@
 # Path, token, matching lines, SHA-256 of sorted trimmed matching lines, reviewed use
 crates/cli/src/session.rs	peripheral_settings	1	b6f148166fd173121496e329fa682befdbc2d9108dc9cbf36551137ff83e1557	Colocated test setup or SQL fault injection for session
 crates/cli/src/session_binding_tests.rs	peripheral_settings	2	18e92e8978de18be85f3660b2cca0bd522dba2165720550b8dedf18d696b6e90	Colocated test setup or SQL fault injection for session_binding_tests
+crates/cli/src/session_origin_tests.rs	peripheral_settings	1	529eec1a2936198e60dbee01fe5153af5a3a2aa36292c7b33e70c614da32d026	Producer regression inspects saved receipts by admitted message ID.
 crates/cli/src/startup_contention_tests.rs	Connection::open	1	556ec7ec48a423d89404683a7813e63e3d33aa93bfbaf326bd5e396c47294afa	Colocated test setup or SQL fault injection for startup_contention_tests
 crates/cli/src/terminal/scrollback.rs	with_conn	1	abccba0e9d55777ced6c325a470957c4ed21d4e4b3fc3ff5ea5d99c7a7fb38bc	Standalone task database fixture
 crates/cli/src/worker_frontend.rs	peripheral_settings	2	4a6c17f633b3166506e5abce35720bdab8d5c15241cf77fc95e58fda6b4ed9db	Colocated test setup or SQL fault injection for worker_frontend
@@ -58,6 +59,7 @@ crates/core/src/services/input_queue.rs	with_conn	14	225b097397455614e3294fac400
 crates/core/src/services/local_coordination/paths.rs	DATABASE_FILE	2	cb5a49ce7c9409446a15c4b6526f1c930d82f0e19a434e1ce8cdae81b64c6796	Coordination registry filename
 crates/core/src/services/local_coordination/store.rs	Connection::open	5	a21bd5f04185154363ffd89b21bfe32eb020b0f98f815afa1134a998d499a255	Independent coordination registry and corruption fixtures
 crates/core/src/services/memory_files.rs	Connection::open	2	b742a7ac59205f819a87de2f622212882847fe35fd280e2773ed47495c75de46	Read-only import of legacy memory.sqlite3 settings and an isolated archive fixture
+crates/core/src/services/memory_files/prompt.rs	peripheral_settings	1	eaaec70e0d689798c258389732d20790adbd1b3c6d1cfe010e619607e930821f	Transactional file-memory receipt lookup for retained messages and tool inputs.
 crates/core/src/services/mod.rs	peripheral_settings	3	5e60a5962ac4aaefc92ce50197145f7993efaccc9048b0abaac070ce294d70d5	ServiceContext<DbManager> fixture setting adapters
 crates/core/src/services/mod.rs	with_conn	2	3eaea3f074a7ba4bccd75c03f8fd2213d8f37d69ea9b3e63bf1c3325f1624cf9	ServiceContext<DbManager> fixture setting adapters
 crates/core/src/services/permission_authority.rs	with_conn	1	bb5a8ce5afccd0e5afa26a1fb60e28129d536f826d665dca848eedca5eef43dc	DbManager parent-child inheritance adapter

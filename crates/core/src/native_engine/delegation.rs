@@ -3,6 +3,7 @@
 mod child_transcript;
 use super::{EngineEvent, ToolLoopExecutor};
 use crate::{
+    db::session_store::ExecutorHistory,
     runtime::{RuntimePaths, SessionStore},
     services::{agents, EnvironmentCredentials, ServiceContext},
     tools::{background_shell::SessionStop, ToolDefinition},
@@ -934,7 +935,13 @@ impl ToolLoopExecutor {
         id: &str,
     ) -> Result<()> {
         let root = &context.paths.data_dir;
-        let shard = context.db.open_session(id)?;
+        let Some(ExecutorHistory::Session(shard)) = &self.executor_history else {
+            anyhow::bail!("Foreground child requires its session history");
+        };
+        ensure!(
+            shard.id() == id,
+            "Foreground child history belongs to another session"
+        );
         let (workspace, project, profile) = shard.scoped_stores().engine_workspace(
             &root.join("workspaces"),
             id,
@@ -945,7 +952,7 @@ impl ToolLoopExecutor {
             shard.read(|r| r.model_history(&self.provider.provider.api_format))?;
         self.applied_compaction = self.context_boundary_id.is_some();
         let (project_memory, receipts) = crate::services::memory_files::prompt::replay(
-            &shard,
+            shard,
             self.context_boundary_id.as_deref(),
             &self.messages,
         )?;
