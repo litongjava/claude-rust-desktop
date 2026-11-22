@@ -75,8 +75,9 @@ pub struct Admission {
     payload: String,
     mode: String,
     delivery: String,
+    prompt_origin: String,
 }
-const QUEUE_COLUMNS: &str = "id,revision,state,request_id,payload,mode,delivery_id";
+const QUEUE_COLUMNS: &str = "id,revision,state,request_id,payload,mode,delivery_id,prompt_origin";
 
 impl Admission {
     fn read(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -88,6 +89,7 @@ impl Admission {
             payload: row.get(4)?,
             mode: row.get(5)?,
             delivery: row.get(6)?,
+            prompt_origin: row.get(7)?,
         })
     }
     fn resolve(self, session: &SessionDb) -> Result<input_queue::QueueItem> {
@@ -95,6 +97,7 @@ impl Admission {
             id: self.id,
             revision: self.revision,
             request_id: self.request,
+            prompt_origin: self.prompt_origin,
             session_id: session.id.clone(),
             content: session.stores.payload(&self.payload)?,
             mode: serde_json::from_value(Value::String(self.mode))?,
@@ -123,12 +126,15 @@ impl super::SessionRepository<'_> {
         request: &str,
         content: Value,
         mode: QueueMode,
+        origin: input_queue::QueueOrigin,
     ) -> Result<input_queue::QueueItem> {
         match &self.0 {
             super::owned::Backend::Shared(db, id) => {
-                input_queue::shared_enqueue(db, id, request, content, mode)
+                input_queue::shared_enqueue(db, id, request, content, mode, origin)
             }
-            super::owned::Backend::Admitted(s) => s.enqueue(request, &content, mode)?.resolve(s),
+            super::owned::Backend::Admitted(s) => {
+                s.enqueue(request, &content, mode, origin)?.resolve(s)
+            }
         }
     }
     pub(crate) fn list_inputs(&self) -> Result<Vec<input_queue::QueueItem>> {
@@ -204,21 +210,34 @@ impl super::SessionRepository<'_> {
     }
 }
 impl SessionDb {
-    pub fn enqueue(&self, request: &str, content: &Value, mode: QueueMode) -> Result<Admission> {
-        if request.starts_with("internal-cli:") {return Err(QueueError::InvalidContent.into());}
-        self.enqueue_content(request,content,mode,false)
+    pub fn enqueue(
+        &self,
+        request: &str,
+        content: &Value,
+        mode: QueueMode,
+        origin: input_queue::QueueOrigin,
+    ) -> Result<Admission> {
+        if request.starts_with("internal-cli:") {
+            return Err(QueueError::InvalidContent.into());
+        }
+        self.enqueue_content(request, content, mode, origin)
     }
 
-    pub fn enqueue_cli_prompt(&self, text:&str) -> Result<()> {
-        let content = input_queue::content_with_images(self.stores.data_dir(), self.id(),text).map(Value::Array).unwrap_or_else(||Value::String(text.into()));
-        let request=format!("internal-cli:prompt:{}",uuid::Uuid::new_v4());
-        self.enqueue_content(&request,&content,QueueMode::Steer,false)?;
-        Ok(())
-    }
-
-    pub fn enqueue_cli_notification(&self, text:&str) -> Result<()> {
-        let request=format!("internal-cli:notice:{}",uuid::Uuid::new_v4());
-        self.enqueue_content(&request,&Value::String(text.into()),QueueMode::Steer,true)?;
+    pub fn enqueue_cli_input(&self, origin: input_queue::QueueOrigin, text: &str) -> Result<()> {
+        let (kind, content) = match origin {
+            input_queue::QueueOrigin::User => {
+                let content =
+                    input_queue::content_with_images(self.stores.data_dir(), self.id(), text)
+                        .map(Value::Array)
+                        .unwrap_or_else(|| Value::String(text.into()));
+                ("prompt", content)
+            }
+            input_queue::QueueOrigin::TaskNotification | input_queue::QueueOrigin::Scheduled => {
+                ("notice", Value::String(text.into()))
+            }
+        };
+        let request = format!("internal-cli:{kind}:{}", uuid::Uuid::new_v4());
+        self.enqueue_content(&request, &content, QueueMode::Steer, origin)?;
         Ok(())
     }
 
@@ -248,7 +267,13 @@ impl SessionDb {
         })
     }
 
-    fn enqueue_content(&self,request:&str,content:&Value,mode:QueueMode,notification:bool)->Result<Admission>{
+    fn enqueue_content(
+        &self,
+        request: &str,
+        content: &Value,
+        mode: QueueMode,
+        origin: input_queue::QueueOrigin,
+    ) -> Result<Admission> {
         if request.trim().is_empty() {
             return Err(QueueError::InvalidContent.into());
         }
@@ -272,13 +297,13 @@ impl SessionDb {
         let original = digest(format!("{mode}/{hash}").as_bytes());
         self.stores.global().write("enqueue", &self.id, false, |c| {
             authorize_queue(c, &self.id)?;
-            if let Some((id, prior)) = c
-                .query_row("SELECT id,admission_digest FROM session_input_queue WHERE session_id=?1 AND request_id=?2", [&self.id, request], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            if let Some((id, prior, prior_origin)) = c
+                .query_row("SELECT id,admission_digest,prompt_origin FROM session_input_queue WHERE session_id=?1 AND request_id=?2", [&self.id, request], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
                 })
                 .optional()?
             {
-                if prior != original {
+                if prior != original || (prior_origin != "legacy_queue" && prior_origin != origin.tag()) {
                     return Err(QueueError::Conflict.into());
                 }
                 return admission(c, id, &self.id);
@@ -291,8 +316,8 @@ impl SessionDb {
                     original,
                     hash,
                     mode,
-                    if notification { format!("notice-{}", self.new_message_id()) } else { self.new_message_id() },
-                    if notification { "task_notification" } else { "typed" }
+                    if origin == input_queue::QueueOrigin::TaskNotification { format!("notice-{}", self.new_message_id()) } else { self.new_message_id() },
+                    origin.tag()
                 ],
             )?;
             admission(c, c.last_insert_rowid(), &self.id)
@@ -1081,13 +1106,7 @@ impl DeliveryOwner {
                         crate::services::permission_authority::record_conn(tx.0,&s.id,crate::services::permission_authority::Source::User,&payload)?;
                     }
                 } else {
-                    if let Some(memory) = &memory {
-                        tx.append_user(&claim.id, &payload, memory)?;
-                    } else {
-                        crate::db::message_repo::save_user_message(tx.0,&claim.id,&s.id,&payload,&chrono::Utc::now().to_rfc3339(),tx.next_order()?)?;
-                        tx.set_prompt_origin(&claim.id, &claim.prompt_origin)?;
-                        tx.2.set(true);
-                    }
+                    tx.append_user(&claim.id, &payload, &claim.prompt_origin, memory.as_ref())?;
                     // The running loop consumes in-turn steers directly.
                     tx.0.execute(
                         "INSERT INTO delivery_generations(delivery_id)
@@ -1181,7 +1200,12 @@ mod turn_delivery_tests {
         let session = stores.create("live-consumer", Default::default())?;
         let mut owner = session.delivery_owner()?;
         session.write(|w| w.start_turn())?;
-        session.enqueue("req", &serde_json::json!("update"), QueueMode::Steer)?;
+        session.enqueue(
+            "req",
+            &serde_json::json!("update"),
+            QueueMode::Steer,
+            input_queue::QueueOrigin::User,
+        )?;
         let deadline = std::time::Instant::now() + super::super::WRITE_DEADLINE;
         while pending_fault.load(Ordering::SeqCst) {
             assert!(owner.poll_turn(false, 8)?.is_empty());

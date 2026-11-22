@@ -30,6 +30,7 @@ fn query<T: rusqlite::types::FromSql>(db: &Connection, sql: &str) -> T {
 }
 fn first_message() -> FirstMessage {
     FirstMessage {
+        origin: "typed".into(),
         text: "first line\n第二行".into(),
         typed: Some(serde_json::json!([{"type":"text","text":"第一"}])),
     }

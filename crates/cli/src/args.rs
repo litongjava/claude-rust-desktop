@@ -6,12 +6,18 @@ use std::path::PathBuf;
 pub enum Continuation {
     Goal,
     Resume,
+    Delegation,
+    McpPrompt,
+    Scheduled,
 }
 
 impl Continuation {
     pub fn worker_argument(self) -> &'static str {
         match self {
             Self::Goal => "--generated-continuation=goal",
+            Self::Delegation => "--generated-continuation=delegation",
+            Self::McpPrompt => "--generated-continuation=mcp-prompt",
+            Self::Scheduled => "--generated-continuation=scheduled",
             Self::Resume => "--generated-continuation=resume",
         }
     }
@@ -109,6 +115,9 @@ pub struct Cli {
     /// The frontend submitted a generated continuation to this worker.
     #[arg(long, hide = true, requires = "resume", value_enum, num_args = 0..=1, require_equals = true, default_missing_value = "goal")]
     pub generated_continuation: Option<Continuation>,
+    /// Original user text when a worker receives expanded model-facing content.
+    #[arg(long, hide = true, requires = "resume", allow_hyphen_values = true)]
+    pub original_user_input: Option<String>,
     /// The generation observed by the terminal requesting a process transfer.
     #[arg(long, hide = true, requires = "resume")]
     pub binding_generation: Option<u64>,

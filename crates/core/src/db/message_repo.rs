@@ -196,7 +196,7 @@ pub fn insert_message(
     Ok(())
 }
 
-pub(super) fn prepare_user_message(content:&serde_json::Value)->Result<(String,serde_json::Value)> {
+pub fn prepare_user_message(content: &serde_json::Value) -> Result<(String, serde_json::Value)> {
     // Keep ordinary text (including historical empty messages) compatible.
     let normalized = if content.is_string() {
         content.clone()

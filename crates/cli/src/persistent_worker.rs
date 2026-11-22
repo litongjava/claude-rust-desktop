@@ -539,7 +539,14 @@ async fn execute(
             && session.permissions.get_mode()
                 == deepseek_code_core::permissions::PermissionMode::BypassPermissions,
     );
-    let result = session.turn(&cli, &prompt, &mut None).await;
+    let result = session
+        .turn(
+            &cli,
+            &prompt,
+            &mut None,
+            crate::session::TurnOrigin::command_line(&cli, &prompt),
+        )
+        .await;
     session.idle_launch = Some((identity, Arc::new(cli)));
     session
         .engine

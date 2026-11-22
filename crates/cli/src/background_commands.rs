@@ -42,7 +42,7 @@ pub async fn handle(
             }
             session.allow_automatic_wake();
             if !wake_for_notifications(cli, session, input).await? {
-                session.turn_with_origin(cli, "Continue the unfinished work in this conversation. Review the saved progress first and do not repeat completed operations.", input, Some(crate::args::Continuation::Resume)).await?;
+                session.turn(cli, "Continue the unfinished work in this conversation. Review the saved progress first and do not repeat completed operations.", input, crate::session::TurnOrigin::Continuation).await?;
             }
         }
         "/btw" => {
@@ -1164,8 +1164,14 @@ pub(crate) fn notification_text(text: &str) -> Option<String> {
 /// notification, as in the reference CLI, and announced once.
 fn shell_notifications(session: &Session) -> Result<Vec<String>> {
     let mut notices = Vec::new();
-    for task in deepseek_code_core::tools::background_shell::collect_finished(&session.paths.data_dir, &session.id)? {
-        session.selected_session()?.enqueue_cli_notification(&task.notification())?;
+    for task in deepseek_code_core::tools::background_shell::collect_finished(
+        &session.paths.data_dir,
+        &session.id,
+    )? {
+        session.selected_session()?.enqueue_cli_input(
+            deepseek_code_core::services::input_queue::QueueOrigin::TaskNotification,
+            &task.notification(),
+        )?;
         notices.push(format!("\u{25cf} {}", task.summary()));
     }
     Ok(notices)
@@ -1175,8 +1181,13 @@ fn shell_notifications(session: &Session) -> Result<Vec<String>> {
 /// announced once.
 fn monitor_notifications(session: &Session) -> Result<Vec<String>> {
     let mut notices = Vec::new();
-    for event in deepseek_code_core::tools::monitor::collect_events(&session.paths.data_dir, &session.id)? {
-        session.selected_session()?.enqueue_cli_notification(&event.notification())?;
+    for event in
+        deepseek_code_core::tools::monitor::collect_events(&session.paths.data_dir, &session.id)?
+    {
+        session.selected_session()?.enqueue_cli_input(
+            deepseek_code_core::services::input_queue::QueueOrigin::TaskNotification,
+            &event.notification(),
+        )?;
         notices.push(format!("\u{25cf} {}", event.summary()));
     }
     Ok(notices)
@@ -1221,7 +1232,7 @@ fn agent_notice(session: &Session, report: String) -> Result<String> {
             summary.push_str(&safe_output(reason).chars().take(400).collect::<String>());
         }
     }
-    session.selected_session()?.enqueue_cli_notification(
+    session.selected_session()?.enqueue_cli_input(deepseek_code_core::services::input_queue::QueueOrigin::TaskNotification,
         &format!("{}\n<task-id>{id}</task-id>\n<status>{status}</status>\n<summary>{summary}</summary>\n<result>See the background task report for this task above.</result>\n</task-notification>", deepseek_code_core::tools::background_shell::NOTIFICATION_START),
     )?;
     Ok(format!("\u{25cf} {summary}"))
@@ -1291,7 +1302,15 @@ mod worker_config_tests {
         };
         let cli = Cli::parse_from(["dcl", "--print", "--permission-mode", "dont-ask"]);
         let notification = "<task-notification>RESUME_PENDING_REPORT</task-notification>";
-        store.db.open_session(&id).unwrap().enqueue_cli_notification(notification).unwrap();
+        store
+            .db
+            .open_session(&id)
+            .unwrap()
+            .enqueue_cli_input(
+                deepseek_code_core::services::input_queue::QueueOrigin::TaskNotification,
+                notification,
+            )
+            .unwrap();
         let mut session = Session::open(&cli, &paths, selection(), Some(&id))
             .await
             .unwrap();
@@ -1355,7 +1374,12 @@ mod worker_config_tests {
             .contains("Continue the unfinished work"));
         session.resume_saved(&paths, &id).await.unwrap();
         session
-            .turn(&cli, "Explicit new task", &mut None)
+            .turn(
+                &cli,
+                "Explicit new task",
+                &mut None,
+                crate::session::TurnOrigin::User("Explicit new task"),
+            )
             .await
             .unwrap();
         assert!(!session.waiting_for_continue());
@@ -1369,7 +1393,16 @@ mod worker_config_tests {
             .unwrap();
         assert!(!fresh.waiting_for_continue());
         fresh.workspace = dir.path().to_owned();
-        fresh.store.db.open_session(&fresh.id).unwrap().enqueue_cli_notification(notification).unwrap();
+        fresh
+            .store
+            .db
+            .open_session(&fresh.id)
+            .unwrap()
+            .enqueue_cli_input(
+                deepseek_code_core::services::input_queue::QueueOrigin::TaskNotification,
+                notification,
+            )
+            .unwrap();
         assert!(wake_for_notifications(&cli, &mut fresh, &mut None)
             .await
             .unwrap());

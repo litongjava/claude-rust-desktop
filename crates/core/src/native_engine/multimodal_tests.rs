@@ -205,6 +205,7 @@ async fn durable_steer_handoff_waits_for_boundary_and_pause_preserves_next_turn(
         "next",
         json!("later"),
         input_queue::QueueMode::NextTurn,
+        input_queue::QueueOrigin::User,
     )
     .unwrap();
     let steer = input_queue::enqueue(
@@ -213,6 +214,7 @@ async fn durable_steer_handoff_waits_for_boundary_and_pause_preserves_next_turn(
         "steer",
         json!("now"),
         input_queue::QueueMode::Steer,
+        input_queue::QueueOrigin::User,
     )
     .unwrap();
     let (mut engine, _events) = executor("http://127.0.0.1:1", "openai", json!("initial"));
@@ -272,12 +274,28 @@ async fn queued_images_replay_after_file_removal_without_becoming_approval_notes
         &[temp.path().join("missing.png"), png.clone()],
     )
     .unwrap();
-    store.db.open_session(&id).unwrap().enqueue_cli_prompt("look [Image #2]").unwrap();
+    store
+        .db
+        .open_session(&id)
+        .unwrap()
+        .enqueue_cli_input(
+            crate::services::input_queue::QueueOrigin::User,
+            "look [Image #2]",
+        )
+        .unwrap();
     let notice = format!(
         "{} [Image #2] internal",
         crate::tools::background_shell::NOTIFICATION_START
     );
-    store.db.open_session(&id).unwrap().enqueue_cli_notification(&notice).unwrap();
+    store
+        .db
+        .open_session(&id)
+        .unwrap()
+        .enqueue_cli_input(
+            crate::services::input_queue::QueueOrigin::TaskNotification,
+            &notice,
+        )
+        .unwrap();
     let (mut engine, mut events) = executor("http://127.0.0.1:1", "openai", json!("initial"));
     let owner = Arc::new(std::sync::Mutex::new(store.db.open_session(&id).unwrap().delivery_owner().unwrap()));
     engine.turn_delivery = Arc::downgrade(&owner);

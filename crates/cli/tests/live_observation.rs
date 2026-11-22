@@ -669,13 +669,16 @@ async fn observing_a_dead_owner_keeps_queued_notifications_pending() {
     let _ = child.wait().await;
 
     // A finished background task left a notification for this session.
-    project.db.open_session(&id).unwrap().enqueue_cli_notification(
-        "<task-notification>background build finished</task-notification>",
-    )
-    .unwrap();
-    let pending = |project: &Project, id: &str| {
-        project.db.pending_input(id, |_| true).unwrap()
-    };
+    project
+        .db
+        .open_session(&id)
+        .unwrap()
+        .enqueue_cli_input(
+            deepseek_code_core::services::input_queue::QueueOrigin::TaskNotification,
+            "<task-notification>background build finished</task-notification>",
+        )
+        .unwrap();
+    let pending = |project: &Project, id: &str| project.db.pending_input(id, |_| true).unwrap();
     assert!(pending(&project, &id));
 
     let requests_before = mock.count();

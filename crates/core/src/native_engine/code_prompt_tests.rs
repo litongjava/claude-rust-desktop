@@ -387,7 +387,14 @@ async fn memory_admission_request_matrix() {
                     };
                     let stale =
                         (path == "steering").then(|| compaction::prepare(&shard, ID).unwrap());
-                    shard.enqueue(path, &json!(text), mode).unwrap();
+                    shard
+                        .enqueue(
+                            path,
+                            &json!(text),
+                            mode,
+                            crate::services::input_queue::QueueOrigin::User,
+                        )
+                        .unwrap();
                     shard
                         .delivery_owner()
                         .unwrap()

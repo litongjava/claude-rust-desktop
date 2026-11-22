@@ -84,13 +84,15 @@ pub async fn turn(
     session: &Session,
     prompt: &str,
     input: &mut Option<TerminalInput>,
-    mut generated: Option<crate::args::Continuation>,
+    mut origin: crate::session::TurnOrigin<'_>,
 ) -> Result<()> {
     let mut next = prompt.to_owned();
     while !crate::signals::terminating() {
-        let Some(kickoff) = Box::pin(single_turn(cli, session, &next, input, generated)).await? else { return Ok(()) };
+        let Some(kickoff) = Box::pin(single_turn(cli, session, &next, input, origin)).await? else {
+            return Ok(());
+        };
         next = kickoff;
-        generated = Some(crate::args::Continuation::Goal);
+        origin = crate::session::TurnOrigin::GoalContinuation;
     }
     Ok(())
 }
@@ -132,7 +134,7 @@ async fn single_turn(
     session: &Session,
     prompt: &str,
     input: &mut Option<TerminalInput>,
-    generated: Option<crate::args::Continuation>,
+    origin: crate::session::TurnOrigin<'_>,
 ) -> Result<Option<String>> {
     let root = &session.paths.data_dir;
     if let Some(job) = settle_session(session)? {
@@ -178,9 +180,7 @@ async fn single_turn(
             prompt,
             &provider,
         )?;
-        if let Some(origin) = generated {
-            arguments.insert(0, origin.worker_argument().into());
-        }
+        arguments.splice(0..0, origin.worker_arguments(prompt)?);
         let mut environment =
             crate::background_commands::worker_environment(session.auto_route, &provider)?;
         environment.push((
@@ -212,9 +212,7 @@ async fn single_turn(
             prompt,
             &provider,
         )?;
-        if let Some(origin) = generated {
-            arguments.insert(0, origin.worker_argument().into());
-        }
+        arguments.splice(0..0, origin.worker_arguments(prompt)?);
         let mut environment = vec![(
             "DEEPSEEK_CODE_WORKER_AUTO_ROUTE".to_owned(),
             session.auto_route.to_string(),
@@ -297,7 +295,7 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
             session,
             &kickoff,
             input,
-            Some(crate::args::Continuation::Goal),
+            crate::session::TurnOrigin::GoalContinuation,
         ))
         .await?;
     }
@@ -761,7 +759,7 @@ async fn observe(
                                     // As in the reference CLI the running turn reads it after its
                                     // next tool results; unread messages become the next prompt.
                                     crate::images::share(&session.id, &prompt);
-                                    session.selected_session()?.enqueue_cli_prompt(&prompt)?;
+                                    session.selected_session()?.enqueue_cli_input(deepseek_code_core::services::input_queue::QueueOrigin::User, &prompt)?;
                                     queued_inputs.push(prompt);
                                     display.queued(queued_inputs.clone());
                                 } else {

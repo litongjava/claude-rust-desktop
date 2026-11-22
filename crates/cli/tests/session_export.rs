@@ -162,7 +162,7 @@ fn reconstruct_history_related_records_and_fork_after_rewind() -> Result<()> {
     )?;
     let typed = json!([{"type":"text","text":"one\ntwo"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]);
     let large = "界🙂\n".repeat(32000);
-    session.admit_user("user", &typed)?;
+    session.admit_user("user", &typed, "typed")?;
     let message = session.write(|w| {
         let turn = w.start_turn()?;
         let message = w.segment(&turn)?;

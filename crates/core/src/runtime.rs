@@ -541,16 +541,22 @@ impl SessionStore<DbManager> {
     }
 
     pub fn append(&self, id: &str, role: &str, text: &str) -> Result<String> {
-        self.append_with_content(id, role, text, None, false)
+        self.append_with_content(id, role, text, None, "generated")
     }
 
-    pub fn append_user_content(&self, id: &str, text: &str, content: &Value) -> Result<String> {
+    pub fn append_user_content(
+        &self,
+        id: &str,
+        text: &str,
+        content: &Value,
+        origin: &str,
+    ) -> Result<String> {
         let content = normalize_user_content(content)?;
-        self.append_with_content(id, "user", text, Some(&content), false)
+        self.append_with_content(id, "user", text, Some(&content), origin)
     }
 
     pub fn append_hook_user(&self, id: &str, text: &str) -> Result<String> {
-        self.append_with_content(id, "user", text, None, true)
+        self.append_with_content(id, "user", text, None, "hook")
     }
 
     fn append_with_content(
@@ -559,7 +565,7 @@ impl SessionStore<DbManager> {
         role: &str,
         text: &str,
         content: Option<&Value>,
-        initial_hook: bool,
+        origin: &str,
     ) -> Result<String> {
         let message_id = uuid::Uuid::new_v4().to_string();
         self.db.with_conn(|conn| -> Result<()> {
@@ -584,12 +590,17 @@ impl SessionStore<DbManager> {
                     false,
                     order,
                 )?;
-                if initial_hook {
+                if role == "user" {
+                    let mut metadata = json!({"promptOrigin":origin});
+                    if origin == "hook" {
+                        metadata["type"] = json!("hook");
+                        metadata["hookEvent"] = json!("SessionStart");
+                    }
                     tx.execute(
                         "INSERT INTO peripheral_settings(key,value) VALUES(?1,?2)",
                         rusqlite::params![
                             format!("message-origin:{message_id}"),
-                            r#"{"type":"hook","hookEvent":"SessionStart"}"#
+                            metadata.to_string()
                         ],
                     )?;
                 }

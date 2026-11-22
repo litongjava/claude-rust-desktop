@@ -2567,6 +2567,16 @@ SKILL_SENTINEL",
 async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
     let server = prompt_suggestion::Endpoint::start("chat").await;
     let root = tempfile::tempdir().unwrap();
+    use deepseek_code_core::services::{
+        memory_files::FileMemory, EnvironmentCredentials, ServiceContext,
+    };
+    let context = ServiceContext::open(
+        deepseek_code_core::runtime::RuntimePaths::new(root.path().join("data")).unwrap(),
+        std::sync::Arc::new(EnvironmentCredentials),
+    )
+    .unwrap();
+    let memory = FileMemory::workspace(&context, root.path()).unwrap();
+    memory.put("saffron.md", "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nEXPANSION_ONLY_RECALL\n", None).unwrap();
     let mut client = server.client(root.path(), &[]);
     client
         .send(initialize_request(
@@ -2575,7 +2585,7 @@ async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
                 "agents":{"main":{
                     "description":"MAIN_AGENT_DESCRIPTION",
                     "prompt":"MAIN_AGENT_SYSTEM_SENTINEL",
-                    "initialPrompt":"INITIAL_PROMPT_SENTINEL"
+                    "initialPrompt":"INITIAL_PROMPT_SENTINEL saffron"
                 }},
                 "agent":"main",
                 "promptSuggestions":true
@@ -2597,7 +2607,8 @@ async fn sdk_main_thread_agent_and_prompt_suggestions_apply() {
         let requests = server.requests.lock().unwrap();
         let first = &requests[0].1;
         assert!(first.contains("MAIN_AGENT_SYSTEM_SENTINEL"), "{first}");
-        assert!(first.contains("INITIAL_PROMPT_SENTINEL"), "{first}");
+        assert!(first.contains("INITIAL_PROMPT_SENTINEL saffron"), "{first}");
+        assert!(!first.contains("EXPANSION_ONLY_RECALL"), "{first}");
     }
     assert!(client.finish().await.0.success());
 }

@@ -419,6 +419,7 @@ fn runtime_resolves_new_resume_clear_and_child_under_one_root() -> Result<()> {
         &id,
         "question",
         &json!([{"type":"text","text":"first input"}]),
+        "typed",
     )?;
     assert_eq!(store.history(&id)?[1]["content"], "question");
     assert_eq!(store.resume(&id)?.model.as_deref(), Some("model"));
@@ -771,7 +772,7 @@ fn first_bridge_message_is_published_with_typed_history_and_chat_authority() -> 
     let root = tempfile::tempdir()?;
     let stores = Stores::open(root.path())?;
     let blocks = json!([{"type":"text","text":"typed hello"}]);
-    stores.admit_chat_message("chat", "model", Some(&blocks))?;
+    stores.admit_chat_message("chat", "model", Some(&blocks), "typed")?;
     let shard = stores.open_session("chat")?;
     shard.read(|r| {
         let messages = r.messages()?;
@@ -781,10 +782,10 @@ fn first_bridge_message_is_published_with_typed_history_and_chat_authority() -> 
         assert_eq!(r.authority()?.len(), 1);
         Ok(())
     })?;
-    stores.admit_chat_message("chat", "model", Some(&json!("second")))?;
+    stores.admit_chat_message("chat", "model", Some(&json!("second")), "typed")?;
     assert_eq!(shard.read(|r| r.messages())?.len(), 2);
     assert!(stores
-        .admit_chat_message("invalid", "model", Some(&json!({"type":"text"})))
+        .admit_chat_message("invalid", "model", Some(&json!({"type":"text"})), "typed")
         .is_err());
     assert!(stores.global().conversation("invalid")?.is_none());
     Ok(())
@@ -956,15 +957,32 @@ fn host_queue_mutations_return_the_committed_payload_and_preserve_claims() -> Re
     let stores = Stores::open(root.path())?;
     let shard = stores.create("chat",Default::default())?;
     let content = serde_json::json!("first");
-    let first = queue::enqueue(&stores,shard.id(),"request",content.clone(),QueueMode::NextTurn)?;
-    let edited = queue::edit(&stores,shard.id(),first.id,first.revision,"edited")?;
-    assert_eq!(edited.content,"edited");
-    assert_eq!(queue::enqueue(&stores,shard.id(),"request",content,QueueMode::NextTurn)?,edited);
-    queue::set_paused(&stores,shard.id(),true)?;
-    assert!(queue::is_paused(&stores,shard.id())?);
-    queue::set_paused(&stores,shard.id(),false)?;
-    let interrupted=stores.with_fault_hook(|phase| {
-        anyhow::ensure!(phase!=Phase::DeliveryCommitted,"interrupted before ack");
+    let first = queue::enqueue(
+        &stores,
+        shard.id(),
+        "request",
+        content.clone(),
+        QueueMode::NextTurn,
+        queue::QueueOrigin::User,
+    )?;
+    let edited = queue::edit(&stores, shard.id(), first.id, first.revision, "edited")?;
+    assert_eq!(edited.content, "edited");
+    assert_eq!(
+        queue::enqueue(
+            &stores,
+            shard.id(),
+            "request",
+            content,
+            QueueMode::NextTurn,
+            queue::QueueOrigin::User
+        )?,
+        edited
+    );
+    queue::set_paused(&stores, shard.id(), true)?;
+    assert!(queue::is_paused(&stores, shard.id())?);
+    queue::set_paused(&stores, shard.id(), false)?;
+    let interrupted = stores.with_fault_hook(|phase| {
+        anyhow::ensure!(phase != Phase::DeliveryCommitted, "interrupted before ack");
         Ok(())
     });
     assert!(interrupted.open_session(shard.id())?.delivery_owner()?.next_queue(QueueMode::NextTurn,None).is_err());
@@ -983,7 +1001,14 @@ fn desktop_recovers_ack_before_dispatch_and_starts_only_the_receipted_turn() -> 
     let root = tempfile::tempdir()?;
     let stores = Stores::open(root.path())?;
     let session = stores.create("chat", Default::default())?;
-    let first = queue::enqueue(&session,session.id(),"request",serde_json::json!("first"),QueueMode::NextTurn)?;
+    let first = queue::enqueue(
+        &session,
+        session.id(),
+        "request",
+        serde_json::json!("first"),
+        QueueMode::NextTurn,
+        queue::QueueOrigin::User,
+    )?;
     let stale = stores.next_desktop_input(session.id())?.unwrap();
     let edited = queue::edit(&session,session.id(),first.id,first.revision,"current")?;
     let lease=Arc::new(session.acquire_execution()?);

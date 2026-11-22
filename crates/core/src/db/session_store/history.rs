@@ -357,10 +357,12 @@ pub(crate) fn visible_memory_index(
 }
 
 impl super::SessionDb {
-    pub fn admit_user(&self, id: &str, content: &Value) -> Result<()> {
+    pub fn admit_user(&self, id: &str, content: &Value, origin: &str) -> Result<()> {
         let _guard = self.hold_incarnation()?;
-        let memory = crate::services::memory_files::prompt::Admission::session(self)?;
-        self.write(|w| w.append_user(id, content, &memory))
+        let memory = (origin == "typed")
+            .then(|| crate::services::memory_files::prompt::Admission::session(self))
+            .transpose()?;
+        self.write(|w| w.append_user(id, content, origin, memory.as_ref()))
     }
 
     /// Persist the producer's prompt and its memory receipt under one shard write.
@@ -369,6 +371,22 @@ impl super::SessionDb {
         display: &str,
         content: Option<&Value>,
         origin: &str,
+    ) -> Result<String> {
+        self.admit_prompt_with_query(
+            display,
+            content,
+            origin,
+            content.unwrap_or(&Value::String(display.into())),
+        )
+    }
+
+    /// Expanded model content and the producer's original recall query may differ.
+    pub fn admit_prompt_with_query(
+        &self,
+        display: &str,
+        content: Option<&Value>,
+        origin: &str,
+        query: &Value,
     ) -> Result<String> {
         let _guard = self.hold_incarnation()?;
         let memory = (origin == "typed")
@@ -384,7 +402,7 @@ impl super::SessionDb {
             };
             w.set_prompt_origin(&id, origin)?;
             if let Some(memory) = &memory {
-                memory.typed(w.0, &id, content.unwrap_or(&Value::String(display.into())))?;
+                memory.typed(w.0, &id, query)?;
             }
             Ok(id)
         })
@@ -430,7 +448,8 @@ impl SessionWrite<'_> {
         &self,
         id: &str,
         content: &Value,
-        memory: &crate::services::memory_files::prompt::Admission,
+        origin: &str,
+        memory: Option<&crate::services::memory_files::prompt::Admission>,
     ) -> Result<()> {
         ensure!(
             !self
@@ -447,14 +466,16 @@ impl SessionWrite<'_> {
             &chrono::Utc::now().to_rfc3339(),
             self.next_order()?,
         )?;
-        self.set_prompt_origin(id, "typed")?;
-        memory.typed(self.0, id, content)?;
-        permission_authority::record_conn(
-            self.0,
-            self.1,
-            permission_authority::Source::User,
-            content,
-        )?;
+        self.set_prompt_origin(id, origin)?;
+        if let Some(memory) = memory {
+            memory.typed(self.0, id, content)?;
+            permission_authority::record_conn(
+                self.0,
+                self.1,
+                permission_authority::Source::User,
+                content,
+            )?;
+        }
         self.2.set(true);
         Ok(())
     }

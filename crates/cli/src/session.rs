@@ -143,10 +143,14 @@ pub(crate) fn recall_queued(
     Ok(recalled)
 }
 
-// Attempt data is published only after optional recovery has settled.
+/// The producer supplies the provenance and the original human text, if any.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum TurnOrigin {
-    User,
+pub(crate) enum TurnOrigin<'a> {
+    User(&'a str),
+    Delegation,
+    McpPrompt,
+    Scheduled,
+    Queue(&'a str, &'a Value),
     Continuation,
     GoalContinuation,
     ErrorResume,
@@ -154,10 +158,59 @@ enum TurnOrigin {
     HookWake,
 }
 
-impl TurnOrigin {
-    fn tag(self) -> &'static str {
+impl<'a> TurnOrigin<'a> {
+    pub(crate) fn command_line(cli: &'a Cli, text: &'a str) -> Self {
+        match cli.generated_continuation {
+            Some(crate::args::Continuation::Goal) => Self::GoalContinuation,
+            Some(crate::args::Continuation::Resume) => Self::Continuation,
+            Some(crate::args::Continuation::Delegation) => Self::Delegation,
+            Some(crate::args::Continuation::McpPrompt) => Self::McpPrompt,
+            Some(crate::args::Continuation::Scheduled) => Self::Scheduled,
+            None => Self::User(cli.original_user_input.as_deref().unwrap_or(text)),
+        }
+    }
+
+    pub(crate) fn worker_arguments(self, prompt: &str) -> Result<Vec<String>> {
+        use crate::args::Continuation;
+        let generated = match self {
+            Self::User(raw) if raw != prompt => {
+                return Ok(vec![format!("--original-user-input={raw}")])
+            }
+            Self::User(_) => return Ok(Vec::new()),
+            Self::GoalContinuation => Continuation::Goal,
+            Self::Continuation => Continuation::Resume,
+            Self::Delegation => Continuation::Delegation,
+            Self::McpPrompt => Continuation::McpPrompt,
+            Self::Scheduled => Continuation::Scheduled,
+            Self::Queue(..) | Self::InitialHook | Self::HookWake | Self::ErrorResume => {
+                bail!("This turn is already owned by the executing session")
+            }
+        };
+        Ok(vec![generated.worker_argument().into()])
+    }
+
+    fn admit(
+        self,
+        shard: &deepseek_code_core::db::session_store::SessionDb,
+        display: &str,
+        content: Option<&Value>,
+    ) -> Result<String> {
         match self {
-            Self::User => "typed",
+            Self::User(raw) => {
+                shard.admit_prompt_with_query(display, content, self.tag(), &json!(raw))
+            }
+            Self::Queue(tag, payload) => shard.admit_prompt(display, Some(payload), tag),
+            _ => shard.admit_prompt(display, content, self.tag()),
+        }
+    }
+
+    fn tag(self) -> &'a str {
+        match self {
+            Self::User(_) => "typed",
+            Self::Delegation => "delegation",
+            Self::McpPrompt => "mcp_prompt",
+            Self::Scheduled => "scheduled",
+            Self::Queue(tag, _) => tag,
             Self::Continuation => "continuation",
             Self::GoalContinuation => "goal_continuation",
             Self::ErrorResume => "error_resume",
@@ -166,9 +219,10 @@ impl TurnOrigin {
     }
 }
 
+// Attempt data is published only after optional recovery has settled.
 #[derive(Default)]
-struct TurnCompletion {
-    queued: Option<deepseek_code_core::services::input_queue::QueueItem>,
+struct TurnCompletion<'a> {
+    queued: Option<&'a deepseek_code_core::services::input_queue::QueueItem>,
     suggestion: Option<(
         deepseek_code_core::native_engine::suggestion::SuggestionCapture,
         deepseek_code_core::session_files::suggestion::SuggestionTurn,
@@ -182,7 +236,7 @@ struct TurnCompletion {
     requests: Vec<Value>,
 }
 
-impl TurnCompletion {
+impl TurnCompletion<'_> {
     fn remember_stdout_failure(&mut self, error: &anyhow::Error) {
         if let Some(failure) = error.downcast_ref::<crate::terminal_output::StdoutWriteFailed>() {
             self.stdout_failure.get_or_insert_with(|| failure.clone());
@@ -1595,21 +1649,12 @@ impl Session {
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub async fn turn(
+    pub(crate) async fn turn(
         &self,
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
-    ) -> Result<()> {
-        self.turn_with_origin(cli, prompt, input, cli.generated_continuation).await
-    }
-
-    pub(crate) async fn turn_with_origin(
-        &self,
-        cli: &Cli,
-        prompt: &str,
-        input: &mut Option<TerminalInput>,
-        generated: Option<crate::args::Continuation>,
+        mut origin: TurnOrigin<'_>,
     ) -> Result<()> {
         use std::io::IsTerminal;
         self.apply_settings_permissions(cli)?;
@@ -1629,20 +1674,15 @@ impl Session {
         }
         // Frontends record original human input before skill expansion/worker handoff.
         // A worker receives synthesized context and must never re-label it as user intent.
-        if generated.is_none() && frontend {
+        if let (true, TurnOrigin::User(raw)) = (frontend, origin) {
             deepseek_code_core::services::permission_authority::record_user(
                 &self.store.db,
                 &self.id,
-                self.sdk_content.as_ref().unwrap_or(&json!(prompt)),
+                self.sdk_content.as_ref().unwrap_or(&json!(raw)),
             )?;
         }
         // Keep engine/goal futures out of the outer host stack. Debug builds on
         // Windows otherwise exhaust the process stack before a worker can run.
-        let mut origin = match generated {
-            Some(crate::args::Continuation::Goal) => TurnOrigin::GoalContinuation,
-            Some(crate::args::Continuation::Resume) => TurnOrigin::Continuation,
-            None => TurnOrigin::User,
-        };
         if self.sdk_content.is_some() {
             return Box::pin(self.run_turn_origin(cli, prompt, input, origin, true)).await;
         }
@@ -1676,7 +1716,7 @@ impl Session {
             && std::env::var("TERM").as_deref() != Ok("dumb")
             && !crate::display_commands::load(self)?.focus
         {
-            return crate::worker_frontend::turn(cli, self, prompt, input, generated).await;
+            return crate::worker_frontend::turn(cli, self, prompt, input, origin).await;
         }
         let mut next = prompt.to_owned();
         loop {
@@ -1820,9 +1860,9 @@ impl Session {
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
+        origin: TurnOrigin<'_>,
     ) -> Result<()> {
-        self.run_turn_origin(cli, prompt, input, TurnOrigin::User, true)
-            .await
+        self.run_turn_origin(cli, prompt, input, origin, true).await
     }
 
     pub(crate) async fn turn_initial_hook(
@@ -1864,10 +1904,20 @@ impl Session {
 
     pub(crate) async fn dispatch_input(&self,cli:&Cli,item:deepseek_code_core::services::input_queue::QueueItem,input:&mut Option<TerminalInput>)->Result<()> {
         self.apply_settings_permissions(cli)?;
-        let prompt=item.content.as_str().or_else(||item.content.pointer("/0/text").and_then(Value::as_str)).unwrap_or_default().to_owned();
-        let mut completion=TurnCompletion{queued:Some(item),..Default::default()};
-        let result=self.run_and_finalize_turn(cli,&prompt,input,TurnOrigin::User,true,&mut completion).await;
-        match completion.stdout_failure { Some(failure)=>Err(failure.into()),None=>result }
+        let (prompt, _) =
+            deepseek_code_core::db::message_repo::prepare_user_message(&item.content)?;
+        let origin = TurnOrigin::Queue(&item.prompt_origin, &item.content);
+        let mut completion = TurnCompletion {
+            queued: Some(&item),
+            ..Default::default()
+        };
+        let result = self
+            .run_and_finalize_turn(cli, &prompt, input, origin, true, &mut completion)
+            .await;
+        match completion.stdout_failure {
+            Some(failure) => Err(failure.into()),
+            None => result,
+        }
     }
 
     async fn run_turn_origin(
@@ -1875,7 +1925,7 @@ impl Session {
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
-        origin: TurnOrigin,
+        origin: TurnOrigin<'_>,
         publish: bool,
     ) -> Result<()> {
         let mut completion = TurnCompletion::default();
@@ -1893,9 +1943,9 @@ impl Session {
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
-        origin: TurnOrigin,
+        origin: TurnOrigin<'_>,
         publish: bool,
-        completion: &mut TurnCompletion,
+        completion: &mut TurnCompletion<'_>,
     ) -> Result<()> {
         // Own the session before the turn becomes visible, and keep that
         // ownership until the turn is persisted. The engine only borrows a clone
@@ -2050,15 +2100,19 @@ impl Session {
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
-        origin: TurnOrigin,
+        origin: TurnOrigin<'_>,
         publish: bool,
         turn: &mut deepseek_code_core::db::turn_repo::TurnTimer,
-        completion: &mut TurnCompletion,
+        completion: &mut TurnCompletion<'_>,
         execution_lease: Option<
             std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>,
         >,
     ) -> Result<()> {
         let hook_wake = origin == TurnOrigin::HookWake;
+        let content = match origin {
+            TurnOrigin::Queue(_, content) => Some(content),
+            _ => self.sdk_content.as_ref(),
+        };
         let transcript = turn.history();
         // Captures the signal count synchronously, before any await. A Ctrl-C
         // delivered while an event is being handled is therefore still seen by
@@ -2101,7 +2155,7 @@ impl Session {
             .model_history_with_boundary(&self.id, &self.selected_provider().await?.provider.api_format)?;
         crate::session_commands::microcompact(self, &mut history, self.context_window().await)?;
         if !hook_wake && completion.queued.is_none() {
-            let message = json!({"role":"user","origin":origin.tag(),"content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))});
+            let message = json!({"role":"user","origin":origin.tag(),"content":content.cloned().unwrap_or(json!(prompt))});
             history.push(message);
         }
         let mut system = match &self.sdk_overrides.system_prompt {
@@ -2131,9 +2185,8 @@ impl Session {
         let mut checkpoint = if hook_wake || completion.queued.is_some() {
             None
         } else {
-            let user_message_id = self
-                .selected_session()?
-                .admit_prompt(prompt, self.sdk_content.as_ref(), origin.tag())
+            let user_message_id = origin
+                .admit(&self.selected_session()?, prompt, content)
                 .context("Persisting CLI user message")?;
             history.last_mut().expect("submitted user message")["id"] = json!(user_message_id);
             match deepseek_code_core::services::checkpoints::capture(
@@ -2413,7 +2466,7 @@ impl Session {
                                     // As in the reference CLI the model reads it after its next
                                     // tool results, or as the next prompt.
                                     crate::images::share(&self.id, &prompt);
-                                    self.selected_session()?.enqueue_cli_prompt(&prompt)?;
+                                    self.selected_session()?.enqueue_cli_input(deepseek_code_core::services::input_queue::QueueOrigin::User, &prompt)?;
                                     pending_inputs.push(prompt);
                                     progress.queued(pending_inputs.clone());
                                 }
@@ -2697,7 +2750,7 @@ impl Session {
                                         progress.styled_lines(crate::terminal::plan_view::rejected(&plan, width));
                                     }
                                     if let Some(note) = &decision.note {
-                                        self.selected_session()?.enqueue_cli_prompt(note)?;
+                                        self.selected_session()?.enqueue_cli_input(deepseek_code_core::services::input_queue::QueueOrigin::User, note)?;
                                     }
                                     self.engine.resume_with_answer(&request_id, decision.engine).await?;
                                     plan_mode_after = decision.mode.map(|mode| (tool_use_id.clone(), mode));
@@ -4313,7 +4366,12 @@ mod event_tests {
             blocked
                 .as_mut()
                 .unwrap()
-                .run_turn(&cli_first, "first task", &mut None)
+                .run_turn(
+                    &cli_first,
+                    "first task",
+                    &mut None,
+                    super::TurnOrigin::User("first task"),
+                )
                 .await
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -4340,7 +4398,12 @@ mod event_tests {
         };
         let turns_before = turn_count();
         let error = second
-            .run_turn(&cli, "second task", &mut None)
+            .run_turn(
+                &cli,
+                "second task",
+                &mut None,
+                super::TurnOrigin::User("second task"),
+            )
             .await
             .expect_err("a concurrent top-level turn must be rejected");
         assert!(
@@ -4414,7 +4477,12 @@ mod event_tests {
         let id = session.id.clone();
         for index in 0..6 {
             session
-                .run_turn(&cli, &format!("task {index}"), &mut None)
+                .run_turn(
+                    &cli,
+                    &format!("task {index}"),
+                    &mut None,
+                    super::TurnOrigin::User(&format!("task {index}")),
+                )
                 .await
                 .unwrap_or_else(|error| panic!("turn {index} failed: {error:#}"));
             // The lease is released by the completed turn itself, so the next
@@ -4492,7 +4560,7 @@ mod event_tests {
         for prompt in ["first SDK turn", "second SDK turn"] {
             tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                session.run_turn(&cli, prompt, &mut None),
+                session.run_turn(&cli, prompt, &mut None, super::TurnOrigin::User(prompt)),
             )
             .await
             .unwrap()
@@ -5312,3 +5380,7 @@ mod request_usage_tests {
 mod binding_tests;
 #[path = "startup_contention_tests.rs"]
 mod startup_contention_tests;
+
+#[cfg(test)]
+#[path = "session_origin_tests.rs"]
+mod origin_tests;

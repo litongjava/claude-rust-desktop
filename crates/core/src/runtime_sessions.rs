@@ -89,10 +89,16 @@ impl SessionStore<Stores> {
     pub fn append_prompt(&self, id: &str, text: &str, origin: &str) -> Result<String> {
         self.db.open_session(id)?.admit_prompt(text, None, origin)
     }
-    pub fn append_user_content(&self, id: &str, text: &str, content: &Value) -> Result<String> {
+    pub fn append_user_content(
+        &self,
+        id: &str,
+        text: &str,
+        content: &Value,
+        origin: &str,
+    ) -> Result<String> {
         self.db
             .open_session(id)?
-            .admit_prompt(text, Some(content), "typed")
+            .admit_prompt(text, Some(content), origin)
     }
     pub fn append_hook_user(&self, id: &str, text: &str) -> Result<String> {
         self.db

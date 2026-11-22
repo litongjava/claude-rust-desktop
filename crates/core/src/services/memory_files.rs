@@ -847,13 +847,13 @@ mod tests {
             .join("journal.json");
         std::fs::write(&journal, b"invalid").unwrap();
         assert!(shard
-            .admit_user("transaction-probe", &json!("preferences"))
+            .admit_user("transaction-probe", &json!("preferences"), "typed")
             .is_err());
         assert!(shard.read(|r| r.messages()).unwrap().is_empty());
         assert!(shard.read(|r| r.authority()).unwrap().is_empty());
         std::fs::remove_file(journal).unwrap();
         shard
-            .admit_user("transaction-probe", &json!("preferences"))
+            .admit_user("transaction-probe", &json!("preferences"), "typed")
             .unwrap();
         assert_eq!(shard.read(|r| r.messages()).unwrap().len(), 1);
     }
@@ -868,6 +868,39 @@ mod tests {
     fn compact(shard: &SessionDb) {
         let prepared = crate::services::compaction::prepare(shard, shard.id()).unwrap();
         crate::services::compaction::commit(shard, prepared, "same summary").unwrap();
+    }
+
+    #[test]
+    fn memory_first_chat_uses_the_producer_origin_for_initial_and_later_submissions() {
+        let (_root, memory) = fixture();
+        let stores = &memory.context.db;
+        let id = "generated-first-chat";
+        let content = json!("generated directive");
+        let (lease, sealed) = stores
+            .admit_chat_execution(id, "model", Some(&content), "delegation")
+            .unwrap();
+        assert!(sealed);
+        drop(lease);
+        stores
+            .admit_chat_message(id, "model", Some(&content), "mcp_prompt")
+            .unwrap();
+        let shard = stores.open_session(id).unwrap();
+        shard
+            .read(|r| {
+                assert!(r.authority()?.is_empty());
+                let messages = r.messages()?;
+                assert_eq!(messages.len(), 2);
+                assert_eq!(
+                    r.message_metadata(&messages[0].id)?.unwrap()["promptOrigin"],
+                    "delegation"
+                );
+                assert_eq!(
+                    r.message_metadata(&messages[1].id)?.unwrap()["promptOrigin"],
+                    "mcp_prompt"
+                );
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

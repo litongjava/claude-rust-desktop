@@ -96,6 +96,7 @@ pub(super) async fn start_authorized_chat(
         &req.conversation_id,
         &req.model,
         user_content.as_ref(),
+        "typed",
     ) {
         Ok((lease, sealed)) => (std::sync::Arc::new(lease), sealed),
         Err(error) => {
@@ -133,8 +134,11 @@ pub(super) async fn start_authorized_chat(
         let db = state.db_manager.clone();
         let conv_id_save = conv_id.clone();
         let model_save = model.clone();
-        let saved=tokio::task::spawn_blocking(move || db.admit_chat_message(&conv_id_save,&model_save,user_content.as_ref())).await;
-        if !matches!(saved,Ok(Ok(()))) {
+        let saved = tokio::task::spawn_blocking(move || {
+            db.admit_chat_message(&conv_id_save, &model_save, user_content.as_ref(), "typed")
+        })
+        .await;
+        if !matches!(saved, Ok(Ok(()))) {
             tracing::error!("Could not persist user content: {:?}", saved);
             return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"Could not save user message"}))).into_response();
         }

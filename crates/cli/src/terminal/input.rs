@@ -16,6 +16,7 @@ pub(crate) mod editor;
 #[derive(Debug, PartialEq, Eq)]
 pub enum PromptEvent {
     Line(String),
+    Scheduled(String),
     CyclePermission,
     StepEffort(bool),
 }
@@ -433,6 +434,10 @@ impl TerminalInput {
     pub fn queue_prompt(&mut self, prompt: String) {
         self.queued.push_back(PromptEvent::Line(prompt));
     }
+    pub fn queue_scheduled(&mut self, prompt: String) {
+        self.queued.push_back(PromptEvent::Scheduled(prompt));
+    }
+
     /// Takes back waiting prompts the user can see, leaving everything else queued.
     pub fn take_prompts(&mut self, shown: &[String]) -> Vec<String> {
         let mut taken = Vec::new();
@@ -537,9 +542,11 @@ impl TerminalInput {
         match self.read_with(prompt, false, true).await? {
             Some(PromptEvent::Line(line)) => Ok(Some(line)),
             None => Ok(None),
-            Some(PromptEvent::CyclePermission | PromptEvent::StepEffort(_)) => {
-                Err(io::Error::other("Shortcut is not a question answer"))
-            }
+            Some(
+                PromptEvent::CyclePermission
+                | PromptEvent::StepEffort(_)
+                | PromptEvent::Scheduled(_),
+            ) => Err(io::Error::other("Shortcut is not a question answer")),
         }
     }
 
@@ -547,9 +554,13 @@ impl TerminalInput {
         match self.read(prompt, false).await? {
             Some(PromptEvent::Line(line)) => Ok(Some(line)),
             None => Ok(None),
-            Some(PromptEvent::CyclePermission | PromptEvent::StepEffort(_)) => Err(
-                io::Error::other("Permission cycle is not a question answer"),
-            ),
+            Some(
+                PromptEvent::CyclePermission
+                | PromptEvent::StepEffort(_)
+                | PromptEvent::Scheduled(_),
+            ) => Err(io::Error::other(
+                "Permission cycle is not a question answer",
+            )),
         }
     }
 

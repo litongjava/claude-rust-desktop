@@ -175,6 +175,7 @@ async fn enqueue(
             &input.request_id,
             content,
             input.mode,
+            queue::QueueOrigin::User,
         )
     });
     match result {

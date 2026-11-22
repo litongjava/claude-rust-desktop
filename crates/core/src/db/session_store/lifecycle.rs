@@ -46,6 +46,7 @@ pub enum Phase {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FirstMessage {
+    pub origin: String,
     pub text: String,
     pub typed: Option<serde_json::Value>,
 }
@@ -271,7 +272,13 @@ enum Seed<'a> {
 impl FirstMessage {
     fn digest(&self) -> Result<String> {
         use sha2::{Digest, Sha256};
-        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&(&self.text, &self.typed))?)))
+        // Typed first submissions retain their existing recovery identity.
+        let content = if self.origin == "typed" {
+            serde_json::to_vec(&(&self.text, &self.typed))?
+        } else {
+            serde_json::to_vec(&(&self.origin, &self.text, &self.typed))?
+        };
+        Ok(format!("{:x}", Sha256::digest(content)))
     }
 }
 
@@ -541,20 +548,29 @@ impl Stores {
                         .typed
                         .clone()
                         .unwrap_or_else(|| serde_json::Value::String(first.text.clone()));
-                    crate::services::permission_authority::record_conn(
-                        tx,
-                        id,
-                        crate::services::permission_authority::Source::User,
-                        &content,
-                    )?;
+                    if first.origin == "typed" {
+                        crate::services::permission_authority::record_conn(
+                            tx,
+                            id,
+                            crate::services::permission_authority::Source::User,
+                            &content,
+                        )?;
+                    }
                     let message = crate::db::transcript::MessageIds::new(&op.incarnation).issue();
                     tx.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                         VALUES(?1,?2,'user',?3,?4,0)",params![message,id,first.text,created])?;
                     tx.execute(
                         "INSERT INTO message_metadata VALUES(?1,?2)",
-                        params![message, r#"{"promptOrigin":"typed"}"#],
+                        params![
+                            message,
+                            serde_json::json!({"promptOrigin": first.origin}).to_string()
+                        ],
                     )?;
-                    memory.first(tx, &message, &content)?;
+                    if first.origin == "typed" {
+                        memory.first(tx, &message, &content)?;
+                    } else {
+                        memory.freeze(tx, None)?;
+                    }
                     if let Some(typed) = &first.typed {
                         tx.execute(
                             "INSERT INTO message_user_content VALUES(?1,?2)",

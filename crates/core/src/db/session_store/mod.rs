@@ -711,12 +711,13 @@ impl SessionRead<'_> {
                         Some(_) => Some(row.get::<_, String>(9)?),
                         None => None,
                     };
-                    Ok((message.content, json))
+                    Ok((message.id, message.content, json))
                 },
             )
             .optional()?;
-        pair.map(|(text, json)| {
+        pair.map(|(id, text, json)| {
             Ok(FirstMessage {
+                origin: message_origin(self.0, &id)?.unwrap_or_else(|| "legacy".into()),
                 text,
                 typed: json.map(|value| serde_json::from_str(&value)).transpose()?,
             })

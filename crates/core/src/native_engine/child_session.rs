@@ -423,6 +423,7 @@ pub(crate) async fn prepare_child_session(
     arguments.extend([
         "--resume".into(),
         session_id.clone(),
+        "--generated-continuation=delegation".into(),
         "--print".into(),
         "--output-format".into(),
         "stream-json".into(),
@@ -968,6 +969,9 @@ mod tests {
         assert!(pair(&arguments, "--permission-mode", "bypass"));
         assert!(pair(&arguments, "--resume", &handle.session_id));
         assert!(pair(&arguments, "--output-format", "stream-json"));
+        assert!(arguments
+            .iter()
+            .any(|arg| arg == "--generated-continuation=delegation"));
         assert!(arguments.iter().any(|arg| arg == "inspect"));
     }
 

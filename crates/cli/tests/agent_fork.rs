@@ -281,7 +281,22 @@ async fn fork_runs_on_a_branch_of_the_parent_session() {
     let child = result["session_id"].as_str().expect("child session id");
 
     let stores=deepseek_code_core::db::session_store::Stores::open(&data).unwrap();
-    let title=stores.global().conversation(child).unwrap().unwrap().title;
+    let child_shard = stores.open_session(child).unwrap();
+    child_shard
+        .read(|r| {
+            let directive = r
+                .messages()?
+                .into_iter()
+                .find(|m| m.role == "user" && m.content.starts_with(FORK_DIRECTIVE))
+                .expect("the child admitted its directive");
+            assert_eq!(
+                r.message_metadata(&directive.id)?.unwrap()["promptOrigin"],
+                "delegation"
+            );
+            Ok(())
+        })
+        .unwrap();
+    let title = stores.global().conversation(child).unwrap().unwrap().title;
     assert!(
         title.as_deref().unwrap_or_default().starts_with("Fork: "),
         "unexpected fork title: {title:?}"

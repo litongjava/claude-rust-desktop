@@ -193,13 +193,23 @@ fn killed_delivery_owners_recover_one_effect_and_one_dispatch() -> Result<()> {
             let a = s.create(A, project(root.path()))?;
             let b = s.create(B, project(root.path()))?;
             if kind == "queue" {
-                b.enqueue("request", &json!("user intent"), QueueMode::NextTurn)?;
+                b.enqueue(
+                    "request",
+                    &json!("user intent"),
+                    QueueMode::NextTurn,
+                    deepseek_code_core::services::input_queue::QueueOrigin::User,
+                )?;
             } else if kind == "tool" {
                 b.write(|w| {
                     let m = w.append("assistant", "using tool")?;
                     w.tool(&tool("frozen", &m, 0), None)
                 })?;
-                b.enqueue("request", &json!("tool intent"), QueueMode::Steer)?;
+                b.enqueue(
+                    "request",
+                    &json!("tool intent"),
+                    QueueMode::Steer,
+                    deepseek_code_core::services::input_queue::QueueOrigin::User,
+                )?;
             } else {
                 a.send_peer(&b, "operation", "peer data")?;
             }
@@ -259,10 +269,28 @@ fn queue_revision_pause_tool_delivery_and_peer_revocation() -> Result<()> {
     let s = Stores::open(root.path())?;
     let a = s.create(A, project(root.path()))?;
     let b = s.create(B, project(root.path()))?;
-    let q = b.enqueue("unique", &json!("earlier"), QueueMode::Steer)?;
-    assert_eq!(b.enqueue("unique", &json!("earlier"), QueueMode::Steer)?, q);
+    let q = b.enqueue(
+        "unique",
+        &json!("earlier"),
+        QueueMode::Steer,
+        deepseek_code_core::services::input_queue::QueueOrigin::User,
+    )?;
+    assert_eq!(
+        b.enqueue(
+            "unique",
+            &json!("earlier"),
+            QueueMode::Steer,
+            deepseek_code_core::services::input_queue::QueueOrigin::User
+        )?,
+        q
+    );
     assert!(b
-        .enqueue("unique", &json!("other"), QueueMode::Steer)
+        .enqueue(
+            "unique",
+            &json!("other"),
+            QueueMode::Steer,
+            deepseek_code_core::services::input_queue::QueueOrigin::User
+        )
         .is_err());
     assert_eq!(b.queue_items()?[0].content, json!("earlier"));
     let edit = b.edit_queue(q.id, q.revision, QueueEdit::Text("edited"))?;
@@ -322,7 +350,11 @@ fn history_nested_replay_full_partial_clear_and_worker_address() -> Result<()> {
     let root = tempdir()?;
     let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
-    a.admit_user("first", &json!([{"type":"text","text":"user scope"}]))?;
+    a.admit_user(
+        "first",
+        &json!([{"type":"text","text":"user scope"}]),
+        "typed",
+    )?;
     let (turn,m)=a.write(|w|{
         w.bind_agent("agent restrictions")?;let t=w.start_turn()?;let m=w.segment(&t)?;w.message_content(&m,"reply")?;
         let nested=format!("{m}:nested");
@@ -625,7 +657,12 @@ fn rewind_retires_undispatched_generation_and_fork_keeps_early_nested_origin() -
     let root = tempdir()?;
     let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
-    a.enqueue("request", &json!("withdrawn"), QueueMode::NextTurn)?;
+    a.enqueue(
+        "request",
+        &json!("withdrawn"),
+        QueueMode::NextTurn,
+        deepseek_code_core::services::input_queue::QueueOrigin::User,
+    )?;
     let mut owner = a.delivery_owner()?;
     let effect = owner.next_queue(QueueMode::NextTurn, None)?.unwrap();
     a.write(|w| w.rewind_from(&effect.id))?;
@@ -781,7 +818,12 @@ fn killed_executor_settles_its_started_turn_and_never_redispatches_it() -> Resul
     let root = tempdir()?;
     let stores = Stores::open(root.path())?;
     let b = stores.create(B, Default::default())?;
-    b.enqueue("launch", &json!("work"), QueueMode::NextTurn)?;
+    b.enqueue(
+        "launch",
+        &json!("work"),
+        QueueMode::NextTurn,
+        deepseek_code_core::services::input_queue::QueueOrigin::User,
+    )?;
     let mut worker = Worker::start(root.path(), "dispatch")?;
     wait(&root.path().join("ready"))?;
     let turn = fs::read_to_string(root.path().join("started-turn"))?;
@@ -902,7 +944,12 @@ fn review_frozen_rewound_tool_cancels_and_unblocks_fifo() -> Result<()> {
         Ok(m)
     })?;
     for key in ["one", "two"] {
-        b.enqueue(key, &json!(key), QueueMode::Steer)?;
+        b.enqueue(
+            key,
+            &json!(key),
+            QueueMode::Steer,
+            deepseek_code_core::services::input_queue::QueueOrigin::User,
+        )?;
     }
     let stop = s.with_fault_hook(|p| {
         ensure!(p != Phase::DeliveryClaimed, "cut");
@@ -932,7 +979,12 @@ fn review_running_turn_consumes_steer_once() -> Result<()> {
     let mut owner = b.delivery_owner()?;
     let turn = b.write(|w| w.start_turn())?;
     for key in ["one", "two"] {
-        b.enqueue(key, &json!(key), QueueMode::Steer)?;
+        b.enqueue(
+            key,
+            &json!(key),
+            QueueMode::Steer,
+            deepseek_code_core::services::input_queue::QueueOrigin::User,
+        )?;
         assert!(owner.next_queue(QueueMode::Steer, None)?.unwrap().applied);
     }
     b.write(|w| w.finish_turn(&turn, TurnStatus::Completed, 10))?;
@@ -949,7 +1001,12 @@ fn review_edit_classifies_conflict_before_attachments() -> Result<()> {
     let s = Stores::open(root.path())?;
     let b = s.create(B, Default::default())?;
     let input = json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}]);
-    let item = b.enqueue("image", &input, QueueMode::NextTurn)?;
+    let item = b.enqueue(
+        "image",
+        &input,
+        QueueMode::NextTurn,
+        deepseek_code_core::services::input_queue::QueueOrigin::User,
+    )?;
     let edit = |id, rev| {
         b.edit_queue(id, rev, QueueEdit::Text("edit"))
             .unwrap_err()
@@ -1348,9 +1405,19 @@ fn host_execution_lease_is_shared_for_handoff_and_fenced_to_the_shard() -> Resul
     let lease=Arc::new(source.acquire_execution()?);
     assert!(source.acquire_execution().is_err());
     assert!(other.delivery_under_lease(lease.clone()).is_err());
-    let mut boundary=source.delivery_under_lease(lease.clone())?;
-    source.enqueue("r",&json!("queued"),QueueMode::NextTurn)?;
-    assert!(boundary.next_queue(QueueMode::NextTurn,None)?.unwrap().applied);
+    let mut boundary = source.delivery_under_lease(lease.clone())?;
+    source.enqueue(
+        "r",
+        &json!("queued"),
+        QueueMode::NextTurn,
+        deepseek_code_core::services::input_queue::QueueOrigin::User,
+    )?;
+    assert!(
+        boundary
+            .next_queue(QueueMode::NextTurn, None)?
+            .unwrap()
+            .applied
+    );
     assert!(boundary.begin_generation()?.is_some());
     drop(boundary);
     assert!(source.acquire_execution().is_err());

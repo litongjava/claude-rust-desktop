@@ -537,6 +537,7 @@ fn large_private_sidecar(stores: &Stores) -> Result<SessionDb> {
         A,
         CreateOptions {
             first_message: Some(FirstMessage {
+                origin: "typed".into(),
                 text: "private".into(),
                 typed: Some(json!([{"type":"image","data":"a".repeat(8 << 20)}])),
             }),
@@ -934,6 +935,7 @@ fn shard_replacement_with_the_same_incarnation_requires_verification() -> Result
         A,
         CreateOptions {
             first_message: Some(FirstMessage {
+                origin: "typed".into(),
                 text: "first".into(),
                 typed: Some(json!(["test"])),
             }),
