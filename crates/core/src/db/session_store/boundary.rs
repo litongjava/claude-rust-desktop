@@ -1,6 +1,6 @@
 //! Every new context window is sealed in the transaction that inserts its first row.
 use super::*;
-use crate::services::memory_files::prompt::Admission;
+use crate::services::memory_files::prompt::{self, Admission, IndexState};
 
 pub(crate) enum Kind {
     Compaction,
@@ -11,6 +11,7 @@ pub(crate) enum Kind {
 #[derive(Clone, Copy)]
 pub(crate) enum Storage<'a> {
     Shard(&'a Admission),
+    Frozen(&'a IndexState),
     Shared,
 }
 
@@ -23,7 +24,9 @@ pub(crate) fn create(
     storage: Storage<'_>,
 ) -> Result<String> {
     let id = match storage {
-        Storage::Shard(_) => crate::db::transcript::MessageIds::for_shard(tx)?.issue(),
+        Storage::Shard(_) | Storage::Frozen(_) => {
+            crate::db::transcript::MessageIds::for_shard(tx)?.issue()
+        }
         Storage::Shared => uuid::Uuid::new_v4().to_string(),
     };
     crate::db::message_repo::insert_message(
@@ -37,7 +40,7 @@ pub(crate) fn create(
         false,
         order,
     )?;
-    seal(tx, session, &id, order, kind, storage)?;
+    seal(tx, session, &id, kind, storage)?;
     Ok(id)
 }
 
@@ -46,7 +49,6 @@ pub(crate) fn seal(
     tx: &Connection,
     session: &str,
     id: &str,
-    order: i64,
     kind: Kind,
     storage: Storage<'_>,
 ) -> Result<()> {
@@ -61,19 +63,46 @@ pub(crate) fn seal(
     };
     let metadata = serde_json::json!({"promptOrigin":origin}).to_string();
     match storage {
-        Storage::Shard(memory) => {
+        Storage::Shard(_) | Storage::Frozen(_) => {
+            if matches!(kind, Kind::Synced) {
+                tx.execute("UPDATE message_metadata SET value=json_set(value,'$.beforeSyncBoundary',json_extract(value,'$.promptOrigin')) WHERE message_id=?1",[id])?;
+            }
             tx.execute(
                 "INSERT INTO message_metadata VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET value=json_patch(message_metadata.value,excluded.value)",
                 [id, &metadata],
             )?;
-            memory.freeze(tx, Some(id))?;
-            crate::services::memory_files::prompt::supersede_copied_indexes(tx, order)?;
+            match storage {
+                Storage::Shard(memory) => memory.freeze(tx, Some(id))?,
+                Storage::Frozen(index) => index.seal(tx, id)?,
+                Storage::Shared => unreachable!(),
+            }
+            if !matches!(kind, Kind::Synced) {
+                prompt::reorder_receipts(tx)?;
+            }
         }
         Storage::Shared => {
             // The compatibility database has no file-memory scope or metadata table.
             super::state::set_local(tx, &format!("message-origin:{id}"), &metadata)?;
             crate::services::memory_files::prompt::freeze_empty_boundary(tx, id)?;
         }
+    }
+    Ok(())
+}
+
+pub(super) fn demote(tx: &Connection, id: &str, shared: bool) -> Result<()> {
+    tx.execute(
+        "UPDATE messages SET is_compact_boundary=0 WHERE id=?1",
+        [id],
+    )?;
+    if shared {
+        tx.execute(
+            "DELETE FROM peripheral_settings WHERE key='compaction.native.'||?1",
+            [id],
+        )?;
+    } else {
+        tx.execute("DELETE FROM native_boundaries WHERE message_id=?1", [id])?;
+        tx.execute("UPDATE message_metadata SET value=json_remove(json_set(value,'$.promptOrigin',
+            coalesce(json_extract(value,'$.beforeSyncBoundary'),'sync')),'$.beforeSyncBoundary') WHERE message_id=?1", [id])?;
     }
     Ok(())
 }

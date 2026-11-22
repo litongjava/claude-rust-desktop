@@ -9,14 +9,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 
-#[derive(Default, Serialize, Deserialize)]
-struct IndexState {
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct IndexState {
+    #[serde(default)]
+    epoch: u64,
     first: Option<String>,
     #[serde(default)]
     first_hash: Option<String>,
 }
 
 const INDEX: Setting<IndexState> = Setting::new("memory.prompt.index");
+const EPOCH: Setting<u64> = Setting::new("memory.prompt.epoch");
+const CHANGE: &str = "MEMORY.md changed. The current index follows.\n";
 const TRUNCATED: &str = "[MEMORY.md truncated]\n";
 
 fn index_excerpt(index: &str) -> String {
@@ -55,11 +59,15 @@ impl FileMemory {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Receipt {
     /// Older receipts predate tracking delivery to a provider.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation: Option<String>,
+    #[serde(default)]
+    epoch: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     announced: Option<bool>,
     index_hash: Option<String>,
@@ -89,36 +97,109 @@ pub(crate) fn freeze_empty_boundary(tx: &rusqlite::Connection, id: &str) -> Resu
     index_key(Some(id)).write(tx, &IndexState::default())
 }
 
-/// A partial summary inserts a new boundary before these already-admitted messages.
-/// Keep their file excerpts, but the boundary supersedes their index announcements.
-pub(crate) fn supersede_copied_indexes(tx: &rusqlite::Connection, order: i64) -> Result<()> {
-    let mut q = tx.prepare("WITH retained AS (
-        SELECT id FROM messages WHERE sort_order > ?1 AND sort_order < coalesce(
-            (SELECT min(sort_order) FROM messages WHERE is_compact_boundary AND sort_order > ?1), 9223372036854775807)
-    ), ids(id) AS (
-        SELECT id FROM retained UNION ALL
-        SELECT json_extract(j.value,'$.message_id') FROM retained r
-        JOIN tool_calls t ON t.message_id=r.id JOIN tool_queued_inputs q ON q.tool_call_id=t.id
-        JOIN json_each(q.inputs_json) j
-    ) SELECT id FROM ids JOIN peripheral_settings p ON p.key='memory.prompt.message.'||ids.id")?;
-    let ids = q
-        .query_map([order], |r| r.get::<_, String>(0))?
+fn observation(hash: &str) -> Setting<IndexState> {
+    Setting::memory_receipt(format!("prompt.observation.{hash}"))
+}
+
+impl IndexState {
+    pub(crate) fn seal(&self, c: &rusqlite::Connection, id: &str) -> Result<()> {
+        let mut frozen = self.clone();
+        frozen.epoch = EPOCH.read(c)?.unwrap_or_default() + 1;
+        EPOCH.write(c, &frozen.epoch)?;
+        index_key(Some(id)).write(c, &frozen)
+    }
+
+    fn announcement(&self) -> Option<String> {
+        self.first.as_ref().map(|index| {
+            index.replacen("<project_memory>", &format!("{CHANGE}<project_memory>"), 1)
+        })
+    }
+}
+
+// Physical row order matches model replay. Tool-addressed inputs follow their
+// parent, in tool and payload order. The same positions drive live admission.
+pub(crate) const INDEX_HISTORY: &str = "WITH history(id,pos,seq,tool,tool_seq,part,boundary) AS (
+    SELECT m.id,m.sort_order,m.rowid,-1,0,0,m.is_compact_boundary FROM messages m
+    LEFT JOIN message_metadata meta ON meta.message_id=m.id
+    WHERE m.is_compact_boundary OR (m.role='user' AND json_extract(meta.value,'$.promptOrigin') IN ('typed','user'))
+    UNION ALL
+    SELECT json_extract(j.value,'$.message_id'),m.sort_order,m.rowid,t.sort_order,t.rowid,j.key,0
+    FROM messages m JOIN tool_calls t ON t.message_id=m.id
+    JOIN tool_queued_inputs q ON q.tool_call_id=t.id JOIN json_each(q.inputs_json) j
+    WHERE m.role='assistant' AND json_extract(j.value,'$.prompt_origin')='typed'
+    AND NOT EXISTS(SELECT 1 FROM tool_call_origins n WHERE n.tool_call_id=t.id)
+)";
+
+/// Rebuild the announcements from immutable observations. A boundary supersedes
+/// observations made before it was sealed, for as long as that boundary precedes them.
+pub(crate) fn reorder_receipts(c: &rusqlite::Connection) -> Result<()> {
+    let mut last = INDEX.read(c)?.unwrap_or_default();
+    let mut boundary_epoch = last.epoch;
+    let mut q = c.prepare(&format!(
+        "{INDEX_HISTORY} SELECT id,boundary FROM history ORDER BY pos,seq,tool,tool_seq,part"
+    ))?;
+    let positions = q
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in ids {
+    for (id, boundary) in positions {
+        if boundary {
+            last = index_key(Some(&id)).read(c)?.unwrap_or_default();
+            boundary_epoch = last.epoch;
+            continue;
+        }
         let key = receipt(&id);
-        if let Some(mut saved) = key.read(tx)? {
-            saved
-                .blocks
-                .retain(|block| !block.starts_with("<system-reminder>\nMEMORY.md changed."));
-            saved.announced = Some(false);
-            saved.index_hash = None;
-            key.write(tx, &saved)?;
+        let Some(mut saved) = key.read(c)? else {
+            continue;
+        };
+        let before = saved.clone();
+        let original = match saved.observation.as_deref() {
+            Some("") => IndexState::default(),
+            Some(hash) => observation(hash)
+                .read(c)?
+                .ok_or_else(|| anyhow::anyhow!("Missing stored memory index observation"))?,
+            None => {
+                // Upgrade pre-observation receipts while their old order is still available.
+                let state = saved
+                    .blocks
+                    .iter()
+                    .find(|b| b.starts_with("<system-reminder>\nMEMORY.md changed."))
+                    .map(|block| IndexState {
+                        first: Some(block.replacen(CHANGE, "", 1)),
+                        first_hash: saved.index_hash.clone(),
+                        epoch: 0,
+                    })
+                    .unwrap_or_else(|| last.clone());
+                if let Some(hash) = &state.first_hash {
+                    observation(hash).write(c, &state)?;
+                    saved.observation = Some(hash.clone());
+                }
+                state
+            }
+        };
+        saved
+            .blocks
+            .retain(|b| !b.starts_with("<system-reminder>\nMEMORY.md changed."));
+        saved.index_hash = None;
+        saved.announced = Some(false);
+        if saved.epoch >= boundary_epoch && original.first_hash != last.first_hash {
+            if let Some(block) = original.announcement() {
+                saved.blocks.insert(0, block);
+                saved.index_hash = original.first_hash.clone();
+                saved.announced = Some(true);
+                last = original;
+            }
+        }
+        if saved != before {
+            key.write(c, &saved)?;
         }
     }
     Ok(())
 }
 
 pub(crate) fn copy_prefix(src: &rusqlite::Connection, dst: &rusqlite::Connection) -> Result<()> {
+    if let Some(epoch) = EPOCH.read(src)? {
+        EPOCH.write(dst, &epoch)?;
+    }
     if let Some(prefix) = INDEX.read(src)? {
         INDEX.write(dst, &prefix)?;
     }
@@ -132,6 +213,11 @@ pub(crate) fn copy_message(
     new: &str,
 ) -> Result<()> {
     if let Some(saved) = receipt(old).read(src)? {
+        if let Some(hash) = &saved.observation {
+            if let Some(state) = observation(hash).read(src)? {
+                observation(hash).write(dst, &state)?;
+            }
+        }
         receipt(new).write(dst, &saved)?;
     }
     if let Some(index) = index_key(Some(old)).read(src)? {
@@ -208,6 +294,7 @@ impl Admission {
             None
         };
         let state = IndexState {
+            epoch: 0,
             first: Some(memory.render_index(snapshot.as_ref())),
             first_hash: Some(format!(
                 "{}/{}",
@@ -219,7 +306,15 @@ impl Admission {
     }
 
     pub(crate) fn freeze(&self, tx: &rusqlite::Connection, boundary: Option<&str>) -> Result<()> {
-        index_key(boundary).write(tx, &self.observe()?.0)
+        let index = self.frozen_index()?;
+        match boundary {
+            Some(id) => index.seal(tx, id),
+            None => INDEX.write(tx, &index),
+        }
+    }
+
+    pub(crate) fn frozen_index(&self) -> Result<IndexState> {
+        Ok(self.observe()?.0)
     }
 
     pub(crate) fn first(&self, tx: &rusqlite::Connection, id: &str, content: &Value) -> Result<()> {
@@ -250,13 +345,7 @@ impl Admission {
         );
         let mut blocks = Vec::new();
         if changed {
-            if let Some(index) = &current.first {
-                blocks.push(index.replacen(
-                    "<project_memory>",
-                    "MEMORY.md changed. The current index follows.\n<project_memory>",
-                    1,
-                ));
-            }
+            blocks.extend(current.announcement());
         }
         if let (Some(memory), Some(snapshot)) = (&self.memory, snapshot) {
             let query = query_text(content);
@@ -264,10 +353,17 @@ impl Admission {
                 blocks.push(format!("<system-reminder>\n{text}</system-reminder>"));
             }
         }
+        if let Some(hash) = &current.first_hash {
+            if observation(hash).read(tx)?.is_none() {
+                observation(hash).write(tx, &current)?;
+            }
+        }
         receipt(id).write(
             tx,
             &Receipt {
                 pending: true,
+                epoch: EPOCH.read(tx)?.unwrap_or_default(),
+                observation: Some(current.first_hash.clone().unwrap_or_default()),
                 announced: Some(changed && current.first.is_some()),
                 index_hash: if changed { current.first_hash } else { None },
                 blocks,

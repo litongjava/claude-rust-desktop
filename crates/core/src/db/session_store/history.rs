@@ -326,34 +326,18 @@ pub(crate) fn visible_memory_index(
     c: &rusqlite::Connection,
     admitting_id: &str,
 ) -> Result<(Option<String>, Option<String>)> {
-    let boundary: Option<String> = c.query_row(
-        "SELECT id FROM messages WHERE is_compact_boundary ORDER BY sort_order DESC,rowid DESC LIMIT 1",
-        [], |r| r.get(0)
-    ).optional()?;
-    let hash = c.query_row(
-        "WITH history AS (
-            SELECT id, role, sort_order, rowid AS sequence FROM messages
-            WHERE ?1 IS NULL OR (sort_order,rowid)>(SELECT sort_order,rowid FROM messages WHERE id=?1)
-         ), visible(id,pos,sequence,tool,tool_sequence,part) AS (
-            SELECT m.id,m.sort_order,m.sequence,-1,0,0 FROM history m
-            JOIN message_metadata meta ON meta.message_id=m.id
-            WHERE m.role='user' AND json_extract(meta.value,'$.promptOrigin') IN ('typed','user')
-            UNION ALL
-            SELECT json_extract(j.value,'$.message_id'),m.sort_order,m.sequence,t.sort_order,t.rowid,j.key
-            FROM history m JOIN tool_calls t ON t.message_id=m.id
-            JOIN tool_queued_inputs q ON q.tool_call_id=t.id JOIN json_each(q.inputs_json) j
-            WHERE m.role='assistant' AND json_extract(j.value,'$.prompt_origin')='typed'
-              AND NOT EXISTS(SELECT 1 FROM tool_call_origins nested WHERE nested.tool_call_id=t.id)
-         )
-         SELECT json_extract(p.value,'$.index_hash') FROM visible v
-         JOIN peripheral_settings p ON p.key='memory.prompt.message.'||v.id
-         WHERE v.id<>?2 AND json_extract(p.value,'$.index_hash') IS NOT NULL
-           AND coalesce(json_extract(p.value,'$.announced'),
-               json_extract(p.value,'$.blocks[0]') GLOB '<system-reminder>'||char(10)||'MEMORY.md changed.*')
-         ORDER BY v.pos DESC,v.sequence DESC,v.tool DESC,v.tool_sequence DESC,v.part DESC LIMIT 1",
-        params![boundary, admitting_id], |r| r.get(0)
-    ).optional()?;
-    Ok((boundary, hash))
+    use crate::services::memory_files::prompt::INDEX_HISTORY;
+    let sql = format!("{INDEX_HISTORY}, prior AS (
+        SELECT * FROM history WHERE NOT EXISTS(SELECT 1 FROM history WHERE id=?1)
+        OR (pos,seq,tool,tool_seq,part)<(SELECT pos,seq,tool,tool_seq,part FROM history WHERE id=?1)
+    ), cut AS (SELECT * FROM prior WHERE boundary ORDER BY pos DESC,seq DESC LIMIT 1)
+    SELECT (SELECT id FROM cut), (SELECT json_extract(p.value,'$.index_hash') FROM prior v
+        JOIN peripheral_settings p ON p.key='memory.prompt.message.'||v.id
+        WHERE NOT v.boundary AND (NOT EXISTS(SELECT 1 FROM cut) OR (v.pos,v.seq)>(SELECT pos,seq FROM cut))
+        AND json_extract(p.value,'$.index_hash') IS NOT NULL AND coalesce(json_extract(p.value,'$.announced'),
+          json_extract(p.value,'$.blocks[0]') GLOB '<system-reminder>'||char(10)||'MEMORY.md changed.*')
+        ORDER BY v.pos DESC,v.seq DESC,v.tool DESC,v.tool_seq DESC,v.part DESC LIMIT 1)");
+    Ok(c.query_row(&sql, [admitting_id], |r| Ok((r.get(0)?, r.get(1)?)))?)
 }
 
 impl super::SessionDb {
@@ -1051,6 +1035,7 @@ mod memory_index_order_tests {
         let session = stores.create("memory-index-order", Default::default())?;
         let boundary = session.approve_plan("boundary")?;
         session.write(|w| {
+            let mut ids = Vec::new();
             for (hash, blocks) in [
                 ("first", vec!["<system-reminder>\nMEMORY.md changed. A"]),
                 ("second", vec!["<system-reminder>\nMEMORY.md changed. B"]),
@@ -1058,11 +1043,16 @@ mod memory_index_order_tests {
             ] {
                 let id = w.append("user", "same text")?;
                 w.set_prompt_origin(&id, "typed")?;
+                ids.push(id.clone());
                 let key =
                     super::super::settings::Setting::memory_receipt(format!("prompt.message.{id}"));
                 w.set_setting(key, &serde_json::json!({"index_hash":hash,"blocks":blocks}))?;
             }
             w.0.execute("UPDATE messages SET sort_order=0", [])?;
+            assert_eq!(
+                visible_memory_index(w.0, &ids[1])?,
+                (Some(boundary.clone()), Some("first".into()))
+            );
             assert_eq!(
                 visible_memory_index(w.0, "next")?,
                 (Some(boundary.clone()), Some("second".into()))

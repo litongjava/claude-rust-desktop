@@ -411,8 +411,11 @@ fn new_memory_boundaries_have_one_writer() {
                 )
                 .unwrap();
                 assert!(
-                    !direct.is_match(production),
-                    "Sync inserts boundary flags directly"
+                    !direct.is_match(production)
+                        && !regex::Regex::new(r"(?i)SET\s+is_compact_boundary\s*=")
+                            .unwrap()
+                            .is_match(production),
+                    "Sync writes boundary flags directly"
                 );
             }
             for pattern in &patterns {

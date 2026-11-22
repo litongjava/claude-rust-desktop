@@ -1455,4 +1455,135 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn memory_sync_tied_boundary_supersedes_index() {
+        let (_root, memory) = fixture();
+        memory.store(false).unwrap();
+        let path = memory.directory.join("MEMORY.md");
+        let shard = memory.session.as_ref().unwrap();
+        std::fs::write(&path, "EARLIER_A").unwrap();
+        shard.admit_prompt("old", None, "typed").unwrap();
+        std::fs::write(&path, "OUTDATED_B").unwrap();
+        shard.admit_prompt("retained", None, "typed").unwrap();
+        let mut rows = shard.repository().messages().unwrap();
+        let mut boundary = rows.remove(0);
+        boundary.is_compact_boundary = true;
+        boundary.sort_order = rows[0].sort_order;
+        std::fs::write(&path, "FROZEN_C").unwrap();
+        memory
+            .context
+            .db
+            .sync_conversation(shard.id(), None, &[boundary])
+            .unwrap();
+        let (prefix, entries) = replay(shard);
+        assert!(
+            prefix.unwrap().contains("FROZEN_C")
+                && !json!(entries).to_string().contains("OUTDATED_B")
+        );
+    }
+
+    #[test]
+    fn memory_sync_demotion_restores_index() {
+        let (_root, mem) = fixture();
+        mem.store(false).unwrap();
+        let shard = mem.session.as_ref().unwrap();
+        let path = mem.directory.join("MEMORY.md");
+        std::fs::write(&path, "ORIGINAL_FROZEN_A").unwrap();
+        shard.admit_prompt("prior", None, "typed").unwrap();
+        let mut row = shard.read(|r| r.messages()).unwrap()[0].clone();
+        row.id = uuid::Uuid::new_v4().to_string();
+        row.sort_order += 1;
+        row.content = "sync marker".into();
+        let sync = |m| {
+            mem.context
+                .db
+                .sync_conversation(shard.id(), None, &[m])
+                .unwrap()
+        };
+        sync(row.clone());
+        std::fs::write(&path, "RETAINED_B").unwrap();
+        shard.admit_prompt("receives B", None, "typed").unwrap();
+        let (original, entries) = replay(shard);
+        assert!(json!(entries).to_string().contains("RETAINED_B"));
+        std::fs::write(&path, "TEMPORARY_C").unwrap();
+        row.is_compact_boundary = true;
+        sync(row.clone());
+        assert!(replay(shard).0.unwrap().contains("TEMPORARY_C"));
+        row.is_compact_boundary = false;
+        // The changed sync payload is a fresh digest, so it exercises demotion.
+        row.content.push_str(" demoted");
+        sync(row.clone());
+        let (after, saved) = replay(shard);
+        assert_eq!(after, original);
+        assert!(json!(saved).to_string().contains("RETAINED_B"));
+    }
+    #[test]
+    fn memory_sync_interruption_preserves_scope() -> Result<()> {
+        use crate::db::session_store::{Phase, SyncHeader, Stores};
+        let (root, mem_a) = fixture();
+        let shard = mem_a.session.as_ref().unwrap();
+        let stores = &mem_a.context.db;
+        let ws_b = root.path().join("other-project");
+        std::fs::create_dir(&ws_b)?;
+        let b = stores.create_code_session(&ws_b, "m", "p", &uuid::Uuid::new_v4().to_string())?;
+        let mem_b = FileMemory::session(&mem_a.context, b.id())?;
+        mem_b.store(false)?;
+        std::fs::write(
+            mem_b.directory.join("MEMORY.md"),
+            "OTHER_PROJECT_INDEX_69C4",
+        )?;
+        shard.admit_prompt("old in A", None, "typed")?;
+        let mut row = shard.read(|r| r.messages())?[0].clone();
+        row.id = uuid::Uuid::new_v4().to_string();
+        row.sort_order += 1;
+        row.content = "received summary".into();
+        row.is_compact_boundary = true;
+        let a_project = stores
+            .global()
+            .conversation(shard.id())?
+            .unwrap()
+            .project_id
+            .unwrap();
+        let b_project = stores
+            .global()
+            .conversation(b.id())?
+            .unwrap()
+            .project_id
+            .unwrap();
+        assert_ne!(a_project, b_project);
+        let header: SyncHeader = serde_json::from_value(
+            json!({"id":shard.id(),"projectId":b_project,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2099-01-01T00:00:00Z"}),
+        )?;
+        let fault = stores.with_fault_hook(|p| {
+            anyhow::ensure!(
+                p != Phase::SyncContent,
+                "interrupted before scope publication"
+            );
+            Ok(())
+        });
+        let err = fault
+            .sync_conversation(shard.id(), Some(&header), &[row])
+            .unwrap_err();
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string() == "interrupted before scope publication"),
+            "{err:#}"
+        );
+        std::fs::write(mem_b.directory.join("MEMORY.md"), "EDIT_AFTER_INTERRUPTION")?;
+        let reopened = Stores::open(&mem_a.context.paths.data_dir)?;
+        let live = reopened.open_session(shard.id())?;
+        let current = reopened
+            .global()
+            .conversation(live.id())?
+            .unwrap()
+            .project_id
+            .unwrap();
+        assert!(current == a_project || current == b_project);
+        let (prefix, _) = replay(&live);
+        assert_eq!(
+            prefix.unwrap().contains("OTHER_PROJECT_INDEX_69C4"),
+            current == b_project
+        );
+        Ok(())
+    }
 }

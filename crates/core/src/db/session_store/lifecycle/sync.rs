@@ -1,5 +1,5 @@
-//! A sync bucket belongs to one logical session. Only a digest and a receipt
-//! cross the directory write boundary, never the transcript body.
+//! Sync one session bucket at a time. A newer header and its shard content
+//! share the recoverable conversation-edit protocol.
 use super::*;
 use crate::db::session_store::boundary;
 use crate::services::memory_files::prompt::Admission;
@@ -37,6 +37,10 @@ fn rows(
     messages: &[MessageRow],
     storage: Option<boundary::Storage<'_>>,
 ) -> Result<()> {
+    let shared = matches!(storage, Some(boundary::Storage::Shared));
+    if !shared && !messages.is_empty() {
+        crate::services::memory_files::prompt::reorder_receipts(conn)?;
+    }
     let mut upsert=conn.prepare_cached("INSERT INTO messages(id,conversation_id,role,content,thinking,created_at,sort_order)
         VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET role=excluded.role,content=excluded.content,
         thinking=excluded.thinking,created_at=excluded.created_at,sort_order=excluded.sort_order
@@ -75,15 +79,15 @@ fn rows(
                 conn,
                 id,
                 &m.id,
-                m.sort_order,
                 boundary::Kind::Synced,
                 storage.context("Missing memory scope for sync boundary")?,
             )?;
         } else if was_boundary && !m.is_compact_boundary {
-            conn.execute(
-                "UPDATE messages SET is_compact_boundary=0 WHERE id=?1",
-                [&m.id],
-            )?;
+            boundary::demote(conn, &m.id, shared)?;
+        }
+        if changed_user && m.is_compact_boundary && !shared {
+            // A changed remote payload no longer carries the old human provenance.
+            conn.execute("UPDATE message_metadata SET value=json_remove(value,'$.beforeSyncBoundary') WHERE message_id=?1", [&m.id])?;
         }
         if changed_user && !m.is_compact_boundary {
             if matches!(storage, Some(boundary::Storage::Shared)) {
@@ -101,7 +105,42 @@ fn rows(
             )?;
         }
     }
+    if !shared && !messages.is_empty() {
+        crate::services::memory_files::prompt::reorder_receipts(conn)?;
+    }
     Ok(())
+}
+
+// The redo file holds exactly the rows and scoped index validated before
+// directory publication. Recovery replays them even if MEMORY.md has changed.
+#[derive(Serialize, Deserialize)]
+pub(in crate::db::session_store) struct SyncEdit<'a> {
+    messages: std::borrow::Cow<'a, [MessageRow]>,
+    digest: String,
+    metadata_revision: i64,
+    index: Option<crate::services::memory_files::prompt::IndexState>,
+}
+
+impl SyncEdit<'_> {
+    pub(in crate::db::session_store) fn apply(
+        &self,
+        w: &super::super::SessionWrite<'_>,
+    ) -> Result<()> {
+        if !w
+            .0
+            .prepare_cached("SELECT 1 FROM sync_receipts WHERE digest=?1")?
+            .exists([&self.digest])?
+        {
+            rows(
+                w.0,
+                w.1,
+                &self.messages,
+                self.index.as_ref().map(boundary::Storage::Frozen),
+            )?;
+            w.0.execute("INSERT INTO sync_receipts(digest,content_revision,metadata_revision) SELECT ?1,content_revision+1,?2 FROM manifest",params![self.digest,self.metadata_revision])?;
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct SyncSeed<'a> {
@@ -267,32 +306,45 @@ impl Stores {
         } else {
             None
         };
-        let storage = memory.as_ref().map(boundary::Storage::Shard);
-        let expected=shard.write_locked("apply sync messages", |w| {
-            let receipt=w.0.query_row("SELECT metadata_revision FROM sync_receipts WHERE digest=?1",[&digest],|r|r.get::<_,Option<i64>>(0)).optional()?;
-            if let Some(revision)=receipt {return Ok(revision);}
-            rows(w.0,id,messages,storage)?;
-            w.0.execute("INSERT INTO sync_receipts(digest,content_revision,metadata_revision) SELECT ?1,content_revision+1,?2 FROM manifest",params![digest,metadata_revision])?;
-            Ok(metadata_revision)
-        })?;
-        self.step(Phase::SyncContent)?;
-        self.global().write("acknowledge session sync",id,false,|c| {
-            if let (Some(h),Some(expected))=(header,expected) {
+        if let (Some(h), Some(expected)) = (header, metadata_revision) {
+            use super::super::conversation_edit::EditContent;
+            let sync = SyncEdit {
+                messages: messages.into(),
+                digest: digest.clone(),
+                metadata_revision: expected,
+                index: memory.as_ref().map(Admission::frozen_index).transpose()?,
+            };
+            return shard.paired_edit(EditContent::Sync(sync), Phase::SyncContent, |c| {
                 if let Some(project)=&h.project_id { Project::select(c,&ProjectSelection::Existing(project.clone()))?; }
                 let workspace=workspace(c,id,h.project_id.as_deref(),h.workspace_path.as_deref())?;
                 c.execute("DELETE FROM conversation_worktrees WHERE conversation_id=?1 AND project_id IS NOT ?2",params![id,h.project_id])?;
-                c.execute("UPDATE conversations SET title=?1,model=?2,provider=?3,workspace_mode=coalesce(?4,workspace_mode),research_mode=?5,
+                let updated = c.execute("UPDATE conversations SET title=?1,model=?2,provider=?3,workspace_mode=coalesce(?4,workspace_mode),research_mode=?5,
                     pinned=?6,archived=?7,project_id=?8,workspace_path=?9,created_at=?10,
                     updated_at=CASE WHEN julianday(updated_at)>julianday(?11) THEN updated_at ELSE ?11 END, metadata_revision=metadata_revision+1
                     WHERE id=?12 AND incarnation=?13 AND metadata_revision=?14",
                     params![h.title,h.model,h.provider,h.workspace_mode.map(|m|m.as_str()),h.research_mode,h.pinned,h.archived,h.project_id,workspace,h.created_at,h.updated_at,id,shard.incarnation,expected])?;
+                ensure!(updated == 1, "Session metadata changed during sync");
+                c.execute("INSERT INTO sync_publications VALUES(?1,?2,?3)",[id,&digest,&shard.incarnation])?;
+                self.admit_session_workspace(c,id)
+            });
+        }
+        let storage = memory.as_ref().map(boundary::Storage::Shard);
+        shard.write_locked("apply sync messages", |w| {
+            if !w.0.prepare_cached("SELECT 1 FROM sync_receipts WHERE digest=?1")?.exists([&digest])? {
+                rows(w.0,id,messages,storage)?;
+                w.0.execute("INSERT INTO sync_receipts(digest,content_revision) SELECT ?1,content_revision+1 FROM manifest",[&digest])?;
             }
-            c.execute("INSERT INTO sync_publications VALUES(?1,?2,?3)",[id,&digest,&shard.incarnation])?;
-            if header.is_some() && expected.is_some() {
-                return self.admit_session_workspace(c, id);
-            }
-            Ok(Vec::new())
-        }).map(drop)
+            Ok(())
+        })?;
+        self.step(Phase::SyncContent)?;
+        self.global()
+            .write("acknowledge session sync", id, false, |c| {
+                c.execute(
+                    "INSERT INTO sync_publications VALUES(?1,?2,?3)",
+                    [id, &digest, &shard.incarnation],
+                )?;
+                Ok(())
+            })
     }
 }
 

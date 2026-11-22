@@ -201,6 +201,7 @@
 1	crates/core/src/services/memory_files.rs	file_memory_zero_hit_receipts_survive_restart_without_user_text	open_session(shard.id())
 1	crates/core/src/services/memory_files.rs	memory_first_chat_uses_the_producer_origin_for_initial_and_later_submissions	open_session(id)
 1	crates/core/src/services/memory_files.rs	memory_partial_boundary_keeps_excerpts_and_supersedes_copied_index	open_session(&branch)
+1	crates/core/src/services/memory_files.rs	memory_sync_interruption_preserves_scope	open_session(shard.id())
 1	crates/core/src/services/memory_files.rs	memory_text_boundary_rebuilds_the_current_scope_prefix	open_session(&id)
 1	crates/core/src/services/memory_files.rs	session	open_session(id)
 1	crates/core/src/services/permission_authority.rs	authority_survives_peer_persistence_compaction_and_resume_without_injection	open_session(&parent)

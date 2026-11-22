@@ -1,5 +1,5 @@
 mod copy;
-mod sync;
+pub(super) mod sync;
 pub(super) use copy::workspace;
 pub use sync::SyncHeader;
 mod import;
