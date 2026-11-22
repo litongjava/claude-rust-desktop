@@ -276,6 +276,7 @@ pub async fn stream_with_options_counted(
 /// transport. A single-post budget uses a client with no redirects and no
 /// internal retries, so one authorized replacement really is one POST.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) async fn stream_with_options_counted_budget(
     provider: &ResolvedProvider,
     messages: Vec<OpenAIMessage>,
@@ -351,19 +352,51 @@ async fn stream_with_options_client_budget(
     budget: crate::performance::AttemptBudget,
 ) -> Result<(ProviderStream, crate::performance::AttemptCounter)> {
     let provider = &provider.current()?;
-    let (entry, model) = metadata(provider)?;
-    let (protocol, api) = resolved_transport(provider)?;
     let initiator = if messages.last().is_some_and(|m| m.role != "user") {
         "agent"
     } else {
         "user"
     };
+    let wire = request_body(
+        provider,
+        messages,
+        system,
+        tools,
+        max_tokens,
+        response_schema,
+        options.session_id.as_deref(),
+    )?;
+    stream_body(
+        provider,
+        wire.body,
+        initiator,
+        wire.builtin_vision.unwrap_or(false),
+        max_tokens,
+        context_capture,
+        options,
+        client,
+        budget,
+    )
+    .await
+}
+
+pub(super) fn request_body(
+    provider: &ResolvedProvider,
+    messages: Vec<OpenAIMessage>,
+    system: Option<&str>,
+    tools: Vec<ToolDefinition>,
+    max_tokens: u32,
+    response_schema: Option<&Value>,
+    session: Option<&str>,
+) -> Result<super::followup::WireRequest> {
+    let (entry, model) = metadata(provider)?;
+    let (protocol, api) = resolved_transport(provider)?;
     let vision = messages.iter().any(|m| matches!(&m.content, super::openai_client::OpenAIContent::Multi(parts) if parts.iter().any(|p| matches!(p,super::openai_client::OpenAIContentPart::Image{..}))));
     let mut body = messages::request(api, provider, model, messages, system, tools, max_tokens)?;
     // Responses endpoints route requests to a prompt cache by this key, so the
     // same conversation keeps reusing one cached prefix.
     if api == "openai-responses" {
-        if let Some(key) = super::request_identity::prompt_cache_key(None) {
+        if let Some(key) = super::request_identity::prompt_cache_key(session) {
             body["prompt_cache_key"] = serde_json::json!(key);
         }
     }
@@ -458,18 +491,11 @@ async fn stream_with_options_client_budget(
             "Fast mode requires the Anthropic messages API"
         );
     }
-    stream_body(
-        provider,
+    Ok(super::followup::WireRequest {
+        api: api.to_owned(),
         body,
-        initiator,
-        vision,
-        max_tokens,
-        context_capture,
-        options,
-        client,
-        budget,
-    )
-    .await
+        builtin_vision: Some(vision),
+    })
 }
 
 fn resolve_endpoint(

@@ -22,6 +22,7 @@ struct Fixture {
     id: String,
     provider: Provider,
     requests: Arc<Mutex<Vec<Value>>>,
+    bodies: Arc<Mutex<Vec<axum::body::Bytes>>>,
     routes: Arc<Mutex<Vec<(String, HeaderMap)>>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -40,7 +41,12 @@ impl Fixture {
         let seen = requests.clone();
         let routes = Arc::new(Mutex::new(Vec::new()));
         let seen_routes = routes.clone();
-        let app = Router::new().fallback(post(move |uri: axum::http::Uri, headers: HeaderMap, Json(body): Json<Value>| {
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let bytes = bodies.clone();
+        let app = Router::new().fallback(post(move |uri: axum::http::Uri, headers: HeaderMap, raw: axum::body::Bytes| {
+            let body: Value = serde_json::from_slice(&raw).unwrap();
+            bytes.lock().unwrap().push(raw);
+            let google = body.get("contents").is_some();
             let compact = headers["x-dcl-request-kind"] == "compaction";
             let cache_write = body.to_string().contains("cache write fixture");
             let stream = body["stream"] == true;
@@ -55,6 +61,10 @@ impl Fixture {
                 let usage = json!({"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":if cache_write {75} else {80}, "cache_write_tokens":if cache_write {5} else {0}}});
                 if uri.path().ends_with("/responses/compact") {
                     return Json(json!({"object":"response.compaction","output":[{"type":"compaction","encrypted_content":"opaque"}],"usage":{"input_tokens":100,"output_tokens":3}})).into_response();
+                }
+                if google {
+                    let event = json!({"candidates":[{"content":{"role":"model","parts":[{"text":text}]},"finishReason":"STOP"}]});
+                    return ([("content-type","text/event-stream")],format!("data: {event}\n\n")).into_response();
                 }
                 if bedrock {
                     let frames: Vec<u8> = [("messageStart",json!({"role":"assistant"})),
@@ -95,6 +105,7 @@ impl Fixture {
             provider,
             requests,
             routes,
+            bodies,
             server,
         }
     }
@@ -116,7 +127,7 @@ impl Fixture {
         self.store.append(&self.id, role, text).unwrap();
     }
 
-    async fn main_turn(&self, schema: Option<Value>) {
+    async fn send_normal(&self, schema: Option<Value>) {
         let request: ChatRequest = serde_json::from_value(json!({"conversation_id":self.id,
             "messages":self.store.model_history(&self.id,&self.provider.api_format).unwrap(),
             "response_schema":schema,"system_prompt":"Custom session instructions","model":self.provider.models[0].id,"effort":self.provider.models[0].effort,"provider_id":"fixture","workspace_path":self.root.path()})).unwrap();
@@ -134,6 +145,10 @@ impl Fixture {
                 "{event:?}"
             );
         }
+    }
+
+    async fn main_turn(&self, schema: Option<Value>) {
+        self.send_normal(schema.clone()).await;
         self.append(
             "assistant",
             if schema.is_some() {
@@ -163,7 +178,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn shortened_main_turn_summarizes_the_complete_durable_input() {
+async fn summary_uses_the_same_locally_compressed_history_as_the_next_turn() {
     let f = Fixture::new(50_000).await;
     let marker = "ORIGINAL_KEEP_MARKER";
     f.append("user", &format!("{}{marker}", "w".repeat(100_000)));
@@ -176,15 +191,15 @@ async fn shortened_main_turn_summarizes_the_complete_durable_input() {
     {
         let calls = f.requests.lock().unwrap();
         assert!(!calls[0].to_string().contains(marker));
-        assert!(calls[1..]
-            .iter()
-            .any(|body| body.to_string().contains(marker)));
+        assert_eq!(calls.len(), 2);
+        assert!(!calls[1].to_string().contains(marker));
+        assert!(calls[1].to_string().contains("later question 4"));
     }
     f.finish().await;
 }
 
 #[tokio::test]
-async fn fallback_after_a_text_boundary_includes_the_retained_originals() {
+async fn summary_replays_the_active_window_after_a_text_boundary() {
     let f = Fixture::new(128_000).await;
     f.append("user", "Original requirement preceding the boundary");
     f.append("assistant", "Acknowledged the original requirement.");
@@ -195,8 +210,8 @@ async fn fallback_after_a_text_boundary_includes_the_retained_originals() {
     {
         let calls = f.requests.lock().unwrap();
         let body = calls[0].to_string();
+        assert!(!body.contains("Original requirement preceding the boundary"));
         for expected in [
-            "Original requirement preceding the boundary",
             "Prior continuation summary",
             "New requirement following the boundary",
         ] {
@@ -207,7 +222,7 @@ async fn fallback_after_a_text_boundary_includes_the_retained_originals() {
 }
 
 #[tokio::test]
-async fn opaque_fallback_sends_native_items_and_the_retained_transcript() {
+async fn opaque_summary_replays_native_items_and_the_following_turns() {
     check_opaque_fallback(128_000, "").await;
 }
 
@@ -220,7 +235,7 @@ async fn check_opaque_fallback(window: usize, padding: &str) {
     let mut f = Fixture::new(window).await;
     f.provider.builtin_id = Some("openai".into());
     f.provider.models[0].api = Some("openai-responses".into());
-    f.append("user", &format!("Original durable requirement {padding}"));
+    f.append("user", "Original durable requirement");
     let boundary = f
         .store
         .append(&f.id, "user", "Native Responses compaction completed.")
@@ -228,7 +243,10 @@ async fn check_opaque_fallback(window: usize, padding: &str) {
     let items = json!([{"type":"compaction","id":"original","encrypted_content":"OPAQUE_WINDOW"}]);
     f.store.db.open_session(&f.id).unwrap().write(|w| w.native_boundary(&boundary,
         &json!({"compaction":true,"api":"openai-responses","items":items,"provider":"fixture","model":"model","base_url":f.provider.base_url}))).unwrap();
-    f.append("user", "Durable correction after boundary");
+    f.append(
+        "user",
+        &format!("Durable correction after boundary {padding}"),
+    );
     f.compact().await.unwrap();
     {
         let calls = f.requests.lock().unwrap();
@@ -239,12 +257,12 @@ async fn check_opaque_fallback(window: usize, padding: &str) {
         assert!(calls.iter().all(|body| body["input"]
             .as_array()
             .is_some_and(|input| input.contains(&items[0]))));
-        for expected in [
-            "Original durable requirement",
-            "Durable correction after boundary",
-        ] {
-            assert!(calls.iter().any(|body| body.to_string().contains(expected)));
-        }
+        assert!(calls
+            .iter()
+            .all(|body| !body.to_string().contains("Original durable requirement")));
+        assert!(calls.iter().any(|body| body
+            .to_string()
+            .contains("Durable correction after boundary")));
     }
     f.finish().await;
 }
@@ -342,7 +360,8 @@ async fn reasoning_enabled_claude_reuses_the_prefix_on_both_transports() {
         f.provider.models[0].id = model.into();
         f.provider.models[0].effort = Some("medium".into());
         f.append("user", "Original question");
-        f.main_turn(None).await;
+        f.append("assistant", "last answer");
+        f.send_normal(None).await;
         f.compact().await.unwrap();
         {
             let calls = f.requests.lock().unwrap();
@@ -354,7 +373,7 @@ async fn reasoning_enabled_claude_reuses_the_prefix_on_both_transports() {
                 .unwrap()
                 .to_string()
                 .contains("Keep pending work"));
-            assert!(messages.pop().unwrap().to_string().contains("last answer"));
+            assert!(messages.last().unwrap().to_string().contains("last answer"));
             assert_eq!(body, calls[0], "{api}");
         }
         f.finish().await;
@@ -515,6 +534,195 @@ async fn historical_bedrock_daily_buckets_survive_a_compaction_fork() -> anyhow:
     assert_eq!(usage.days.len(), 1);
     let day = &usage.days[0];
     assert_eq!((day.requests, day.heat, day.tokens), (1, 103, [20, 3, 75, 5]));
+    f.finish().await;
+    Ok(())
+}
+
+fn save_lookup(f: &Fixture, value: &str) -> anyhow::Result<String> {
+    use deepseek_code_core::db::message_repo::ToolCallRow;
+    let shard = f.store.db.open_session(&f.id)?;
+    let message = shard.write(|w| w.append("assistant", ""))?;
+    let display = shard.save_mcp(&message, "lookup", &json!({
+        "content":[{"type":"text","text":"Lookup complete"}], "structuredContent":{"decision":value}
+    }), false)?;
+    shard.write(|w| {
+        w.stream_tools(
+            &message,
+            "",
+            &[ToolCallRow {
+                id: "lookup".into(),
+                message_id: message.clone(),
+                name: "mcp__fixture__lookup".into(),
+                input: Some("{}".into()),
+                output: Some(display.clone()),
+                is_error: false,
+                sort_order: 0,
+            }],
+            &Default::default(),
+        )
+    })?;
+    Ok(message)
+}
+
+#[tokio::test]
+async fn compaction_replays_the_next_normal_body_on_every_protocol() -> anyhow::Result<()> {
+    for (format, builtin, protocol, model, key) in [
+        ("openai", None, None, "chat", "messages"),
+        ("anthropic", None, None, "claude-sonnet-4-5", "messages"),
+        (
+            "openai",
+            Some("openai"),
+            Some("openai-completions"),
+            "chat",
+            "messages",
+        ),
+        (
+            "openai",
+            Some("mistral"),
+            Some("mistral-conversations"),
+            "model",
+            "messages",
+        ),
+        (
+            "openai",
+            Some("azure-openai-responses"),
+            Some("azure-openai-responses"),
+            "model",
+            "input",
+        ),
+        (
+            "openai",
+            Some("openai-codex"),
+            Some("openai-codex-responses"),
+            "model",
+            "input",
+        ),
+        (
+            "openai",
+            Some("google-vertex"),
+            Some("google-vertex"),
+            "gemini-2.5-flash",
+            "contents",
+        ),
+        (
+            "openai",
+            Some("openai"),
+            Some("openai-responses"),
+            "model",
+            "input",
+        ),
+        (
+            "openai",
+            Some("anthropic"),
+            Some("anthropic-messages"),
+            "claude-sonnet-4-5",
+            "messages",
+        ),
+        (
+            "openai",
+            Some("google"),
+            Some("google-generative-ai"),
+            "gemini-2.5-flash",
+            "contents",
+        ),
+        (
+            "openai",
+            Some("amazon-bedrock"),
+            Some("bedrock-converse-stream"),
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "messages",
+        ),
+    ] {
+        let mut f = Fixture::new(128_000).await;
+        f.provider.api_format = serde_json::from_value(json!(format))?;
+        f.provider.builtin_id = builtin.map(String::from);
+        if protocol == Some("openai-codex-responses") {
+            use base64::Engine;
+            let claim = json!({"https://api.openai.com/auth":{"chatgpt_account_id":"fixture"}});
+            let payload =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claim.to_string());
+            f.provider.api_key = format!("fixture.{payload}.fixture");
+        }
+        f.provider.models[0].api = protocol.map(String::from);
+        f.provider.models[0].id = model.into();
+        f.provider.models[0].effort = Some("medium".into());
+        f.append("user", "DISCARDED_PLAN_GATE");
+        let shard = f.store.db.open_session(&f.id)?;
+        shard.write(|w| w.approve_plan("APPROVED_RELEASE_PLAN"))?;
+        shard.write(|w| w.append_user_content("Attached release.txt", &json!([{"type":"attachment","fileName":"release.txt","size":20,"source":{"type":"base64","media_type":"text/plain","data":"REVQTE9ZX09OTFlfQUZURVJfUUE="}}])))?;
+        save_lookup(&f, "STRUCTURED_DECISION")?;
+        f.append("user", "Summarize the current decision");
+        f.send_normal(None).await;
+        f.compact().await?;
+        {
+            let bodies = f.bodies.lock().unwrap();
+            assert_eq!(bodies.len(), 2, "{model}");
+            let compact = std::str::from_utf8(&bodies[1])?;
+            let mut parsed: Value = serde_json::from_str(compact)?;
+            let instruction = parsed[key].as_array_mut().unwrap().pop().unwrap();
+            assert!(instruction.to_string().contains("Keep pending work"));
+            let suffix = format!(",{}", serde_json::to_string(&instruction)?);
+            assert_eq!(compact.matches(&suffix).count(), 1);
+            assert_eq!(
+                compact.replacen(&suffix, "", 1),
+                std::str::from_utf8(&bodies[0])?,
+                "{model} {protocol:?}"
+            );
+            for marker in [
+                "APPROVED_RELEASE_PLAN",
+                "DEPLOY_ONLY_AFTER_QA",
+                "STRUCTURED_DECISION",
+                "Custom session instructions",
+            ] {
+                assert!(compact.contains(marker), "{model}: missing {marker}");
+            }
+            assert!(!compact.contains("DISCARDED_PLAN_GATE"));
+        }
+        f.finish().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn compaction_conflict_guard_and_partial_summary_include_the_structured_result(
+) -> anyhow::Result<()> {
+    let f = Fixture::new(128_000).await;
+    f.append("user", "Initial request");
+    let message = save_lookup(&f, "PENDING_REVIEW")?;
+    let shard = f.store.db.open_session(&f.id)?;
+    shard.write(|w| w.request_compaction("keep approval", 50, 100))?;
+    let owner = shard.delivery_owner()?;
+    let queued = owner.claim_compaction()?.unwrap();
+    let prepared = compaction::prepare(&f.store.db, &f.id)?;
+    shard.save_mcp(&message, "lookup", &json!({
+        "content":[{"type":"text","text":"Lookup complete"}], "structuredContent":{"decision":"APPROVED_REVIEW"}
+    }), false)?;
+    for error in [
+        compaction::commit(&f.store.db, prepared, "Still pending").unwrap_err(),
+        owner
+            .finish_compaction(&queued, &"Still pending".into())
+            .unwrap_err(),
+    ] {
+        let cause = format!("{error:#}");
+        assert!(
+            cause.contains("Session changed during compaction"),
+            "{cause}"
+        );
+    }
+    drop(owner);
+    compaction::summarize_part(
+        &f.engine(),
+        &f.store.db,
+        &f.id,
+        &message,
+        compaction::Part::From,
+        "fixture",
+        "model",
+    )
+    .await?;
+    let body = f.requests.lock().unwrap()[0].to_string();
+    assert!(body.contains("APPROVED_REVIEW"));
+    assert!(!body.contains("Initial request"));
     f.finish().await;
     Ok(())
 }

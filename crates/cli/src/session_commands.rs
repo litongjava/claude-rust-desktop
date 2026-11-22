@@ -742,21 +742,11 @@ pub async fn context_status(session: &Session) -> Option<String> {
     context_note(left, threshold.is_some())
 }
 
-const MICROCOMPACT_KEEP_RECENT: usize = 10;
-use deepseek_code_core::services::compaction::microcompact::clear_tool_results;
 #[cfg(test)]
 use deepseek_code_core::services::compaction::microcompact::{
-    CLEARED_TOOL_RESULT, MICROCOMPACT_MIN_CHARS,
+    clear_tool_results, through as microcompact_through, CLEARED_TOOL_RESULT,
+    MICROCOMPACT_MIN_CHARS,
 };
-
-/// Microcompact moves its line forward only once the request passes half the
-/// window, so between moves every request shares the same prefix and cache.
-fn microcompact_through(current: usize, len: usize, estimated_tokens: usize, window: Option<u32>) -> usize {
-    match window.filter(|window| *window > 0) {
-        Some(window) if estimated_tokens > window as usize / 2 => current.max(len.saturating_sub(MICROCOMPACT_KEEP_RECENT)),
-        _ => current,
-    }
-}
 
 /// As the reference CLI's microcompact: once the conversation passes half the
 /// context window, large tool results older than the last few messages are
@@ -767,14 +757,8 @@ pub fn microcompact(session: &Session, history: &mut [Value], window: Option<u32
     use deepseek_code_core::db::session_store::settings::{Microcompact, MICROCOMPACT};
     let repository = session.selected_session()?.repository();
     let mut state = repository.preference(MICROCOMPACT)?.filter(|state| state.boundary == boundary).unwrap_or(Microcompact { through: 0, boundary });
-    let len = history.len();
-    clear_tool_results(&mut history[..state.through.min(len)]);
-    let estimated = serde_json::to_string(&history)?.len().div_ceil(3);
-    let through = microcompact_through(state.through, len, estimated, window);
-    if through != state.through {
-        state.through = through;
+    if deepseek_code_core::services::compaction::microcompact::replay(history, &mut state, window)? {
         repository.set_preference(MICROCOMPACT, Some(&state))?;
-        clear_tool_results(&mut history[..through.min(len)]);
         crate::compaction::notice("Cleared older tool results to save context.");
     }
     Ok(())

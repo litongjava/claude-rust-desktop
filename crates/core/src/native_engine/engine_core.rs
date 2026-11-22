@@ -105,6 +105,32 @@ pub struct ChatRequest {
     pub reasoning_mode: Option<ReasoningMode>,
 }
 
+/// Host-supplied inputs that cannot be inferred from message history. Keep
+/// them before composing system instructions so replay composes them once.
+#[derive(Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SessionRequestOptions {
+    system_prompt: Option<String>,
+    standalone_frontend: bool,
+    workspace_path: Option<String>,
+    reasoning_mode: Option<ReasoningMode>,
+    effort: Option<String>,
+    max_tokens: Option<u32>,
+}
+
+enum TurnPurpose {
+    Submit,
+    HookWake,
+    Summary,
+}
+
+struct PreparedTurn {
+    executor: ToolLoopExecutor,
+    history: crate::db::session_store::ExecutorHistory,
+    learning: Option<crate::learning::TurnObservation<Stores>>,
+    events: mpsc::Receiver<EngineEvent>,
+    sender: mpsc::Sender<EngineEvent>,
+}
+
 #[derive(Debug)]
 pub struct ActiveTurn {
     pub event_tx: mpsc::Sender<EngineEvent>,
@@ -514,7 +540,7 @@ impl QueryEngine {
         provider_id: &str,
         model: &str,
         system: &str,
-        input: &str,
+        _input: &str,
         instructions: &str,
     ) -> Result<crate::services::compaction::GeneratedSummary> {
         self.generate_compaction_recorded(
@@ -522,7 +548,6 @@ impl QueryEngine {
             provider_id,
             model,
             system,
-            input,
             instructions,
             super::request_options::RequestOptions::from_db(
                 &self.db_manager,
@@ -539,7 +564,6 @@ impl QueryEngine {
         provider_id: &str,
         model: &str,
         system: &str,
-        input: &str,
         instructions: &str,
         options: super::request_options::RequestOptions,
     ) -> Result<crate::services::compaction::GeneratedSummary> {
@@ -550,11 +574,12 @@ impl QueryEngine {
             .resolve_selected(provider_id, model)
             .ok_or_else(|| anyhow!("Provider/model is unavailable: {provider_id}::{model}"))?;
         let shard = self.db_manager.open_session(session)?;
-        let mut options = options;
-        options.compaction_metrics = Some(super::compaction_metrics::MetricsStore(shard.clone()));
-        let (history, _) = shard.read(|r| r.model_history(&provider.provider.api_format))?;
+        let (mut history, boundary) =
+            shard.read(|r| r.model_history(&provider.provider.api_format))?;
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
+            let mut options = options;
+            options.compaction_metrics = Some(super::compaction_metrics::MetricsStore(shard));
             return crate::services::compaction::native::generate(
                 history,
                 session,
@@ -564,21 +589,56 @@ impl QueryEngine {
             )
             .await;
         }
+        if shard
+            .read(|r| r.setting(crate::db::session_store::settings::MODEL_REQUEST_OPTIONS))?
+            .is_some_and(|host| host.standalone_frontend)
+        {
+            use crate::db::session_store::settings::{Microcompact, MICROCOMPACT};
+            let boundary = boundary.as_deref().unwrap_or_default();
+            let mut state = shard
+                .repository()
+                .preference(MICROCOMPACT)?
+                .filter(|state| state.boundary == boundary)
+                .unwrap_or(Microcompact {
+                    through: 0,
+                    boundary: boundary.into(),
+                });
+            crate::services::compaction::microcompact::replay(
+                &mut history,
+                &mut state,
+                provider.model.context_window,
+            )?;
+        }
+        self.generate_replay_summary(
+            shard,
+            provider,
+            system,
+            instructions,
+            history,
+            boundary,
+            options,
+        )
+        .await
+        .map(Into::into)
+    }
+
+    pub(crate) async fn generate_replay_summary(
+        &self,
+        shard: crate::db::session_store::SessionDb,
+        provider: super::provider_manager::ResolvedProvider,
+        system: &str,
+        instructions: &str,
+        history: Vec<Value>,
+        boundary: Option<String>,
+        mut options: super::request_options::RequestOptions,
+    ) -> Result<String> {
+        let session = shard.id();
         let selected = shard.scoped_stores();
         let mut checkpoint = crate::services::compaction::checkpoint::Checkpoint::open(
-            &selected,
-            session,
-            &provider,
-            system,
+            &selected, session, &provider, system,
         )?;
+        options.compaction_metrics = Some(super::compaction_metrics::MetricsStore(shard.clone()));
         checkpoint.options = options;
-        let prefix = match super::compaction_prefix::load(&shard, &provider, &history) {
-            Ok(prefix) => prefix,
-            Err(error) => {
-                tracing::warn!(%error, "Could not restore the main request for compaction");
-                None
-            }
-        };
         let window = history
             .first()
             .filter(|m| m["provider_content"]["compaction"] == true)
@@ -612,16 +672,72 @@ impl QueryEngine {
                 })
             })
             .transpose()?;
-        super::generation::summarize_with_prefix(
+        let saved_options =
+            shard.read(|r| r.setting(crate::db::session_store::settings::MODEL_REQUEST_OPTIONS))?;
+        let has_main_turn = saved_options.is_some();
+        let host = saved_options.unwrap_or_else(|| SessionRequestOptions {
+            effort: provider.model.effort.clone(),
+            ..Default::default()
+        });
+        let request = ChatRequest {
+            conversation_id: session.into(),
+            messages: history,
+            context_boundary: boundary,
+            provider_id: Some(provider.provider.id.clone()),
+            model: provider.model.id.clone(),
+            effort: host.effort,
+            max_tokens: host.max_tokens,
+            reasoning_mode: host.reasoning_mode,
+            standalone_frontend: host.standalone_frontend,
+            system_prompt: host.system_prompt,
+            workspace_path: host.workspace_path,
+            response_schema: None,
+            assistant_message_id: None,
+            max_turns: None,
+            temperature: None,
+            top_p: None,
+        };
+        let std::ops::ControlFlow::Continue(mut turn) = self
+            .prepare_turn(shard.clone(), request, TurnPurpose::Summary)
+            .await?
+        else {
+            anyhow::bail!("Cannot prepare a summary request");
+        };
+        turn.executor.restore_request_context().await?;
+        let durable = turn.executor.prepare_main_history()?;
+        // Recovery uses the same active messages, before local window reduction.
+        // Keep encrypted items in their typed Responses field on every fragment.
+        let recovery_rows = if window.is_some() {
+            &durable[1..]
+        } else {
+            &durable[..]
+        };
+        let input = format!(
+            "Summary focus requested by the user:\n{instructions}\n\nConversation JSON:\n{}",
+            serde_json::to_string(recovery_rows)?
+        );
+        if super::generation::requires_fragments(&provider, system, &input, has_main_turn) {
+            return super::generation::summarize_history(
+                provider,
+                system,
+                &input,
+                Some(&mut checkpoint),
+                None,
+                window,
+            )
+            .await;
+        }
+        let mut wire = turn.executor.replay_request().await?;
+        wire.allow_text_summary();
+        super::generation::summarize_history(
             provider,
             system,
-            input,
+            &input,
             Some(&mut checkpoint),
-            prefix.map(|wire| (wire, instructions)),
+            Some((wire, instructions)),
             window,
         )
         .await
-        .map(Into::into)
     }
     pub fn new(
         provider_manager: Arc<Mutex<ProviderManager>>,
@@ -893,40 +1009,23 @@ impl QueryEngine {
             .await
     }
 
-    async fn send_with_origin(
+    async fn prepare_turn(
         &self,
+        selected: crate::db::session_store::SessionDb,
         mut request: ChatRequest,
-        save_response: bool,
-        hook_wake: bool,
-        execution_lease: Option<std::sync::Arc<crate::services::session_messages::ExecutionLease>>,
-        suggestion: Option<super::suggestion::SuggestionCapture>,
-    ) -> Result<mpsc::Receiver<EngineEvent>> {
-        // Every submission owns the session for its whole attempt. A host that
-        // already acquired (CLI, SDK, Desktop SSE) shares that same `Arc`; an
-        // independent caller is refused here, before any turn work.
-        let lease = match execution_lease {
-            Some(lease) => lease,
-            None => Arc::new(
-                self.db_manager
-                    .open_session(&request.conversation_id)?
-                    .acquire_execution()?,
-            ),
+        purpose: TurnPurpose,
+    ) -> Result<std::ops::ControlFlow<mpsc::Receiver<EngineEvent>, PreparedTurn>> {
+        let replay = matches!(purpose, TurnPurpose::Summary);
+        let hook_wake = matches!(purpose, TurnPurpose::HookWake);
+        let applied_compaction = if replay {
+            request.context_boundary.is_some()
+        } else {
+            crate::services::compaction::apply_persisted_boundary(
+                &selected,
+                &request.conversation_id,
+                &mut request.messages,
+            )?
         };
-        let address = lease
-            .address
-            .as_ref()
-            .context("Execution lacks a recorded session")?;
-        anyhow::ensure!(
-            address.session == request.conversation_id,
-            "Execution session changed"
-        );
-        let selected = self.db_manager.resume_history(address)?;
-        let execution_lease = Some(lease);
-        let applied_compaction = crate::services::compaction::apply_persisted_boundary(
-            &selected,
-            &request.conversation_id,
-            &mut request.messages,
-        )?;
         let skill_invocation = request
             .messages
             .iter()
@@ -1007,12 +1106,14 @@ impl QueryEngine {
         let (workspace, project, prompt_profile) = tokio::task::spawn_blocking(move || {
             db.engine_workspace(&workspaces_root, &project_conv_id, requested_workspace.as_deref())
         }).await??;
-        crate::services::lifecycle_events::check_configuration(
-            &plugin_context,
-            &workspace,
-            &conv_id,
-        )
-        .await?;
+        if !replay {
+            crate::services::lifecycle_events::check_configuration(
+                &plugin_context,
+                &workspace,
+                &conv_id,
+            )
+            .await?;
+        }
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
         let standalone_frontend = request.standalone_frontend;
         request.system_prompt = Some(crate::prompt::compose_customized(
@@ -1075,7 +1176,7 @@ impl QueryEngine {
         // a skill's block also records the skill for after a compaction.
         let mut turn_blocks: Vec<(String, Option<crate::services::turn_context::InvokedSkill>)> =
             Vec::new();
-        if let Some((command, arguments)) = skill_invocation.filter(|_| !hook_wake) {
+        if let Some((command, arguments)) = skill_invocation.filter(|_| !hook_wake && !replay) {
             let content = if let Some(skill) = discovered_skills.get(&command) {
                 let bundled = crate::skills::discovery::is_bundled_path(
                     &skill.path,
@@ -1241,7 +1342,7 @@ impl QueryEngine {
                     &first_message_session,
                     &available_skills,
                 );
-                let changes = has_user_message
+                let changes = (has_user_message && !replay)
                     .then(|| {
                         let (now, gone) = if tool_load_available {
                             crate::prompt::set_changes(
@@ -1274,7 +1375,9 @@ impl QueryEngine {
         )?;
         let hook_provider = {
             let pm = self.provider_manager.lock().await;
-            if let Some(active) = pm.binding.resolve(None) { Some(active) } else if let Some(id) = request.provider_id.as_deref() {
+            if let Some(active) = pm.binding.resolve(None).filter(|_| !replay) {
+                Some(active)
+            } else if let Some(id) = request.provider_id.as_deref() {
                 pm.resolve_selected(id, &request.model)
             } else {
                 pm.resolve_provider(&request.model).await
@@ -1295,7 +1398,7 @@ impl QueryEngine {
             .find(|m| m["role"] == "user")
             .map(|m| m["content"].clone())
             .unwrap_or(Value::Null);
-        if !hook_wake {
+        if !hook_wake && !replay {
             let hook_result = hooks
                 .run(
                     crate::services::tool_hooks::HookEvent::UserPromptSubmit,
@@ -1332,13 +1435,15 @@ impl QueryEngine {
             .iter()
             .map(|item| (item.path.clone(), item.sha256.clone()))
             .collect();
-        crate::services::lifecycle_events::instructions(
-            &plugin_context,
-            &hooks,
-            &conv_id,
-            &instruction_files,
-        )
-        .await?;
+        if !replay {
+            crate::services::lifecycle_events::instructions(
+                &plugin_context,
+                &hooks,
+                &conv_id,
+                &instruction_files,
+            )
+            .await?;
+        }
         // Like the reference CLI, instructions, the environment and the Git
         // snapshot open the first user message instead of the system prompt,
         // which stays the same across projects and so shares one cache entry.
@@ -1348,10 +1453,10 @@ impl QueryEngine {
         // The frozen environment keeps the first message stable; a date the
         // session outlived is announced once, on the message it was attached to.
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let date_reminder = request
+        let date_reminder = (!replay && request
             .messages
             .iter()
-            .any(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("user")))
             .then(|| {
                 crate::prompt::date_change_reminder(
                     &turn_root,
@@ -1441,7 +1546,7 @@ impl QueryEngine {
             workspace_path
         );
 
-        if let Some(ref tracker) = self.cost_tracker {
+        if let Some(tracker) = self.cost_tracker.as_ref().filter(|_| !replay) {
             let estimated_tokens = request
                 .messages
                 .iter()
@@ -1471,7 +1576,7 @@ impl QueryEngine {
                             stop_reason: Some("budget_warning".to_string()),
                         })
                         .await;
-                    return Ok(warn_rx);
+                    return Ok(std::ops::ControlFlow::Break(warn_rx));
                 }
                 BudgetCheckResult::WithinBudget => {}
             }
@@ -1496,7 +1601,9 @@ impl QueryEngine {
 
         let mut provider = {
             let pm = self.provider_manager.lock().await;
-            let resolved = if let Some(active) = pm.binding.resolve(None) { Some(active) } else if let Some(id) = request.provider_id.as_deref() {
+            let resolved = if let Some(active) = pm.binding.resolve(None).filter(|_| !replay) {
+                Some(active)
+            } else if let Some(id) = request.provider_id.as_deref() {
                 pm.resolve_selected(id, &model)
             } else {
                 pm.resolve_provider(&model).await
@@ -1511,23 +1618,24 @@ impl QueryEngine {
         };
 
         let (event_tx, event_rx) = mpsc::channel::<EngineEvent>(500);
-        let event_tx_for_turn = event_tx.clone();
 
-        let state = ConversationState {
-            conversation_id: conv_id.clone(),
-            model: request
-                .provider_id
-                .as_ref()
-                .map(|id| format!("{}::{}", id, model))
-                .unwrap_or_else(|| model.clone()),
-            messages: request.messages.clone(),
-            system_prompt: request.system_prompt.clone(),
-            last_activity: Utc::now().to_rfc3339(),
-            turn_count: 0,
-            status: ConversationStatus::Active,
+        if !replay {
+            let state = ConversationState {
+                conversation_id: conv_id.clone(),
+                model: request
+                    .provider_id
+                    .as_ref()
+                    .map(|id| format!("{}::{}", id, model))
+                    .unwrap_or_else(|| model.clone()),
+                messages: request.messages.clone(),
+                system_prompt: request.system_prompt.clone(),
+                last_activity: Utc::now().to_rfc3339(),
+                turn_count: 0,
+                status: ConversationStatus::Active,
         };
         self.update_conversation_state(&conv_id, state).await;
         tracing::info!(module = "EngineCore", "Conversation state updated");
+        }
 
         if let Some(effort) = request.effort.as_deref() {
             if !["off", "low", "medium", "high", "xhigh", "max"].contains(&effort) {
@@ -1536,7 +1644,10 @@ impl QueryEngine {
         }
         provider.model.effort = request.effort.clone();
         validate_model_input(&provider.model, &request.messages)?;
-        let configured_max = provider.model.max_tokens.unwrap_or(8192);
+        let configured_max = match provider.model.max_tokens {
+            Some(0) if replay => super::generation::FALLBACK_OUTPUT,
+            cap => cap.unwrap_or(8192),
+        };
         let mut max_tokens = request
             .max_tokens
             .unwrap_or(configured_max)
@@ -1552,10 +1663,12 @@ impl QueryEngine {
                 // Shrink the output budget to what the window still holds; only
                 // fail when too little is left for a useful answer.
                 let remaining = (context as u64).saturating_sub(estimated);
-                if remaining < 4096 {
+                if remaining < 4096 && !replay {
                     anyhow::bail!("Input plus output budget exceeds the configured context window; compact the conversation or lower max output tokens");
                 }
-                max_tokens = remaining as u32;
+                if remaining >= 4096 {
+                    max_tokens = remaining as u32;
+                }
             }
         }
 
@@ -1583,7 +1696,7 @@ impl QueryEngine {
         } else {
             request.system_prompt.clone()
         };
-        let learning = if plugin_context
+        let learning = if !replay && plugin_context
             .global_setting::<bool>(GlobalSetting::LearningRecord("learning.enabled"))?
             .unwrap_or(false)
         {
@@ -1682,6 +1795,84 @@ impl QueryEngine {
         if let Some(ref registry) = self.mcp_registry {
             executor = executor.with_mcp_registry(registry.clone());
         }
+        Ok(std::ops::ControlFlow::Continue(PreparedTurn {
+            executor,
+            history,
+            learning,
+            events: event_rx,
+            sender: event_tx,
+        }))
+    }
+
+    async fn send_with_origin(
+        &self,
+        request: ChatRequest,
+        save_response: bool,
+        hook_wake: bool,
+        execution_lease: Option<std::sync::Arc<crate::services::session_messages::ExecutionLease>>,
+        suggestion: Option<super::suggestion::SuggestionCapture>,
+    ) -> Result<mpsc::Receiver<EngineEvent>> {
+        // Every submission owns the session for its whole attempt. A host that
+        // already acquired (CLI, SDK, Desktop SSE) shares that same `Arc`; an
+        // independent caller is refused here, before any turn work.
+        let lease = match execution_lease {
+            Some(lease) => lease,
+            None => Arc::new(
+                self.db_manager
+                    .open_session(&request.conversation_id)?
+                    .acquire_execution()?,
+            ),
+        };
+        let address = lease
+            .address
+            .as_ref()
+            .context("Execution lacks a recorded session")?;
+        anyhow::ensure!(
+            address.session == request.conversation_id,
+            "Execution session changed"
+        );
+        let selected = self.db_manager.resume_history(address)?;
+        let conv_id = request.conversation_id.clone();
+        let options = SessionRequestOptions {
+            system_prompt: request.system_prompt.clone(),
+            standalone_frontend: request.standalone_frontend,
+            workspace_path: request.workspace_path.clone(),
+            reasoning_mode: request.reasoning_mode.clone(),
+            effort: request.effort.clone(),
+            max_tokens: request.max_tokens,
+        };
+        let option_store = selected.clone();
+        let PreparedTurn {
+            mut executor,
+            history,
+            learning,
+            events: event_rx,
+            sender: event_tx,
+        } = match self
+            .prepare_turn(
+                selected,
+                request,
+                if hook_wake {
+                    TurnPurpose::HookWake
+                } else {
+                    TurnPurpose::Submit
+                },
+            )
+            .await?
+        {
+            std::ops::ControlFlow::Continue(turn) => turn,
+            std::ops::ControlFlow::Break(events) => return Ok(events),
+        };
+        use crate::db::session_store::settings::MODEL_REQUEST_OPTIONS;
+        if option_store
+            .read(|r| r.setting(MODEL_REQUEST_OPTIONS))?
+            .as_ref()
+            != Some(&options)
+        {
+            option_store.write(|w| w.set_setting(MODEL_REQUEST_OPTIONS, &options))?;
+        }
+        let event_tx_for_turn = event_tx.clone();
+        let execution_lease = Some(lease);
         // Ownership stays with the executor for its entire task lifetime,
         // including the cleanup after the public MessageStop. The host shares
         // this same lease; the last remaining owner performs the explicit

@@ -440,6 +440,27 @@ impl AnthropicClient {
         crate::performance::AttemptCounter,
     )> {
         let provider = &provider.current()?;
+        let body = self.request_body(
+            provider,
+            messages,
+            system_prompt,
+            tools,
+            max_tokens,
+            enable_thinking,
+        )?;
+        self.stream_body(provider, body, max_tokens, context_capture)
+            .await
+    }
+
+    pub(super) fn request_body(
+        &self,
+        provider: &ResolvedProvider,
+        messages: Vec<AnthropicMessage>,
+        system_prompt: Option<&str>,
+        tools: Vec<ToolDefinition>,
+        max_tokens: u32,
+        enable_thinking: bool,
+    ) -> Result<Value> {
         let base_url = provider.provider.base_url.trim_end_matches('/');
         let mut body = json!({
             "model": provider.model.id,
@@ -472,8 +493,7 @@ impl AnthropicClient {
 
         self.apply_options(&mut body, provider)?;
         crate::performance::apply_conversation_cache(&mut body);
-        self.stream_body(provider, body, max_tokens, context_capture)
-            .await
+        Ok(body)
     }
 
     pub(super) async fn stream_body(

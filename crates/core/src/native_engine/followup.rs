@@ -4,10 +4,9 @@ use super::{
     provider_manager::ResolvedProvider, provider_runtime, request_options::RequestOptions,
 };
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub(crate) struct WireRequest {
     pub api: String,
     pub body: Value,
@@ -147,22 +146,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compaction_preserves_system_text_and_permits_a_free_text_answer() {
+    fn compaction_keeps_tools_and_effort_while_permitting_a_free_text_answer() {
         let schema = json!({"type":"boolean"});
-        for mut body in [
-            json!({"system":"Original"}),
-            json!({"system":[{"type":"text","text":"Original"}]}),
-            json!({"messages":[{"role":"system","content":"Original"}]}),
-        ] {
-            let original = body.clone();
-            if body.get("system").is_some() {
-                crate::structured_output::append_anthropic_instruction(&mut body, &schema);
-            } else {
-                crate::structured_output::append_openai_instruction(&mut body, &schema);
-            }
-            crate::structured_output::remove_prompt_instruction(&mut body, &schema);
-            assert_eq!(body, original);
-        }
         for choice in [
             json!("required"),
             json!({"type":"tool","name":"Write"}),

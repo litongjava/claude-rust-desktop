@@ -211,14 +211,24 @@ pub(crate) fn replay_history(
     format: &ApiFormat,
     native: impl Fn(&str) -> Result<Option<Value>>,
 ) -> Result<(Vec<Value>, Option<String>)> {
-    let mut history = Vec::new();
     let messages = message_repo::get_messages_by_conversation(conn, id)?;
+    replay_rows(conn, id, &messages, format, native)
+}
+
+pub(crate) fn replay_rows(
+    conn: &rusqlite::Connection,
+    id: &str,
+    messages: &[message_repo::MessageRow],
+    format: &ApiFormat,
+    native: impl Fn(&str) -> Result<Option<Value>>,
+) -> Result<(Vec<Value>, Option<String>)> {
+    let mut history = Vec::new();
     let start = messages.iter().rposition(|m| m.is_compact_boundary).unwrap_or(0);
     let boundary = messages
         .get(start)
         .filter(|m| m.is_compact_boundary)
         .map(|m| m.id.clone());
-    for message in messages.into_iter().skip(start) {
+    for message in messages.iter().skip(start) {
         if let Some(native) = native(&message.id)? {
             history.push(json!({"role":message.role,"content":message.content,"provider_content":native}));
             continue;

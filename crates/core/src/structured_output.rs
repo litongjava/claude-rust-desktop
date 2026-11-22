@@ -48,39 +48,6 @@ pub fn append_openai_instruction(body: &mut Value, schema: &Value) {
     }
 }
 
-/// Undo only the schema instruction added by the request builder.
-pub(crate) fn remove_prompt_instruction(body: &mut Value, schema: &Value) {
-    let instruction = prompt_instruction(schema);
-    let remove = |value: &mut Value| {
-        if let Some(text) = value
-            .as_str()
-            .and_then(|text| text.strip_suffix(&instruction))
-        {
-            *value = Value::String(text.strip_suffix("\n\n").unwrap_or(text).into());
-            return true;
-        }
-        false
-    };
-    if let Some(system) = body.get_mut("system") {
-        if let Some(blocks) = system.as_array_mut() {
-            if let Some(block) = blocks.last_mut() {
-                if remove(&mut block["text"]) && block["text"] == "" {
-                    blocks.pop();
-                }
-            }
-        } else {
-            remove(system);
-        }
-    }
-    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
-        if let Some(first) = messages.first_mut().filter(|m| m["role"] == "system") {
-            if remove(&mut first["content"]) && first["content"] == "" {
-                messages.remove(0);
-            }
-        }
-    }
-}
-
 /// Removes surrounding whitespace and one enclosing Markdown code fence, which
 /// prompt-guided models still add occasionally.
 pub fn strip_code_fence(text: &str) -> &str {

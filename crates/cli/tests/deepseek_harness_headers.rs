@@ -226,25 +226,15 @@ async fn scenario(api: &'static str, tool: &'static str) {
         .pop()
         .unwrap();
     assert_eq!(instruction["role"], "user");
-    if tool == "Read" {
-        // The main turn renders Read as plain text. The durable output also
-        // contains line-count and truncation fields that the fallback must see.
-        let input = instruction["content"].as_str().unwrap();
-        assert!(input.contains("HEADER_FILE_CONTENTS"));
-        assert!(input.contains("HEADER_NORMAL_REPLY"));
-        assert!(input.contains(r#"\"lines\":"#) && input.contains(r#"\"truncated\":"#));
+    assert!(instruction.to_string().contains("Return only the summary"));
+    assert!(!summary_body["tools"].as_array().unwrap().is_empty());
+    let history = summary_body["messages"].to_string();
+    assert!(history.contains("HEADER_NORMAL_REPLY"));
+    assert!(history.contains(if tool == "Read" {
+        "HEADER_FILE_CONTENTS"
     } else {
-        assert!(instruction.to_string().contains("Return only the summary"));
-        assert!(!summary_body["tools"].as_array().unwrap().is_empty());
-        let answer = summary_body["messages"]
-            .as_array_mut()
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(answer["role"], "assistant");
-        assert!(answer.to_string().contains("HEADER_NORMAL_REPLY"));
-        assert_eq!(summary_body, requests[1].1, "last completed main prefix");
-    }
+        "fixture.HEADER_PATH"
+    }));
     assert_eq!(requests[3].0["x-dcl-request-kind"], "compaction");
     assert!(requests[4].1.to_string().contains("HEADER_COMPACT_SUMMARY"));
     assert!(store

@@ -40,5 +40,4 @@ pub mod request_recording;
 pub mod suggestion;
 
 pub(crate) mod compaction_metrics;
-pub(crate) mod compaction_prefix;
 mod followup;

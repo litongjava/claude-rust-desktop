@@ -269,7 +269,7 @@ impl From<CommittedCompaction> for CompactionResult {
 // already serializes the tail for the prompt, and a whole-session string cost
 // megabytes per commit. The digest is stable because every entry is serialized
 // in order with a separator.
-pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, String, usize)> {
+pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(String, usize)> {
     use sha2::{Digest, Sha256};
     let rows = message_repo::get_messages_by_conversation(conn, id)?;
     let start = rows
@@ -300,7 +300,7 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
             hasher.update(window.as_bytes());
         }
     }
-    let mut all = Vec::new();
+
     for row in &rows {
         let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
         let mut stmt = conn.prepare("SELECT id,file_name,file_type,mime_type,file_size,source FROM attachments WHERE message_id=?1 ORDER BY id")?;
@@ -320,6 +320,13 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
             entry["user_content"] = serde_json::from_str(&content)?;
         }
         for call in &calls {
+            if let Some(display) = call.output.as_deref() {
+                if let Some(output) =
+                    crate::native_engine::mcp_output::McpOutput::load(conn, id, &call.id, display)?
+                {
+                    entry["mcp_content"][&call.id] = output.content;
+                }
+            }
             let notes = message_repo::tool_call_note(conn, &call.id)?;
             let delivered = crate::services::input_queue::load_delivered(conn, &call.id)?;
             if notes.is_some() || !delivered.is_empty() {
@@ -327,10 +334,7 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
                     json!({"approval_note":notes,"delivered":delivered});
             }
         }
-        all.push(entry);
-    }
-    for entry in &all {
-        serde_json::to_writer(&mut hasher, entry)?;
+        serde_json::to_writer(&mut hasher, &entry)?;
         hasher.write_all(b"\n")?;
     }
     let digest = hasher.finalize();
@@ -340,11 +344,18 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
             text.push_str(&format!("{byte:02x}"));
             text
         });
-    Ok((
-        fingerprint,
-        serde_json::to_string(&all)?,
-        count,
-    ))
+    Ok((fingerprint, count))
+}
+
+/// Model-visible rows for the optional request record and durable queue claim.
+pub(crate) fn recorded_history(conn: &rusqlite::Connection, id: &str) -> Result<String> {
+    let (rows, _) = crate::runtime::replay_history(
+        conn,
+        id,
+        &crate::native_engine::provider_manager::ApiFormat::OpenAI,
+        |_| Ok(None),
+    )?;
+    Ok(serde_json::to_string(&rows)?)
 }
 
 pub fn prepare(db: &impl crate::db::session_store::SessionAccess, id: &str) -> Result<PreparedCompaction> {
@@ -524,10 +535,6 @@ pub async fn compact(
 ) -> Result<CompactionResult> {
     let started = std::time::Instant::now();
     let prepared = prepare(db, id)?;
-    let input = format!(
-        "Summary focus requested by the user:\n{}\n\nConversation JSON:\n{}",
-        instructions, prepared.transcript
-    );
     let mut options =
         crate::native_engine::request_options::RequestOptions::from_db(db, Some(id), "compaction");
     let mut record = crate::native_engine::request_recording::CompactionRecord::start(
@@ -541,7 +548,6 @@ pub async fn compact(
             provider_id,
             model,
             PROMPT,
-            &input,
             instructions,
             options,
         )
@@ -565,6 +571,8 @@ pub enum Part {
 }
 
 pub struct PreparedPart {
+    pub(crate) messages: Vec<Value>,
+    pub(crate) boundary: Option<String>,
     pub(crate) incarnation: String,
     pub(crate) fingerprint: String,
     pub(crate) transcript: String,
@@ -594,8 +602,12 @@ pub async fn summarize_part(
     provider_id: &str,
     model: &str,
 ) -> Result<(String, usize)> {
-    let prepared = prepare_part(db, id, message_id, part)?;
-    let input = format!("Conversation JSON:\n{}", prepared.transcript);
+    let provider = engine.resolved_provider(provider_id, model).await?;
+    let prepared = db.open_session(id)?.prepare_summary_part_for(
+        message_id,
+        part,
+        &provider.provider.api_format,
+    )?;
     let mut options =
         crate::native_engine::request_options::RequestOptions::from_db(db, Some(id), "compaction");
     let mut record = crate::native_engine::request_recording::CompactionRecord::start(
@@ -604,7 +616,15 @@ pub async fn summarize_part(
         &prepared.transcript,
     );
     let summary = engine
-        .generate_summary_recorded(Some(id), provider_id, model, PROMPT, &input, options)
+        .generate_replay_summary(
+            db.open_session(id)?,
+            provider,
+            PROMPT,
+            "",
+            prepared.messages.clone(),
+            prepared.boundary.clone(),
+            options,
+        )
         .await?;
     let result = commit_part(db, id, message_id, part, prepared, &summary)?;
     if let Some(record) = &mut record {
@@ -671,14 +691,13 @@ pub async fn compact_with_hooks_tracked(
         instructions,
         trigger,
         tracker,
-        |input, focus, options| async move {
+        |focus, options| async move {
             engine
                 .generate_compaction_recorded(
                     id,
                     provider_id,
                     model,
                     PROMPT,
-                    &input,
                     &focus,
                     options,
                 )
@@ -699,7 +718,7 @@ async fn compact_hooks<F, Fut>(
     summarize: F,
 ) -> Result<CompactionResult>
 where
-    F: FnOnce(String, String, crate::native_engine::request_options::RequestOptions) -> Fut,
+    F: FnOnce(String, crate::native_engine::request_options::RequestOptions) -> Fut,
     Fut: std::future::Future<Output = Result<GeneratedSummary>>,
 {
     use super::tool_hooks::{HookEvent, HookRunner};
@@ -737,10 +756,6 @@ where
             focus.push_str(&text);
         }
     }
-    let input = format!(
-        "Summary focus requested by the user:\n{}\n\nConversation JSON:\n{}",
-        focus, prepared.transcript
-    );
     let mut options = crate::native_engine::request_options::RequestOptions::from_db(
         &context.db,
         Some(id),
@@ -751,7 +766,7 @@ where
         trigger,
         &prepared.transcript,
     );
-    let summary = summarize(input, focus, options).await?;
+    let summary = summarize(focus, options).await?;
     let (fresh_context, start_warnings) =
         match super::session_hooks::collect(context, workspace, id, "compact", model).await {
             Ok(result) => result,
@@ -893,7 +908,7 @@ mod hook_tests {
             "",
             "manual",
             None,
-            |_, _, _| async { Ok("summary".into()) },
+            |_, _| async { Ok("summary".into()) },
         )
         .await
         .unwrap();
@@ -917,7 +932,7 @@ mod hook_tests {
             "",
             "manual",
             Some(&tracker),
-            |_, _, _| async { Ok("summary".into()) },
+            |_, _| async { Ok("summary".into()) },
         );
         tokio::pin!(future);
         let outcome = tokio::select! {
@@ -967,8 +982,7 @@ mod hook_tests {
                 "focus",
                 trigger,
                 None,
-                |input, focus, _| async move {
-                    assert!(input.contains("focus\n\nkeep exact paths"));
+                |focus, _| async move {
                     assert_eq!(focus, "focus\n\nkeep exact paths");
                     Ok("summary".into())
                 },
@@ -1016,7 +1030,7 @@ mod hook_tests {
                 "",
                 "auto",
                 None,
-                |_, _, _| async {
+                |_, _| async {
                     if failure == "generation" {
                         anyhow::bail!("generation failed");
                     }
@@ -1064,7 +1078,7 @@ mod hook_tests {
                 "",
                 "manual",
                 None,
-                |_, _, _| async {
+                |_, _| async {
                     if stage == "summary" {
                         std::fs::write(dir.path().join("started"), "yes").unwrap();
                         std::future::pending::<()>().await;
@@ -1115,7 +1129,7 @@ mod hook_tests {
             "",
             "manual",
             Some(&tracker),
-            |_, _, _| async { Ok("summary".into()) },
+            |_, _| async { Ok("summary".into()) },
         )
         .await
         .unwrap();
@@ -1141,7 +1155,7 @@ mod hook_tests {
             "",
             "manual",
             Some(&tracker),
-            |_, _, _| async { anyhow::bail!("generation failed") },
+            |_, _| async { anyhow::bail!("generation failed") },
         )
         .await;
         assert!(result.is_err());

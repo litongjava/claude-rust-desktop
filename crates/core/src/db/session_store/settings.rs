@@ -182,8 +182,9 @@ pub struct LiveRequest {
     pub context_usage: Option<serde_json::Value>,
 }
 
-pub(crate) const COMPACTION_PREFIX: Setting<crate::native_engine::compaction_prefix::SavedPrefix> =
-    Setting::new("compaction.main-prefix");
+pub(crate) const MODEL_REQUEST_OPTIONS: Setting<
+    crate::native_engine::engine_core::SessionRequestOptions,
+> = Setting::new("model.request_options");
 pub const PREFERENCES: Setting<Preferences> = Setting::new("cli.session");
 pub const PERMISSIONS: Setting<HashMap<String, PermissionAction>> = Setting::new("cli.permissions");
 pub const DISPLAY: Setting<Display> = Setting::new("cli.display");

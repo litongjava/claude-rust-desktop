@@ -10,7 +10,7 @@ use std::fmt;
 /// Fixed generation budget when neither the selected model nor reliable
 /// provider/model metadata supplies a positive output cap. This is an explicit
 /// fallback, not a value assumed for models that configure their own cap.
-const FALLBACK_OUTPUT: u32 = 32_768;
+pub(super) const FALLBACK_OUTPUT: u32 = 32_768;
 /// Desired concise length of a fragment or intermediate merge summary.
 const FRAGMENT_SUMMARY_TARGET: u32 = 2048;
 /// Desired concise length of the final summary.
@@ -1101,15 +1101,37 @@ pub(crate) async fn summarize(
     input: &str,
     checkpoint: Option<&mut Checkpoint<'_>>,
 ) -> Result<String> {
-    summarize_with_prefix(provider, system, input, checkpoint, None, None).await
+    summarize_history(provider, system, input, checkpoint, None, None).await
 }
 
-pub(super) async fn summarize_with_prefix(
+/// Plan oversized input from the active durable rows before a normal turn's
+/// local compression shortens it. Recovery must be able to split the originals.
+pub(super) fn requires_fragments(
+    provider: &ResolvedProvider,
+    system: &str,
+    input: &str,
+    has_main_turn: bool,
+) -> bool {
+    let window = provider.model.context_window.unwrap_or_else(|| {
+        super::token_counter::TokenCounter::get_model_context_limit(&provider.model.id) as u32
+    });
+    let limit = input_budget_for(u64::from(window), output_budget(provider).0);
+    // A session with a main turn can reuse the provider cache up to its safe
+    // window. A cold import starts at the bounded fragment size.
+    input_tokens(system, input)
+        > if has_main_turn {
+            limit
+        } else {
+            limit.min(MAX_INPUT_TOKENS)
+        }
+}
+
+pub(super) async fn summarize_history(
     mut provider: ResolvedProvider,
     system: &str,
     input: &str,
     mut checkpoint: Option<&mut Checkpoint<'_>>,
-    prefix: Option<(WireRequest, &str)>,
+    request: Option<(WireRequest, &str)>,
     window_fallback: Option<WireRequest>,
 ) -> Result<String> {
     let window = provider.model.context_window.unwrap_or_else(|| {
@@ -1130,12 +1152,11 @@ pub(super) async fn summarize_with_prefix(
         fragment_output.max(final_output)
     );
     let targets = Targets::new(fragment_output, final_output);
-    let whole_request = if let Some((mut wire, focus)) = prefix {
+    let whole_request = if let Some((mut wire, focus)) = request {
         let prompt = targets.prompt(Stage::Final);
         wire.append_instruction(&format!(
             "{system}\n\n{prompt}Summary focus requested by the user:\n{focus}"
         ))?;
-        wire.set_output_budget(final_output);
         let estimate = super::request_context::ContextUsage::from_body(
             &wire.api,
             &wire.body,

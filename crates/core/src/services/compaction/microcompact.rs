@@ -1,3 +1,4 @@
+use crate::db::session_store::settings::Microcompact;
 use serde_json::{json, Value};
 
 pub const MICROCOMPACT_MIN_CHARS: usize = 1000;
@@ -33,5 +34,34 @@ pub fn clear_tool_results(messages: &mut [Value]) {
                 }
             }
         }
+    }
+}
+
+/// Render the standalone frontend's durable tool-result window. The caller
+/// decides whether this is an actual turn that should advance the cursor.
+pub fn replay(
+    history: &mut [Value],
+    state: &mut Microcompact,
+    window: Option<u32>,
+) -> anyhow::Result<bool> {
+    let len = history.len();
+    clear_tool_results(&mut history[..state.through.min(len)]);
+    let estimated = serde_json::to_string(&history)?.len().div_ceil(3);
+    let through = through(state.through, len, estimated, window);
+    if through == state.through {
+        return Ok(false);
+    }
+    state.through = through;
+    clear_tool_results(&mut history[..through.min(len)]);
+    Ok(true)
+}
+
+pub fn through(current: usize, len: usize, estimated_tokens: usize, window: Option<u32>) -> usize {
+    const KEEP_RECENT: usize = 10;
+    match window.filter(|window| *window > 0) {
+        Some(window) if estimated_tokens > window as usize / 2 => {
+            current.max(len.saturating_sub(KEEP_RECENT))
+        }
+        _ => current,
     }
 }

@@ -167,7 +167,7 @@ impl DeliveryOwner {
             if !has_target {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"missing compaction target"});
             }
-            let (fingerprint, transcript, count) = compaction::fingerprint(&tx, &s.id)?;
+            let (fingerprint, count) = compaction::fingerprint(&tx, &s.id)?;
             if count < 2 {
                 return Ok(PendingClaim::Obsolete {id, revision, reason:"not enough messages to compact"});
             }
@@ -176,7 +176,7 @@ impl DeliveryOwner {
                 incarnation: s.incarnation.clone(),
                 fingerprint,
                 keep,
-                transcript,
+                transcript: compaction::recorded_history(&tx, &s.id)?,
             }))
         })?;
         match candidate {
@@ -263,7 +263,7 @@ impl SessionRepository<'_> {
                     .context("Session not found")?;
                 ensure!(!row.archived, "Session is archived");
             }
-            let (fingerprint, transcript, count) = compaction::fingerprint(c, id)?;
+            let (fingerprint, count) = compaction::fingerprint(c, id)?;
             ensure!(count >= 2, "Not enough messages to compact");
             let pending_request = if incarnation.is_some() {
                 c.query_row("SELECT id FROM compaction_request WHERE singleton=1",[],|r|r.get(0)).optional()?
@@ -273,7 +273,7 @@ impl SessionRepository<'_> {
                 incarnation,
                 conversation_id: id.into(),
                 fingerprint,
-                transcript,
+                transcript: compaction::recorded_history(c, id)?,
                 count,
             })
         })
@@ -346,7 +346,6 @@ impl SessionWrite<'_> {
             self.0
                 .execute("UPDATE compaction_state SET local_count=local_count+1", [])?;
         }
-        self.clear_setting(settings::COMPACTION_PREFIX)?;
         self.0.execute("DELETE FROM compaction_checkpoint", [])?;
         Ok(message)
     }

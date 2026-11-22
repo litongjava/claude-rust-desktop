@@ -97,6 +97,13 @@ async fn scenario(api: &str, truncate: bool) {
             Arc::new(FileCache::new()),
         )
     };
+    store.append(&id, "assistant", "last answer").unwrap();
+    // A user can append input before asking to compact. The whole request fits
+    // the 128K window even when this suffix exceeds the fragment planner's 64K.
+    let long_suffix = (api == "openai" && !truncate).then(|| "中".repeat(70_000));
+    if let Some(text) = &long_suffix {
+        store.append(&id, "user", text).unwrap();
+    }
     let main = engine();
     let request: ChatRequest = serde_json::from_value(json!({"conversation_id":id,
         "messages":store.model_history(&id,&provider.api_format).unwrap(),
@@ -113,13 +120,6 @@ async fn scenario(api: &str, truncate: bool) {
             ),
             "{event:?}"
         );
-    }
-    store.append(&id, "assistant", "last answer").unwrap();
-    // A user can append input before asking to compact. The whole request fits
-    // the 128K window even when this suffix exceeds the fragment planner's 64K.
-    let long_suffix = (api == "openai" && !truncate).then(|| "中".repeat(70_000));
-    if let Some(text) = &long_suffix {
-        store.append(&id, "user", text).unwrap();
     }
     let shard = store.db.open_session(&id).unwrap();
     let input_before = shard.repository().usage_totals(&[]).unwrap().1;
@@ -148,11 +148,15 @@ async fn scenario(api: &str, truncate: bool) {
         .to_string()
         .contains("Keep pending work"));
     if let Some(text) = long_suffix {
-        let extra = messages.pop().unwrap();
+        let extra = messages.last().unwrap();
         assert_eq!(extra["role"], "user");
         assert_eq!(extra["content"].as_str().unwrap(), text);
     }
-    let last = messages.pop().unwrap();
+    let last = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "assistant")
+        .unwrap();
     assert_eq!(last["role"], "assistant");
     assert!(last.to_string().contains("last answer"));
     assert!(messages
