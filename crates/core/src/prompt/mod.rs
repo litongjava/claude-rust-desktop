@@ -320,6 +320,22 @@ pub fn environment_reminder(workspace: Option<&Path>) -> String {
 /// The reminder's text frozen on the session's first request, including the
 /// project's name and source folders. Later requests and resumes read the same
 /// file, so a changing date or runtime fact can never rewrite the first message.
+pub(crate) fn session_environment(
+    root: &Path,
+    session: &str,
+    workspace: &Path,
+    project: Option<&crate::db::project_repo::ProjectRow>,
+) -> (String, String) {
+    let folders = project.map(|p| p.folders.iter().map(|f| f.path.clone()).collect::<Vec<_>>());
+    let description = project
+        .zip(folders.as_deref())
+        .map(|(p, folders)| (p.name.as_str(), folders));
+    (
+        environment_for_session(root, session, Some(workspace), description),
+        date_for_session(root, session),
+    )
+}
+
 pub fn environment_for_session(
     root: &Path,
     session: &str,

@@ -983,28 +983,13 @@ impl QueryEngine {
         let environment_root = plugin_context.paths.data_dir.clone();
         let environment_session = conv_id.clone();
         let environment_workspace = workspace.clone();
-        let environment_project = project.as_ref().map(|project| {
-            (
-                project.name.clone(),
-                project
-                    .folders
-                    .iter()
-                    .map(|folder| folder.path.clone())
-                    .collect::<Vec<_>>(),
-            )
-        });
+        let environment_project = project.clone();
         let (environment, frozen_date) = tokio::task::spawn_blocking(move || {
-            let project = environment_project
-                .as_ref()
-                .map(|(name, folders)| (name.as_str(), folders.as_slice()));
-            (
-                crate::prompt::environment_for_session(
-                    &environment_root,
-                    &environment_session,
-                    Some(&environment_workspace),
-                    project,
-                ),
-                crate::prompt::date_for_session(&environment_root, &environment_session),
+            crate::prompt::session_environment(
+                &environment_root,
+                &environment_session,
+                &environment_workspace,
+                environment_project.as_ref(),
             )
         })
         .await?;
@@ -2336,7 +2321,12 @@ pub type NativeEngine = QueryEngine;
 
 /// One model-facing line of the available-skills list. Whitespace in the free
 /// text collapses to single spaces so a multi-line description stays one line.
-fn skill_listing_line(name: &str, description: &str, context: Option<&str>, name_only: bool) -> String {
+pub(super) fn skill_listing_line(
+    name: &str,
+    description: &str,
+    context: Option<&str>,
+    name_only: bool,
+) -> String {
     let one_line = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut line = if name_only {
         format!("- {name}")

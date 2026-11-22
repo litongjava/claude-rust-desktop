@@ -545,9 +545,10 @@ impl ToolLoopExecutor {
         if let Some(prompt) = prompt {
             sessions.append_prompt(id, prompt, "delegation_resume")?;
         }
-        (entry.executor.messages, entry.executor.context_boundary_id) = sessions
-            .model_history_with_boundary(id, &entry.executor.provider.provider.api_format)?;
-        entry.executor.applied_compaction = entry.executor.context_boundary_id.is_some();
+        entry
+            .executor
+            .load_foreground_child_context(&context, id)
+            .await?;
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         entry.executor.event_tx = events;
         entry.executor.answer_waiters = self.answer_waiters.clone();
@@ -927,6 +928,91 @@ impl ToolLoopExecutor {
         }))
     }
 
+    async fn load_foreground_child_context(
+        &mut self,
+        context: &ServiceContext,
+        id: &str,
+    ) -> Result<()> {
+        let root = &context.paths.data_dir;
+        let shard = context.db.open_session(id)?;
+        let (workspace, project, profile) = shard.scoped_stores().engine_workspace(
+            &root.join("workspaces"),
+            id,
+            Some(&self.workspace_cwd),
+        )?;
+        self.prompt_profile = profile;
+        (self.messages, self.context_boundary_id) =
+            shard.read(|r| r.model_history(&self.provider.provider.api_format))?;
+        self.applied_compaction = self.context_boundary_id.is_some();
+        let (project_memory, receipts) = crate::services::memory_files::prompt::replay(
+            &shard,
+            self.context_boundary_id.as_deref(),
+            &self.messages,
+        )?;
+        self.turn_context = crate::services::turn_context::load(root, id)?;
+        self.turn_context.extend(receipts);
+        let instructions = crate::project_instructions::load_all(Some(root), &workspace)?;
+        let (user_instructions, project_instructions) =
+            crate::project_instructions::reminder_parts(&instructions);
+        let (environment, date) =
+            crate::prompt::session_environment(root, id, &workspace, project.as_ref());
+
+        let customization = self.customization()?;
+        let (builtin, mcp) = if customization.loading("ToolLoad").enabled
+            && self
+                .allowed_tools
+                .as_ref()
+                .is_none_or(|tools| tools.iter().any(|name| name == "ToolLoad"))
+        {
+            let catalog = customization.described(self.builtin_catalog());
+            let mcp_tools = match &self.mcp_registry {
+                Some(registry) => super::discover_mcp_tools(registry).await?.0,
+                None => Vec::new(),
+            };
+            super::loadable_tool_lists(
+                &customization,
+                &catalog,
+                &mcp_tools,
+                &crate::mcp::states::load(root),
+                self.allowed_tools.as_deref(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut skills = crate::services::plugins::skill_commands(context)?;
+        skills.extend(crate::skills::discovery::discover(root, &workspace)?);
+        let lines = skills
+            .values()
+            .filter(|skill| skill.model_invocable())
+            .map(|skill| {
+                crate::native_engine::engine_core::skill_listing_line(
+                    &skill.name,
+                    &skill.description,
+                    skill.context.as_deref(),
+                    skill.listing_name_only,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.set_session_reminders(crate::prompt::SessionReminders {
+            user_instructions,
+            project_instructions,
+            project_memory,
+            environment: Some(environment),
+            date: Some(date),
+            git: crate::services::git_snapshot::for_session(root, id, &workspace)
+                .as_deref()
+                .map(crate::services::git_snapshot::reminder),
+            loadable_tools: crate::prompt::loadable_tools_for_session(root, id, &builtin, &mcp),
+            available_skills: crate::prompt::skills_for_session(root, id, &lines),
+            standalone_frontend: self.standalone_frontend,
+            skills: crate::services::turn_context::invoked_skills_reminder(
+                &self.turn_context,
+                &self.messages,
+            ),
+        });
+        Ok(())
+    }
+
     /// Builds an owned child session without running it so a leader can start
     /// several teammates before awaiting any of them.
     async fn prepare_delegated_child(
@@ -1198,7 +1284,7 @@ impl ToolLoopExecutor {
         let read_only_shell = definition.read_only_shell;
         let mut child = ToolLoopExecutor::new(
             provider,
-            vec![json!({"role":"user","content":prompt})],
+            Vec::new(),
             Some(system),
             child_max_tokens,
             events,
@@ -1210,7 +1296,6 @@ impl ToolLoopExecutor {
         .with_allowed_tools(definition.tools)
         .with_read_only_shell(read_only_shell)
         .with_prompt_profile(self.prompt_profile)
-        .with_context_reminders(self.context_reminders.clone())
         .with_conv_id(id.clone())
         .with_executor_history(context.db.executor_history(&id)?)?
         .with_answer_waiters(self.answer_waiters.clone())
@@ -1294,6 +1379,8 @@ impl ToolLoopExecutor {
             },
         );
         child.mcp_registry = self.mcp_registry.clone();
+        child.standalone_frontend = self.standalone_frontend;
+        child.load_foreground_child_context(&context, &id).await?;
         if let Some(memory) = &self.file_memory {
             child = child.with_file_memory(memory.child(&id)?);
         }

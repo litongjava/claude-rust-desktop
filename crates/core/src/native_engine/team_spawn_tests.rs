@@ -497,3 +497,39 @@ async fn context_search_scopes_parent_agent_teammate_and_owned_resume() {
     );
     server.abort();
 }
+
+#[tokio::test]
+async fn foreground_agent_uses_child_memory_after_parent_index_changes() {
+    use crate::services::memory_files::FileMemory;
+    let temp = tempfile::tempdir().unwrap();
+    let parent = uuid::Uuid::new_v4().to_string();
+    let (executor, context) = executor(temp.path(), &parent, "http://127.0.0.1:1".into()).await;
+    let memory = FileMemory::session(&context, &parent).unwrap();
+    memory.store(false).unwrap();
+    let index = memory.directory.join("MEMORY.md");
+    let executor = executor.with_context_reminders(vec!["PARENT_ONLY_INDEX".into()]);
+    std::fs::write(&index, "CHILD_FROZEN_INDEX").unwrap();
+    let prepared = executor
+        .prepare_delegated_child(
+            &json!({"prompt":"inspect","agent_type":"general"}),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    std::fs::write(index, "LATER_INDEX").unwrap();
+    let shard = context.db.open_session(&prepared.id).unwrap();
+    let (messages, boundary) = shard
+        .read(|r| r.model_history(&crate::native_engine::provider_manager::ApiFormat::OpenAI))
+        .unwrap();
+    let (stored, _) =
+        crate::services::memory_files::prompt::replay(&shard, boundary.as_deref(), &messages)
+            .unwrap();
+    let stored = stored.unwrap();
+    assert!(stored.contains("CHILD_FROZEN_INDEX"));
+    let request = serde_json::to_value(prepared.child.build_openai_messages().unwrap()).unwrap();
+    let first = request[0]["content"].as_str().unwrap();
+    assert!(first.contains(&stored));
+    assert!(!first.contains("PARENT_ONLY_INDEX"));
+}
