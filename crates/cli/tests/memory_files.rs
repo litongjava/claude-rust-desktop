@@ -119,10 +119,29 @@ async fn run(
     );
     output
 }
+fn first_user_text(request: &Value) -> String {
+    let user = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "user")
+        .unwrap();
+    match &user["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("unexpected user content: {other}"),
+    }
+}
+
 async fn scenario(protocol: &'static str, plan: bool) {
     let root = tempfile::tempdir().unwrap();
     let workspace = root.path().join("project");
     std::fs::create_dir(&workspace).unwrap();
+    std::fs::write(workspace.join("AGENTS.md"), "project-layout-marker").unwrap();
     let paths = RuntimePaths::new(root.path().join("data")).unwrap();
     let context = ServiceContext::open(paths.clone(), Arc::new(EnvironmentCredentials)).unwrap();
     let memory = FileMemory::workspace(&context, &workspace).unwrap();
@@ -133,9 +152,8 @@ async fn scenario(protocol: &'static str, plan: bool) {
             None,
         )
         .unwrap();
-    let legacy = deepseek_code_core::memory::MemExClient::with_path(
-        paths.data_dir.join("memory.sqlite3"),
-    );
+    let legacy =
+        deepseek_code_core::memory::MemExClient::with_path(paths.data_dir.join("memory.sqlite3"));
     legacy
         .ingest(
             "中文测试 legacy-unassigned-must-not-recall",
@@ -195,10 +213,36 @@ async fn scenario(protocol: &'static str, plan: bool) {
             } else {
                 request["messages"][0]["content"].to_string()
             };
+            let first = first_user_text(request);
             assert!(
-                system.contains("MEMORY.md") && system.contains("中文 preferences"),
-                "{system}"
+                !system.contains("<project_memory>")
+                    && !system.contains("unique-body-recall-marker")
             );
+            let project = first.find("project-layout-marker").unwrap();
+            let index = first.find("<project_memory>").unwrap();
+            assert!(
+                project < index && first[index..].contains("中文 preferences"),
+                "{first}"
+            );
+            assert_eq!(first.matches("Relevant project memory files:").count(), 1);
+            assert_eq!(
+                first,
+                first_user_text(&requests[0]),
+                "a tool round changed the first message"
+            );
+            for message in request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .skip_while(|m| m["role"] != "user")
+                .skip(1)
+            {
+                if message["role"] != "assistant" {
+                    assert!(!message["content"]
+                        .to_string()
+                        .contains("Relevant project memory files:"));
+                }
+            }
             assert!(!request["tools"].to_string().contains("memory_search"));
             assert!(!request["tools"].to_string().contains("memory_ingest"));
             assert!(!request["messages"]
@@ -230,6 +274,11 @@ async fn scenario(protocol: &'static str, plan: bool) {
     } else {
         "updated-body-marker"
     }));
+    std::fs::write(
+        memory.directory.join("MEMORY.md"),
+        "manual-index-edit-on-resume\n",
+    )
+    .unwrap();
     let id = context.db.latest_code(&workspace).unwrap().unwrap().id;
     run(
         &paths.data_dir,
@@ -241,8 +290,23 @@ async fn scenario(protocol: &'static str, plan: bool) {
     )
     .await;
     let requests = mock.requests.lock().unwrap();
-    let last = requests.last().unwrap().to_string();
-    assert!(last.contains("MEMORY.md"));
+    let last = requests.last().unwrap();
+    assert_eq!(first_user_text(last), first_user_text(&requests[0]));
+    assert!(!first_user_text(last).contains("manual-index-edit-on-resume"));
+    let latest = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .unwrap();
+    let text = latest["content"].to_string();
+    assert!(
+        text.contains("MEMORY.md changed") && text.contains("manual-index-edit-on-resume"),
+        "{text}"
+    );
+    assert!(text.contains("Relevant project memory files:"));
+    drop(requests);
     assert_eq!(legacy.stats().await.unwrap().total_memories, 1);
 }
 #[tokio::test]
