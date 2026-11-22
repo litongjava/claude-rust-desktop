@@ -137,6 +137,23 @@ impl SessionRead<'_> {
         read_metadata(self.0, "request_metadata", "request_id", id)
     }
 }
+impl SessionDb {
+    pub fn approve_plan(&self, content: &str) -> Result<String> {
+        let _locks = self.hold_incarnation()?;
+        let memory = crate::services::memory_files::prompt::Admission::session(self)?;
+        self.write_locked("approve plan", |w| {
+            let message = w.plan_marker(content, &memory)?;
+            permission_authority::record_conn(
+                w.0,
+                w.1,
+                permission_authority::Source::ApprovedPlan,
+                &Value::String(content.into()),
+            )?;
+            Ok(message)
+        })
+    }
+}
+
 impl SessionWrite<'_> {
     pub fn set_goal(&self, condition: &str) -> Result<session_goals::Goal> {
         session_goals::set_conn(self.0, self.1, condition)
@@ -178,21 +195,21 @@ impl SessionWrite<'_> {
         self.2.set(true);
         Ok(())
     }
-    pub fn approve_plan(&self, content:&str) -> Result<String> {
-        let message=self.plan_marker(content)?;
-        permission_authority::record_conn(self.0,self.1,permission_authority::Source::ApprovedPlan,&Value::String(content.into()))?;
-        Ok(message)
-    }
-    pub(super) fn plan_marker(&self, content: &str) -> Result<String> {
-        // The legacy plan setting refers to the latest approval only. A rewind
-        // removing that marker must never reactivate an older approval.
+    pub(super) fn plan_marker(
+        &self,
+        content: &str,
+        memory: &crate::services::memory_files::prompt::Admission,
+    ) -> Result<String> {
         self.0.execute("DELETE FROM approved_plan_boundaries", [])?;
-        let message = self.append("user", content)?;
-        self.set_prompt_origin(&message, "approved_plan")?;
-        self.0.execute(
-            "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
-            [&message],
+        let message = boundary::create(
+            self.0,
+            self.1,
+            self.next_order()?,
+            content,
+            boundary::Kind::ApprovedPlan,
+            boundary::Storage::Shard(memory),
         )?;
+        self.2.set(true);
         self.0.execute(
             "INSERT INTO approved_plan_boundaries VALUES(?1)",
             [&message],

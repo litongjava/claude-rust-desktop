@@ -1349,25 +1349,23 @@ impl QueryEngine {
             (memory, index, turns)
         };
         turn_context.extend(memory_turns);
-        let context_reminders = crate::prompt::first_message_reminders(
-            crate::prompt::SessionReminders {
-                user_instructions,
-                environment: Some(environment),
-                project_instructions,
-                project_memory,
-                standalone_frontend,
-                loadable_tools,
-                available_skills: available_skills_listing,
-                date: Some(frozen_date),
-                git: git_snapshot
-                    .as_deref()
-                    .map(crate::services::git_snapshot::reminder),
-                skills: crate::services::turn_context::invoked_skills_reminder(
-                    &turn_context,
-                    &request.messages,
-                ),
-            },
-        );
+        let context_reminders = crate::prompt::SessionReminders {
+            user_instructions,
+            environment: Some(environment),
+            project_instructions,
+            project_memory,
+            standalone_frontend,
+            loadable_tools,
+            available_skills: available_skills_listing,
+            date: Some(frozen_date),
+            git: git_snapshot
+                .as_deref()
+                .map(crate::services::git_snapshot::reminder),
+            skills: crate::services::turn_context::invoked_skills_reminder(
+                &turn_context,
+                &request.messages,
+            ),
+        };
         let allowed_directories = project
             .as_ref()
             .map(|project| {
@@ -1590,7 +1588,7 @@ impl QueryEngine {
         .with_allowed_tools(agent.as_ref().and_then(|d| d.tools.clone()))
         .with_read_only_shell(agent.as_ref().is_some_and(|d| d.read_only_shell))
         .with_prompt_profile(prompt_profile)
-        .with_context_reminders(context_reminders)
+        .with_session_reminders(context_reminders)
         .with_turn_context(turn_context)
         .with_bundled_resources(self.bundled_resources.clone())
         .with_search_config_path(search_config_path)

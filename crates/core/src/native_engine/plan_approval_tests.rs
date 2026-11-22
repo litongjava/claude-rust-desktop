@@ -251,6 +251,13 @@ async fn approval_choices_preserve_rules_cancel_waiters_and_rollback_failed_boun
 async fn clear_plan_context_skips_stale_tools_and_survives_resume_on_both_protocols() {
     for format in ["openai", "anthropic"] {
         let (temp, context, sessions, mut executor, mut events, manager) = fixture();
+        let memory = crate::services::memory_files::FileMemory::session(
+            &context,
+            executor.conv_id.as_deref().unwrap(),
+        )
+        .unwrap();
+        memory.store(false).unwrap();
+        std::fs::write(memory.directory.join("MEMORY.md"), "PLAN-BOUNDARY-INDEX").unwrap();
         let target = temp.path().join("must-not-exist.txt");
         let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let recorder = requests.clone();
@@ -317,6 +324,14 @@ async fn clear_plan_context_skips_stale_tools_and_survives_resume_on_both_protoc
         assert!(!requests[1]["messages"]
             .to_string()
             .contains("OLD_HISTORY_SENTINEL"));
+        assert_eq!(
+            requests[1]["messages"]
+                .to_string()
+                .matches("PLAN-BOUNDARY-INDEX")
+                .count(),
+            1,
+            "{format}"
+        );
         assert!(requests[1].to_string().contains("APPROVED_PLAN"));
         assert!(requests[1].to_string().contains("CURRENT_SYSTEM"));
         let restored = sessions

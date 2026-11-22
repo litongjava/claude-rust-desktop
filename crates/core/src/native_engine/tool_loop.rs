@@ -332,6 +332,8 @@ pub struct ToolLoopExecutor {
     /// `<system-reminder>` blocks placed before the first user message's text
     /// in every request; never saved to the transcript.
     context_reminders: Vec<String>,
+    memory_prefix_position: usize,
+    standalone_frontend: bool,
     /// Hook context and skill content recorded for earlier user messages.
     turn_context: Vec<crate::services::turn_context::Entry>,
     reasoning_mode: ReasoningMode,
@@ -369,7 +371,7 @@ pub struct ToolLoopExecutor {
     pub(super) execution_lease:
         Option<std::sync::Arc<crate::services::session_messages::ExecutionLease>>,
     message_deliveries: usize,
-    pending_plan_reset: Option<(String, String)>,
+    pending_plan_reset: Option<(String, crate::db::session_store::SessionDb)>,
     allowed_directories: Vec<std::path::PathBuf>,
     /// Built-in tools the model loaded with ToolLoad in this session, in load
     /// order.
@@ -1644,6 +1646,8 @@ impl ToolLoopExecutor {
             file_memory: None,
             prompt_profile: PromptProfile::Desktop,
             context_reminders: Vec::new(),
+            memory_prefix_position: 0,
+            standalone_frontend: false,
             turn_context: Vec::new(),
             reasoning_mode,
             prefetch_engine: None,
@@ -3000,6 +3004,24 @@ impl ToolLoopExecutor {
         self
     }
 
+    pub(crate) fn with_session_reminders(mut self, parts: crate::prompt::SessionReminders) -> Self {
+        self.set_session_reminders(parts);
+        self
+    }
+
+    fn set_session_reminders(&mut self, parts: crate::prompt::SessionReminders) {
+        self.memory_prefix_position = [
+            &parts.user_instructions,
+            &parts.environment,
+            &parts.project_instructions,
+        ]
+        .into_iter()
+        .filter(|part| part.is_some())
+        .count();
+        self.standalone_frontend = parts.standalone_frontend;
+        self.context_reminders = crate::prompt::first_message_reminders(parts);
+    }
+
     pub fn with_context_reminders(mut self, reminders: Vec<String>) -> Self {
         self.context_reminders = reminders;
         self
@@ -3558,6 +3580,27 @@ impl ToolLoopExecutor {
             && self.conv_id.is_some()
     }
 
+    fn restore_plan_boundary(&mut self) -> Result<Option<String>> {
+        let Some((id, shard)) = self.pending_plan_reset.take() else {
+            return Ok(None);
+        };
+        let (message, prefix) = shard.plan_boundary_context(&id)?;
+        self.context_reminders
+            .retain(|block| !block.starts_with("<system-reminder>\n<project_memory>\n"));
+        if let Some(prefix) = prefix {
+            self.context_reminders.insert(
+                self.memory_prefix_position
+                    .min(self.context_reminders.len()),
+                prefix,
+            );
+        }
+        self.messages = vec![message];
+        self.context_boundary_id = Some(id.clone());
+        self.applied_compaction = true;
+        self.stop_hook_active = false;
+        Ok(Some(id))
+    }
+
     async fn publish_context_reset(&mut self, boundary_id: String) -> Result<()> {
         let sender = self.event_tx.clone();
         let event = sender.reserve().await.map_err(|_| anyhow!("Planning event receiver closed"))?;
@@ -3902,13 +3945,7 @@ impl ToolLoopExecutor {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
         self.approved_call = None;
-        if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
-            self.messages = vec![json!({"role":"user","content":content})];
-            // The reset transcript was built from this boundary, so later
-            // requests must report it rather than any newer stored boundary.
-            self.context_boundary_id = Some(boundary_id.clone());
-            self.applied_compaction = true;
-            self.stop_hook_active = false;
+        if let Some(boundary_id) = self.restore_plan_boundary()? {
             self.publish_context_reset(boundary_id).await?;
         }
         // The OS lock is scoped to this future: cancellation/crash releases it.
@@ -5964,18 +6001,10 @@ impl ToolLoopExecutor {
                     content: AnthropicContent::Blocks(tool_results),
                 });
                 after_tool_results = true;
-                if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
+                if let Some(boundary_id) = self.restore_plan_boundary()? {
                     after_tool_results = false;
-                    self.messages = vec![json!({"role":"user","content":content})];
-                    self.context_boundary_id = Some(boundary_id.clone());
-                    self.applied_compaction = true;
-                    conversation_messages = vec![AnthropicMessage {
-                        role: "user".into(),
-                        content: AnthropicContent::Text(content),
-                    }];
+                    conversation_messages = self.build_anthropic_messages()?;
                     full_text.clear();
-                    self.messages.clear();
-                    self.stop_hook_active = false;
                     self.publish_context_reset(boundary_id).await?;
                 }
             } else {
@@ -6926,22 +6955,10 @@ impl ToolLoopExecutor {
                     });
                 }
                 after_tool_results = true;
-                if let Some((boundary_id, content)) = self.pending_plan_reset.take() {
+                if let Some(boundary_id) = self.restore_plan_boundary()? {
                     after_tool_results = false;
-                    self.messages = vec![json!({"role":"user","content":content})];
-                    self.context_boundary_id = Some(boundary_id.clone());
-                    self.applied_compaction = true;
-                    conversation_messages = vec![OpenAIMessage {
-                        role: "user".into(),
-                        content: OpenAIContent::Text(content),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                        provider_content: None,
-                    }];
+                    conversation_messages = self.build_openai_messages()?;
                     full_text.clear();
-                    self.messages.clear();
-                    self.stop_hook_active = false;
                     self.publish_context_reset(boundary_id).await?;
                 }
             } else {

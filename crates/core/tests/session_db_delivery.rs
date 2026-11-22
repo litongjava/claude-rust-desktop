@@ -525,6 +525,22 @@ fn import_preview_replay_dedup_and_atomic_visibility() -> Result<()> {
     Ok(())
 }
 
+fn commit_native_fixture(session: &SessionDb, native: Value) -> Result<String> {
+    session.write(|w| {
+        w.append("user", "request")?;
+        w.append("assistant", "answer")?;
+        w.request_compaction("retain", 50, 100)
+    })?;
+    let owner = session.delivery_owner()?;
+    owner.finish_compaction(
+        &owner.claim_compaction()?.unwrap(),
+        &deepseek_code_core::services::compaction::GeneratedSummary {
+            text: "summary".into(),
+            native: Some(native),
+        },
+    )
+}
+
 #[test]
 fn fork_pins_one_snapshot_and_resets_local_compaction_count() -> Result<()> {
     use deepseek_code_core::native_engine::provider_manager::ApiFormat;
@@ -532,11 +548,7 @@ fn fork_pins_one_snapshot_and_resets_local_compaction_count() -> Result<()> {
     let root = tempdir()?;
     let stores = Stores::open(root.path())?;
     let a = stores.create(A, Default::default())?;
-    let boundary = a.write(|w| {
-        let id = w.append("assistant", "summary")?;
-        w.native_boundary(&id, &json!({"compaction":true,"model":"original"}))?;
-        Ok(id)
-    })?;
+    let boundary = commit_native_fixture(&a, json!({"compaction":true,"model":"original"}))?;
     let (pinned, observed) = mpsc::sync_channel(1);
     let (release, wait) = mpsc::sync_channel(1);
     let wait = Mutex::new(wait);
@@ -553,11 +565,11 @@ fn fork_pins_one_snapshot_and_resets_local_compaction_count() -> Result<()> {
     release.send(())?;
     let fork = copy.join().unwrap()?;
     late?;
-    assert_eq!(a.read(|r| r.messages())?.len(), 2);
+    assert_eq!(a.read(|r| r.messages())?.len(), 4);
     assert_eq!(a.read(|r| r.compaction_count())?, 1);
     fork.read(|r| {
         assert_eq!(r.compaction_count()?, 0);
-        assert_eq!(r.messages()?.len(), 1);
+        assert_eq!(r.messages()?.len(), 3);
         let (history, id) = r.model_history(&ApiFormat::OpenAI)?;
         assert_ne!(id.as_ref(), Some(&boundary));
         assert_eq!(history.len(), 1);
@@ -1078,16 +1090,15 @@ fn review_partial_fork_excludes_later_parent_and_sidecars() -> Result<()> {
 fn review_fork_rewrites_retry_and_compaction_references() -> Result<()> {
     let root = tempdir()?;
     let a = Stores::open(root.path())?.create(A, Default::default())?;
+    let boundary = commit_native_fixture(&a, json!({}))?;
     a.write(|w|{
-        let boundary=w.append("assistant","summary")?;
-        w.native_boundary(&boundary,&json!({}))?;
         let m=w.append("assistant","response")?;
         w.snapshots(&m,&json!([{"id":"retry","replacesRequestId":"original","contextBoundary":boundary},{"id":"original"}]))
     })?;
     a.branch(B, Branch::Full)?.read(|r| {
         let rows = r.messages()?;
-        let requests = r.requests(&rows[1].id)?;
-        assert_eq!(requests[0]["contextBoundary"], rows[0].id);
+        let requests = r.requests(&rows[3].id)?;
+        assert_eq!(requests[0]["contextBoundary"], rows[2].id);
         assert_eq!(requests[0]["replacesRequestId"], requests[1]["id"]);
         assert_ne!(requests[1]["id"], "original");
         Ok(())

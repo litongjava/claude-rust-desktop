@@ -82,6 +82,43 @@ fn index_key(boundary: Option<&str>) -> Setting<IndexState> {
     })
 }
 
+pub(crate) fn frozen_index(tx: &rusqlite::Connection, id: Option<&str>) -> Result<Option<String>> {
+    Ok(index_key(id).read(tx)?.and_then(|state| state.first))
+}
+
+pub(crate) fn freeze_empty_boundary(tx: &rusqlite::Connection, id: &str) -> Result<()> {
+    index_key(Some(id)).write(tx, &IndexState::default())
+}
+
+/// A partial summary inserts a new boundary before these already-admitted messages.
+/// Keep their file excerpts, but the boundary supersedes their index announcements.
+pub(crate) fn supersede_copied_indexes(tx: &rusqlite::Connection, order: i64) -> Result<()> {
+    let mut q = tx.prepare("WITH retained AS (
+        SELECT id FROM messages WHERE sort_order > ?1 AND sort_order < coalesce(
+            (SELECT min(sort_order) FROM messages WHERE is_compact_boundary AND sort_order > ?1), 9223372036854775807)
+    ), ids(id) AS (
+        SELECT id FROM retained UNION ALL
+        SELECT json_extract(j.value,'$.message_id') FROM retained r
+        JOIN tool_calls t ON t.message_id=r.id JOIN tool_queued_inputs q ON q.tool_call_id=t.id
+        JOIN json_each(q.inputs_json) j
+    ) SELECT id FROM ids JOIN peripheral_settings p ON p.key='memory.prompt.message.'||ids.id")?;
+    let ids = q
+        .query_map([order], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in ids {
+        let key = receipt(&id);
+        if let Some(mut saved) = key.read(tx)? {
+            saved
+                .blocks
+                .retain(|block| !block.starts_with("<system-reminder>\nMEMORY.md changed."));
+            saved.announced = Some(false);
+            saved.index_hash = None;
+            key.write(tx, &saved)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn copy_prefix(src: &rusqlite::Connection, dst: &rusqlite::Connection) -> Result<()> {
     if let Some(prefix) = INDEX.read(src)? {
         INDEX.write(dst, &prefix)?;

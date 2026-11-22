@@ -468,7 +468,7 @@ impl ToolLoopExecutor {
                 expected_mode,
                 mode,
             )?;
-            self.pending_plan_reset = Some((boundary, message));
+            self.pending_plan_reset = Some((boundary, context.db.open_session(&session)?));
         }
         if !clear {
             plan_approval::commit_approved_mode(

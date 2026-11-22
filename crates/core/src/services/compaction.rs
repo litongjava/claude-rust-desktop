@@ -427,22 +427,19 @@ pub(crate) fn commit_locked(
         [id],
         |r| r.get(0),
     )?;
-    let message_id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let content = format!(
         "[Conversation summary — earlier transcript retained in session history]\n{}",
         summary.trim()
     );
-    message_repo::insert_message(
+    use crate::db::session_store::boundary;
+    let message_id = boundary::create(
         tx,
-        &message_id,
         id,
-        "user",
-        &content,
-        None,
-        &now,
-        true,
         order,
+        &content,
+        boundary::Kind::Compaction,
+        boundary::Storage::Shared,
     )?;
     conversation_repo::increment_message_count(tx, id)?;
     if let Some(native) = &generated.native {

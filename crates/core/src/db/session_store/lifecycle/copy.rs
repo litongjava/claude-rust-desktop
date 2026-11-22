@@ -652,24 +652,34 @@ pub(super) fn copy_snapshot(
         } else {
             "Summary of the later conversation — full transcript retained in session history"
         };
-        let message = crate::db::transcript::MessageIds::for_shard(dst)?.issue();
-        message_repo::insert_message(
-            dst,
-            &message,
-            id,
-            "user",
-            &format!("[{heading}]\n{text}"),
-            None,
-            &chrono::Utc::now().to_rfc3339(),
-            boundary,
-            order,
-        )?;
-        dst.execute(
-            "INSERT INTO message_metadata VALUES(?1,?2)",
-            [&message, r#"{"promptOrigin":"compaction"}"#],
-        )?;
+        let content = format!("[{heading}]\n{text}");
         if boundary {
-            memory.freeze(dst, Some(&message))?;
+            use super::super::boundary;
+            boundary::create(
+                dst,
+                id,
+                order,
+                &content,
+                boundary::Kind::Compaction,
+                boundary::Storage::Shard(memory),
+            )?;
+        } else {
+            let message = crate::db::transcript::MessageIds::for_shard(dst)?.issue();
+            message_repo::insert_message(
+                dst,
+                &message,
+                id,
+                "user",
+                &content,
+                None,
+                &chrono::Utc::now().to_rfc3339(),
+                false,
+                order,
+            )?;
+            dst.execute(
+                "INSERT INTO message_metadata VALUES(?1,?2)",
+                [&message, r#"{"promptOrigin":"summary"}"#],
+            )?;
         }
     }
     super::super::history::advance(dst)

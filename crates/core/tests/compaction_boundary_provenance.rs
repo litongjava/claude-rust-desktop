@@ -368,3 +368,51 @@ async fn restored_and_reset_histories_bind_the_requests_they_send() {
         assert!(body.contains("RESET_CONTEXT") && !body.contains("RESTORED_SUMMARY"));
     }
 }
+
+/// Guard the production writers. History migration, import and fork copy existing
+/// row flags; creating a fresh boundary must go through the transactional writer.
+#[test]
+fn new_memory_boundaries_have_one_writer() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let patterns = [
+        r"(?i)\bset\s+is_compact_boundary\s*=\s*(?:1|true)",
+        r#"(?s)\binsert_message\([^;]{0,1000}?,\s*(?:true|boundary|is_boundary)\s*,"#,
+        r#"set_prompt_origin\([^;]*?,\s*"(?:approved_plan|compaction)""#,
+        r#"promptOrigin"\s*:\s*"(?:approved_plan|compaction)""#,
+    ]
+    .map(|pattern| regex::Regex::new(pattern).unwrap());
+    let test_modules = regex::Regex::new(r"(?ms)^#\[cfg\(test\)\]\s*mod \w+\s*\{.*?^\}").unwrap();
+    let mut violations = Vec::new();
+    for tree in ["crates/core/src", "crates/cli/src", "src-tauri/src"] {
+        for entry in walkdir::WalkDir::new(root.join(tree)) {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let name = path.file_name().unwrap().to_string_lossy();
+            if path.extension().is_none_or(|ext| ext != "rs") || name.ends_with("tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(path).unwrap();
+            let production_source = test_modules.replace_all(&source, "");
+            let mut production = production_source.as_ref();
+            let mut outside_writer = String::new();
+            if path.ends_with("db/session_store/boundary.rs") {
+                let (before, writer) = production.split_once("pub(crate) fn create(").unwrap();
+                let (_, after) = writer.split_once("\n}").unwrap();
+                outside_writer.push_str(before);
+                outside_writer.push_str(after);
+                production = &outside_writer;
+            }
+            for pattern in &patterns {
+                for hit in pattern.find_iter(production) {
+                    violations.push(format!(
+                        "{} at byte {}: {}",
+                        path.strip_prefix(&root).unwrap().display(),
+                        hit.start(),
+                        hit.as_str()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(violations.is_empty(), "{}", violations.join("\n"));
+}

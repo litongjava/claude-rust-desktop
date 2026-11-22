@@ -183,12 +183,14 @@ impl DeliveryOwner {
     ) -> Result<String> {
         layout::allow_entry()?;
         let s = &self.session;
+        let _guard = s.hold_incarnation()?;
         s.require_active_compaction()?;
         ensure!(s.incarnation == claim.incarnation, "Wrong compaction owner");
         ensure!(
             !summary.text.trim().is_empty() && summary.text.chars().count() <= 32_000,
             "Empty or oversized compaction summary"
         );
+        let memory = crate::services::memory_files::prompt::Admission::session(s)?;
         s.write_locked("commit session compaction", |w| {
             ensure!(
                 w.0.execute("DELETE FROM compaction_request WHERE id=?1", [&claim.id])? == 1,
@@ -198,7 +200,7 @@ impl DeliveryOwner {
                 compaction::fingerprint(w.0, w.1)?.0 == claim.fingerprint,
                 "Session changed during compaction"
             );
-            w.commit_summary(summary)
+            w.commit_summary(summary, &memory)
         })
     }
 }
@@ -285,9 +287,7 @@ impl SessionRepository<'_> {
                     if let Some(request)=&prepared.pending_request {
                         ensure!(w.0.execute("DELETE FROM compaction_request WHERE id=?1",[request])?==1,"Compaction request changed");
                     }
-                    let message_id = w.commit_summary(generated)?;
-                    w.set_prompt_origin(&message_id, "compaction")?;
-                    memory.freeze(w.0, Some(&message_id))?;
+                    let message_id = w.commit_summary(generated, &memory)?;
                     if let Some(context) = context {
                         state::set_local(
                             w.0,
@@ -310,22 +310,32 @@ impl SessionRepository<'_> {
 }
 
 impl SessionWrite<'_> {
-    fn commit_summary(&self, summary: &compaction::GeneratedSummary) -> Result<String> {
+    fn commit_summary(
+        &self,
+        summary: &compaction::GeneratedSummary,
+        memory: &crate::services::memory_files::prompt::Admission,
+    ) -> Result<String> {
         let content = format!(
             "[Conversation summary — earlier transcript retained in session history]\n{}",
             summary.text.trim()
         );
-        let message = self.append("user", &content)?;
+        let message = boundary::create(
+            self.0,
+            self.1,
+            self.next_order()?,
+            &content,
+            boundary::Kind::Compaction,
+            boundary::Storage::Shard(memory),
+        )?;
+        self.2.set(true);
         if let Some(native) = &summary.native {
-            self.native_boundary(&message, native)?;
-        } else {
             self.0.execute(
-                "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
-                [&message],
+                "INSERT INTO native_boundaries VALUES(?1,?2)",
+                params![message, serde_json::to_string(native)?],
             )?;
-            self.0
-                .execute("UPDATE compaction_state SET local_count=local_count+1", [])?;
         }
+        self.0
+            .execute("UPDATE compaction_state SET local_count=local_count+1", [])?;
         self.0.execute("DELETE FROM compaction_checkpoint", [])?;
         Ok(message)
     }

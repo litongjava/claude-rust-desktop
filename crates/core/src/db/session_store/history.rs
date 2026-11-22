@@ -898,20 +898,6 @@ impl SessionRead<'_> {
         )
     }
 }
-impl SessionWrite<'_> {
-    pub fn native_boundary(&self, message: &str, value: &Value) -> Result<()> {
-        self.0.execute("UPDATE compaction_state SET local_count=local_count+1 WHERE singleton=1 AND NOT EXISTS(SELECT 1 FROM native_boundaries WHERE message_id=?1)", [message])?;
-        self.0
-            .execute("INSERT INTO native_boundaries VALUES(?1,?2) ON CONFLICT(message_id) DO UPDATE SET value=excluded.value", params![message, serde_json::to_string(value)?])?;
-        self.0.execute(
-            "UPDATE messages SET is_compact_boundary=1 WHERE id=?1",
-            [message],
-        )?;
-        self.2.set(true);
-        Ok(())
-    }
-}
-
 /// Timings and token counts reported by a single model request.
 pub struct RequestMetrics {
     pub output_tokens: Option<i64>,
@@ -989,8 +975,8 @@ mod memory_index_order_tests {
         let temp = tempfile::tempdir()?;
         let stores = crate::db::session_store::Stores::open(temp.path())?;
         let session = stores.create("memory-index-order", Default::default())?;
+        let boundary = session.approve_plan("boundary")?;
         session.write(|w| {
-            let boundary = w.plan_marker("boundary")?;
             for (hash, blocks) in [
                 ("first", vec!["<system-reminder>\nMEMORY.md changed. A"]),
                 ("second", vec!["<system-reminder>\nMEMORY.md changed. B"]),
@@ -1005,7 +991,7 @@ mod memory_index_order_tests {
             w.0.execute("UPDATE messages SET sort_order=0", [])?;
             assert_eq!(
                 visible_memory_index(w.0, "next")?,
-                (Some(boundary), Some("second".into()))
+                (Some(boundary.clone()), Some("second".into()))
             );
             Ok(())
         })

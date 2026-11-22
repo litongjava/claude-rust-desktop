@@ -904,6 +904,76 @@ mod tests {
     }
 
     #[test]
+    fn memory_claimed_boundary_freezes_its_own_index_and_origin() {
+        let (_root, memory) = fixture();
+        let shard = memory.session.as_ref().unwrap();
+        memory.store(false).unwrap();
+        let index = memory.directory.join("MEMORY.md");
+        std::fs::write(&index, "CLAIMED-INDEX").unwrap();
+        shard
+            .write(|w| {
+                w.append("user", "question")?;
+                w.append("assistant", "answer")?;
+                w.request_compaction("retain", 50, 100)
+            })
+            .unwrap();
+        let owner = shard.delivery_owner().unwrap();
+        let claim = owner.claim_compaction().unwrap().unwrap();
+        let id = owner.finish_compaction(&claim, &"finished".into()).unwrap();
+        drop(owner);
+        std::fs::write(index, "later").unwrap();
+        assert_eq!(
+            shard.read(|r| r.message_metadata(&id)).unwrap().unwrap()["promptOrigin"],
+            "compaction"
+        );
+        assert!(replay(shard).0.unwrap().contains("CLAIMED-INDEX"));
+    }
+
+    #[test]
+    fn memory_partial_boundary_keeps_excerpts_and_supersedes_copied_index() {
+        use crate::services::compaction::{commit_part, Part};
+        let (_root, memory) = fixture();
+        let shard = memory.session.as_ref().unwrap();
+        memory.put("note.md", &note("retained fact"), None).unwrap();
+        let index = memory.directory.join("MEMORY.md");
+        std::fs::write(&index, "INDEX-A").unwrap();
+        shard.admit_prompt("first", None, "typed").unwrap();
+        std::fs::write(&index, "INDEX-B").unwrap();
+        let kept = shard.admit_prompt("preferences", None, "typed").unwrap();
+        let prepared = shard.prepare_summary_part(&kept, Part::UpTo).unwrap();
+        std::fs::write(&index, "INDEX-C").unwrap();
+        let (branch, _) = commit_part(
+            &memory.context.db,
+            shard.id(),
+            &kept,
+            Part::UpTo,
+            prepared,
+            "summary",
+        )
+        .unwrap();
+        let branch = memory.context.db.open_session(&branch).unwrap();
+        let (prefix, entries) = replay(&branch);
+        assert!(prefix.unwrap().contains("INDEX-C"));
+        assert!(entries[0].blocks.join("").contains("retained fact"));
+        assert!(!entries[0].blocks.join("").contains("INDEX-B"));
+        branch.admit_prompt("preferences", None, "typed").unwrap();
+        assert!(!replay(&branch)
+            .1
+            .last()
+            .unwrap()
+            .blocks
+            .join("")
+            .contains("MEMORY.md changed"));
+        assert!(replay(shard)
+            .1
+            .last()
+            .unwrap()
+            .blocks
+            .join("")
+            .contains("INDEX-B"));
+    }
+
+    #[test]
     fn memory_text_boundary_rebuilds_the_current_scope_prefix() {
         let (root, first) = fixture();
         let workspace = root.path().join("workspace");

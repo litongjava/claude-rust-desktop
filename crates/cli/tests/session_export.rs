@@ -204,7 +204,6 @@ fn reconstruct_history_related_records_and_fork_after_rewind() -> Result<()> {
         w.diff(&serde_json::from_value(json!({"id":"d","conversation_id":"source","message_id":message,
             "file_path":"f","original_content":"old","modified_content":"new","diff_text":"change","status":"pending","created_at":"2026-01-01"}))?)?;
         w.set_goal("finish export")?;
-        w.approve_plan("approved plan")?;
         w.set_message_metadata(&message, &json!({"fixture":true}))?;
         w.set_request_metadata("r1", &json!({"fixture":1}))?;
         w.bind_agent("agent definition")?;
@@ -218,6 +217,7 @@ fn reconstruct_history_related_records_and_fork_after_rewind() -> Result<()> {
         w.rewind_from(&tail)?;
         Ok(message)
     })?;
+    session.approve_plan("approved plan")?;
     session.save_mcp(
         &message,
         "child",

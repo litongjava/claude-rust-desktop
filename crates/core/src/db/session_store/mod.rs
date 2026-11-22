@@ -8,6 +8,7 @@ pub use plugins::{PluginCatalog,PluginInstall};
 pub use agents::AgentCatalog;
 mod admission;
 mod binding;
+pub(crate) mod boundary;
 mod compaction;
 mod directory;
 pub mod diagnostics;

@@ -19,12 +19,9 @@ fn search_indexes_rollback_with_content_and_cursors_bind_to_the_incarnation() ->
     let a = stores.create(A, Default::default())?;
     let b = stores.create("b", Default::default())?;
     let big = format!("{}needle old", "x".repeat(130_000));
-    let (before, boundary, after) = a.write(|w| {
-        let first = w.append("user", &big)?;
-        let boundary = w.approve_plan("needle hidden boundary")?;
-        let after = w.append("assistant", "needle new")?;
-        Ok((first, boundary, after))
-    })?;
+    let before = a.write(|w| w.append("user", &big))?;
+    let boundary = a.approve_plan("needle hidden boundary")?;
+    let after = a.write(|w| w.append("assistant", "needle new"))?;
     let search = |s: &SessionDb, q: Value| -> Result<Value> {
         Ok(serde_json::from_str(&s.context_search(q)?)?)
     };
@@ -296,9 +293,9 @@ fn typed_state_and_file_read_evidence_survive_resume_with_session_isolation() ->
         a.write(|w| {
             w.set_goal("finish work")?;
             w.save_goal_proposals(&ProposalState::default(), &proposals)?;
-            w.set_agent_mode(PermissionMode::PlanMode)?;
-            w.approve_plan("approved work")
+            w.set_agent_mode(PermissionMode::PlanMode)
         })?;
+        a.approve_plan("approved work")?;
         let b = s.create("other", Default::default())?;
         assert!(b.check_file_write(&file).is_err());
         assert!(b.read(|r| r.goal())?.is_none());
@@ -318,7 +315,7 @@ fn typed_state_and_file_read_evidence_survive_resume_with_session_isolation() ->
     );
     assert_eq!(a.read(|r| r.agent_mode())?, Some(PermissionMode::PlanMode));
     assert!(a.read(|r| r.approved_plan_boundary())?.is_some());
-    let boundary = a.write(|w| w.approve_plan("revised approval"))?;
+    let boundary = a.approve_plan("revised approval")?;
     assert!(a
         .write(|w| w.save_goal_proposals(&ProposalState::default(), &ProposalState::default()))
         .is_err());
@@ -544,8 +541,8 @@ fn large_private_sidecar(stores: &Stores) -> Result<SessionDb> {
             ..Default::default()
         },
     )?;
+    a.approve_plan("boundary")?;
     a.write(|w| {
-        w.approve_plan("boundary")?;
         w.append("assistant", "public needle")
     })?;
     Ok(a)
