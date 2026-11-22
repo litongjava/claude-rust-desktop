@@ -554,6 +554,90 @@ mod tests {
     }
 
     #[test]
+    fn base64_model_boundary_stored_page_compaction_and_search() {
+        let f = Fixture::new();
+        f.append("user", "retrieve an old page");
+        let message = f.append("assistant", "");
+        let payload = "QUJD".repeat(256);
+        let page =
+            json!({"output_mode":"page","stdout":format!("page-marker!{payload}!")}).to_string();
+        f.tool(&message, "old-page", "TaskGet", &page);
+        let compact = || compaction::prepare(&f.db, &f.session).unwrap().transcript;
+        let transcript = compact();
+        assert_eq!(transcript, compact());
+        let entries: Vec<Value> = serde_json::from_str(&transcript).unwrap();
+        let view = entries.last().unwrap()["tools"][0]["output"]
+            .as_str()
+            .unwrap();
+        assert!(!view.contains(&payload));
+        let reference = view
+            .split_once("; full text: ")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0;
+        let (file, line) = reference.rsplit_once(", line ").unwrap();
+        assert_eq!(line, "1");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), page);
+        let part =
+            compaction::prepare_part(&f.db, &f.session, &message, compaction::Part::From).unwrap();
+        let entries: Vec<Value> = serde_json::from_str(&part.transcript).unwrap();
+        assert_eq!(entries[0]["tools"][0]["output"], view);
+        let result = f.search(json!({"query":"page-marker","tool_name":"TaskGet"}));
+        assert!(result["matches"][0]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains(reference));
+        assert!(
+            f.search(json!({"query":"QUJD","tool_name":"TaskGet"}))["matches"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let notice = crate::tools::monitor::Event {
+            task_id: "old-monitor".into(),
+            description: "legacy".into(),
+            kind: "output".into(),
+            text: format!("notification-marker!{payload}!"),
+        }
+        .notification();
+        f.append("user", &notice);
+        let entries: Vec<Value> = serde_json::from_str(&compact()).unwrap();
+        let projected = entries.last().unwrap()["message"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(!projected.contains(&payload));
+        let reference = projected
+            .split_once("; full text: ")
+            .unwrap()
+            .1
+            .split_once(']')
+            .unwrap()
+            .0;
+        let (file, line) = reference.rsplit_once(", line ").unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), notice);
+        assert!(notice
+            .lines()
+            .nth(line.parse::<usize>().unwrap() - 1)
+            .unwrap()
+            .contains(&payload));
+        let hit = f.search(json!({"query":"<event>notification-marker","role":"user"}));
+        assert!(hit["matches"][0]["excerpt"]
+            .as_str()
+            .unwrap()
+            .contains(reference));
+        let large = format!(
+            "large-task-begin!{}!large-task-end",
+            ".".repeat(8 * 1024 * 1024)
+        );
+        f.tool(&message, "ordinary", "TaskGet", &large);
+        let hit = f.search(json!({"query":"large-task-begin","tool_name":"TaskGet"}));
+        assert_eq!(hit["skipped_structured_sources"], 0);
+        assert_eq!(hit["matches"][0]["tool_call_id"], "ordinary");
+    }
+
+    #[test]
     fn context_search_compaction_ranges_roles_and_location() {
         let f = Fixture::new();
         let old = f.append("user", "exact path /old/needle.txt");

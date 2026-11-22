@@ -844,6 +844,10 @@ fn shell_matches(requested: &str, shell_path: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "model_projection_tests.rs"]
+mod projection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::*;
     use super::*;
@@ -1380,7 +1384,7 @@ mod tests {
         assert_eq!(render("ToolLoad", "plain text", None), "plain text");
     }
 
-    fn executor(root: &std::path::Path) -> ToolLoopExecutor {
+    pub(super) fn executor(root: &std::path::Path) -> ToolLoopExecutor {
         crate::config::OrchestrationConfig::init_global().unwrap();
         let provider = ResolvedProvider {
             provider: serde_json::from_value(json!({"id":"fixture","name":"fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","models":[],"enabled":true})).unwrap(),
