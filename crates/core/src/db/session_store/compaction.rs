@@ -153,20 +153,20 @@ impl SessionRead<'_> {
 
 /// The physical transcript cut and its optimistic write fence are selected in
 /// the same snapshot. A tool-delivered input belongs to the whole assistant row.
-pub(crate) struct NativeWindow {
+pub(crate) struct CompactionWindow {
     pub prefix_len: usize,
     before: Option<String>,
-    fingerprint: String,
+    pub(crate) fingerprint: String,
 }
 
 impl SessionRead<'_> {
-    pub(crate) fn native_window(
+    pub(crate) fn compaction_window(
         &self,
         messages: &[serde_json::Value],
         protected: Option<usize>,
         segment: Option<&str>,
-    ) -> Result<NativeWindow> {
-        use crate::native_engine::provider_manager::ApiFormat;
+        format: &crate::native_engine::provider_manager::ApiFormat,
+    ) -> Result<CompactionWindow> {
         let protected_row: Option<String> = if let Some(at) = protected {
             let input = messages[at]["id"]
                 .as_str()
@@ -189,11 +189,11 @@ impl SessionRead<'_> {
                  (NOT EXISTS(SELECT 1 FROM cut) OR (sort_order,rowid)>(SELECT sort_order,seq FROM cut))
              ORDER BY sort_order,rowid LIMIT 1", params![protected_row, segment], |r| r.get(0),
         ).optional()?;
-        let (prefix, boundary) =
-            self.model_history_before(&ApiFormat::OpenAI, before.as_deref())?;
+        let (prefix, boundary) = self.model_history_before(format, before.as_deref())?;
         let prefix_len = if boundary.is_some()
             && prefix.len() == 1
-            && prefix[0]["provider_content"]["compaction"] == true
+            && (prefix[0]["provider_content"]["compaction"] == true
+                || prefix[0]["origin"] == "compaction")
         {
             0 // Only the previously sealed opaque window precedes the protected exchange.
         } else {
@@ -202,7 +202,7 @@ impl SessionRead<'_> {
         let id: String = self
             .0
             .query_row("SELECT id FROM manifest", [], |r| r.get(0))?;
-        Ok(NativeWindow {
+        Ok(CompactionWindow {
             before,
             prefix_len,
             fingerprint: compaction::fingerprint(self.0, &id)?.0,
@@ -211,17 +211,17 @@ impl SessionRead<'_> {
 }
 
 impl SessionDb {
-    pub(crate) fn commit_native_window(
+    pub(crate) fn commit_compaction_window(
         &self,
-        cut: &NativeWindow,
+        cut: &CompactionWindow,
         summary: &compaction::GeneratedSummary,
     ) -> Result<String> {
         let _guard = self.hold_incarnation()?;
         let memory = crate::services::memory_files::prompt::Admission::session(self)?;
-        self.write_locked("seal native Responses window", |w| {
+        self.write_locked("seal compressed window", |w| {
             ensure!(
                 compaction::fingerprint(w.0, w.1)?.0 == cut.fingerprint,
-                "Session changed during native compaction"
+                "Session changed during compaction"
             );
             w.commit_summary(summary, &memory, cut.before.as_deref())
         })

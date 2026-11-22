@@ -17,6 +17,7 @@ pub use scope::MemoryScope;
 pub use store::{Diagnostic, Entry, ExpectedVersion, FileMemoryStore, Snapshot, StoreOptions};
 
 use sha2::{Digest, Sha256};
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MemoryFileError {
@@ -93,4 +94,41 @@ pub fn content_hash(bytes: &[u8]) -> String {
 
 pub fn normalized_name(name: &str) -> String {
     format::name_key(name)
+}
+
+/// Read only the resident index. A manually maintained scope needs no catalog.
+pub(crate) fn resident_index(root: &Path, directory: &Path) -> Result<Option<(Vec<u8>, String)>> {
+    if !directory.join("MEMORY.md").try_exists()? {
+        return Ok(None);
+    }
+    scoped_directory(root, directory, true)?.index_prefix(IndexLimits::default().bytes + 1)
+}
+
+pub(crate) fn copy_session_memory(root: &Path, source: &Path, dest: &Path) -> Result<()> {
+    let source = match scoped_directory(root, source, true) {
+        Err(MemoryFileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    };
+    source.copy_contents(&scoped_directory(root, dest, false)?)
+}
+
+fn scoped_directory(
+    root: &Path,
+    directory: &Path,
+    read_only: bool,
+) -> Result<std::sync::Arc<safe_dir::SafeDir>> {
+    let mut dir = safe_dir::SafeDir::root(root)?;
+    for component in directory
+        .strip_prefix(root)
+        .map_err(|_| invalid("index outside scope"))?
+        .iter()
+    {
+        dir = dir.child_mode(
+            component
+                .to_str()
+                .ok_or_else(|| invalid("invalid memory directory"))?,
+            read_only,
+        )?;
+    }
+    Ok(dir)
 }

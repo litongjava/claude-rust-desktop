@@ -580,7 +580,7 @@ impl QueryEngine {
             shard.read(|r| r.model_history_before(&provider.provider.api_format, before))?;
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
-            shard.read(|r| r.attach_summary_recall(&mut history))?;
+            history.retain(|row| row["origin"] != "memory_change");
             let mut options = options;
             options.compaction_metrics = Some(super::compaction_metrics::MetricsStore(shard));
             return crate::services::compaction::native::generate(
@@ -710,7 +710,7 @@ impl QueryEngine {
         };
         turn.executor.restore_request_context().await?;
         let mut durable = turn.executor.prepare_main_history()?;
-        shard.read(|r| r.attach_summary_recall(&mut durable))?;
+        durable.retain(|row| row["origin"] != "memory_change");
         // The saved Responses prefix is already carried in the typed window.
         if window.is_some() {
             durable.remove(0);
@@ -1469,7 +1469,7 @@ impl QueryEngine {
             crate::project_instructions::reminder_parts(&instructions);
         let memory_session = selected.clone();
         let memory_context = plugin_context.clone();
-        let (file_memory, project_memory, turn_context) = {
+        let (file_memory, resident_indexes, turn_context) = {
             use crate::services::memory_files::{self, FileMemory};
             let memory = memory_files::config(&memory_context)?
                 .enabled
@@ -1486,7 +1486,7 @@ impl QueryEngine {
             user_instructions,
             environment: Some(environment),
             project_instructions,
-            project_memory,
+            resident_indexes,
             standalone_frontend,
             loadable_tools,
             available_skills: available_skills_listing,

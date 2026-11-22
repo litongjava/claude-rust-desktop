@@ -949,7 +949,7 @@ impl ToolLoopExecutor {
         )?;
         self.prompt_profile = profile;
         self.reload_history(&shard.clone())?;
-        let project_memory = self.session_reminders.project_memory.clone();
+        let resident_indexes = self.session_reminders.resident_indexes.clone();
         let instructions = crate::project_instructions::load_all(Some(root), &workspace)?;
         let (user_instructions, project_instructions) =
             crate::project_instructions::reminder_parts(&instructions);
@@ -995,7 +995,7 @@ impl ToolLoopExecutor {
         self.set_session_reminders(crate::prompt::SessionReminders {
             user_instructions,
             project_instructions,
-            project_memory,
+            resident_indexes,
             environment: Some(environment),
             date: Some(date),
             git: crate::services::git_snapshot::for_session(root, id, &workspace)
@@ -1245,6 +1245,12 @@ impl ToolLoopExecutor {
             agents::bind(&context.db, &id, &definition)?;
         }
         context.set_child_description(&id, input["description"].as_str().unwrap_or(prompt))?;
+        context.db.open_session(&id)?.write(|w| {
+            w.set_setting(
+                crate::db::session_store::settings::MEMORY_AGENT,
+                &definition.id,
+            )
+        })?;
         sessions.append_prompt(&id, prompt, "delegation")?;
         let (events, receiver) = tokio::sync::mpsc::channel(500);
         let mut system = format!(

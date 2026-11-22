@@ -54,8 +54,8 @@ impl ToolLoopExecutor {
     fn reload_with_cut(
         &mut self,
         shard: &crate::db::session_store::SessionDb,
-        native: bool,
-    ) -> Result<Option<crate::db::session_store::NativeWindow>> {
+        capture_cut: bool,
+    ) -> Result<Option<crate::db::session_store::CompactionWindow>> {
         if let Some(segment) = &self.parent_message_id {
             if !self.replay_tools.is_empty() {
                 ExecutorHistory::Session(shard.clone()).save_segment(
@@ -78,9 +78,14 @@ impl ToolLoopExecutor {
                     &messages,
                 )?;
                 let protection = r.protected_inputs(&messages)?;
-                let cut = native
+                let cut = capture_cut
                     .then(|| {
-                        r.native_window(&messages, protection.0, self.parent_message_id.as_deref())
+                        r.compaction_window(
+                            &messages,
+                            protection.0,
+                            self.parent_message_id.as_deref(),
+                            &self.provider.provider.api_format,
+                        )
                     })
                     .transpose()?;
                 Ok((messages, boundary, context, protection, cut))
@@ -95,7 +100,7 @@ impl ToolLoopExecutor {
         }
         self.protected_input = protected;
         self.pending_inputs = pending;
-        self.session_reminders.project_memory = index;
+        self.session_reminders.resident_indexes = index;
         self.session_reminders.skills =
             crate::services::turn_context::invoked_skills_reminder(&entries, &messages);
         self.context_reminders =
@@ -117,7 +122,7 @@ impl ToolLoopExecutor {
     async fn compact_native_window(
         &self,
         shard: &crate::db::session_store::SessionDb,
-        cut: &crate::db::session_store::NativeWindow,
+        cut: &crate::db::session_store::CompactionWindow,
         mut input: Vec<Value>,
     ) -> Result<()> {
         use crate::native_engine::request_recording::CompactionRecord;
@@ -143,7 +148,7 @@ impl ToolLoopExecutor {
             self.conv_id.as_deref(),
         )
         .await?;
-        let boundary = shard.commit_native_window(cut, &compacted)?;
+        let boundary = shard.commit_compaction_window(cut, &compacted)?;
         if let Some(record) = &mut record {
             record.finish(&compacted, &boundary);
         }
@@ -181,13 +186,13 @@ impl ToolLoopExecutor {
         if estimated <= (limit * 70 / 100).min(capacity) && (native || estimated <= threshold) {
             return Ok(());
         }
-        let mut native_cut = None;
+        let mut physical_cut = None;
         let mut persisted_len = window.len();
         if let (Some(durable_len), Some(ExecutorHistory::Session(shard))) =
             (durable_len, self.executor_history.clone())
         {
             let additions = window.split_off(durable_len);
-            native_cut = self.reload_with_cut(&shard, native)?;
+            physical_cut = self.reload_with_cut(&shard, true)?;
             *window = render(self, &self.message_additions())?;
             persisted_len = window.len();
             window.extend(additions);
@@ -213,7 +218,7 @@ impl ToolLoopExecutor {
             let Some(ExecutorHistory::Session(shard)) = self.executor_history.clone() else {
                 anyhow::bail!("Native Responses compression requires durable session history");
             };
-            let cut = native_cut.context("Missing native compaction snapshot")?;
+            let cut = physical_cut.context("Missing native compaction snapshot")?;
             if cut.prefix_len > 0 {
                 // The Responses renderer can insert one standalone index after
                 // an opaque boundary when no later receipt supersedes it.
@@ -245,20 +250,76 @@ impl ToolLoopExecutor {
             return Ok(());
         }
 
+        // A generated text summary is a durable boundary, just like a native
+        // Responses window. Assign the cut to an actual transcript row before
+        // committing so a retained tool call and its results remain together.
+        if let (Some(original), Some(ExecutorHistory::Session(shard))) =
+            (physical_cut, self.executor_history.clone())
+        {
+            let end = self.protected_input.unwrap_or_else(|| {
+                self.messages
+                    .iter()
+                    .rposition(|m| m["role"] == "user")
+                    .unwrap_or(self.messages.len())
+            });
+            if let Some(mut at) = compressor.retained_input(&self.messages, end, &level) {
+                if TokenCounter::estimate(&rows[at..]) > capacity {
+                    at = end;
+                }
+                let cut = shard.read(|r| {
+                    r.compaction_window(
+                        &self.messages,
+                        (at < self.messages.len()).then_some(at),
+                        self.parent_message_id.as_deref(),
+                        &self.provider.provider.api_format,
+                    )
+                })?;
+                anyhow::ensure!(
+                    cut.fingerprint == original.fingerprint,
+                    "Session changed during compaction"
+                );
+                if cut.prefix_len > 0 {
+                    let mut prefix = self.messages[..cut.prefix_len].to_vec();
+                    prefix.retain(|m| m["origin"] != "memory_change");
+                    let text = compressor.window_summary(&prefix, &level).await;
+                    shard.commit_compaction_window(&cut, &text.as_str().into())?;
+                    let tail = window.split_off(persisted_len);
+                    self.reload_history(&shard)?;
+                    *window = render(self, &self.message_additions())?;
+                    window.extend(tail);
+                    let mut rebuilt = values(window)?;
+                    if TokenCounter::estimate(&rebuilt) > capacity {
+                        crate::services::compaction::clear_tool_results(&mut rebuilt);
+                        anyhow::ensure!(TokenCounter::estimate(&rebuilt) <= capacity,"Context overflow: the admitted inputs and required context exceed the model window");
+                        *window = rebuilt
+                            .into_iter()
+                            .map(serde_json::from_value)
+                            .collect::<serde_json::Result<_>>()?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
         // Compress only the history preceding the current typed exchange. Its
         // multimodal blocks, receipts and any following steers travel together.
         let protected = self.protected_input;
         let cut = protected.unwrap_or(rows.len()).min(rows.len());
-        let mut additions = self.message_additions();
-        let (changed, index) = project_memory_context::replay_index(&mut additions, cut);
-        let prefix_index = index.map(|text| json!({"role":"user","content":text}));
-        if changed {
-            let rendered = values(&render(self, &additions)?)?;
-            // Keep any in-flight tool or hook messages appended since render.
-            anyhow::ensure!(rendered.len() <= rows.len(), "Invalid replay window");
-            rows.splice(..rendered.len(), rendered);
-        }
+        let prefix_index = match &self.executor_history {
+            Some(ExecutorHistory::Session(shard)) => shard.read(|r| {
+                crate::services::memory_files::prompt::visible_indexes(
+                    r,
+                    self.context_boundary_id.as_deref(),
+                    &self.messages,
+                )
+            })?,
+            _ => self.session_reminders.resident_indexes.clone(),
+        };
+        let prefix_index = (!prefix_index.is_empty())
+            .then(|| json!({"role":"user","content":prefix_index.join("\n\n")}));
         let mut suffix = rows.split_off(cut);
+        self.remove_compaction_indexes(&mut rows);
+        self.remove_compaction_indexes(&mut suffix);
         if protected.is_some() && TokenCounter::estimate(&suffix) > capacity {
             crate::services::compaction::clear_tool_results(&mut suffix);
             if durable_len.is_none() && TokenCounter::estimate(&suffix) > capacity {

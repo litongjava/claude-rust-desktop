@@ -297,6 +297,7 @@ async fn memory_request_bytes(
     shard: &crate::db::session_store::SessionDb,
     protocol: &str,
 ) -> Vec<u8> {
+    crate::services::memory_files::prompt::Admission::refresh(shard).unwrap();
     let format = if protocol == "anthropic" {
         ApiFormat::Anthropic
     } else {
@@ -312,7 +313,7 @@ async fn memory_request_bytes(
 /// Capture raw HTTP bodies. A separate invocation of the test executable reopens
 /// the same shard and compares the bytes while the edited files remain on disk.
 #[tokio::test]
-async fn memory_admission_request_matrix() {
+async fn memory_resident_request_matrix() {
     use crate::db::session_store::Stores;
     use crate::services::{compaction, input_queue::QueueMode, memory_files::FileMemory};
     const CHILD: &str = "DCL_MEMORY_MATRIX_RESUME";
@@ -453,36 +454,7 @@ async fn memory_admission_request_matrix() {
                 };
                 assert_eq!(count, 1, "{protocol} tool result");
             }
-            for (texts, expect) in [(&typed, true), (&generated, false)] {
-                for text in texts {
-                    let message = messages
-                        .iter()
-                        .find(|m| m["content"].to_string().contains(text))
-                        .unwrap();
-                    // Anthropic may join adjacent user frames. Each typed text
-                    // must be followed by its own receipt before the next text.
-                    let content = message["content"].to_string();
-                    let suffix = content.split_once(text).unwrap().1;
-                    let end = typed
-                        .iter()
-                        .chain(&generated)
-                        .filter_map(|t| suffix.find(t))
-                        .min()
-                        .unwrap_or(suffix.len());
-                    assert_eq!(
-                        suffix[..end].contains("STORED-EXCERPT"),
-                        expect,
-                        "{protocol} {path}: {text}"
-                    );
-                }
-            }
-            assert_eq!(
-                String::from_utf8_lossy(&bytes)
-                    .matches("STORED-EXCERPT")
-                    .count(),
-                typed.len(),
-                "{protocol} {path}"
-            );
+            assert!(!String::from_utf8_lossy(&bytes).contains("STORED-EXCERPT"));
             assert_eq!(
                 bytes,
                 memory_request_bytes(&shard, protocol).await,
@@ -493,27 +465,8 @@ async fn memory_admission_request_matrix() {
             if compact {
                 std::fs::write(&index, "BOUNDARY-INDEX").unwrap();
                 let prepared = compaction::prepare(&shard, ID).unwrap();
-                assert_eq!(
-                    prepared.transcript.matches("STORED-EXCERPT").count(),
-                    typed.len()
-                );
+                assert!(!prepared.transcript.contains("STORED-EXCERPT"));
                 assert!(!prepared.transcript.contains("SESSION-INDEX"));
-                if protocol == "responses" {
-                    let compact_input = shard
-                        .read(|r| {
-                            let (mut rows, _) = r.model_history(&ApiFormat::OpenAI)?;
-                            r.attach_summary_recall(&mut rows)?;
-                            Ok(rows)
-                        })
-                        .unwrap();
-                    assert_eq!(
-                        serde_json::to_string(&compact_input)
-                            .unwrap()
-                            .matches("STORED-EXCERPT")
-                            .count(),
-                        typed.len()
-                    );
-                }
                 let native = (protocol == "responses").then(|| json!({"api":"openai-responses","compaction":true,"items":[{"type":"compaction","encrypted_content":"opaque-item"}]}));
                 shard
                     .repository()
@@ -534,15 +487,15 @@ async fn memory_admission_request_matrix() {
             if compact {
                 let request = String::from_utf8_lossy(&bytes);
                 assert_eq!(request.matches("BOUNDARY-INDEX").count(), 1);
-                assert_eq!(request.matches("STORED-EXCERPT").count(), 1);
+                assert!(!request.contains("STORED-EXCERPT"));
                 assert!(!request.contains("SESSION-INDEX"));
             }
-            std::fs::write(&index, "unadmitted disk edit").unwrap();
+
             std::fs::write(root.path().join("request"), &bytes).unwrap();
             let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    concat!(module_path!(), "::memory_admission_request_matrix")
+                    concat!(module_path!(), "::memory_resident_request_matrix")
                         .split_once("::")
                         .unwrap()
                         .1,
@@ -676,7 +629,7 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
         user_instructions: user_block,
         environment: Some(environment),
         project_instructions: project_block,
-        project_memory: Some("<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()),
+        resident_indexes: vec!["<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()],
         standalone_frontend: true,
         loadable_tools: Some(
             "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
@@ -1166,7 +1119,7 @@ async fn memory_live_replay_bytes_after_clear_compression_and_steering() -> Resu
         .with_conv_id(ID.into())
         .with_executor_history(ExecutorHistory::Session(shard.clone()))?
         .with_session_reminders(crate::prompt::SessionReminders {
-            project_memory: index,
+            resident_indexes: index,
             skills,
             ..Default::default()
         })
@@ -1287,13 +1240,13 @@ async fn memory_live_replay_bytes_after_clear_compression_and_steering() -> Resu
     for term in [
         "Compressed",
         "FIRST_STEER",
-        "STEER_EXCERPT",
         "SECOND_STEER",
         image,
         "PLAN_INDEX_C",
     ] {
         assert!(wire.contains(term), "missing {term}");
     }
+    assert!(!wire.contains("STEER_EXCERPT"));
     assert!(rows[1] == rows[2], "live and resumed HTTP bodies differ");
     Ok(())
 }
@@ -1325,7 +1278,7 @@ async fn memory_native_window_replays_opaque_item() -> Result<()> {
         .with_conv_id(id.into())
         .with_executor_history(ExecutorHistory::Session(shard))?
         .with_session_reminders(crate::prompt::SessionReminders {
-            project_memory: idx,
+            resident_indexes: idx,
             ..Default::default()
         })
         .with_turn_context(entries)
@@ -1423,3 +1376,6 @@ async fn memory_native_window_replays_opaque_item() -> Result<()> {
     assert!(std::str::from_utf8(&seen[0])?.contains("opaque-1"));
     Ok(())
 }
+
+#[path = "resident_index_tests.rs"]
+mod resident_indexes;

@@ -389,9 +389,7 @@ pub(crate) fn recorded_history(
         sharded,
         before,
     )?;
-    if sharded {
-        crate::services::memory_files::prompt::attach_summary_recall(conn, &mut rows)?;
-    }
+    rows.retain(|row| row["origin"] != "memory_change");
     Ok(serde_json::to_string(&rows)?)
 }
 

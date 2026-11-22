@@ -10,7 +10,7 @@ mod admission;
 mod binding;
 pub(crate) mod boundary;
 mod compaction;
-pub(crate) use compaction::NativeWindow;
+pub(crate) use compaction::CompactionWindow;
 mod directory;
 pub mod diagnostics;
 mod conversations;
@@ -48,7 +48,7 @@ mod mcp_control;
 pub use mcp_control::McpControl;
 mod global_format;
 mod history;
-pub(crate) use history::visible_memory_index;
+
 mod im;
 pub use im::FeishuChatMapping;
 mod im_catalog;
@@ -456,6 +456,10 @@ pub(crate) struct TurnWal {
 }
 
 impl SessionDb {
+    pub fn memory_directory(&self) -> PathBuf {
+        self.stores.sessions().join(&self.key).join("memory")
+    }
+
     pub(crate) fn hold_turn_wal(
         &self,
         lease: Arc<crate::services::session_messages::ExecutionLease>,
@@ -728,6 +732,7 @@ impl SessionRead<'_> {
     }
 }
 pub struct SessionWrite<'a>(&'a Connection, &'a str, std::cell::Cell<bool>, &'a binding::BindingControl);
+
 impl SessionWrite<'_> {
     #[doc(hidden)]
     pub fn synchronous_for_test(&self) -> Result<i32> {

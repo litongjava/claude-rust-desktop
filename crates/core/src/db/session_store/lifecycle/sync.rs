@@ -38,9 +38,6 @@ fn rows(
     storage: Option<boundary::Storage<'_>>,
 ) -> Result<()> {
     let shared = matches!(storage, Some(boundary::Storage::Shared));
-    if !shared && !messages.is_empty() {
-        crate::services::memory_files::prompt::reorder_receipts(conn)?;
-    }
     let mut upsert=conn.prepare_cached("INSERT INTO messages(id,conversation_id,role,content,thinking,created_at,sort_order)
         VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET role=excluded.role,content=excluded.content,
         thinking=excluded.thinking,created_at=excluded.created_at,sort_order=excluded.sort_order
@@ -104,9 +101,6 @@ fn rows(
                 [&m.id, r#"{"promptOrigin":"sync"}"#],
             )?;
         }
-    }
-    if !shared && !messages.is_empty() {
-        crate::services::memory_files::prompt::reorder_receipts(conn)?;
     }
     Ok(())
 }
@@ -302,7 +296,17 @@ impl Stores {
             let owner = saved
                 .filter(|(p, _)| p == &project)
                 .map_or(default_owner, |(_, owner)| owner);
-            Some(Admission::starting(self, &roots, &owner)?)
+            let agent = shard
+                .connection_under_lock(rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY, |c| {
+                    super::super::settings::MEMORY_AGENT.read(c)
+                })?;
+            Some(Admission::starting(
+                self,
+                &roots,
+                &owner,
+                shard.memory_directory(),
+                agent,
+            )?)
         } else {
             None
         };

@@ -1,6 +1,6 @@
 //! Every new context window is sealed in the transaction that inserts its first row.
 use super::*;
-use crate::services::memory_files::prompt::{self, Admission, IndexState};
+use crate::services::memory_files::prompt::{Admission, IndexState};
 
 pub(crate) enum Kind {
     Compaction,
@@ -73,11 +73,8 @@ pub(crate) fn seal(
             )?;
             match storage {
                 Storage::Shard(memory) => memory.freeze(tx, Some(id))?,
-                Storage::Frozen(index) => index.seal(tx, id)?,
+                Storage::Frozen(index) => index.seal(tx, Some(id))?,
                 Storage::Shared => unreachable!(),
-            }
-            if !matches!(kind, Kind::Synced) {
-                prompt::reorder_receipts(tx)?;
             }
         }
         Storage::Shared => {
@@ -87,6 +84,13 @@ pub(crate) fn seal(
         }
     }
     Ok(())
+}
+
+/// A partial summary of the suffix keeps its earlier rows. The branch has a
+/// new memory epoch even though its transcript still starts at the old cut.
+pub(super) fn freeze_retained_prefix(tx: &Connection, memory: &Admission) -> Result<()> {
+    let cut: Option<String> = tx.query_row("SELECT id FROM messages WHERE is_compact_boundary ORDER BY sort_order DESC,rowid DESC LIMIT 1",[],|r|r.get(0)).optional()?;
+    memory.frozen_index()?.seal(tx, cut.as_deref())
 }
 
 pub(super) fn demote(tx: &Connection, id: &str, shared: bool) -> Result<()> {

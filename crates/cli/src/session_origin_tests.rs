@@ -3,7 +3,7 @@ use clap::Parser;
 use deepseek_code_core::services::memory_files::FileMemory;
 
 #[test]
-fn memory_turn_producers_keep_origin_and_original_query() -> Result<()> {
+fn memory_turn_producers_keep_explicit_origin() -> Result<()> {
     let root = tempfile::tempdir()?;
     let paths = RuntimePaths::new(root.path().join("data"))?;
     let context = deepseek_code_core::services::ServiceContext::open(
@@ -13,12 +13,6 @@ fn memory_turn_producers_keep_origin_and_original_query() -> Result<()> {
     let sessions = deepseek_code_core::runtime::SessionStore::new(context.db.clone());
     let id = sessions.create(root.path(), "model", "provider")?;
     let shard = context.db.open_session(&id)?;
-    let memory = FileMemory::session(&context, &id)?;
-    memory.put(
-        "saffron.md",
-        "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nMATCHED-FILE\n",
-        None,
-    )?;
     let positional = Cli::try_parse_from(["dcl", "--print"])?;
     let child = Cli::try_parse_from([
         "dcl",
@@ -29,86 +23,73 @@ fn memory_turn_producers_keep_origin_and_original_query() -> Result<()> {
     let expanded = Cli::try_parse_from(["dcl", "--resume", &id, "--original-user-input=/work"])?;
     let notification = json!("saffron");
     let typed = json!([{"type":"text","text":"saffron"}]);
-    for (producer, origin, tag, hit) in [
+    for (producer, origin, tag) in [
         (
             "CLI positional",
             TurnOrigin::command_line(&positional, "saffron"),
             "typed",
-            true,
         ),
         (
             "background Agent and fork",
             TurnOrigin::command_line(&child, "saffron"),
             "delegation",
-            false,
         ),
         (
             "REPL and speech",
             TurnOrigin::User("saffron"),
             "typed",
-            true,
         ),
         (
             "SDK initialPrompt prefix",
             TurnOrigin::User("hello"),
             "typed",
-            false,
         ),
         (
             "inline skill and file mention",
             TurnOrigin::User("/work"),
             "typed",
-            false,
         ),
         (
             "expanded worker handoff",
             TurnOrigin::command_line(&expanded, "saffron"),
             "typed",
-            false,
         ),
         (
             "MCP server expansion",
             TurnOrigin::McpPrompt,
             "mcp_prompt",
-            false,
         ),
         (
             "queued user retry",
             TurnOrigin::Queue("typed", &typed),
             "typed",
-            true,
         ),
         (
             "queued notification retry",
             TurnOrigin::Queue("task_notification", &notification),
             "task_notification",
-            false,
         ),
         (
             "explicit continuation",
             TurnOrigin::Continuation,
             "continuation",
-            false,
         ),
         (
             "goal continuation",
             TurnOrigin::GoalContinuation,
             "goal_continuation",
-            false,
         ),
         (
             "error resume",
             TurnOrigin::ErrorResume,
             "error_resume",
-            false,
         ),
         (
             "cron and loop wakeups",
             TurnOrigin::Scheduled,
             "scheduled",
-            false,
         ),
-        ("session start hook", TurnOrigin::InitialHook, "hook", false),
+        ("session start hook", TurnOrigin::InitialHook, "hook"),
     ] {
         let message = origin.admit(&shard, "saffron", None)?;
         assert_eq!(
@@ -116,10 +97,6 @@ fn memory_turn_producers_keep_origin_and_original_query() -> Result<()> {
             tag,
             "{producer}"
         );
-        let saved = context.db.shard_sql(&id, |c| -> Result<bool> {
-            Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM peripheral_settings WHERE key='memory.prompt.message.'||?1 AND instr(value,'MATCHED-FILE')>0)", [&message], |r| r.get(0))?)
-        })??;
-        assert_eq!(saved, hit, "{producer}");
     }
     assert_eq!(TurnOrigin::HookWake.tag(), "hook");
     Ok(())
@@ -147,10 +124,15 @@ async fn queued_compaction(autocompact: bool) -> Result<()> {
     fn check_admitted(stores: &Stores, shard: &SessionDb) -> Result<()> {
         let (rows, bytes) = shard.repository().active_history_size()?;
         assert_eq!((rows, bytes.div_ceil(3)), (3, 48_514));
-        let selected: bool = stores.shard_sql(shard.id(), |c| c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM messages m JOIN peripheral_settings p ON p.key='memory.prompt.message.'||m.id
-             WHERE m.content='saffron QUEUED_INPUT_7F03' AND instr(p.value,'NOTIFICATION-MATCH')>0)", [], |r|r.get(0)))??;
-        assert!(selected);
+        let pending: bool = stores.shard_sql(shard.id(), |c| {
+            c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages m JOIN peripheral_settings p
+                 ON p.key='prompt.pending.'||m.id WHERE m.content='saffron QUEUED_INPUT_7F03')",
+                [],
+                |row| row.get(0),
+            )
+        })??;
+        assert!(pending);
         Ok(())
     }
     let admitted = Arc::new(std::sync::OnceLock::<(Arc<Stores>, SessionDb)>::new());
@@ -162,7 +144,7 @@ async fn queued_compaction(autocompact: bool) -> Result<()> {
             if headers.get("x-dcl-request-kind").is_some_and(|kind| kind == "compaction") {
                 if autocompact {
                     // The 24,000-token window triggers at 19,200. Observe the
-                    // admitted input and receipt while its prefix is being summarized.
+                    // admitted input's pending marker while its prefix is being summarized.
                     let (stores, shard) = summary_session.get().unwrap();
                     check_admitted(stores, shard).unwrap();
                     assert!(!body["messages"].to_string().contains("QUEUED_INPUT_7F03"));
@@ -244,7 +226,7 @@ async fn queued_compaction(autocompact: bool) -> Result<()> {
         assert_eq!(calls.len(), 1);
         let body = calls[0]["messages"].to_string();
         assert!(body.contains("earlier transcript retained"));
-        assert!(body.contains("QUEUED_INPUT_7F03") && body.contains("NOTIFICATION-MATCH"));
+        assert!(body.contains("QUEUED_INPUT_7F03") && !body.contains("NOTIFICATION-MATCH"));
         return Ok(());
     }
     assert_eq!(calls.len(), 2);

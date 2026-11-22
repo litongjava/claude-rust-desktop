@@ -166,6 +166,49 @@ impl FileMemoryStore {
         Self::open_mode(data_dir, scope, StoreOptions::default(), true)
     }
 
+    pub(crate) fn open_resident(root: &Path, directory: &Path, read_only: bool) -> Result<Self> {
+        let directory = super::scoped_directory(root, directory, read_only)?;
+        let state = directory.child_mode(".state", read_only)?;
+        let trash = directory.child_mode(".trash", read_only)?;
+        let store = Self {
+            directory,
+            state,
+            trash,
+            options: StoreOptions::default(),
+            read_only,
+        };
+        let _lock = store.lock()?;
+        store.recover()?;
+        Ok(store)
+    }
+
+    pub(crate) fn read_resident_file(
+        root: &Path,
+        directory: &Path,
+        filename: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        if filename != "MEMORY.md" {
+            memory_filename(filename)?;
+        }
+        super::scoped_directory(root, directory, true)?.read(filename, limit(filename))
+    }
+
+    pub(crate) fn write_resident_index(
+        &self,
+        bytes: &[u8],
+        expected: ExpectedVersion,
+    ) -> Result<String> {
+        if self.read_only || bytes.len() > MAX_INDEX_BYTES || std::str::from_utf8(bytes).is_err() {
+            return Err(invalid("invalid index write"));
+        }
+        let _lock = self.lock()?;
+        self.recover()?;
+        let old = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
+        expected.check("MEMORY.md", old.as_deref())?;
+        self.directory.atomic_write("MEMORY.md", bytes)?;
+        Ok(hash(bytes))
+    }
+
     fn open_mode(
         data_dir: &Path,
         scope: &MemoryScope,
@@ -334,41 +377,16 @@ impl FileMemoryStore {
         let _lock = self.lock()?;
         self.recover()?;
         if self.read_only {
-            return self.scanned_snapshot(false);
+            return self.scanned_snapshot();
         }
         self.mutate(None, None)
     }
 
-    /// Capture the user's on-disk index and candidate files under the same lock.
-    /// Context assembly must not repair away an intervening manual index edit.
-    pub(crate) fn prompt_snapshot(&self) -> Result<Snapshot> {
-        let _lock = self.lock()?;
-        self.recover()?;
-        self.scanned_snapshot(true)
-    }
-
-    fn scanned_snapshot(&self, use_disk_index: bool) -> Result<Snapshot> {
+    fn scanned_snapshot(&self) -> Result<Snapshot> {
         let (entries, diagnostics) = self.scan(None)?;
-        let disk = if use_disk_index {
-            // Extra bytes accommodate a UTF-8 character crossing the display limit.
-            self.directory
-                .index_prefix(super::IndexLimits::default().bytes + 4)?
-        } else {
-            None
-        };
-        let (index, index_hash) = match disk {
-            Some(snapshot) => snapshot,
-            None => {
-                let previous = if use_disk_index {
-                    None
-                } else {
-                    self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?
-                };
-                let index = index::build(&entries, previous.as_deref().unwrap_or_default());
-                let digest = hash(index.as_bytes());
-                (index, digest)
-            }
-        };
+        let previous = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
+        let index = index::build(&entries, previous.as_deref().unwrap_or_default());
+        let index_hash = hash(index.as_bytes());
         Ok(Snapshot {
             generation: self.generation()?,
             index_hash,

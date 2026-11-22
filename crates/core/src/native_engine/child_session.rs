@@ -376,6 +376,17 @@ pub(crate) async fn prepare_child_session(
         }
     };
 
+    if let Some(definition) = &definition {
+        if !resumed {
+            context.db.open_session(&session_id)?.write(|w| {
+                w.set_setting(
+                    crate::db::session_store::settings::MEMORY_AGENT,
+                    &definition.id,
+                )
+            })?;
+        }
+    }
+
     let owners = match resume_pair {
         Some(pair) => pair,
         None => context.db.worker_pair(&spawn.parent_session_id, &session_id)?,

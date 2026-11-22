@@ -526,7 +526,7 @@ async fn foreground_agent_uses_child_memory_after_parent_index_changes() {
     let (stored, _) =
         crate::services::memory_files::prompt::replay(&shard, boundary.as_deref(), &messages)
             .unwrap();
-    let stored = stored.unwrap();
+    let stored = stored.join("\n");
     assert!(stored.contains("CHILD_FROZEN_INDEX"));
     let request = serde_json::to_value(prepared.child.build_openai_messages().unwrap()).unwrap();
     let first = request[0]["content"].as_str().unwrap();

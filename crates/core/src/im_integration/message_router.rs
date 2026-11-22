@@ -94,8 +94,8 @@ impl UnifiedMessage {
             }
             _ => None,
         };
-        if let Some(text) = query.filter(|s| !s.trim().is_empty()) {
-            shard.admit_prompt_with_query(&self.content, None, "typed", &text.into())
+        if query.is_some_and(|s| !s.trim().is_empty()) {
+            shard.admit_prompt(&self.content, None, "typed")
         } else {
             let origin = if sender == Some("app") {
                 "im_app"

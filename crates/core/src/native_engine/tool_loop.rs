@@ -3242,7 +3242,7 @@ impl ToolLoopExecutor {
                     .position(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
             })
             .flatten();
-        let mut additions: Vec<_> =
+        let additions: Vec<_> =
             crate::services::turn_context::resolve(&self.turn_context, &self.messages)
                 .into_iter()
                 .enumerate()
@@ -3257,9 +3257,7 @@ impl ToolLoopExecutor {
                     )
                 })
                 .collect();
-        if self.applied_compaction {
-            project_memory_context::replay_index(&mut additions, 0);
-        }
+
         additions
     }
 
@@ -5335,7 +5333,14 @@ impl ToolLoopExecutor {
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
                 .await?;
             let peers = self.drain_peer_messages()?;
-            if !queued.is_empty()
+            let memory_changed =
+                if let Some(ExecutorHistory::Session(shard)) = &self.executor_history {
+                    crate::services::memory_files::prompt::Admission::refresh(shard)?
+                } else {
+                    false
+                };
+            if memory_changed
+                || !queued.is_empty()
                 || !peers.is_empty()
                 || (iteration > 0 && self.boundary_changed()?)
             {
@@ -6032,7 +6037,14 @@ impl ToolLoopExecutor {
                 .deliver_queued_inputs(std::mem::take(&mut after_tool_results))
                 .await?;
             let peers = self.drain_peer_messages()?;
-            if !queued.is_empty()
+            let memory_changed =
+                if let Some(ExecutorHistory::Session(shard)) = &self.executor_history {
+                    crate::services::memory_files::prompt::Admission::refresh(shard)?
+                } else {
+                    false
+                };
+            if memory_changed
+                || !queued.is_empty()
                 || !peers.is_empty()
                 || (iteration > 0 && self.boundary_changed()?)
             {
@@ -7092,16 +7104,18 @@ impl ToolLoopExecutor {
                 .as_ref()
                 .is_some_and(|v| v["compaction"] == true)
         }) {
-            if let Some(index) = additions[0]
+            let indexes: Vec<_> = additions[0]
                 .0
                 .iter()
-                .find(|s| s.starts_with("<system-reminder>\n<project_memory>\n"))
-            {
+                .filter(|s| project_memory_context::is_index(s))
+                .map(String::as_str)
+                .collect();
+            if !indexes.is_empty() {
                 built.insert(
                     1,
                     OpenAIMessage {
                         role: "user".into(),
-                        content: OpenAIContent::Text(index.clone()),
+                        content: OpenAIContent::Text(indexes.join("\n\n")),
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,

@@ -124,20 +124,13 @@ fn export(data: &Path, id: &str) -> Vec<Value> {
         .unwrap()
 }
 
-fn admitted(rows: &[Value]) -> Option<(String, Value)> {
+fn admitted(rows: &[Value]) -> Option<String> {
     let mut users = rows
         .iter()
         .filter(|r| r["type"] == "message" && r["role"] == "user" && r["content"] == QUESTION);
     let id = users.next()?["id"].as_str().unwrap();
     assert!(users.next().is_none());
-    let key = format!("memory.prompt.message.{id}");
-    let receipt = rows
-        .iter()
-        .find(|r| r["type"] == "local_setting" && r["key"] == key)?;
-    Some((
-        id.to_owned(),
-        serde_json::from_str(receipt["value"].as_str().unwrap()).unwrap(),
-    ))
+    Some(id.to_owned())
 }
 
 async fn overflow(fail_summary: bool) {
@@ -176,22 +169,20 @@ async fn overflow(fail_summary: bool) {
     assert_eq!(output.status.success(), !fail_summary, "{stderr}");
     let calls = requests.lock().unwrap();
     assert_eq!(calls.len(), if fail_summary { 3 } else { 4 }, "{stderr}");
-    let (id, receipt) = calls[1]
+    let id = calls[1]
         .1
         .clone()
         .expect("row at the overflowing generation");
-    assert!(calls[1].0.contains(QUESTION) && calls[1].0.contains(ORIGINAL));
-    assert!(receipt["blocks"].to_string().contains(ORIGINAL));
+    assert!(calls[1].0.contains(QUESTION) && !calls[1].0.contains(ORIGINAL));
     assert!(calls[2].0.contains("hello") && !calls[2].0.contains(QUESTION));
     assert_eq!(
         calls[2].1.as_ref(),
         calls[1].1.as_ref(),
-        "row and receipt during summary"
+        "admitted row during summary"
     );
     let rows = export(&fixture.root.path().join("data"), &fixture.id);
-    let (final_id, final_receipt) = admitted(&rows).expect("admitted row after recovery");
+    let final_id = admitted(&rows).expect("admitted row after recovery");
     assert_eq!(final_id, id);
-    assert_eq!(final_receipt["blocks"], receipt["blocks"]);
     let messages = rows
         .iter()
         .filter(|r| r["type"] == "message")
@@ -203,7 +194,7 @@ async fn overflow(fail_summary: bool) {
         assert!(stderr.contains("2 messages summarized"), "{stderr}");
         assert_eq!(calls[3].1, calls[1].1);
         assert_eq!(calls[3].0.matches(QUESTION).count(), 1);
-        assert_eq!(calls[3].0.matches(ORIGINAL).count(), 1);
+        assert_eq!(calls[3].0.matches(ORIGINAL).count(), 0);
         assert!(!calls[3].0.contains(EDITED));
         let at = messages.iter().position(|r| r["id"] == id).unwrap();
         assert_eq!(messages[at - 1]["is_compact_boundary"], true);
@@ -211,12 +202,12 @@ async fn overflow(fail_summary: bool) {
 }
 
 #[tokio::test]
-async fn overflow_retry_reuses_admitted_receipt() {
+async fn overflow_retry_preserves_input_and_refreshes_indexes() {
     overflow(false).await;
 }
 
 #[tokio::test]
-async fn overflow_summary_failure_keeps_admitted_receipt() {
+async fn overflow_summary_failure_keeps_admitted_input() {
     overflow(true).await;
 }
 
@@ -260,7 +251,11 @@ async fn compressed_chat(large: bool, edited: bool) {
         );
     }
     fs::write(index, &current).unwrap();
-    let prompt = if large {
+    let prompt = if large && !edited {
+        // The unchanged index produces no change reminder. Supply enough input to
+        // cross the compression threshold without relying on a recalled file body.
+        format!("{QUESTION}{}", " detail".repeat(550))
+    } else if large {
         "What does saffron mean?".to_owned()
     } else {
         format!("{QUESTION}{}", " saffron".repeat(800))
@@ -279,7 +274,7 @@ async fn compressed_chat(large: bool, edited: bool) {
     assert!(last.contains("[CRITICAL: Context Compressed]"));
     assert_eq!(last.matches(&current).count(), 1);
     assert!(!last.contains("INDEX_OLD_37"));
-    assert_eq!(last.matches(ORIGINAL).count(), 1);
+    assert_eq!(last.matches(ORIGINAL).count(), 0);
     assert_eq!(last.matches(&prompt).count(), 1);
 }
 
@@ -299,7 +294,7 @@ async fn compressed_chat_fits_large_unchanged_index() {
 }
 
 #[tokio::test]
-async fn receipt_after_text_boundary_supersedes_all_earlier_indexes() {
+async fn post_boundary_changes_leave_the_frozen_index_intact() {
     use deepseek_code_core::services::compaction;
 
     let fixture = Fixture::new();
@@ -339,9 +334,9 @@ async fn receipt_after_text_boundary_supersedes_all_earlier_indexes() {
     let calls = requests.lock().unwrap();
     assert_eq!(calls.len(), 3);
     let last = calls[2].to_string();
-    assert!(!last.contains("FROZEN_INDEX_C") && !last.contains("INDEX_CHANGE_D"));
+    assert!(last.contains("FROZEN_INDEX_C") && last.contains("INDEX_CHANGE_D"));
     assert_eq!(last.matches("INDEX_CHANGE_E").count(), 1);
-    assert_eq!(last.matches(ORIGINAL).count(), 2);
+    assert_eq!(last.matches(ORIGINAL).count(), 0);
     let latest = calls[2].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap();

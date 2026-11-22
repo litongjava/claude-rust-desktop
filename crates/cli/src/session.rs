@@ -212,9 +212,6 @@ impl<'a> TurnOrigin<'a> {
         content: Option<&Value>,
     ) -> Result<String> {
         match self {
-            Self::User(raw) => {
-                shard.admit_prompt_with_query(display, content, self.tag(), &json!(raw))
-            }
             Self::Queue(tag, payload) => shard.admit_prompt(display, Some(payload), tag),
             _ => shard.admit_prompt(display, content, self.tag()),
         }

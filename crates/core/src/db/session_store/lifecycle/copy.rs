@@ -279,6 +279,7 @@ struct Copier<'a> {
     src: &'a Connection,
     dst: &'a Connection,
     id: &'a str,
+    session_dir: PathBuf,
     keep_unresolved_origins: bool,
 }
 impl Copier<'_> {
@@ -408,7 +409,11 @@ impl Copier<'_> {
                     if let Some(old) = &input.message_id {
                         let new = self.assign("message", old)?;
                         crate::services::memory_files::prompt::copy_message(
-                            self.src, self.dst, old, &new,
+                            self.src,
+                            self.dst,
+                            old,
+                            &new,
+                            &self.session_dir,
                         )?;
                         input.message_id = Some(new);
                     }
@@ -455,7 +460,7 @@ impl Copier<'_> {
         if matches!(boundary, Branch::Clear | Branch::Child) {
             return Ok(());
         }
-        crate::services::memory_files::prompt::copy_prefix(self.src, self.dst)?;
+        crate::services::memory_files::prompt::copy_prefix(self.src, self.dst, &self.session_dir)?;
         let limit = match boundary {
             Branch::Through { message, index } => {
                 let by_id = message
@@ -488,7 +493,11 @@ impl Copier<'_> {
             )?;
             if m.role == "user" {
                 crate::services::memory_files::prompt::copy_message(
-                    self.src, self.dst, &m.id, &id,
+                    self.src,
+                    self.dst,
+                    &m.id,
+                    &id,
+                    &self.session_dir,
                 )?;
             }
             count += 1;
@@ -688,6 +697,11 @@ pub(super) fn copy_snapshot(
         src: &tx,
         dst,
         id,
+        session_dir: source
+            .stores
+            .sessions()
+            .join(storage_key(id)?)
+            .join("memory"),
         keep_unresolved_origins: matches!(boundary, Branch::Full | Branch::AgentFork { .. }),
     }
     .run(boundary)?;
@@ -712,6 +726,7 @@ pub(super) fn copy_snapshot(
                 boundary::Storage::Shard(memory),
             )?;
         } else {
+            super::super::boundary::freeze_retained_prefix(dst, memory)?;
             let message = crate::db::transcript::MessageIds::for_shard(dst)?.issue();
             message_repo::insert_message(
                 dst,

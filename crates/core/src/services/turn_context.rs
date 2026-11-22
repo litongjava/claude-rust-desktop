@@ -85,7 +85,7 @@ pub(crate) fn replay(
     shard: &crate::db::session_store::SessionDb,
     boundary: Option<&str>,
     messages: &[Value],
-) -> Result<(Option<String>, Vec<Entry>)> {
+) -> Result<(Vec<String>, Vec<Entry>)> {
     shard.read(|r| replay_at(shard, r, boundary, messages))
 }
 
@@ -94,7 +94,7 @@ pub(crate) fn replay_at(
     r: &crate::db::session_store::SessionRead<'_>,
     boundary: Option<&str>,
     messages: &[Value],
-) -> Result<(Option<String>, Vec<Entry>)> {
+) -> Result<(Vec<String>, Vec<Entry>)> {
     let mut saved = load(shard.scoped_stores().data_dir(), shard.id())?;
     let (index, receipts) =
         crate::services::memory_files::prompt::replay_at(r, boundary, messages)?;
@@ -144,7 +144,7 @@ pub fn resolve(entries: &[Entry], messages: &[Value]) -> Vec<Vec<String>> {
                 .iter()
                 .filter(|entry| {
                     if let Some(id) = entry.key.strip_prefix("message:") {
-                        return message["origin"] == "typed" && message["id"].as_str() == Some(id);
+                        return message["id"].as_str() == Some(id);
                     }
                     entry.key == key && entry.occurrence == occurrence
                 })

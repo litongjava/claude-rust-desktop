@@ -116,7 +116,7 @@ impl SafeDir {
     }
 
     /// Hash the complete index while retaining only a bounded display prefix.
-    pub fn index_prefix(&self, limit: usize) -> Result<Option<(String, String)>> {
+    pub fn index_prefix(&self, limit: usize) -> Result<Option<(Vec<u8>, String)>> {
         use sha2::{Digest, Sha256};
         let name = "MEMORY.md";
         self.verify()?;
@@ -146,10 +146,29 @@ impl SafeDir {
         if size != before.len() || size != after.len() || before.modified()? != after.modified()? {
             return Err(MemoryFileError::Conflict(name.into()));
         }
-        // The prompt reader retains lookahead beyond its display limit. A partial
-        // code point or invalid byte in an oversized external edit is printable.
-        let text = String::from_utf8_lossy(&prefix).into_owned();
-        Ok(Some((text, format!("{:x}", hash.finalize()))))
+        Ok(Some((prefix, format!("{:x}", hash.finalize()))))
+    }
+
+    /// Copy into an unpublished shard. Do not follow links or write through
+    /// existing files, even if an entry changes after the directory listing.
+    pub fn copy_contents(self: &Arc<Self>, dest: &Arc<Self>) -> Result<()> {
+        for name in self.list()? {
+            safe_component(&name)?;
+            if std::fs::symlink_metadata(self.path.join(&name))?.is_dir() {
+                self.child_mode(&name, true)?
+                    .copy_contents(&dest.child(&name)?)?;
+            } else {
+                let mut source = platform::open_file(self, &name, false, false)?;
+                self.verify_file(&name, &source)?;
+                let mut target = platform::open_file(dest, &name, true, true)?;
+                platform::validate_file(&target)?;
+                std::io::copy(&mut source, &mut target)?;
+                self.verify_file(&name, &source)?;
+                target.sync_all()?;
+                dest.verify_file(&name, &target)?;
+            }
+        }
+        dest.sync()
     }
 
     pub fn create(&self, name: &str, bytes: &[u8]) -> Result<()> {

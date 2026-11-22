@@ -237,7 +237,7 @@ pub struct SessionReminders {
     pub user_instructions: Option<String>,
     pub environment: Option<String>,
     pub project_instructions: Option<String>,
-    pub project_memory: Option<String>,
+    pub resident_indexes: Vec<String>,
     pub standalone_frontend: bool,
     /// The tools ToolLoad can load, frozen on the first request.
     pub loadable_tools: Option<String>,
@@ -258,7 +258,7 @@ pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     blocks.extend(parts.user_instructions);
     blocks.extend(parts.environment);
     blocks.extend(parts.project_instructions);
-    blocks.extend(parts.project_memory);
+    blocks.extend(parts.resident_indexes);
     if parts.standalone_frontend {
         blocks.push(standalone_frontend_reminder());
     }
@@ -1132,7 +1132,7 @@ mod tests {
         let blocks = first_message_reminders(SessionReminders {
             user_instructions: Some("<system-reminder>\nuser rules\n</system-reminder>".into()),
             environment: Some(environment),
-            project_memory: None,
+            resident_indexes: Vec::new(),
             project_instructions: Some("<system-reminder>\nproject rules\n</system-reminder>".into()),
             standalone_frontend: true,
             loadable_tools: Some(

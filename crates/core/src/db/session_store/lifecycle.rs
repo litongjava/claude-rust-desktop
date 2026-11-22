@@ -522,14 +522,28 @@ impl Stores {
             Some(Project::NewWorkspace(folder)) => vec![PathBuf::from(folder)],
             None => Vec::new(),
         };
-        let memory = match &seed {
-            Seed::Fork(parent, Branch::Child | Branch::AgentFork { .. }, _) => {
-                Admission::session(parent)?
-            }
-            _ => Admission::starting(self, &roots, &op.incarnation)?,
-        };
         let stage = op.stage(self);
         fs::create_dir(&stage)?;
+        let session_dir = self.sessions().join(&op.key).join("memory");
+        let agent = match &seed {
+            Seed::Fork(source, kind, _) if !matches!(kind, Branch::Child | Branch::Clear) => {
+                crate::memory::files::copy_session_memory(
+                    self.data_dir(),
+                    &source.memory_directory(),
+                    &stage.join("memory"),
+                )?;
+                source.read(|r| r.setting(super::settings::MEMORY_AGENT))?
+            }
+            _ => None,
+        };
+        let memory = Admission::starting(
+            self,
+            &roots,
+            &op.incarnation,
+            session_dir.clone(),
+            agent.clone(),
+        )?
+        .staged_session(stage.join("memory"));
         sync_dir(stage.parent().unwrap())?;
         self.step(Phase::StageDirectory)?;
         {
@@ -540,8 +554,8 @@ impl Stores {
                     "INSERT INTO manifest VALUES(1,?1,?2,?3,?4,?5,?5,?6,?6,NULL)",
                     params![op.store, id, op.incarnation, op.operation, created, n],
                 )?;
-                if first.is_none() {
-                    memory.freeze(tx, None)?;
+                if let Some(agent) = &agent {
+                    super::settings::MEMORY_AGENT.write(tx, agent)?;
                 }
                 if let Some(first) = first {
                     let content = first
@@ -566,10 +580,9 @@ impl Stores {
                             serde_json::json!({"promptOrigin": first.origin}).to_string()
                         ],
                     )?;
+                    memory.freeze(tx, None)?;
                     if first.origin == "typed" {
-                        memory.first(tx, &message, &content)?;
-                    } else {
-                        memory.freeze(tx, None)?;
+                        super::history::mark_input_pending(tx, &message)?;
                     }
                     if let Some(typed) = &first.typed {
                         tx.execute(

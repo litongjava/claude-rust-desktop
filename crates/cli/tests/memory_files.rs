@@ -237,7 +237,7 @@ async fn scenario(protocol: &'static str, plan: bool) {
                 project < index && first[index..].contains("中文 preferences"),
                 "{first}"
             );
-            assert_eq!(first.matches("Relevant project memory files:").count(), 1);
+            assert_eq!(first.matches("Relevant project memory files:").count(), 0);
             assert_eq!(
                 first,
                 first_user_text(&requests[0]),
@@ -262,7 +262,7 @@ async fn scenario(protocol: &'static str, plan: bool) {
                 .to_string()
                 .contains("legacy-unassigned-must-not-recall"));
         }
-        assert!(requests[0]["messages"]
+        assert!(!requests[0]["messages"]
             .to_string()
             .contains("unique-body-recall-marker"));
         let last = requests.last().unwrap().to_string();
@@ -316,7 +316,7 @@ async fn scenario(protocol: &'static str, plan: bool) {
         let content = generated["content"].to_string();
         assert!(content.contains("Continue toward the goal"));
         assert!(!content.contains("Relevant project memory files:"));
-        assert!(!content.contains("manual-index-edit-on-resume"));
+        assert!(content.contains("manual-index-edit-on-resume"));
     }
     run(
         &paths.data_dir,
@@ -332,21 +332,10 @@ async fn scenario(protocol: &'static str, plan: bool) {
     let last = requests.last().unwrap();
     assert_eq!(first_user_text(last), first_user_text(&requests[0]));
     assert!(!first_user_text(last).contains("manual-index-edit-on-resume"));
-    let latest = last["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .rev()
-        .find(|m| m["role"] == "user")
-        .unwrap();
-    let text = latest["content"].to_string();
-    assert!(
-        text.contains("MEMORY.md changed") && text.contains("manual-index-edit-on-resume"),
-        "{text}"
-    );
-    assert!(text.contains("[MEMORY.md truncated]"));
-    assert!(!text.contains("hidden-tail"));
-    assert!(text.contains("Relevant project memory files:"));
+    let text = last["messages"].to_string();
+    assert_eq!(text.matches("manual-index-edit-on-resume").count(), 1);
+    assert!(text.contains("[MEMORY.md truncated") && !text.contains("hidden-tail"));
+    assert!(!text.contains("Relevant project memory files:"));
     drop(requests);
     assert_eq!(legacy.stats().await.unwrap().total_memories, 1);
 }

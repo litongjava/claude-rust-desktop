@@ -109,12 +109,6 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         let memory = FileMemory::workspace(&context, root.path()).unwrap();
         memory.put("saffron.md", "---\nname: saffron\ndescription: saffron preferences for a steered answer\nmetadata:\n  type: user\n---\nsteer-recall-marker\n", None).unwrap();
         let correction = "saffron: Skip the rest and answer STEERED now";
-        assert!(memory
-            .context_block(correction, true)
-            .unwrap()
-            .1
-            .unwrap()
-            .contains("steer-recall-marker"));
         let coord = root.path().join("coord");
         let diagnostics = root.path().join("delivery.log");
         let transport = Some((
@@ -214,8 +208,8 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
             "missing index change in {content}"
         );
         assert!(
-            content.contains("steer-recall-marker"),
-            "missing recalled excerpt in {content}"
+            !content.contains("steer-recall-marker"),
+            "unexpected file body in {content}"
         );
         assert!(
             steer >= tool,
@@ -274,9 +268,14 @@ async fn user_frame_during_a_tool_run_reaches_the_next_model_request() {
         assert!(resumed.finish().await.0.success());
         let replay = streamed_requests(&server).pop().unwrap();
         let at = message_index(&replay, "answer STEERED now").unwrap();
-        for marker in ["steer-recall-marker", "steer-index-marker"] {
-            assert_eq!(replay["messages"][at].to_string().matches(marker).count(), 1);
-        }
+        assert!(!replay.to_string().contains("steer-recall-marker"));
+        assert_eq!(
+            replay["messages"][at]
+                .to_string()
+                .matches("steer-index-marker")
+                .count(),
+            1
+        );
     }
 }
 

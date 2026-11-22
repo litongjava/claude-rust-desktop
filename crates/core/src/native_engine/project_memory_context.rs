@@ -2,11 +2,15 @@
 //! attached indexes out of summaries and provider-preserved user items.
 use super::*;
 
-fn is_index(block: &str) -> bool {
-    block.starts_with("<system-reminder>\n<project_memory>\n")
-        || block.starts_with(
-            "<system-reminder>\nMEMORY.md changed. The current index follows.\n<project_memory>\n",
-        )
+pub(super) fn is_index(block: &str) -> bool {
+    block
+        .strip_prefix("<system-reminder>\n")
+        .is_some_and(|body| {
+            body.starts_with("MEMORY.md changed.")
+                || ["global", "team", "project", "subagent", "session"]
+                    .iter()
+                    .any(|scope| body.starts_with(&format!("<{scope}_memory>\n")))
+        })
 }
 
 impl ToolLoopExecutor {
@@ -58,63 +62,5 @@ impl ToolLoopExecutor {
                 _ => true,
             }
         });
-    }
-}
-
-/// Walk generated reminders in reverse transcript order. Keep the newest index
-/// on its own message when that message survives. If it is in the prefix being
-/// summarized, return it for the new window instead. User content is untouched.
-pub(super) fn replay_index(
-    additions: &mut [(Vec<String>, Vec<String>)],
-    retain_from: usize,
-) -> (bool, Option<String>) {
-    let mut changed = false;
-    let mut seen = false;
-    let mut prefix = None;
-    for (row, (before, after)) in additions.iter_mut().enumerate().rev() {
-        for blocks in [after, before] {
-            for i in (0..blocks.len()).rev() {
-                if !is_index(&blocks[i]) {
-                    continue;
-                }
-                if seen {
-                    changed = true;
-                    blocks.remove(i);
-                } else if row < retain_from {
-                    changed = true;
-                    prefix = Some(blocks.remove(i).replacen(
-                        "MEMORY.md changed. The current index follows.\n",
-                        "",
-                        1,
-                    ));
-                }
-                seen = true;
-            }
-        }
-    }
-    (changed, prefix)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_replay_keeps_only_the_newest_announcement_with_protected_steers() {
-        let index = "<system-reminder>\n<project_memory>\nC".to_owned();
-        let change = |content| {
-            format!("<system-reminder>\nMEMORY.md changed. The current index follows.\n<project_memory>\n{content}")
-        };
-        let mut rows = vec![
-            (vec![index], vec![]),
-            (vec![], vec![change("C"), "first recall".into()]),
-            (vec![], vec![change("D")]),
-            (vec![], vec![change("C"), "steer recall".into()]),
-        ];
-        let (changed, prefix) = replay_index(&mut rows, 1);
-        assert!(changed && prefix.is_none());
-        assert!(rows[0].0.is_empty() && rows[2].1.is_empty());
-        assert_eq!(rows[1].1, ["first recall"]);
-        assert_eq!(rows[3].1, [change("C"), "steer recall".to_owned()]);
     }
 }

@@ -737,13 +737,13 @@ async fn compaction_replays_the_next_normal_body_on_every_protocol() -> anyhow::
             ] {
                 assert!(compact.contains(marker), "{model}: missing {marker}");
             }
-            for marker in ["CURRENT_RECEIPT_INDEX", "ADMITTED_RECALL_MARKER"] {
+            for marker in ["FROZEN_PLAN_INDEX", "LATER_DISK_INDEX"] {
                 assert_eq!(compact.matches(marker).count(), 1, "{model} {marker}");
             }
             for marker in [
                 "DISCARDED_PLAN_GATE",
-                "FROZEN_PLAN_INDEX",
-                "LATER_DISK_INDEX",
+                "CURRENT_RECEIPT_INDEX",
+                "ADMITTED_RECALL_MARKER",
                 "LATER_DISK_RECALL",
             ] {
                 assert!(!compact.contains(marker), "{model} {marker}");

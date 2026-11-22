@@ -320,24 +320,8 @@ impl SessionRead<'_> {
     }
 }
 
-/// Read the index actually announced in the surviving transcript. Tool-addressed
-/// inputs occupy their parent tool's position and disappear when it is rewound.
-pub(crate) fn visible_memory_index(
-    c: &rusqlite::Connection,
-    admitting_id: &str,
-) -> Result<(Option<String>, Option<String>)> {
-    use crate::services::memory_files::prompt::INDEX_HISTORY;
-    let sql = format!("{INDEX_HISTORY}, prior AS (
-        SELECT * FROM history WHERE NOT EXISTS(SELECT 1 FROM history WHERE id=?1)
-        OR (pos,seq,tool,tool_seq,part)<(SELECT pos,seq,tool,tool_seq,part FROM history WHERE id=?1)
-    ), cut AS (SELECT * FROM prior WHERE boundary ORDER BY pos DESC,seq DESC LIMIT 1)
-    SELECT (SELECT id FROM cut), (SELECT json_extract(p.value,'$.index_hash') FROM prior v
-        JOIN peripheral_settings p ON p.key='memory.prompt.message.'||v.id
-        WHERE NOT v.boundary AND (NOT EXISTS(SELECT 1 FROM cut) OR (v.pos,v.seq)>(SELECT pos,seq FROM cut))
-        AND json_extract(p.value,'$.index_hash') IS NOT NULL AND coalesce(json_extract(p.value,'$.announced'),
-          json_extract(p.value,'$.blocks[0]') GLOB '<system-reminder>'||char(10)||'MEMORY.md changed.*')
-        ORDER BY v.pos DESC,v.seq DESC,v.tool DESC,v.tool_seq DESC,v.part DESC LIMIT 1)");
-    Ok(c.query_row(&sql, [admitting_id], |r| Ok((r.get(0)?, r.get(1)?)))?)
+pub(super) fn mark_input_pending(tx: &Connection, id: &str) -> Result<()> {
+    super::state::set_local(tx, &format!("prompt.pending.{id}"), "true")
 }
 
 impl super::SessionDb {
@@ -352,6 +336,10 @@ impl super::SessionDb {
             )?;
             for id in ids {
                 update.execute([id])?;
+                w.0.execute(
+                    "DELETE FROM peripheral_settings WHERE key='prompt.pending.'||?1",
+                    [id],
+                )?;
             }
             Ok(())
         })
@@ -359,39 +347,19 @@ impl super::SessionDb {
 
     pub fn admit_user(&self, id: &str, content: &Value, origin: &str) -> Result<()> {
         let _guard = self.hold_incarnation()?;
-        let memory = (origin == "typed")
-            .then(|| crate::services::memory_files::prompt::Admission::session(self))
-            .transpose()?;
-        self.write(|w| w.append_user(id, content, origin, memory.as_ref()))
+        let memory = crate::services::memory_files::prompt::Admission::session(self)?;
+        self.write(|w| w.append_user(id, content, origin, Some(&memory)))
     }
 
-    /// Persist the producer's prompt and its memory receipt under one shard write.
+    /// Freeze any resident-index change in the same transaction as its prompt.
     pub fn admit_prompt(
         &self,
         display: &str,
         content: Option<&Value>,
         origin: &str,
     ) -> Result<String> {
-        self.admit_prompt_with_query(
-            display,
-            content,
-            origin,
-            content.unwrap_or(&Value::String(display.into())),
-        )
-    }
-
-    /// Expanded model content and the producer's original recall query may differ.
-    pub fn admit_prompt_with_query(
-        &self,
-        display: &str,
-        content: Option<&Value>,
-        origin: &str,
-        query: &Value,
-    ) -> Result<String> {
         let _guard = self.hold_incarnation()?;
-        let memory = (origin == "typed")
-            .then(|| crate::services::memory_files::prompt::Admission::session(self))
-            .transpose()?;
+        let memory = crate::services::memory_files::prompt::Admission::session(self)?;
         self.write(|w| {
             if origin == "hook" {
                 return w.append_hook_user(display);
@@ -401,8 +369,9 @@ impl super::SessionDb {
                 None => w.append("user", display)?,
             };
             w.set_prompt_origin(&id, origin)?;
-            if let Some(memory) = &memory {
-                memory.typed(w.0, &id, query)?;
+            memory.admit(w.0, &id)?;
+            if origin == "typed" {
+                mark_input_pending(w.0, &id)?;
             }
             Ok(id)
         })
@@ -410,6 +379,16 @@ impl super::SessionDb {
 }
 
 impl SessionWrite<'_> {
+    pub(crate) fn refresh_resident_indexes(
+        &self,
+        memory: &crate::services::memory_files::prompt::Admission,
+    ) -> Result<bool> {
+        memory.refresh_request(self.0, || {
+            let id = self.append("user", "")?;
+            self.set_prompt_origin(&id, "memory_change")?;
+            Ok(id)
+        })
+    }
     pub(super) fn next_order(&self) -> Result<i64> {
         Ok(self.0.query_row(
             "SELECT coalesce(max(sort_order),-1)+1 FROM messages",
@@ -468,7 +447,10 @@ impl SessionWrite<'_> {
         )?;
         self.set_prompt_origin(id, origin)?;
         if let Some(memory) = memory {
-            memory.typed(self.0, id, content)?;
+            memory.admit(self.0, id)?;
+        }
+        if origin == "typed" {
+            mark_input_pending(self.0, id)?;
             permission_authority::record_conn(
                 self.0,
                 self.1,
@@ -850,10 +832,6 @@ impl SessionRead<'_> {
             |r| r.get(0),
         )?)
     }
-    pub(crate) fn attach_summary_recall(&self, messages: &mut [Value]) -> Result<()> {
-        crate::services::memory_files::prompt::attach_summary_recall(self.0, messages)
-    }
-
     pub(crate) fn boundary_id(&self) -> Result<Option<String>> {
         Ok(self.0.query_row("SELECT id FROM messages WHERE is_compact_boundary=1 ORDER BY sort_order DESC,rowid DESC LIMIT 1",
             [], |r| r.get(0)).optional()?)
@@ -871,7 +849,7 @@ impl SessionRead<'_> {
         )?;
         let mut pending = self.0.prepare_cached(
             "SELECT 1 FROM peripheral_settings WHERE key='memory.prompt.message.'||?1
-            AND json_extract(value,'$.pending')=1",
+            AND json_extract(value,'$.pending')=1 OR key='prompt.pending.'||?1",
         )?;
         let mut unsent = Vec::new();
         let mut first = None;
@@ -997,43 +975,5 @@ impl SessionRead<'_> {
             tail.push(TranscriptExcerpt { role, text:row.get(2)?, tools });
         }
         Ok(tail)
-    }
-}
-
-#[cfg(test)]
-mod memory_index_order_tests {
-    use super::*;
-
-    #[test]
-    fn memory_watermark_follows_visible_rows_with_equal_sort_order() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let stores = crate::db::session_store::Stores::open(temp.path())?;
-        let session = stores.create("memory-index-order", Default::default())?;
-        let boundary = session.approve_plan("boundary")?;
-        session.write(|w| {
-            let mut ids = Vec::new();
-            for (hash, blocks) in [
-                ("first", vec!["<system-reminder>\nMEMORY.md changed. A"]),
-                ("second", vec!["<system-reminder>\nMEMORY.md changed. B"]),
-                ("unannounced", Vec::new()),
-            ] {
-                let id = w.append("user", "same text")?;
-                w.set_prompt_origin(&id, "typed")?;
-                ids.push(id.clone());
-                let key =
-                    super::super::settings::Setting::memory_receipt(format!("prompt.message.{id}"));
-                w.set_setting(key, &serde_json::json!({"index_hash":hash,"blocks":blocks}))?;
-            }
-            w.0.execute("UPDATE messages SET sort_order=0", [])?;
-            assert_eq!(
-                visible_memory_index(w.0, &ids[1])?,
-                (Some(boundary.clone()), Some("first".into()))
-            );
-            assert_eq!(
-                visible_memory_index(w.0, "next")?,
-                (Some(boundary.clone()), Some("second".into()))
-            );
-            Ok(())
-        })
     }
 }

@@ -223,6 +223,7 @@ pub fn rejected_configuration(workspace: &Path) -> Setting<(Vec<Option<String>>,
     Setting::workspace("lifecycle-config.rejected", workspace)
 }
 
+pub(crate) const MEMORY_AGENT: Setting<String> = Setting::new("memory.agent-definition");
 pub(crate) const MEMORY_SCOPE: Setting<(Option<String>, String)> = Setting::new("memory.scope");
 pub(crate) const MEMORY_OWNER: Setting<(Option<String>, String)> =
     Setting::new("memory.private-owner");

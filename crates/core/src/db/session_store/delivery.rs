@@ -1117,7 +1117,8 @@ impl DeliveryOwner {
                     });
                     input_queue::save_delivered(tx.0, tool, &inputs)?;
                     if let Some(memory) = &memory {
-                        memory.typed(tx.0, &claim.id, &payload)?;
+                        memory.admit(tx.0, &claim.id)?;
+                        super::history::mark_input_pending(tx.0,&claim.id)?;
                         crate::services::permission_authority::record_conn(tx.0,&s.id,crate::services::permission_authority::Source::User,&payload)?;
                     }
                 } else {
