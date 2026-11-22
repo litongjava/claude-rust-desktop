@@ -261,7 +261,8 @@ pub(crate) fn prepare(
         (Some(m), Some(snapshot), Some((_, query))) => m.recall(snapshot, query, recall_budget)?,
         _ => None,
     };
-    let first = shard.write(|w| {
+    let (first, new_entry) = shard.write(|w| {
+        let mut new_entry = None;
         let state = match w.setting(index_state())? {
             Some(state) => state,
             None => {
@@ -291,10 +292,10 @@ pub(crate) fn prepare(
                         }
                     }
                     blocks.extend(
-                        recall.map(|text| format!("<system-reminder>\n{text}</system-reminder>")),
+                        recall.as_ref().map(|text| format!("<system-reminder>\n{text}</system-reminder>")),
                     );
                     let saved = Receipt {
-                        index_hash: hash,
+                        index_hash: hash.clone(),
                         blocks,
                     };
                     w.set_setting(receipt(id), &saved)?;
@@ -302,11 +303,12 @@ pub(crate) fn prepare(
                 }
             };
             if !saved.blocks.is_empty() {
-                entries.push(attachment(id, saved.blocks));
+                new_entry = Some(attachment(id, saved.blocks));
             }
         }
-        Ok(state.first)
+        Ok((state.first, new_entry))
     })?;
+    entries.extend(new_entry);
     Ok((first, entries))
 }
 
