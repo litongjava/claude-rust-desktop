@@ -99,11 +99,11 @@ impl FileMemory {
         }
     }
 
-    fn render_index(&self, snapshot: Option<&crate::memory::files::Snapshot>) -> String {
+    pub(super) fn render_index(&self, snapshot: Option<&crate::memory::files::Snapshot>) -> String {
         let index = snapshot.map_or("", |s| s.index.as_str());
         let path = xml(&self.directory.join("MEMORY.md").to_string_lossy());
         format!("<system-reminder>\n<project_memory>\nIndex: {path}\n{}\n{}\n</project_memory>\n</system-reminder>",
-            include_str!("../../prompt/file_memory.md"), index_excerpt(&xml(index)))
+            include_str!("../../prompt/file_memory.md"), xml(&index_excerpt(index)))
     }
 
     pub(crate) fn prepare_delivery(

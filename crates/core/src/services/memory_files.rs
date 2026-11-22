@@ -795,6 +795,21 @@ mod tests {
             .is_empty());
     }
     #[test]
+    fn memory_oversized_disk_index_truncates_before_escaping_and_hashes_tail() {
+        let (_root, memory) = fixture();
+        memory.store(false).unwrap();
+        let path = memory.directory.join("MEMORY.md");
+        let raw = "<".repeat(9 * 1024 * 1024);
+        std::fs::write(&path, &raw).unwrap();
+        let snapshot = memory.store(true).unwrap().prompt_snapshot().unwrap();
+        let rendered = memory.render_index(Some(&snapshot));
+        assert!(rendered.contains("[MEMORY.md truncated]"));
+        assert!(rendered.matches("&lt;").count() > 25000);
+        std::fs::write(path, raw + "x").unwrap();
+        assert_ne!(snapshot.index_hash, memory.store(true).unwrap().prompt_snapshot().unwrap().index_hash);
+    }
+
+    #[test]
     fn memory_text_boundary_rebuilds_the_current_scope_prefix() {
         let (root, first) = fixture();
         let second_root = root.path().join("other");

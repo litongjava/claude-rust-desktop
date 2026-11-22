@@ -115,6 +115,43 @@ impl SafeDir {
         Ok(Some(data))
     }
 
+    /// Hash the complete index while retaining only a bounded display prefix.
+    pub fn index_prefix(&self, limit: usize) -> Result<Option<(String, String)>> {
+        use sha2::{Digest, Sha256};
+        let name = "MEMORY.md";
+        self.verify()?;
+        let mut file = match platform::open_file(self, name, false, false) {
+            Err(MemoryFileError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None)
+            }
+            result => result?,
+        };
+        platform::validate_file(&file)?;
+        let before = file.metadata()?;
+        let mut prefix = Vec::new();
+        let mut hash = Sha256::new();
+        let mut buffer = [0; 16384];
+        let mut size = 0u64;
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            size += n as u64;
+            hash.update(&buffer[..n]);
+            prefix.extend_from_slice(&buffer[..n.min(limit.saturating_sub(prefix.len()))]);
+        }
+        let after = file.metadata()?;
+        self.verify_file(name, &file)?;
+        if size != before.len() || size != after.len() || before.modified()? != after.modified()? {
+            return Err(MemoryFileError::Conflict(name.into()));
+        }
+        // The prompt reader retains lookahead beyond its display limit. A partial
+        // code point or invalid byte in an oversized external edit is printable.
+        let text = String::from_utf8_lossy(&prefix).into_owned();
+        Ok(Some((text, format!("{:x}", hash.finalize()))))
+    }
+
     pub fn create(&self, name: &str, bytes: &[u8]) -> Result<()> {
         safe_component(name)?;
         self.verify()?;

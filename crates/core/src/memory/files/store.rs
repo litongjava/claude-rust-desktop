@@ -349,16 +349,29 @@ impl FileMemoryStore {
 
     fn scanned_snapshot(&self, use_disk_index: bool) -> Result<Snapshot> {
         let (entries, diagnostics) = self.scan(None)?;
-        let previous = self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?;
-        let index = match previous {
-            Some(bytes) if use_disk_index => {
-                String::from_utf8(bytes).map_err(|_| invalid("invalid index encoding"))?
+        let disk = if use_disk_index {
+            // Extra bytes accommodate a UTF-8 character crossing the display limit.
+            self.directory
+                .index_prefix(super::IndexLimits::default().bytes + 4)?
+        } else {
+            None
+        };
+        let (index, index_hash) = match disk {
+            Some(snapshot) => snapshot,
+            None => {
+                let previous = if use_disk_index {
+                    None
+                } else {
+                    self.directory.read("MEMORY.md", MAX_INDEX_BYTES)?
+                };
+                let index = index::build(&entries, previous.as_deref().unwrap_or_default());
+                let digest = hash(index.as_bytes());
+                (index, digest)
             }
-            bytes => index::build(&entries, bytes.as_deref().unwrap_or_default()),
         };
         Ok(Snapshot {
             generation: self.generation()?,
-            index_hash: hash(index.as_bytes()),
+            index_hash,
             index,
             entries,
             diagnostics,
