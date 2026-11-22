@@ -2324,7 +2324,7 @@ fn run(
                         let paths = deepseek_code_core::runtime::RuntimePaths::new(root.clone()).ok()?;
                         let mut context = crate::services::context(&paths).ok()?;
                         context.db = std::sync::Arc::new(owner.scoped_stores());
-                        Some(context)
+                        Some((context, owner))
                     });
                     state.shell_context = Some((root, session));
                 }
@@ -3176,15 +3176,13 @@ fn run(
         }
         if last_agents.elapsed() >= Duration::from_secs(1) {
             last_agents = Instant::now();
-            if let Some((_, session)) = &state.shell_context {
-                if let Some(context) = &agent_context {
-                    state.agent_panel = crate::background_commands::running_agents(&context.paths, &context.db, session);
-                    super::title::background(!state.agent_panel.is_empty());
-                    state.agent_panel.extend(state.foreground_agents.iter().filter_map(|(id, kind)| crate::background_commands::foreground_agent(context, id, kind)));
+            if let Some((context, parent)) = &agent_context {
+                let (background, agents) = crate::background_commands::panel_agents(context, parent, &state.foreground_agents);
+                super::title::background(background > 0);
+                state.agent_panel = agents;
 
-                    if let Some(id) = &state.agent_detail { agent_preview = crate::background_commands::agent_execution(context, id); }
-                    dirty = true;
-                }
+                if let Some(id) = &state.agent_detail { agent_preview = crate::background_commands::agent_execution(context, id); }
+                dirty = true;
             }
         }
         if last_tick.elapsed() >= Duration::from_millis(120) {
