@@ -579,12 +579,46 @@ impl QueryEngine {
                 None
             }
         };
+        let window = history
+            .first()
+            .filter(|m| m["provider_content"]["compaction"] == true)
+            .map(|boundary| -> Result<_> {
+                let mut body = super::provider_runtime::messages::request(
+                    "openai-responses",
+                    &provider,
+                    &serde_json::Value::Null,
+                    vec![serde_json::from_value(boundary.clone())?],
+                    Some(system),
+                    vec![],
+                    0,
+                )?;
+                anyhow::ensure!(
+                    body["input"] == boundary["provider_content"]["items"]
+                        && body["input"]
+                            .as_array()
+                            .is_some_and(|items| items.iter().any(|i| i["type"] == "compaction"
+                                && i["encrypted_content"]
+                                    .as_str()
+                                    .is_some_and(|v| !v.is_empty()))),
+                    "Cannot replay the saved opaque Responses window; original history retained"
+                );
+                if let Some(key) = super::request_identity::prompt_cache_key(Some(session)) {
+                    body["prompt_cache_key"] = key.into();
+                }
+                Ok(super::followup::WireRequest {
+                    api: "openai-responses".into(),
+                    body,
+                    builtin_vision: Some(false),
+                })
+            })
+            .transpose()?;
         super::generation::summarize_with_prefix(
             provider,
             system,
             input,
             Some(&mut checkpoint),
             prefix.map(|wire| (wire, instructions)),
+            window,
         )
         .await
         .map(Into::into)

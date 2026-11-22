@@ -276,6 +276,30 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
         .iter()
         .rposition(|m| m.is_compact_boundary)
         .unwrap_or(0);
+    let count = rows.len() - start;
+    let mut hasher = Sha256::new();
+    if let Some(boundary) = rows.get(start).filter(|m| m.is_compact_boundary) {
+        use rusqlite::OptionalExtension;
+        let sharded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='native_boundaries')",
+            [],
+            |r| r.get(0),
+        )?;
+        let window = if sharded {
+            conn.query_row(
+                "SELECT value FROM native_boundaries WHERE message_id=?1",
+                [&boundary.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            native::load(conn, &boundary.id)?.map(|v| v.to_string())
+        };
+        if let Some(window) = window {
+            // Fence replacement of the opaque payload during generation.
+            hasher.update(window.as_bytes());
+        }
+    }
     let mut all = Vec::new();
     for row in &rows {
         let calls = message_repo::get_tool_calls_for_message(conn, &row.id)?;
@@ -283,9 +307,28 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
         let attachments = stmt.query_map([&row.id], |r| {
             Ok(json!({"id":r.get::<_,String>(0)?, "file_name":r.get::<_,Option<String>>(1)?, "file_type":r.get::<_,Option<String>>(2)?, "mime_type":r.get::<_,Option<String>>(3)?, "file_size":r.get::<_,Option<i64>>(4)?, "source":r.get::<_,Option<String>>(5)?}))
         })?.collect::<rusqlite::Result<Vec<_>>>()?;
-        all.push(json!({"message": row, "tools": calls, "attachment_metadata": attachments}));
+        let mut entry = json!({"message": row, "tools": calls, "attachment_metadata": attachments});
+        use rusqlite::OptionalExtension;
+        if let Some(content) = conn
+            .query_row(
+                "SELECT content_json FROM message_user_content WHERE message_id=?1",
+                [&row.id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            entry["user_content"] = serde_json::from_str(&content)?;
+        }
+        for call in &calls {
+            let notes = message_repo::tool_call_note(conn, &call.id)?;
+            let delivered = crate::services::input_queue::load_delivered(conn, &call.id)?;
+            if notes.is_some() || !delivered.is_empty() {
+                entry["tool_context"][&call.id] =
+                    json!({"approval_note":notes,"delivered":delivered});
+            }
+        }
+        all.push(entry);
     }
-    let mut hasher = Sha256::new();
     for entry in &all {
         serde_json::to_writer(&mut hasher, entry)?;
         hasher.write_all(b"\n")?;
@@ -299,8 +342,8 @@ pub(crate) fn fingerprint(conn: &rusqlite::Connection, id: &str) -> Result<(Stri
         });
     Ok((
         fingerprint,
-        serde_json::to_string(&all[start..])?,
-        rows.len() - start,
+        serde_json::to_string(&all)?,
+        count,
     ))
 }
 

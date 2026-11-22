@@ -367,13 +367,6 @@ fn node_quota(pool: usize) -> usize {
 /// When the safe line cannot provide it, planning fails before any request.
 const MIN_INPUT_TOKENS: u64 = 1024;
 
-/// Largest input one initial fragment or intermediate merge may carry. The
-/// request output budget is the selected model cap, so no room is reserved for
-/// a later raise.
-fn planning_limit_for(window: u64, output: u32) -> u64 {
-    input_budget_for(window, output).min(MAX_INPUT_TOKENS)
-}
-
 fn input_tokens(system: &str, input: &str) -> u64 {
     super::request_context::ContextUsage::from_body(
         "openai-completions",
@@ -540,6 +533,13 @@ fn log_request(
     );
 }
 
+// Recovery requests must carry encrypted Responses items as protocol objects.
+struct WindowFallback {
+    wire: WireRequest,
+    tokens: u64,
+    checkpoint_system: String,
+}
+
 struct WholeRequest {
     planner_text: String,
     wire: WireRequest,
@@ -574,6 +574,7 @@ struct Summarizer<'a, 'b> {
     // Only the complete-history request uses this body. Split and merge nodes
     // must consume their own reduced input.
     whole_request: Option<WholeRequest>,
+    fallback: Option<WindowFallback>,
 }
 
 impl<'a, 'b> Summarizer<'a, 'b> {
@@ -585,7 +586,9 @@ impl<'a, 'b> Summarizer<'a, 'b> {
     /// Largest input one initial fragment or merge may carry. The generation
     /// budget is already the selected model cap, so no raise is reserved.
     fn planning_limit(&self, output: u32) -> u64 {
-        planning_limit_for(self.window, output)
+        self.input_budget(output)
+            .saturating_sub(self.fallback.as_ref().map_or(0, |f| f.tokens))
+            .min(MAX_INPUT_TOKENS)
     }
 
     /// The full request text for this stage. The length target is fixed, so a
@@ -633,7 +636,11 @@ impl<'a, 'b> Summarizer<'a, 'b> {
         if let Some(request) = self.whole_request(text) {
             return request.checkpoint_key.clone();
         }
-        Checkpoint::request_key(self.system, text, output)
+        let system = self
+            .fallback
+            .as_ref()
+            .map_or(self.system, |f| &f.checkpoint_system);
+        Checkpoint::request_key(system, text, output)
     }
 
     fn cached(&self, text: &str, output: u32) -> Option<String> {
@@ -708,11 +715,17 @@ impl<'a, 'b> Summarizer<'a, 'b> {
                 super::request_options::RequestOptions::for_session(session.as_deref())
             })
             .compaction(label);
-        let summary = match self.whole_request(text) {
-            Some(request) => {
+        let summary = match (self.whole_request(text), &self.fallback) {
+            (Some(request), _) => {
                 generate_followup(&self.provider, request.wire.clone(), output, options).await?
             }
-            None => {
+            (None, Some(fallback)) => {
+                let mut wire = fallback.wire.clone();
+                wire.append_instruction(text)?;
+                wire.set_output_budget(output);
+                generate_followup(&self.provider, wire, output, options).await?
+            }
+            (None, None) => {
                 generate_request(
                     self.provider.clone(),
                     self.system,
@@ -1086,7 +1099,7 @@ pub(crate) async fn summarize(
     input: &str,
     checkpoint: Option<&mut Checkpoint<'_>>,
 ) -> Result<String> {
-    summarize_with_prefix(provider, system, input, checkpoint, None).await
+    summarize_with_prefix(provider, system, input, checkpoint, None, None).await
 }
 
 pub(super) async fn summarize_with_prefix(
@@ -1095,6 +1108,7 @@ pub(super) async fn summarize_with_prefix(
     input: &str,
     mut checkpoint: Option<&mut Checkpoint<'_>>,
     prefix: Option<(WireRequest, &str)>,
+    window_fallback: Option<WireRequest>,
 ) -> Result<String> {
     let window = provider.model.context_window.unwrap_or_else(|| {
         super::token_counter::TokenCounter::get_model_context_limit(&provider.model.id) as u32
@@ -1137,7 +1151,18 @@ pub(super) async fn summarize_with_prefix(
     } else {
         None
     };
+    let fallback = window_fallback.map(|wire| {
+        let serialized = wire.body["input"].to_string();
+        let tokens = (serialized.len() as u64).div_ceil(3);
+        let checkpoint_system = Checkpoint::request_key(system, &serialized, final_output);
+        WindowFallback {
+            wire,
+            tokens,
+            checkpoint_system,
+        }
+    });
     let mut summarizer = Summarizer {
+        fallback,
         provider,
         system,
         window: u64::from(window),
@@ -1149,7 +1174,7 @@ pub(super) async fn summarize_with_prefix(
         checkpoint: checkpoint.as_deref_mut(),
         whole_request,
     };
-    let final_limit = summarizer.input_budget(final_output).min(MAX_INPUT_TOKENS);
+    let final_limit = summarizer.planning_limit(final_output);
     // A history that fits one final summary is summarized in one request.
     if summarizer.text_fits(&summarizer.text(Stage::Final, input), final_output) {
         let mut quota = Quota::new(MAX_SEGMENT_RECOVERIES);
@@ -1720,6 +1745,7 @@ mod tests {
             reused: 0,
             checkpoint: None,
             whole_request: None,
+            fallback: None,
         }
     }
 
