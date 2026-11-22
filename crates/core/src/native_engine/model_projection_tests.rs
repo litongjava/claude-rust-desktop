@@ -356,3 +356,39 @@ fn base64_model_boundary_without_a_settings_path_uses_the_runtime_directory() {
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }
+
+#[test]
+fn base64_model_boundary_replays_plaintext_in_native_windows() {
+    let dir = tempfile::tempdir().unwrap();
+    let payload = "QUJD".repeat(256);
+    let page = format!("historical page\n!{payload}!");
+    let notice =
+        format!("<task-notification>\n<kind>monitor</kind>\n!{payload}!\n</task-notification>");
+    let mut messages = vec![json!({"role":"user","content":"Native compact window",
+    "provider_content":{"compaction":true,"items":[
+        {"type":"function_call","call_id":"call","name":"TaskGet"},
+        {"type":"function_call_output","call_id":"call","output":page},
+        {"role":"user","content":[{"type":"input_text","text":notice}]},
+        {"type":"compaction","encrypted_content":payload}
+    ]}})];
+    super::project_stored_history(&mut messages, dir.path(), "window");
+    let items = &messages[0]["provider_content"]["items"];
+    check_view(
+        "native stored page",
+        dir.path(),
+        &page,
+        items[1]["output"].as_str().unwrap(),
+        true,
+    );
+    check_view(
+        "native Monitor",
+        dir.path(),
+        &notice,
+        items[2]["content"][0]["text"].as_str().unwrap(),
+        true,
+    );
+    assert_eq!(items[3]["encrypted_content"], payload);
+    let expected = messages.clone();
+    super::project_stored_history(&mut messages, dir.path(), "window");
+    assert_eq!(messages, expected);
+}

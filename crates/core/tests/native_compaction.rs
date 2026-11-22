@@ -637,3 +637,84 @@ async fn context_search_hint_requires_persisted_compaction_without_host_provenan
         .contains("Host continuation summary"));
     server.abort();
 }
+
+#[tokio::test]
+async fn base64_model_boundary_native_compaction_projects_stored_protocol_results() {
+    let Fixture {
+        dir: _dir,
+        store,
+        id,
+        engine,
+        seen,
+        server,
+        ..
+    } = fixture(0).await;
+    let assistant = store.append(&id, "assistant", "").unwrap();
+    let payload = "QUJD".repeat(256);
+    let page = format!("historical page\n!{payload}!");
+    let ordinary = r#"{"stdout":"ordinary"}"#;
+    store
+        .db
+        .shard_sql(&id, |conn| {
+            for (index, (name, text)) in [("TaskGet", page.as_str()), ("Bash", ordinary)]
+                .into_iter()
+                .enumerate()
+            {
+                deepseek_code_core::db::message_repo::insert_tool_call(
+                    conn,
+                    &format!("call{index}"),
+                    &assistant,
+                    name,
+                    Some("{}"),
+                    Some(text),
+                    false,
+                    index as i64,
+                )?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .unwrap()
+        .unwrap();
+    let notice = format!("<task-notification>\n<kind>monitor</kind>\n<event>!{payload}!</event>\n</task-notification>");
+    store.append(&id, "user", &notice).unwrap();
+    compaction::compact(&engine, &store.db, &id, "gateway", "gpt-6-astra", "")
+        .await
+        .unwrap();
+    let request = seen.lock().unwrap()[0].clone();
+    let items = request["input"].as_array().unwrap();
+    let page_view = items
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .find_map(|i| {
+            i["output"]
+                .as_str()
+                .filter(|text| text.starts_with("historical page"))
+        })
+        .unwrap();
+    let notice_view = items
+        .iter()
+        .filter(|i| i["role"] == "user")
+        .find_map(|i| {
+            i["content"][0]["text"]
+                .as_str()
+                .filter(|text| text.starts_with("<task-notification>"))
+        })
+        .unwrap();
+    for (view, raw, number) in [
+        (page_view, page.as_str(), 2),
+        (notice_view, notice.as_str(), 3),
+    ] {
+        assert!(!view.contains(&payload));
+        let (file, line) = view
+            .split_once("; full text: ")
+            .unwrap()
+            .1
+            .split_once(", line ")
+            .unwrap();
+        assert_eq!(line.split_once(']').unwrap().0, number.to_string());
+        assert_eq!(std::fs::read_to_string(file).unwrap(), raw);
+    }
+    assert!(items.iter().any(|i| i["output"] == ordinary));
+    server.abort();
+    let _ = server.await;
+}

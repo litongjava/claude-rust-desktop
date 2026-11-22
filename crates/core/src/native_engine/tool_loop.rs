@@ -569,6 +569,7 @@ impl Drop for PermissionWaiterGuard {
 
 #[path = "model_tool_output.rs"]
 mod model_output;
+pub(crate) use model_output::project_stored_history;
 #[path = "model_projection.rs"]
 mod model_projection;
 pub(crate) use model_projection::{monitor_notification, project_for_model};

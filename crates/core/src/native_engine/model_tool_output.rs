@@ -20,87 +20,30 @@ impl super::ToolLoopExecutor {
         inputs
             .into_iter()
             .map(|mut input| {
-                self.project_notification(&mut input.content);
+                project_notification(
+                    &mut input.content,
+                    self.search_config_path.as_deref().and_then(Path::parent),
+                    self.conv_id.as_deref().unwrap_or_default(),
+                );
                 input.content
             })
             .collect()
     }
 
-    pub(super) fn project_notification(&self, content: &mut Value) {
-        let root = self.search_config_path.as_deref().and_then(Path::parent);
-        let Some(text) = content.as_str().filter(|s| super::monitor_notification(s)) else {
-            return;
-        };
-        if let Some(view) = super::project_for_model(
-            "Monitor",
-            text,
-            root,
-            self.conv_id.as_deref().unwrap_or_default(),
-        ) {
-            *content = Value::String(view);
-        }
-    }
-
     /// Called by both provider builders, after typed MCP/image restoration.
     pub(super) fn prepare_history_tool_outputs(&self, messages: &mut [Value]) {
-        let mut names = std::collections::HashMap::<String, String>::new();
-        for message in messages {
-            if message["role"] == "user" {
-                self.project_notification(&mut message["content"]);
-                if let Some(blocks) = message["content"].as_array_mut() {
-                    for block in blocks.iter_mut().filter(|block| block["type"] == "text") {
-                        self.project_notification(&mut block["text"]);
-                    }
+        visit_history_outputs(
+            messages,
+            self.search_config_path.as_deref().and_then(Path::parent),
+            self.conv_id.as_deref().unwrap_or_default(),
+            |name, id, content| {
+                if let Some(text) = content.as_str() {
+                    *content = Value::String(self.preview_tool_output_for_id(name, text, Some(id)));
+                } else {
+                    self.retain_content(name, content);
                 }
-            }
-            if let Some(calls) = message["tool_calls"].as_array() {
-                for call in calls {
-                    if let (Some(id), Some(name)) =
-                        (call["id"].as_str(), call["function"]["name"].as_str())
-                    {
-                        names.insert(id.into(), name.into());
-                    }
-                }
-            }
-            if message["role"] == "tool" {
-                if let (Some(name), Some(text)) = (
-                    message["tool_call_id"]
-                        .as_str()
-                        .and_then(|id| names.get(id)),
-                    message["content"].as_str(),
-                ) {
-                    message["content"] = Value::String(self.preview_tool_output_for_id(
-                        name,
-                        text,
-                        message["tool_call_id"].as_str(),
-                    ));
-                }
-            } else if let Some(blocks) = message["content"].as_array_mut() {
-                for block in blocks {
-                    if block["type"] == "tool_use" {
-                        if let (Some(id), Some(name)) =
-                            (block["id"].as_str(), block["name"].as_str())
-                        {
-                            names.insert(id.into(), name.into());
-                        }
-                    } else if block["type"] == "tool_result" {
-                        if let Some(name) =
-                            block["tool_use_id"].as_str().and_then(|id| names.get(id))
-                        {
-                            if let Some(text) = block["content"].as_str() {
-                                block["content"] = Value::String(self.preview_tool_output_for_id(
-                                    name,
-                                    text,
-                                    block["tool_use_id"].as_str(),
-                                ));
-                            } else {
-                                self.retain_content(name, &mut block["content"]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+            },
+        );
     }
 
     pub(super) fn retain_content(&self, name: &str, content: &mut Value) {
@@ -119,6 +62,124 @@ impl super::ToolLoopExecutor {
                     .collect::<Vec<_>>()
                     .join("\n");
                 *content = Value::String(self.preview_tool_output(name, &text));
+            }
+        }
+    }
+}
+
+fn project_text_blocks(content: &mut Value, mut project: impl FnMut(&str) -> Option<String>) {
+    if let Some(blocks) = content.as_array_mut() {
+        for block in blocks
+            .iter_mut()
+            .filter(|block| matches!(block["type"].as_str(), Some("text" | "input_text")))
+        {
+            if let Some(view) = block["text"].as_str().and_then(&mut project) {
+                block["text"] = Value::String(view);
+            }
+        }
+    } else if let Some(view) = content.as_str().and_then(project) {
+        *content = Value::String(view);
+    }
+}
+
+fn project_notification(content: &mut Value, root: Option<&Path>, session: &str) {
+    project_text_blocks(content, |text| {
+        if super::monitor_notification(text) {
+            super::project_for_model("Monitor", text, root, session)
+        } else {
+            None
+        }
+    });
+}
+
+/// Manual native compaction consumes stored protocol messages directly.
+pub(crate) fn project_stored_history(messages: &mut [Value], root: &Path, session: &str) {
+    visit_history_outputs(messages, Some(root), session, |name, _, content| {
+        project_text_blocks(content, |text| {
+            super::project_for_model(name, text, Some(root), session)
+        });
+    });
+}
+
+// A saved Responses compact window can contain plaintext messages alongside
+// encrypted reasoning. Only identified results and Monitor text are projected.
+fn project_native_window(window: &mut Value, root: Option<&Path>, session: &str) {
+    if window["compaction"] != true {
+        return;
+    }
+    let Some(items) = window.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut names = std::collections::HashMap::<String, String>::new();
+    for item in items {
+        if item["role"] == "user" {
+            if let Some(content) = item.get_mut("content") {
+                project_notification(content, root, session);
+            }
+        } else if item["type"] == "function_call" {
+            if let (Some(id), Some(name)) = (item["call_id"].as_str(), item["name"].as_str()) {
+                names.insert(id.into(), name.into());
+            }
+        } else if item["type"] == "function_call_output" {
+            if let Some(name) = item["call_id"].as_str().and_then(|id| names.get(id)) {
+                if let Some(output) = item.get_mut("output") {
+                    project_text_blocks(output, |text| {
+                        super::project_for_model(name, text, root, session)
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn visit_history_outputs(
+    messages: &mut [Value],
+    root: Option<&Path>,
+    session: &str,
+    mut result: impl FnMut(&str, &str, &mut Value),
+) {
+    let mut names = std::collections::HashMap::<String, String>::new();
+    for message in messages {
+        if let Some(window) = message.get_mut("provider_content") {
+            project_native_window(window, root, session);
+        }
+        if message["role"] == "user" {
+            if let Some(content) = message.get_mut("content") {
+                project_notification(content, root, session);
+            }
+        }
+        if let Some(calls) = message["tool_calls"].as_array() {
+            for call in calls {
+                if let (Some(id), Some(name)) =
+                    (call["id"].as_str(), call["function"]["name"].as_str())
+                {
+                    names.insert(id.into(), name.into());
+                }
+            }
+        }
+        if message["role"] == "tool" {
+            if message["content"].is_string() {
+                if let Some((id, name)) = message["tool_call_id"]
+                    .as_str()
+                    .and_then(|id| names.get_key_value(id))
+                {
+                    result(name, id, &mut message["content"]);
+                }
+            }
+        } else if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
+            for block in blocks {
+                if block["type"] == "tool_use" {
+                    if let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) {
+                        names.insert(id.into(), name.into());
+                    }
+                } else if block["type"] == "tool_result" {
+                    if let Some((id, name)) = block["tool_use_id"]
+                        .as_str()
+                        .and_then(|id| names.get_key_value(id))
+                    {
+                        result(name, id, &mut block["content"]);
+                    }
+                }
             }
         }
     }

@@ -545,10 +545,15 @@ impl QueryEngine {
             .await
             .resolve_selected(provider_id, model)
             .ok_or_else(|| anyhow!("Provider/model is unavailable: {provider_id}::{model}"))?;
-        let history = crate::runtime::SessionStore::new(self.db_manager.clone())
+        let mut history = crate::runtime::SessionStore::new(self.db_manager.clone())
             .model_history(session, &provider.provider.api_format)?;
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
+            super::tool_loop::project_stored_history(
+                &mut history,
+                self.db_manager.data_dir(),
+                session,
+            );
             return crate::services::compaction::native::generate(
                 history,
                 session,

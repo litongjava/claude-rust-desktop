@@ -919,6 +919,7 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 
 ```bash
 cargo test --locked -p deepseek-code-core --lib -- base64_model_boundary base64_i6_cut base64_review_history base64_shell_thresholds
+cargo test --locked -p deepseek-code-core --test native_compaction base64_model_boundary_native_compaction
 cargo test --locked -p deepseek-code-cli --test taskget_background cli_base64_model_boundary_resumes_100_kib_shell_results
 ```
 
