@@ -13,7 +13,7 @@ pub(super) struct InvalidFormat(pub(super) String);
 pub(super) const GLOBAL: i32 = 0x4443_4c47; // DCLG
 pub(super) const SESSION: i32 = 0x4443_4c53; // DCLS
 pub(super) const GLOBAL_VERSION: i32 = 16;
-pub(super) const SESSION_VERSION: i32 = 13;
+pub(super) const SESSION_VERSION: i32 = 14;
 
 pub(super) fn canonical_uuid(id: &str) -> bool {
     Uuid::parse_str(id).is_ok_and(|uuid| uuid.to_string() == id)
@@ -326,7 +326,7 @@ pub(super) fn upgrade(path: &Path, kind: i32) -> Result<()> {
                     [],
                 )?;
             }
-            if kind == SESSION && version < 13 {
+            if kind == SESSION && version < 14 {
                 crate::db::context_search_index::migrate(tx)?;
             }
             if kind == GLOBAL {
@@ -657,6 +657,9 @@ fn verify_tables(conn: &Connection, kind: i32, expected: i32, journal_mode: &str
         )?;
         conn.prepare("SELECT model_content,model_recovery FROM messages LIMIT 0")?;
         conn.prepare("SELECT model_content_json FROM mcp_tool_outputs LIMIT 0")?;
+    }
+    if kind == SESSION && expected >= 14 {
+        conn.prepare("SELECT model_checked FROM tool_calls LIMIT 0")?;
     }
     for &(table, required) in tables
         .iter()

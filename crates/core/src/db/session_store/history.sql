@@ -94,6 +94,7 @@ CREATE TABLE tool_calls (
     message_id TEXT NOT NULL,
     name TEXT NOT NULL,
     input TEXT,
+    model_checked INTEGER NOT NULL DEFAULT 0,
     model_output TEXT,
     model_preview TEXT,
     model_recovery TEXT,

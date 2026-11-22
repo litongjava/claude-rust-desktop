@@ -195,7 +195,7 @@ pub fn insert_message(
         sort_order,
         view.as_ref().map(|v| &v.text),
         view.as_ref()
-            .and_then(|v| v.recovery.as_ref())
+            .map(|v| &v.recovery)
             .map(serde_json::to_string)
             .transpose()?,
     ])?;
@@ -243,7 +243,7 @@ pub fn save_user_message(
     let view = super::model_results::notification(conn, conversation_id, "user", &display)?;
     let changed = conn.execute(
         "INSERT INTO messages (id, conversation_id, role, content, created_at, sort_order, model_content, model_recovery) VALUES (?1, ?2, 'user', ?3, ?4, ?5, ?6, ?7) ON CONFLICT(id) DO UPDATE SET content = excluded.content,model_content=excluded.model_content,model_recovery=excluded.model_recovery, sort_order = excluded.sort_order WHERE messages.conversation_id = excluded.conversation_id AND messages.role = 'user'",
-        params![id, conversation_id, display, created_at, sort_order,view.as_ref().map(|v|&v.text),view.as_ref().and_then(|v|v.recovery.as_ref()).map(serde_json::to_string).transpose()?],
+        params![id, conversation_id, display, created_at, sort_order,view.as_ref().map(|v|&v.text),view.as_ref().map(|v|&v.recovery).map(serde_json::to_string).transpose()?],
     )?;
     anyhow::ensure!(
         changed == 1,
@@ -492,27 +492,20 @@ pub(super) fn store_tool_call(
     )?;
     // A stream flush may revisit a completed occurrence. Assign its view only
     // when the actual result changes, including a transition back to pending.
-    if conn.execute("UPDATE tool_calls SET input=?5,is_error=?6,sort_order=?7 WHERE id=?1 AND name=?2 AND message_id=?3 AND output IS ?4 AND (model_output IS NOT NULL OR output IS NULL)",params![id,name,message_id,output,input,is_error,sort_order])? == 1 {
+    if conn.execute("UPDATE tool_calls SET input=?5,is_error=?6,sort_order=?7 WHERE id=?1 AND name=?2 AND message_id=?3 AND output IS ?4 AND (model_checked OR output IS NULL)",params![id,name,message_id,output,input,is_error,sort_order])? == 1 {
         return Ok(());
     }
     let root = super::model_results::data_root(conn)?;
-    let view = output.map(|raw| {
-        super::model_results::ModelText::new(name, raw, root.as_deref(), &session, Some(id), cwd)
+    let view = output.and_then(|raw| {
+        super::model_results::result_override(name, raw, root.as_deref(), &session, Some(id), cwd)
     });
     let text = view.as_ref().map(|v| v.text.as_str());
-    let recovery = view.as_ref().and_then(|v| v.recovery.as_ref());
-    let search = text.and_then(|t| {
-        if recovery.is_some() {
-            Some(std::borrow::Cow::Borrowed(t))
-        } else {
-            super::model_results::search_text(name, t)
-        }
-    });
-    conn.execute("INSERT INTO tool_calls (id,message_id,name,input,output,is_error,sort_order,model_output,model_recovery,model_search,model_preview)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id,name=excluded.name,
+    let recovery = view.as_ref().map(|v| &v.recovery);
+    conn.execute("INSERT INTO tool_calls (id,message_id,name,input,output,is_error,sort_order,model_output,model_recovery,model_search,model_preview,model_checked)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?8,NULL,?5 IS NOT NULL) ON CONFLICT(id) DO UPDATE SET message_id=excluded.message_id,name=excluded.name,
         input=excluded.input,output=excluded.output,is_error=excluded.is_error,sort_order=excluded.sort_order,
-        model_output=excluded.model_output,model_recovery=excluded.model_recovery,model_search=excluded.model_search,model_preview=excluded.model_preview",
-        params![id,message_id,name,input,output,is_error,sort_order,text,recovery.map(serde_json::to_string).transpose()?,search.as_deref(),view.as_ref().and_then(|v|v.preview.as_deref())])?;
+        model_output=excluded.model_output,model_recovery=excluded.model_recovery,model_search=excluded.model_search,model_preview=NULL,model_checked=excluded.model_checked",
+        params![id,message_id,name,input,output,is_error,sort_order,text,recovery.map(serde_json::to_string).transpose()?])?;
     Ok(())
 }
 
@@ -622,7 +615,7 @@ pub(super) fn pending_after_completion(
 ) -> Result<bool> {
     Ok(output.is_none()
         && conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM tool_calls WHERE id=? AND model_output IS NOT NULL)",
+            "SELECT EXISTS(SELECT 1 FROM tool_calls WHERE id=? AND output IS NOT NULL)",
             [id],
             |r| r.get::<_, bool>(0),
         )?)

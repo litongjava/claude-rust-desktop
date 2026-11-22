@@ -34,8 +34,18 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         }
     }
     let installed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('context_search_sources') WHERE name='materialized')",[],|r|r.get(0))?;
-    if installed {
+    let checked: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tool_calls') WHERE name='model_checked')",
+        [],
+        |r| r.get(0),
+    )?;
+    if installed && checked {
         return Ok(());
+    }
+    if !checked {
+        conn.execute_batch(
+            "ALTER TABLE tool_calls ADD COLUMN model_checked INTEGER NOT NULL DEFAULT 0",
+        )?;
     }
     let upgrading: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='context_search_sources')",
@@ -43,10 +53,16 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         |r| r.get(0),
     )?;
     if upgrading {
-        conn.execute_batch(
+        if !installed {
+            conn.execute_batch(
             "ALTER TABLE context_search_sources ADD COLUMN materialized INTEGER NOT NULL DEFAULT 0;
             ALTER TABLE context_search_sources ADD COLUMN recovery TEXT;",
         )?;
+        } else {
+            conn.execute_batch(
+                "DROP TRIGGER invalidate_model_tool; DROP TRIGGER invalidate_model_message;",
+            )?;
+        }
         for table in ["messages", "tool_calls"] {
             for op in ["insert", "update", "delete"] {
                 conn.execute_batch(&format!("DROP TRIGGER context_search_{table}_{op}"))?;
@@ -98,8 +114,10 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         let chunks=format!("CASE WHEN {ready} THEN {model} IS NOT NULL AND
             (length(CAST({model} AS BLOB))>{BLOCK} OR length(CAST({column} AS BLOB))>{BLOCK} OR length(CAST({input} AS BLOB))>4096)
             ELSE ({chunked}) END",input=if kind=="tool" {"input"}else{"NULL"});
+        // 0 legacy/unclassified, 1 projected bytes, 2 classified original bytes.
+        let materialization = if kind == "tool" { "CASE WHEN model_output IS NOT NULL THEN 1 WHEN model_checked THEN 2 ELSE 0 END" } else { &ready };
         let insert = format!("INSERT INTO context_search_sources
-            SELECT '{kind}',id,{metadata},{size},coalesce(({chunks}),0),({ready}),model_recovery FROM {table}");
+            SELECT '{kind}',id,{metadata},{size},coalesce(({chunks}),0),({materialization}),model_recovery FROM {table}");
         if !upgrading {
         conn.execute_batch(&insert)?;
         // Open each old value once and advance sequentially. Backfill occurs once
@@ -110,7 +128,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         let mut buf = vec![0; BLOCK];
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
-            let source=if row.get::<_,bool>(2)? {model}else{column};
+            let source = if row.get::<_, i64>(2)? == 1 { model } else { column };
             let value = conn.blob_open(DatabaseName::Main, table, source, row.get(1)?, true)?;
             for (part, offset) in (0..value.len()).step_by(BLOCK).enumerate() {
                 let len = BLOCK.min(value.len() - offset);
@@ -129,7 +147,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
                 SELECT 0,size FROM context_search_sources WHERE kind='{kind}' AND id=NEW.id AND chunked=1 AND size>0
                 UNION ALL SELECT pos+{BLOCK},size FROM offsets WHERE pos+{BLOCK}<size
             ) SELECT '{kind}',NEW.id,pos/{BLOCK},substr(CAST(({value}) AS BLOB),pos+1,{BLOCK}) FROM offsets JOIN {table} ON {table}.rowid=NEW.rowid;");
-        let fields=format!("{fields},{model},model_recovery");
+        let fields=format!("{fields},{model},model_recovery{}", if kind=="tool" {",model_checked,model_output"} else {""});
         let old = remove("OLD");
         let new = remove("NEW");
         conn.execute_batch(&format!(
@@ -139,10 +157,20 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         ))?;
     }
     conn.execute_batch("CREATE TRIGGER invalidate_model_tool AFTER UPDATE OF output,name ON tool_calls
-        WHEN (OLD.output IS NOT NEW.output OR OLD.name IS NOT NEW.name) AND NEW.model_output IS OLD.model_output AND NEW.model_search IS OLD.model_search AND NEW.model_recovery IS OLD.model_recovery
-        BEGIN UPDATE tool_calls SET model_output=NULL,model_preview=NULL,model_search=NULL,model_recovery=NULL WHERE id=NEW.id; END;
+        WHEN (OLD.output IS NOT NEW.output OR OLD.name IS NOT NEW.name) AND NEW.model_checked IS OLD.model_checked AND NEW.model_output IS OLD.model_output AND NEW.model_search IS OLD.model_search AND NEW.model_recovery IS OLD.model_recovery
+        BEGIN UPDATE tool_calls SET model_checked=0,model_output=NULL,model_preview=NULL,model_search=NULL,model_recovery=NULL WHERE id=NEW.id; END;
         CREATE TRIGGER invalidate_model_message AFTER UPDATE OF content ON messages WHEN OLD.content IS NOT NEW.content AND NEW.model_content IS OLD.model_content AND NEW.model_content IS NOT NULL
         BEGIN UPDATE messages SET model_content=NULL,model_recovery=NULL WHERE id=NEW.id; END;")?;
+    if installed {
+        // Previous builds materialized ordinary previews too. Recovery metadata
+        // identifies scalar overrides, even when saving the recovery file failed.
+        conn.execute_batch("UPDATE tool_calls SET model_checked=1,
+            model_output=CASE WHEN model_recovery IS NOT NULL THEN model_output END,
+            model_search=CASE WHEN model_recovery IS NOT NULL THEN model_search END, model_preview=NULL
+            WHERE model_output IS NOT NULL;
+            UPDATE messages SET model_content=NULL WHERE model_recovery IS NULL AND model_content IS NOT NULL;")?;
+        crate::native_engine::mcp_output::discard_ordinary_sidecars(conn)?;
+    }
     Ok(())
 }
 
@@ -209,4 +237,50 @@ pub(super) fn read_bytes(
         charged += count;
     }
     Ok((bytes, charged))
+}
+
+#[cfg(test)]
+mod override_tests {
+    use super::*;
+
+    #[test]
+    fn base64_model_boundary_upgrade_reindexes_ordinary_results_and_keeps_recovery() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(crate::db::schema::SCHEMA_SQL).unwrap();
+        migrate(&db).unwrap();
+        // Simulate the preceding schema: all completed results had materialized
+        // text, and the search index and its triggers were already installed.
+        db.execute_batch("ALTER TABLE tool_calls RENAME COLUMN model_checked TO old_fixture_field;
+            INSERT INTO conversations(id,created_at,updated_at) VALUES('s','now','now');
+            INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order) VALUES('m','s','assistant','','now',0);
+            INSERT INTO tool_calls(id,message_id,name,output,sort_order,model_output,model_preview,model_search)
+              VALUES('plain','m','Bash','ordinary',0,'ordinary','old preview','ordinary');
+            INSERT INTO tool_calls(id,message_id,name,output,sort_order,model_output,model_search,model_recovery)
+              VALUES('projected','m','Bash','original',1,'saved text','saved text','saved recovery');
+            INSERT INTO mcp_tool_outputs(conversation_id,tool_use_id,content_json,model_content_json,metadata_json,display_text,is_error)
+              VALUES('s','plain','\"ordinary\"','\"old preview\"','{}','ordinary',0);").unwrap();
+        migrate(&db).unwrap();
+        migrate(&db).unwrap();
+        let ordinary: bool = db.query_row("SELECT model_checked AND output='ordinary' AND model_output IS NULL AND model_preview IS NULL
+            AND model_search IS NULL AND model_recovery IS NULL FROM tool_calls WHERE id='plain'", [], |r| r.get(0)).unwrap();
+        assert!(ordinary);
+        let indexes: Vec<(String, i64)> = db
+            .prepare(
+                "SELECT id,materialized FROM context_search_sources WHERE kind='tool' ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(indexes, vec![("plain".into(), 2), ("projected".into(), 1)]);
+        assert!(db
+            .query_row(
+                "SELECT model_content_json IS NULL FROM mcp_tool_outputs WHERE tool_use_id='plain'",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
+        assert!(db.query_row("SELECT model_output='saved text' AND model_recovery='saved recovery' FROM tool_calls WHERE id='projected'", [], |r|r.get::<_,bool>(0)).unwrap());
+    }
 }

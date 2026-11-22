@@ -418,7 +418,7 @@ impl Page {
         session: &str,
         len: usize,
         chunked: bool,
-        materialized: bool,
+        materialization: i64,
         recovery: Option<String>,
         position: Position,
         location: Location,
@@ -434,16 +434,15 @@ impl Page {
             .as_deref()
             .unwrap_or(&location.message_id);
         let mut recovery = recovery.map(|v| serde_json::from_str(&v)).transpose()?;
-        let legacy = if materialized {
+        let materialized = materialization == 1;
+        let legacy = if materialization != 0 {
             None
         } else if let Some(name) = location
             .tool_name
             .as_deref()
             .filter(|name| crate::native_engine::tool_loop::eligible(name))
         {
-            Some(super::model_results::legacy_search(
-                conn, session, name, id, false,
-            )?)
+            super::model_results::legacy_search(conn, session, name, id, false)?
         } else if location.role == "user"
             && len >= crate::tools::background_shell::NOTIFICATION_START.len()
         {
@@ -452,9 +451,7 @@ impl Page {
                 super::context_search_index::read_bytes(conn, kind, id, chunked, false, 0, size)?;
             self.payload_read += charged;
             if prefix == crate::tools::background_shell::NOTIFICATION_START.as_bytes() {
-                Some(super::model_results::legacy_search(
-                    conn, session, "Monitor", id, true,
-                )?)
+                super::model_results::legacy_search(conn, session, "Monitor", id, true)?
             } else {
                 None
             }
@@ -462,7 +459,7 @@ impl Page {
             None
         };
         let legacy = legacy.map(|view| {
-            recovery = view.recovery;
+            recovery = Some(view.recovery);
             view.text
         });
         let len = legacy.as_ref().map_or(len, String::len);

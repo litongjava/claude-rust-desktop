@@ -63,7 +63,7 @@ async fn base64_model_boundary_light_pressure() {
         };
         assert!(result("marker").contains(", line 1]"));
         let run = result("invalid").bytes().take_while(|b| *b == b'Q').count();
-        assert!(run == 4097 || run < 1024);
+        assert_eq!(run, if window == 200_000 { 4097 } else { 3999 });
     }
 }
 
@@ -97,8 +97,14 @@ async fn base64_review_ordinary_light_cut_matches_main() {
         json!({"role":"user","content":"continue"}),
     ];
     let sent = pressure_request(messages, 4841).await;
-    let result = sent.iter().find(|m| m["tool_call_id"] == "invalid").unwrap();
-    assert_eq!(result["content"], format!("{}... [truncated, 4097 bytes total]", "Q".repeat(3999)));
+    let result = sent
+        .iter()
+        .find(|m| m["tool_call_id"] == "invalid")
+        .unwrap();
+    assert_eq!(
+        result["content"],
+        format!("{}... [truncated, 4097 bytes total]", "Q".repeat(3999))
+    );
 }
 
 #[tokio::test]
@@ -110,13 +116,18 @@ async fn base64_review_ordinary_progressive_budget_matches_main() {
         json!({"role":"tool","tool_call_id":"old","content":raw}),
     ];
     for _ in 0..12 {
-        messages.extend([json!({"role":"user","content":"keep going"}), json!({"role":"assistant","content":"step done"})]);
+        messages.extend([
+            json!({"role":"user","content":"keep going"}),
+            json!({"role":"assistant","content":"step done"}),
+        ]);
     }
     messages.push(json!({"role":"user","content":"continue"}));
     let sent = pressure_request(messages, 39360).await;
     assert_eq!(sent.len(), 21);
     assert!(sent.iter().all(|m| m["role"] != "tool"));
-    assert!(sent.iter().any(|m| m["role"] == "system" && m.to_string().contains("plain_symbol")));
+    assert!(sent
+        .iter()
+        .any(|m| m["role"] == "system" && m.to_string().contains("plain_symbol")));
 }
 
 #[tokio::test]
@@ -125,15 +136,24 @@ async fn base64_review_ordinary_legacy_image_matches_main() {
     let message = f.store.append(&f.id, "assistant", "").unwrap();
     let id = format!("{message}:image");
     let content = json!({"content":[{"type":"text","text":"plain ordinary line.\n".repeat(1200)},{"type":"image","mimeType":"image/png","data":PNG}]});
-    let display = f.store.db.open_session(&f.id).unwrap().save_mcp(&message, "image", &content, false).unwrap();
+    let display = f
+        .store
+        .db
+        .open_session(&f.id)
+        .unwrap()
+        .save_mcp(&message, "image", &content, false)
+        .unwrap();
     f.store.db.shard_sql(&f.id, |conn| {
         deepseek_code_core::db::message_repo::insert_tool_call(conn, &id, &message, "mcp__example__capture", None, Some(&display), false, 0).unwrap();
-        conn.execute_batch("UPDATE tool_calls SET model_output=NULL, model_preview=NULL, model_recovery=NULL, model_search=NULL; UPDATE mcp_tool_outputs SET model_content_json=NULL").unwrap();
+        conn.execute_batch("UPDATE tool_calls SET model_checked=0, model_output=NULL, model_preview=NULL, model_recovery=NULL, model_search=NULL; UPDATE mcp_tool_outputs SET model_content_json=NULL").unwrap();
     }).unwrap();
     f.store.append(&f.id, "user", "continue").unwrap();
     for format in [ApiFormat::Anthropic, ApiFormat::OpenAI] {
         let history = f.store.model_history(&f.id, &format).unwrap();
-        assert!(json!(history).to_string().contains(PNG), "{format:?} replay");
+        assert!(
+            json!(history).to_string().contains(PNG),
+            "{format:?} replay"
+        );
     }
     let history = f.store.model_history(&f.id, &ApiFormat::OpenAI).unwrap();
     let req=serde_json::from_value(json!({"conversation_id":f.id,"messages":history,"model":"gpt-6-astra","provider_id":"gateway","workspace_path":f.dir.path()})).unwrap();
@@ -144,6 +164,161 @@ async fn base64_review_ordinary_legacy_image_matches_main() {
     let wire = f.seen.lock().unwrap().last().unwrap().to_string();
     assert!(wire.contains(PNG));
     assert!(!wire.contains("base64 data omitted"));
+    f.server.abort();
+    let _ = f.server.await;
+}
+
+use deepseek_code_core::super_agent::{
+    crp::ToolRuntime, model::TaskSpec, review, store::TaskStore,
+};
+
+fn assigned_reviewer(f: &Fixture) -> ToolRuntime {
+    let reviewer = f.store.create(f.dir.path(), "fixture", "fixture").unwrap();
+    let router = f.store.create(f.dir.path(), "fixture", "fixture").unwrap();
+    let data_dir = f.store.db.data_dir().to_owned();
+    let tasks = TaskStore::new(f.store.db.clone(), data_dir.clone());
+    let spec: TaskSpec = serde_json::from_value(
+        json!({"title":"Review", "workspace":f.dir.path(), "goal":"Inspect session evidence"}),
+    )
+    .unwrap();
+    let task = tasks.create_task(&router, spec, "create").unwrap();
+    tasks
+        .set_sessions(&task.task_id, Some(&f.id), Some(&reviewer))
+        .unwrap();
+    ToolRuntime {
+        db: f.store.db.clone(),
+        data_dir,
+        session_id: reviewer,
+    }
+}
+
+async fn reviewer_wire(f: &Fixture, runtime: &ToolRuntime) -> Value {
+    let evidence = review::execute(runtime, "SessionMessages", json!({"session_id":f.id})).unwrap();
+    let reply = evidence.to_string();
+    let sent = pressure_request(vec![
+        json!({"role":"assistant","content":"","tool_calls":[{"id":"review","type":"function","function":{"name":"SessionMessages","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"review","content":reply}),
+        json!({"role":"user","content":"continue"}),
+    ], 200000).await;
+    let text = sent.iter().find(|m| m["tool_call_id"] == "review").unwrap()["content"]
+        .as_str()
+        .unwrap();
+    assert_eq!(text, reply);
+    serde_json::from_str(text).unwrap()
+}
+
+#[tokio::test]
+async fn base64_review_session_messages_on_provider_wire() {
+    let f = fixture(0).await;
+    let payload = "QUJD".repeat(256);
+    let raw = json!({"stdout":format!("log!{payload}!"),"stderr":"","exit_code":0}).to_string();
+    let msg = f.store.append(&f.id, "assistant", "").unwrap();
+    f.store
+        .db
+        .shard_sql(&f.id, |c| {
+            deepseek_code_core::db::message_repo::insert_tool_call(
+                c,
+                "qualifying",
+                &msg,
+                "Bash",
+                Some("{}"),
+                Some(&raw),
+                false,
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let evidence = reviewer_wire(&f, &assigned_reviewer(&f)).await;
+    let message = evidence["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == msg)
+        .unwrap();
+    let output = message["tool_calls"][0]["output"].as_str().unwrap();
+    assert!(output.contains("base64 data omitted") && !output.contains(&payload));
+    f.server.abort();
+    let _ = f.server.await;
+}
+
+/// These expected strings are shared with the main-revision control. Each consumer
+/// has its own representation: history and native compaction keep JSON, I6 renders stdout.
+#[tokio::test]
+async fn base64_review_ordinary_consumer_wire_matrix() {
+    let f = fixture(0).await;
+    let shard = f.store.db.open_session(&f.id).unwrap();
+    let msg = f.store.append(&f.id, "assistant", "").unwrap();
+    let raw = r#"{"stdout":"ordinary-marker!","stderr":"","exit_code":0}"#;
+    let cases = [
+        ("bash", "Bash", "ordinary-marker!"),
+        ("task", "TaskGet", raw),
+    ];
+    for (i, (id, name, _)) in cases.iter().enumerate() {
+        f.store
+            .db
+            .shard_sql(&f.id, |c| {
+                deepseek_code_core::db::message_repo::insert_tool_call(
+                    c,
+                    id,
+                    &msg,
+                    name,
+                    Some("{}"),
+                    Some(raw),
+                    false,
+                    i as i64,
+                )
+            })
+            .unwrap()
+            .unwrap();
+    }
+    f.store.append(&f.id, "user", "continue").unwrap();
+    let history = f.store.model_history(&f.id, &ApiFormat::OpenAI).unwrap();
+    for item in history.iter().filter(|m| m["role"] == "tool") {
+        assert_eq!(item["content"], raw);
+    }
+    let sent = pressure_request(history, 200000).await;
+    let hits: Value = serde_json::from_str(
+        &shard
+            .context_search(json!({"query":"ordinary-marker","role":"tool"}))
+            .unwrap(),
+    )
+    .unwrap();
+    for (id, _, preview) in cases {
+        let tool = sent.iter().find(|m| m["tool_call_id"] == id).unwrap();
+        assert_eq!(tool["content"], preview, "Chat Completions {id}");
+        let hit = hits["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|h| h["tool_call_id"] == id)
+            .unwrap();
+        assert_eq!(hit["excerpt"], preview, "ContextSearch {id}");
+    }
+    let runtime = assigned_reviewer(&f);
+    let evidence = reviewer_wire(&f, &runtime).await;
+    let calls = evidence["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == msg)
+        .unwrap()["tool_calls"]
+        .as_array()
+        .unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|c| c["output"] == raw));
+    compaction::compact(&f.engine, &f.store.db, &f.id, "gateway", "gpt-6-astra", "")
+        .await
+        .unwrap();
+    let body = f.seen.lock().unwrap().last().unwrap().clone();
+    let outputs: Vec<_> = body["input"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["type"] == "function_call_output")
+        .map(|i| &i["output"])
+        .collect();
+    assert_eq!(outputs, vec![&json!(raw); 2]);
     f.server.abort();
     let _ = f.server.await;
 }

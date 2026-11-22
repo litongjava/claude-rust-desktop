@@ -67,8 +67,8 @@ pub fn branch_conversation(conn: &Connection, source_id: &str, message_id: Optio
                         })
                         .map(|id| format!("{new_message_id}:{id}"))
                         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    transaction.execute("INSERT INTO tool_calls(id,message_id,name,input,output,is_error,sort_order,model_output,model_preview,model_search,model_recovery)
-                        SELECT ?1,?2,name,input,output,is_error,sort_order,model_output,model_preview,model_search,model_recovery FROM tool_calls WHERE id=?3",
+                    transaction.execute("INSERT INTO tool_calls(id,message_id,name,input,output,is_error,sort_order,model_output,model_preview,model_search,model_recovery,model_checked)
+                        SELECT ?1,?2,name,input,output,is_error,sort_order,model_output,model_preview,model_search,model_recovery,model_checked FROM tool_calls WHERE id=?3",
                         params![new_tool_id,new_message_id,tool.id])?;
                     transaction.execute("INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error,model_content_json) SELECT ?1,?2,content_json,metadata_json,display_text,is_error,model_content_json FROM mcp_tool_outputs WHERE conversation_id=?3 AND tool_use_id=?4", params![new_id,new_tool_id,source_id,tool.id])?;
                     transaction.execute("INSERT INTO tool_call_notes (tool_call_id, note) SELECT ?1, note FROM tool_call_notes WHERE tool_call_id = ?2", params![new_tool_id, tool.id])?;

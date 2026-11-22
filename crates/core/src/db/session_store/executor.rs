@@ -114,10 +114,10 @@ impl ExecutorHistory {
         output: &str,
         failed: bool,
         cwd: &std::path::Path,
-    ) -> Result<String> {
+    ) -> Result<Option<String>> {
         use rusqlite::params;
         let id = format!("{message}:{occurrence}");
-        let save = |conn: &Connection| -> Result<String> {
+        let save = |conn: &Connection| -> Result<Option<String>> {
             conn.execute("INSERT INTO messages(id,conversation_id,role,content,created_at,sort_order)
                 VALUES(?1,?2,'assistant','',?3,(SELECT coalesce(max(sort_order),-1)+1 FROM messages WHERE conversation_id=?2))
                 ON CONFLICT(id) DO NOTHING",params![message,self.id(),chrono::Utc::now().to_rfc3339()])?;
@@ -142,7 +142,7 @@ impl ExecutorHistory {
                 cwd,
             )?;
             Ok(conn.query_row(
-                "SELECT coalesce(model_preview,model_output) FROM tool_calls WHERE id=?",
+                "SELECT model_output FROM tool_calls WHERE id=?",
                 [&id],
                 |r| r.get(0),
             )?)

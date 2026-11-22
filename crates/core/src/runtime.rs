@@ -209,20 +209,20 @@ pub(crate) fn replay_history(
     conn: &rusqlite::Connection,
     id: &str,
     format: &ApiFormat,
-    full: bool,
     native: impl Fn(&str) -> Result<Option<Value>>,
 ) -> Result<(Vec<Value>, Option<String>)> {
     let mut history = Vec::new();
-    let messages = crate::db::model_results::messages(conn, id)?;
+    let messages =
+        crate::db::model_results::read_messages(conn, id, |row, collapsed| (row, collapsed))?;
     let start = messages
         .iter()
-        .rposition(|m| m.is_compact_boundary)
+        .rposition(|(m, _)| m.is_compact_boundary)
         .unwrap_or(0);
     let boundary = messages
         .get(start)
-        .filter(|m| m.is_compact_boundary)
-        .map(|m| m.id.clone());
-    for message in messages.into_iter().skip(start) {
+        .filter(|(m, _)| m.is_compact_boundary)
+        .map(|(m, _)| m.id.clone());
+    for (message, collapsed) in messages.into_iter().skip(start) {
         if let Some(mut native) = native(&message.id)? {
             crate::native_engine::tool_loop::prepare_native_window(
                 &mut native,
@@ -234,14 +234,7 @@ pub(crate) fn replay_history(
             );
             continue;
         }
-        let mut calls = crate::db::model_results::calls(conn, &message.id, id)?;
-        if !full {
-            for tool in &mut calls {
-                if let Some(preview) = tool.preview.take() {
-                    tool.text = Some(preview);
-                }
-            }
-        }
+        let mut calls = crate::db::model_results::replay_calls(conn, &message.id, id)?;
         // Nested ToolScript calls are history, not provider protocol:
         // the provider never emitted their ids, so replaying them would
         // fabricate an assistant tool_use with no matching requested
@@ -285,8 +278,33 @@ pub(crate) fn replay_history(
         }
         use rusqlite::OptionalExtension;
         let structured: Option<String> = conn.query_row("SELECT content_json FROM message_user_content WHERE message_id=?1", [&message.id], |r|r.get(0)).optional()?;
-        if let Some(content)=structured {history.push(json!({"role":message.role,"content":serde_json::from_str::<Value>(&content)?}));}
-        else if !message.content.is_empty() { history.push(json!({"role":message.role,"content":message.content})); }
+        let mut collapsed = collapsed;
+        let content = if let Some(json) = structured {
+            let mut content: Value = serde_json::from_str(&json)?;
+            if collapsed
+                && content
+                    .as_array()
+                    .is_some_and(|b| b.len() == 1 && b[0]["type"] == "text")
+            {
+                content[0]["text"] = Value::String(message.content);
+            } else if message.role == "user" {
+                collapsed |= crate::native_engine::tool_loop::project_notification(
+                    &mut content,
+                    crate::db::model_results::data_root(conn)?.as_deref(),
+                    id,
+                );
+            }
+            content
+        } else if !message.content.is_empty() {
+            Value::String(message.content)
+        } else {
+            continue;
+        };
+        let mut item = json!({"role":message.role,"content":content});
+        if collapsed {
+            item["_collapsed_monitor"] = Value::Bool(true);
+        }
+        history.push(item);
     }
     crate::native_engine::mcp_output::restore_history(&mut history, conn, id)?;
     Ok((history, boundary))
@@ -525,7 +543,7 @@ impl SessionStore<DbManager> {
         format: &ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
         self.db.with_conn(|conn| {
-            replay_history(conn, id, format, false, |message| {
+            replay_history(conn, id, format, |message| {
                 crate::services::compaction::native::load(conn, message)
             })
         })?

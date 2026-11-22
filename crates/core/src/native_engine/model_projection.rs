@@ -148,14 +148,13 @@ pub(super) fn recovery_path(path: &Path) -> String {
     }
 }
 
-pub(crate) fn project_for_model(
-    name: &str,
-    raw: &str,
-    root: Option<&Path>,
-    session: &str,
-) -> Option<Projected> {
+pub(crate) fn has_qualifying_result(name: &str, raw: &str) -> bool {
+    !result_runs(name, raw).1.is_empty()
+}
+
+fn result_runs(name: &str, raw: &str) -> (bool, Vec<Run>) {
     if !eligible(name) || raw.len() < base64_collapse::DATA_URI_THRESHOLD {
-        return None;
+        return (false, Vec::new());
     }
     let typed = raw
         .trim_start()
@@ -164,6 +163,16 @@ pub(crate) fn project_for_model(
         .flatten();
     let blocks = typed.is_some();
     let runs = typed.unwrap_or_else(|| content_runs(raw));
+    (blocks, runs)
+}
+
+pub(crate) fn project_for_model(
+    name: &str,
+    raw: &str,
+    root: Option<&Path>,
+    session: &str,
+) -> Option<Projected> {
+    let (blocks, runs) = result_runs(name, raw);
     if runs.is_empty() {
         return None;
     }

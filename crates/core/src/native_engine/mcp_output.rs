@@ -124,8 +124,10 @@ impl McpOutput {
             Some(model.to_string())
         } else {
             let name=conn.query_row("SELECT t.name FROM tool_calls t JOIN messages m ON m.id=t.message_id WHERE t.id=?1 AND m.conversation_id=?2",[id,session],|r|r.get::<_,String>(0)).optional()?;
-            name.map(|name| sidecar_json(conn, session, &name, &json))
+            name.map(|name| sidecar_override(conn, session, &name, &json))
                 .transpose()?
+                .flatten()
+                .map(|v| v.to_string())
         };
         conn.execute("INSERT OR REPLACE INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error,model_content_json) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![session,id,json,self.metadata.to_string(),display,failed,view])?;
         Ok(())
@@ -136,7 +138,8 @@ impl McpOutput {
         // text. Bind either spelling to this occurrence's original sidecar.
         let row=conn.query_row("SELECT coalesce(s.model_content_json,s.content_json),s.metadata_json,s.model_content_json IS NOT NULL,t.name
             FROM mcp_tool_outputs s LEFT JOIN tool_calls t ON t.id=s.tool_use_id AND t.output=s.display_text
-            WHERE s.conversation_id=?1 AND s.tool_use_id=?2 AND (s.display_text=?3 OR coalesce(t.model_preview,t.model_output)=?3)",
+              AND EXISTS (SELECT 1 FROM messages m WHERE m.id=t.message_id AND m.conversation_id=s.conversation_id)
+            WHERE s.conversation_id=?1 AND s.tool_use_id=?2 AND (s.display_text=?3 OR t.model_output=?3)",
             params![session,id,display],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,bool>(2)?,r.get::<_,Option<String>>(3)?))).optional()?;
         row.map(|(content, metadata, stored, name)| {
             let mut content = serde_json::from_str(&content)?;
@@ -161,18 +164,55 @@ impl McpOutput {
     }
 }
 
-fn sidecar_json(conn: &Connection, session: &str, name: &str, raw: &str) -> Result<String> {
+pub(crate) fn sidecar_override(
+    conn: &Connection,
+    session: &str,
+    name: &str,
+    raw: &str,
+) -> Result<Option<Value>> {
     if !super::tool_loop::eligible(name) {
-        return Ok(raw.to_owned());
+        return Ok(None);
     }
     let mut content = serde_json::from_str(raw)?;
-    super::tool_loop::project_result_content(
+    let collapsed = super::tool_loop::project_result_content(
         name,
         &mut content,
         crate::db::model_results::data_root(conn)?.as_deref(),
         session,
     );
-    Ok(content.to_string())
+    Ok(collapsed.then_some(content))
+}
+
+/// Previous builds also stored ordinary previews. Retain the exact bytes of
+/// projected sidecars (including recovery paths inherited through a fork).
+pub(crate) fn discard_ordinary_sidecars(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE mcp_tool_outputs SET model_content_json=NULL WHERE model_content_json=content_json",
+        [],
+    )?;
+    let mut query = conn.prepare("SELECT s.rowid, s.content_json, t.name FROM mcp_tool_outputs s
+        LEFT JOIN tool_calls t ON t.id=s.tool_use_id AND t.output=s.display_text
+              AND EXISTS (SELECT 1 FROM messages m WHERE m.id=t.message_id AND m.conversation_id=s.conversation_id)
+        WHERE s.model_content_json IS NOT NULL ORDER BY s.rowid")?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: Option<String> = row.get(2)?;
+        let content: Value = serde_json::from_str(row.get_ref(1)?.as_str()?)?;
+        let raw = content
+            .as_str()
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or_else(|| std::borrow::Cow::Owned(content.to_string()));
+        if !name
+            .as_deref()
+            .is_some_and(|n| super::tool_loop::has_qualifying_result(n, &raw))
+        {
+            conn.execute(
+                "UPDATE mcp_tool_outputs SET model_content_json=NULL WHERE rowid=?1",
+                [row.get::<_, i64>(0)?],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Stream metadata and typed content can arrive in either order. Bind the
@@ -182,7 +222,10 @@ pub(crate) fn bind_pending(conn: &Connection, id: &str, name: &str) -> Result<()
         JOIN tool_calls t ON t.id=s.tool_use_id AND t.output=s.display_text JOIN messages m ON m.id=t.message_id AND m.conversation_id=s.conversation_id
         WHERE t.id=?1 AND s.model_content_json IS NULL",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
     if let Some((session, raw)) = row {
-        conn.execute("UPDATE mcp_tool_outputs SET model_content_json=?1 WHERE conversation_id=?2 AND tool_use_id=?3 AND content_json=?4 AND model_content_json IS NULL", params![sidecar_json(conn,&session,name,&raw)?,session,id,raw])?;
+        let Some(view) = sidecar_override(conn, &session, name, &raw)? else {
+            return Ok(());
+        };
+        conn.execute("UPDATE mcp_tool_outputs SET model_content_json=?1 WHERE conversation_id=?2 AND tool_use_id=?3 AND content_json=?4 AND model_content_json IS NULL", params![view.to_string(),session,id,raw])?;
     }
     Ok(())
 }

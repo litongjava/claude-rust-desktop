@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     output TEXT,
     is_error INTEGER DEFAULT 0,
     sort_order INTEGER NOT NULL,
+    model_checked INTEGER NOT NULL DEFAULT 0,
     model_output TEXT,
     model_preview TEXT,
     model_recovery TEXT,

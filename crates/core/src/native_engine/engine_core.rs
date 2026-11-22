@@ -548,7 +548,7 @@ impl QueryEngine {
         let history = self
             .db_manager
             .open_session(session)?
-            .read(|r| r.replay(&provider.provider.api_format, true))?
+            .read(|r| r.model_history(&provider.provider.api_format))?
             .0;
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {

@@ -739,17 +739,10 @@ impl SessionRead<'_> {
         &self,
         format: &crate::native_engine::provider_manager::ApiFormat,
     ) -> Result<(Vec<Value>, Option<String>)> {
-        self.replay(format, false)
-    }
-    pub(crate) fn replay(
-        &self,
-        format: &crate::native_engine::provider_manager::ApiFormat,
-        full: bool,
-    ) -> Result<(Vec<Value>, Option<String>)> {
         let id: String = self
             .0
             .query_row("SELECT id FROM manifest", [], |r| r.get(0))?;
-        crate::runtime::replay_history(self.0, &id, format, full, |message| {
+        crate::runtime::replay_history(self.0, &id, format, |message| {
             let raw: Option<String> = self
                 .0
                 .query_row(

@@ -12,70 +12,143 @@ const DIGEST_BUDGET: usize = 2048;
 #[path = "command_output_summary.rs"]
 mod command_output_summary;
 
+/// Only actual overrides bypass a later light cut, including when a
+/// provider reuses a call ID. Keep fingerprints instead of copying image blocks.
+#[derive(Default, Clone)]
+pub(crate) struct AppliedOverrides(
+    std::collections::HashMap<String, std::collections::HashSet<[u8; 32]>>,
+);
+
+impl AppliedOverrides {
+    fn fingerprint(content: &Value) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        match content.as_str() {
+            Some(text) => Sha256::digest(text.as_bytes()).into(),
+            None => Sha256::digest(content.to_string().as_bytes()).into(),
+        }
+    }
+    pub(super) fn record(&mut self, id: &str, content: &Value) {
+        self.0
+            .entry(id.to_owned())
+            .or_default()
+            .insert(Self::fingerprint(content));
+    }
+    pub(crate) fn contains(&self, id: &str, content: &Value) -> bool {
+        self.0
+            .get(id)
+            .is_some_and(|views| views.contains(&Self::fingerprint(content)))
+    }
+}
+
 impl super::ToolLoopExecutor {
     pub(super) fn queued_model_content(
-        &self,
+        &mut self,
         inputs: Vec<crate::services::input_queue::DeliveredInput>,
     ) -> Vec<Value> {
         inputs
             .into_iter()
             .map(|input| {
-                input.model_content(
+                let original = super::monitor_notification(&input.text).then(|| input.text.clone());
+                let content = input.model_content(
                     self.search_config_path.as_deref().and_then(Path::parent),
                     self.conv_id.as_deref().unwrap_or_default(),
-                )
+                );
+                if original
+                    .as_deref()
+                    .is_some_and(|raw| content.as_str().is_some_and(|text| text != raw))
+                {
+                    self.projected_results.record("", &content);
+                }
+                content
             })
             .collect()
     }
 
-    /// Resolve occurrence IDs before any compressor can move results to another role.
-    /// A host can also supply an unsaved protocol history, including typed results.
-    pub(super) fn prepare_history_tool_outputs(
-        &self,
-        messages: &mut [Value],
-    ) -> anyhow::Result<()> {
+    /// Replace only complete results that actually collapsed. Ordinary history
+    /// retains its original size until the provider builder renders it.
+    pub(super) fn project_history(&mut self, messages: &mut [Value]) -> anyhow::Result<()> {
+        use crate::db::model_results::StoredContent;
         let root = self.search_config_path.as_deref().and_then(Path::parent);
         let session = self.conv_id.as_deref().unwrap_or_default();
-        let mut prepare = |conn: Option<&rusqlite::Connection>| {
-            visit_history_outputs(messages, root, session, |name, id, content, openai| {
-                if let Some(conn) = conn {
-                    if let Some(text) =
-                        crate::db::model_results::provider_content(conn, session, id, name, openai)?
-                    {
-                        *content = text;
-                        return Ok(());
+        let history = self.session_search_storage();
+        let cwd = std::path::PathBuf::from(self.get_workspace_cwd());
+        let overrides = &mut self.projected_results;
+        for message in messages.iter_mut() {
+            if let Some(window) = message.get_mut("provider_content") {
+                prepare_native_window(window, root, session);
+            }
+            if message["role"] == "user" {
+                let stored = message
+                    .as_object_mut()
+                    .and_then(|m| m.remove("_collapsed_monitor"))
+                    == Some(Value::Bool(true));
+                if let Some(content) = message.get_mut("content") {
+                    if stored || project_notification(content, root, session) {
+                        overrides.record("", content);
                     }
                 }
-                if let Some(text) = content.as_str() {
-                    *content = Value::String(self.preview_tool_output_for_id(name, text, Some(id)));
-                } else if openai {
-                    project_result_content(name, content, root, session);
-                } else {
-                    self.retain_content(name, content);
-                }
-                Ok(())
+            }
+        }
+        let mut prepare = |conn: Option<&rusqlite::Connection>| {
+            visit_history_outputs(messages, |name, id, content, openai, _| {
+                let stored = match conn {
+                    Some(conn) => {
+                        crate::db::model_results::provider_content(conn, session, id, name, openai)?
+                    }
+                    None => StoredContent::Missing,
+                };
+                let view = match stored {
+                    StoredContent::Ordinary => return Ok(false),
+                    StoredContent::Override(view) => view,
+                    StoredContent::Missing => {
+                        if let Some(raw) = content.as_str() {
+                            let Some(view) = crate::db::model_results::result_override(
+                                name,
+                                raw,
+                                root,
+                                session,
+                                Some(id),
+                                &cwd,
+                            ) else {
+                                return Ok(false);
+                            };
+                            Value::String(view.text)
+                        } else {
+                            if !project_result_content(name, content, root, session) {
+                                return Ok(false);
+                            }
+                            content.clone()
+                        }
+                    }
+                };
+                overrides.record(id, &view);
+                *content = view;
+                Ok(true)
             })
         };
-        if let Some(history) = self.session_search_storage() {
+        if let Some(history) = history {
             history.read(|conn, _| prepare(Some(conn)))
         } else {
             prepare(None)
         }
     }
 
+    pub(super) fn render_history(&self, messages: &mut [Value]) -> anyhow::Result<()> {
+        visit_history_outputs(messages, |name, id, content, openai, collapsed| {
+            if !collapsed {
+                if let Some(text) = content.as_str() {
+                    *content = Value::String(self.ordinary_preview(name, text, Some(id)));
+                } else if !openai {
+                    self.retain_content(name, content);
+                }
+            }
+            Ok(false)
+        })
+    }
+
     pub(super) fn retain_content(&self, name: &str, content: &mut Value) {
         if let Some(text) = content.as_str() {
-            *content = Value::String(self.preview_tool_output(name, text));
-            return;
-        }
-        if super::eligible(name)
-            && project_result_content(
-                name,
-                content,
-                self.search_config_path.as_deref().and_then(Path::parent),
-                self.conv_id.as_deref().unwrap_or_default(),
-            )
-        {
+            *content = Value::String(self.ordinary_preview(name, text, None));
             return;
         }
         if let Some(blocks) = content.as_array() {
@@ -90,7 +163,7 @@ impl super::ToolLoopExecutor {
                     .filter_map(|block| block["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
-                *content = Value::String(self.preview_tool_output(name, &text));
+                *content = Value::String(self.ordinary_preview(name, &text, None));
             }
         }
     }
@@ -149,7 +222,11 @@ pub(crate) fn ordinary_preview(
     }
 }
 
-fn project_text_blocks(content: &mut Value, mut project: impl FnMut(&str) -> Option<String>) {
+fn project_text_blocks(
+    content: &mut Value,
+    mut project: impl FnMut(&str) -> Option<String>,
+) -> bool {
+    let mut changed = false;
     if let Some(blocks) = content.as_array_mut() {
         for block in blocks
             .iter_mut()
@@ -157,21 +234,28 @@ fn project_text_blocks(content: &mut Value, mut project: impl FnMut(&str) -> Opt
         {
             if let Some(view) = block["text"].as_str().and_then(&mut project) {
                 block["text"] = Value::String(view);
+                changed = true;
             }
         }
     } else if let Some(view) = content.as_str().and_then(project) {
         *content = Value::String(view);
+        changed = true;
     }
+    changed
 }
 
-fn project_notification(content: &mut Value, root: Option<&Path>, session: &str) {
+pub(crate) fn project_notification(
+    content: &mut Value,
+    root: Option<&Path>,
+    session: &str,
+) -> bool {
     project_text_blocks(content, |text| {
         if super::monitor_notification(text) {
             super::project_for_model("Monitor", text, root, session).map(|v| v.text)
         } else {
             None
         }
-    });
+    })
 }
 
 /// Keep the exact gateway reply for display and its model-facing window together.
@@ -201,10 +285,11 @@ pub(crate) fn prepare_native_window(window: &mut Value, root: Option<&Path>, ses
         return;
     };
     let mut names = std::collections::HashMap::<String, String>::new();
+    let mut changed = false;
     for item in items {
         if item["role"] == "user" {
             if let Some(content) = item.get_mut("content") {
-                project_notification(content, root, session);
+                changed |= project_notification(content, root, session);
             }
         } else if item["type"] == "function_call" {
             if let (Some(id), Some(name)) = (item["call_id"].as_str(), item["name"].as_str()) {
@@ -213,30 +298,22 @@ pub(crate) fn prepare_native_window(window: &mut Value, root: Option<&Path>, ses
         } else if item["type"] == "function_call_output" {
             if let Some(name) = item["call_id"].as_str().and_then(|id| names.get(id)) {
                 if let Some(output) = item.get_mut("output") {
-                    project_result_content(name, output, root, session);
+                    changed |= project_result_content(name, output, root, session);
                 }
             }
         }
     }
-    window["model_projected"] = Value::Bool(true);
+    if changed {
+        window["model_projected"] = Value::Bool(true);
+    }
 }
 
 fn visit_history_outputs(
     messages: &mut [Value],
-    root: Option<&Path>,
-    session: &str,
-    mut result: impl FnMut(&str, &str, &mut Value, bool) -> anyhow::Result<()>,
+    mut result: impl FnMut(&str, &str, &mut Value, bool, bool) -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
     let mut names = std::collections::HashMap::<String, String>::new();
     for message in messages {
-        if let Some(window) = message.get_mut("provider_content") {
-            prepare_native_window(window, root, session);
-        }
-        if message["role"] == "user" {
-            if let Some(content) = message.get_mut("content") {
-                project_notification(content, root, session);
-            }
-        }
         if let Some(calls) = message["tool_calls"].as_array() {
             for call in calls {
                 if let (Some(id), Some(name)) =
@@ -251,7 +328,11 @@ fn visit_history_outputs(
                 .as_str()
                 .and_then(|id| names.get_key_value(id))
             {
-                result(name, id, &mut message["content"], true)?;
+                let collapsed = message.as_object_mut().unwrap().remove("_collapsed")
+                    == Some(Value::Bool(true));
+                if result(name, id, &mut message["content"], true, collapsed)? {
+                    message["_collapsed"] = Value::Bool(true);
+                }
             }
         } else if let Some(blocks) = message.get_mut("content").and_then(Value::as_array_mut) {
             for block in blocks {
@@ -264,7 +345,11 @@ fn visit_history_outputs(
                         .as_str()
                         .and_then(|id| names.get_key_value(id))
                     {
-                        result(name, id, &mut block["content"], false)?;
+                        let collapsed = block.as_object_mut().unwrap().remove("_collapsed")
+                            == Some(Value::Bool(true));
+                        if result(name, id, &mut block["content"], false, collapsed)? {
+                            block["_collapsed"] = Value::Bool(true);
+                        }
                     }
                 }
             }

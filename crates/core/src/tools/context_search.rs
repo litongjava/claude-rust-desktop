@@ -431,6 +431,75 @@ mod tests {
     }
 
     #[test]
+    fn base64_model_boundary_ordinary_persistence_matrix() {
+        use crate::native_engine::provider_manager::ApiFormat;
+        let f = Fixture::new();
+        f.append("user", "inspect");
+        let message = f.append("assistant", "");
+        let raw = r#"{"stdout":"ordinary-marker!","stderr":"","exit_code":0}"#;
+        for name in ["Bash", "TaskGet", "Monitor", "Other"] {
+            f.tool(&message, name, name, raw);
+        }
+        let expected = f.db.fixture_shard(&f.session, |c| {
+            let rows = message_repo::get_tool_calls_for_message(c, &message).unwrap();
+            let nulls: usize = c.query_row("SELECT count(*) FROM tool_calls
+                WHERE model_output IS NULL AND model_preview IS NULL AND model_recovery IS NULL AND model_search IS NULL",
+                [], |r| r.get(0)).unwrap();
+            assert_eq!(nulls, 4);
+            json!(rows)
+        }).unwrap();
+        for legacy in [false, true] {
+            if legacy {
+                f.db.fixture_shard(&f.session, |c| {
+                    c.execute("UPDATE tool_calls SET model_checked=0", [])
+                })
+                .unwrap()
+                .unwrap();
+            }
+            for format in [ApiFormat::OpenAI, ApiFormat::Anthropic] {
+                let history = f.store.model_history(&f.session, &format).unwrap();
+                let outputs: Vec<_> = match format {
+                    ApiFormat::OpenAI => history
+                        .iter()
+                        .filter(|m| m["role"] == "tool")
+                        .map(|m| &m["content"])
+                        .collect(),
+                    ApiFormat::Anthropic => history
+                        .iter()
+                        .flat_map(|m| m["content"].as_array().into_iter().flatten())
+                        .filter(|b| b["type"] == "tool_result")
+                        .map(|b| &b["content"])
+                        .collect(),
+                };
+                assert_eq!(outputs, vec![&json!(raw); 4]);
+            }
+            let full = compaction::prepare(&f.db, &f.session).unwrap().transcript;
+            let part =
+                compaction::prepare_part(&f.db, &f.session, &message, compaction::Part::From)
+                    .unwrap()
+                    .transcript;
+            for transcript in [&full, &part] {
+                let entries: Vec<Value> = serde_json::from_str(transcript).unwrap();
+                assert_eq!(entries.last().unwrap()["tools"], expected);
+            }
+            let results = f.search(json!({"query":"ordinary-marker","role":"tool"}));
+            let matches = results["matches"].as_array().unwrap();
+            assert_eq!(matches.len(), 4);
+            for hit in matches {
+                assert_eq!(
+                    hit["excerpt"],
+                    if hit["tool_name"] == "Bash" {
+                        "ordinary-marker!"
+                    } else {
+                        raw
+                    }
+                );
+                assert!(hit.get("recovery_path").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn base64_model_boundary_persists_typed_content_in_either_arrival_order() {
         let f = Fixture::new();
         let message = f.append("assistant", "");
@@ -458,8 +527,23 @@ mod tests {
                 assert!(blocks[0]["text"].as_str().unwrap().contains("base64 data omitted"));
                 assert!(!blocks[0]["text"].as_str().unwrap().contains(&payload));
                 assert_eq!(blocks[1],original.content[1]);
-                assert_eq!(crate::db::model_results::provider_content(conn,&f.session,&id,"Bash",false).unwrap(),Some(blocks));
+                assert!(matches!(crate::db::model_results::provider_content(conn,&f.session,&id,"Bash",false).unwrap(),crate::db::model_results::StoredContent::Override(view) if view == blocks));
             }).unwrap();
+            f.db.fixture_shard(&f.session, |conn| {
+                conn.execute("UPDATE tool_calls SET model_checked=0,model_output=NULL,model_search=NULL,model_recovery=NULL WHERE id=?1", [&id]).unwrap();
+                conn.execute("UPDATE mcp_tool_outputs SET model_content_json=NULL WHERE tool_use_id=?1", [&id]).unwrap();
+            }).unwrap();
+            use crate::native_engine::provider_manager::ApiFormat;
+            for format in [ApiFormat::OpenAI, ApiFormat::Anthropic] {
+                let history = f.store.model_history(&f.session, &format).unwrap();
+                let json = serde_json::to_string(&history).unwrap();
+                assert!(
+                    json.contains("AQID")
+                        && json.contains("base64 data omitted")
+                        && !json.contains(&payload),
+                    "legacy {format:?} sidecar"
+                );
+            }
         }
     }
 
@@ -515,7 +599,7 @@ mod tests {
             f.search(json!({"query":"stored-model-sentinel"}))["matches"][0]["excerpt"],
             "stored-model-sentinel"
         );
-        f.db.fixture_shard(&f.session,|c|c.execute("UPDATE tool_calls SET model_output=NULL,model_preview=NULL,model_search=NULL,model_recovery=NULL WHERE id='stored'",[])).unwrap().unwrap();
+        f.db.fixture_shard(&f.session,|c|c.execute("UPDATE tool_calls SET model_checked=0,model_output=NULL,model_preview=NULL,model_search=NULL,model_recovery=NULL WHERE id='stored'",[])).unwrap().unwrap();
         assert_eq!(
             read().into_iter().find(|m| m["role"] == "tool").unwrap()["content"],
             view
