@@ -73,3 +73,7 @@ legacy/**/target/
 
 # Codex project MCP config (machine-bound absolute paths)
 /.codex/config.toml
+
+# AOCI agent host integration (machine-bound; do not commit)
+.mcp.json
+.mcp.json.backup.*
