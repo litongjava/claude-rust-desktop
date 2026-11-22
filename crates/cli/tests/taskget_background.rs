@@ -407,7 +407,7 @@ async fn run_background_shell(long_output: bool, opt_out: OptOut, foreground: bo
         let compact = serde_json::to_string(compact).unwrap();
         assert!(compact.contains("warning: duplicated tail"), "{compact}");
         assert!(!compact.contains("output_capture"));
-        assert!(!compact.contains("Omitted output:"));
+        assert!(compact.contains(&serde_json::to_string(&summary).unwrap()[1..serde_json::to_string(&summary).unwrap().len() - 1]), "{compact}");
         return;
     }
 
