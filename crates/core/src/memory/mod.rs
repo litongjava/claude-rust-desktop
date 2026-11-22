@@ -365,6 +365,21 @@ impl TieredCompressor {
         }
     }
 
+    fn result_hint(text: &str, limit: usize) -> &str {
+        let Some((cut, _)) = text.char_indices().nth(limit) else {
+            return text;
+        };
+        let prefix = &text[..cut];
+        // Hints are optional. Leave a reference in the stored result when
+        // the whole line would exceed this summary's character budget.
+        if let Some(start) = prefix.rfind("[base64 data omitted:") {
+            if text.contains("\nbase64: ") && !prefix[start..].contains('\n') {
+                return &prefix[..start];
+            }
+        }
+        prefix
+    }
+
     fn extract_text_content(msg: &Value) -> String {
         if let Some(s) = msg["content"].as_str() {
             return s.to_string();
@@ -376,7 +391,7 @@ impl TieredCompressor {
                     Some("tool_use") => Some(format!("[ToolCall: {}]",
                         b["name"].as_str().unwrap_or("?"))),
                     Some("tool_result") => Some(format!("[ToolResult: {}]",
-                        b["content"].as_str().unwrap_or("").chars().take(200).collect::<String>())),
+                        Self::result_hint(b["content"].as_str().unwrap_or(""), 200))),
                     _ => None,
                 }
             }).collect();
@@ -428,8 +443,7 @@ impl TieredCompressor {
                         if block["type"].as_str() == Some("tool_result") {
                             let content = block["content"].as_str().unwrap_or("");
                             if !content.is_empty() {
-                                let hint: String = content.chars().take(80).collect();
-                                result_hint = hint;
+                                result_hint = Self::result_hint(content, 80).to_owned();
                             }
                         }
                     }
@@ -868,5 +882,20 @@ mod tests {
         let msgs = vec!["The architecture uses microservices".to_string(), "Bug: memory leak in pool".to_string(), "Random chat".to_string()];
         let s = ContextManager::simple_summarize(&msgs);
         assert!(s.contains("architecture") || s.contains("Bug"));
+    }
+}
+
+#[cfg(test)]
+mod model_hint_tests {
+    #[test]
+    fn base64_model_boundary_summary_hint_preserves_recovery_lines() {
+        let line=format!("log: [base64 data omitted: about 768 bytes decoded; full text: {}, line 1]\nbase64: 1 block collapsed (1024 encoded bytes)","path/".repeat(80));
+        for budget in [80, 200] {
+            assert_eq!(super::TieredCompressor::result_hint(&line, budget), "log: ");
+            assert_eq!(
+                super::TieredCompressor::result_hint("ordinary 日志", budget),
+                "ordinary 日志"
+            );
+        }
     }
 }

@@ -2810,22 +2810,6 @@ impl ToolLoopExecutor {
         view.preview.unwrap_or(view.text)
     }
 
-    fn ordinary_tool_preview(
-        &self,
-        tool_name: &str,
-        output: &str,
-        id: Option<&str>,
-        root: Option<&std::path::Path>,
-    ) -> String {
-        model_output::ordinary_preview(
-            tool_name,
-            output,
-            id,
-            root,
-            std::path::Path::new(self.get_workspace_cwd()),
-        )
-    }
-
     fn completed_model_text(
         &self,
         call: &PendingToolCall,

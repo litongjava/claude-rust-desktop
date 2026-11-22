@@ -75,9 +75,6 @@ fn content_runs(text: &str) -> Vec<Run> {
         let mut token = serde_json::Deserializer::from_str(&text[quote..end]).into_iter::<String>();
         let value = token.next().unwrap().expect("validated JSON string");
         pos = quote + token.byte_offset();
-        if text[pos..end].trim_start().starts_with(':') {
-            continue;
-        }
         result.extend(string_runs(&text[quote + 1..pos - 1], &value, quote + 1));
     }
     result.extend(
@@ -92,6 +89,9 @@ fn content_runs(text: &str) -> Vec<Run> {
 }
 
 fn string_runs(encoded: &str, value: &str, start: usize) -> Vec<Run> {
+    if value.len() < base64_collapse::DATA_URI_THRESHOLD {
+        return Vec::new();
+    }
     let mut runs = content_runs(value);
     if !runs.is_empty() {
         let mut offsets = JsonOffsets {
@@ -338,6 +338,16 @@ fn expand_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn base64_model_boundary_covers_json_object_keys_in_command_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let payload = "QUJD".repeat(256);
+        let stdout = serde_json::json!({&payload: "value"}).to_string();
+        let raw = serde_json::json!({"stdout":stdout}).to_string();
+        let view = project_for_model("Bash", &raw, Some(temp.path()), "session").unwrap();
+        assert!(!view.text.contains(&payload));
+        assert_eq!(std::fs::read_to_string(&view.recovery.path).unwrap(), raw);
+    }
     #[test]
     fn base64_shell_thresholds_and_recovery_failure() {
         let temp = tempfile::tempdir().unwrap();
