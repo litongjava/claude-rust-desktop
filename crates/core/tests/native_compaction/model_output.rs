@@ -1,0 +1,310 @@
+use super::*;
+use axum::http::header;
+use deepseek_code_core::native_engine::{
+    engine_core::ReasoningMode, provider_manager::ResolvedProvider, tool_loop::ToolLoopExecutor,
+};
+
+async fn pressure_request(messages: Vec<Value>, window: usize) -> Vec<Value> {
+    deepseek_code_core::config::OrchestrationConfig::init_global().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    let app=Router::new().route("/v1/chat/completions",post(move |Json(body):Json<Value>| {capture.lock().unwrap().push(body); async {
+        ([(header::CONTENT_TYPE,"text/event-stream")],"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":null}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+    }}));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let root = tempfile::tempdir().unwrap();
+    let provider=ResolvedProvider{
+            provider:serde_json::from_value(json!({"id":"fixture","name":"fixture","base_url":url,"api_format":"openai","api_key":"fixture","enabled":true,"models":[]})).unwrap(),
+            model:serde_json::from_value(json!({"id":"fixture","name":"fixture","context_window":window,"enabled":true,"supports_vision":false,"supports_web_search":false})).unwrap()};
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    let mut runner = ToolLoopExecutor::new(
+        provider,
+        messages.clone(),
+        None,
+        128,
+        tx,
+        root.path().to_str().unwrap().into(),
+        ReasoningMode::Standard,
+    )
+    .with_search_config_path(root.path().join("config.json"))
+    .with_conv_id("review".into());
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), runner.execute())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.0, "done");
+    let body = seen.lock().unwrap().last().unwrap().clone();
+    let array = body["messages"].as_array().unwrap();
+    let result = array.clone();
+    server.abort();
+    let _ = server.await;
+    result
+}
+
+#[tokio::test]
+async fn base64_model_boundary_light_pressure() {
+    let data = format!("{}!{}!", ".".repeat(3900), "QUJD".repeat(256));
+    let invalid = "Q".repeat(4097);
+    let messages = vec![
+        json!({"role":"user","content":"check results"}),
+        json!({"role":"assistant","content":"","tool_calls":[{"id":"marker","type":"function","function":{"name":"Bash","arguments":"{}"}},{"id":"invalid","type":"function","function":{"name":"Bash","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"marker","content":data}),
+        json!({"role":"tool","tool_call_id":"invalid","content":invalid}),
+        json!({"role":"user","content":"continue"}),
+    ];
+    for window in [200_000, 4452] {
+        let sent = pressure_request(messages.clone(), window).await;
+        let result = |id: &str| {
+            sent.iter().find(|m| m["tool_call_id"] == id).unwrap()["content"]
+                .as_str()
+                .unwrap()
+        };
+        assert!(result("marker").contains(", line 1]"));
+        let run = result("invalid").bytes().take_while(|b| *b == b'Q').count();
+        assert!(run == 4097 || run < 1024);
+    }
+}
+
+#[tokio::test]
+async fn base64_model_boundary_progressive_pressure() {
+    let payload = "QUJD".repeat(256);
+    let raw = json!({"stdout":format!("fn {payload} ()!\n{}", ".".repeat(90_000))}).to_string();
+    let mut messages = vec![
+        json!({"role":"user","content":"first"}),
+        json!({"role":"assistant","content":"","tool_calls":[{"id":"old","type":"function","function":{"name":"Bash","arguments":"{}"}}]}),
+        json!({"role":"tool","tool_call_id":"old","content":raw}),
+    ];
+    for _ in 0..12 {
+        messages.extend([
+            json!({"role":"user","content":"keep going"}),
+            json!({"role":"assistant","content":"step done"}),
+        ]);
+    }
+    messages.push(json!({"role":"user","content":"continue"}));
+    let window = (TokenCounter::estimate(&messages) as f64 / 0.9) as usize;
+    let sent = pressure_request(messages, window).await;
+    assert!(!json!(sent).to_string().contains(&payload));
+}
+#[tokio::test]
+async fn base64_model_boundary_returned_window_and_replay() {
+    let f = fixture(7).await;
+    let payload = "QUJD".repeat(256);
+    let large = "Detailed evidence ".repeat(2200);
+    let first = vec![
+        json!({"role":"user","content":"First"}),
+        json!({"role":"assistant","content":large}),
+        json!({"role":"user","content":"continue"}),
+    ];
+    let mut previous = None;
+    for label in ["auto", "replay"] {
+        let messages = if label == "auto" {
+            first.clone()
+        } else {
+            compaction::compact(&f.engine, &f.store.db, &f.id, "gateway", "gpt-6-astra", "")
+                .await
+                .unwrap();
+            f.store.append(&f.id, "user", "continue").unwrap();
+            f.store.model_history(&f.id, &ApiFormat::OpenAI).unwrap()
+        };
+        let req=serde_json::from_value(json!({"conversation_id":f.id,"messages":messages,"model":"gpt-6-astra","provider_id":"gateway","max_tokens":1000,"workspace_path":f.dir.path()})).unwrap();
+        let mut events = f.engine.send_message(req).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(12), async {
+            while let Some(event) = events.recv().await {
+                assert!(!format!("{event:?}").starts_with("Error"), "{event:?}");
+            }
+        })
+        .await
+        .unwrap();
+        let req = f.seen.lock().unwrap().last().unwrap().clone();
+        let items = req["input"].as_array().unwrap();
+        let result = items
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .unwrap()["output"]
+            .as_str()
+            .unwrap();
+        let notice = items
+            .iter()
+            .filter(|i| i["role"] == "user")
+            .flat_map(|i| i["content"].as_array().into_iter().flatten())
+            .find_map(|p| p["text"].as_str().filter(|s| s.contains("<kind>monitor")))
+            .unwrap();
+        assert!(
+            !result.contains(&payload) && !notice.contains(&payload),
+            "{label}"
+        );
+        assert!(items
+            .iter()
+            .any(|i| i["encrypted_content"] == "opaque exact content"));
+        let observed = (result.to_owned(), notice.to_owned());
+        if let Some(prior) = previous.replace(observed.clone()) {
+            assert_eq!(prior, observed);
+        }
+    }
+    f.server.abort();
+    let _ = f.server.await;
+}
+
+#[tokio::test]
+async fn base64_model_boundary_typed_responses() {
+    let f = fixture(0).await;
+    let payload = "QUJD".repeat(256);
+    let messages = json!([{"role":"assistant","content":"","tool_calls":[{"id":"array","type":"function","function":{"name":"Bash","arguments":"{}"}}]}, {"role":"tool","tool_call_id":"array","content":[{"type":"text","text":format!("header\n{payload}\n")}]},{"role":"user","content":"continue"}]);
+    let req=serde_json::from_value(json!({"conversation_id":f.id,"messages":messages,"model":"gpt-6-astra","provider_id":"gateway","workspace_path":f.dir.path()})).unwrap();
+    let mut events = f.engine.send_message(req).await.unwrap();
+    while let Some(event) = events.recv().await {
+        assert!(!format!("{event:?}").starts_with("Error"));
+    }
+    let body = f.seen.lock().unwrap()[0].clone();
+    assert!(body.to_string().contains("base64 data omitted"));
+    assert!(!body.to_string().contains(&payload));
+    f.server.abort();
+    let _ = f.server.await;
+}
+
+#[tokio::test]
+async fn base64_model_boundary_summary_newline() {
+    let f = fixture(0).await;
+    let payload = "QUJD".repeat(256);
+    let raw =
+        json!({"stdout":format!("header\n{payload}\n"),"stderr":"","exit_code":0}).to_string();
+    let msg = f.store.append(&f.id, "assistant", "").unwrap();
+    let add = |id: &str, name: &str, text: &str| {
+        f.store
+            .db
+            .shard_sql(&f.id, |c| {
+                deepseek_code_core::db::message_repo::insert_tool_call(
+                    c,
+                    id,
+                    &msg,
+                    name,
+                    Some("{}"),
+                    Some(text),
+                    false,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap()
+    };
+    add("nl", "Bash", &raw);
+    f.store.append(&f.id, "user", "summarize").unwrap();
+
+    let _ = compaction::summarize_part(&f.engine,&f.store.db,&f.id,&msg,compaction::Part::From,"gateway","gpt-6-astra").await;
+    let summary_request = f.seen.lock().unwrap().last().unwrap().clone();
+    assert!(!summary_request.to_string().contains(&payload));
+    assert!(summary_request.to_string().contains("base64 data omitted"));
+    compaction::compact(&f.engine, &f.store.db, &f.id, "gateway", "gpt-6-astra", "")
+        .await
+        .unwrap();
+    let req = f.seen.lock().unwrap().last().unwrap().clone();
+    assert!(!req.to_string().contains(&payload) && req.to_string().contains("base64 data omitted"));
+    f.server.abort();
+    let _ = f.server.await;
+}
+
+#[tokio::test]
+async fn base64_model_boundary_search_chunk() {
+    let f = fixture(0).await;
+    let payload = "QUJD".repeat(256);
+    let msg = f.store.append(&f.id, "assistant", "").unwrap();
+    let add = |id: &str, name: &str, text: &str| {
+        f.store
+            .db
+            .shard_sql(&f.id, |c| {
+                deepseek_code_core::db::message_repo::insert_tool_call(
+                    c,
+                    id,
+                    &msg,
+                    name,
+                    Some("{}"),
+                    Some(text),
+                    false,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let find = |name: &str, q: &str| -> Value {
+        serde_json::from_str(
+            &f.store
+                .db
+                .open_session(&f.id)
+                .unwrap()
+                .context_search(json!({"tool_name":name,"query":q}))
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let header = r#"{"output_mode":"page","stdout":""#;
+    let keyword = "boundary-sign!";
+    let chunk = 8 * 1024 * 1024;
+    let frame = format!(
+        "{header}{}{keyword}{payload}Z!\"}}",
+        ".".repeat(chunk - 1024 - header.len() - keyword.len())
+    );
+    assert!(serde_json::from_str::<Value>(&frame).is_ok());
+    assert!(frame[..chunk].ends_with(&payload));
+    add("legacy-fragment", "TaskGet", &frame);
+    let hit = find("TaskGet", keyword);
+    let excerpt = hit["matches"][0]["excerpt"].as_str().unwrap();
+    assert!(excerpt.contains("boundary-sign!QUJD") && !excerpt.contains("base64 data omitted"));
+    f.server.abort();
+    let _ = f.server.await;
+}
+
+#[cfg(unix)]
+#[test]
+fn base64_model_boundary_search_recovery_paths() {
+    use std::os::unix::ffi::OsStringExt;
+    let temp = tempfile::tempdir().unwrap();
+    for (label, directory) in [
+        ("control", std::ffi::OsString::from("normal")),
+        ("comma", std::ffi::OsString::from("data, line west")),
+        (
+            "non_utf8",
+            std::ffi::OsString::from_vec(b"review-\xff".to_vec()),
+        ),
+    ] {
+        let root = temp.path().join(directory);
+        let paths = RuntimePaths::new(root.clone()).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(temp.path(), "fixture", "local").unwrap();
+        let msg = store.append(&id, "assistant", "").unwrap();
+        let raw = format!("anchor!{}!{}!", ".".repeat(35), "QUJD".repeat(256));
+        store
+            .db
+            .shard_sql(&id, |c| {
+                deepseek_code_core::db::message_repo::insert_tool_call(
+                    c,
+                    "call",
+                    &msg,
+                    "TaskGet",
+                    Some("{}"),
+                    Some(&raw),
+                    false,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let hit: Value = serde_json::from_str(
+            &store
+                .db
+                .open_session(&id)
+                .unwrap()
+                .context_search(json!({"query":"anchor!","tool_name":"TaskGet"}))
+                .unwrap(),
+        )
+        .unwrap();
+        let excerpt = hit["matches"][0]["excerpt"].as_str().unwrap();
+        assert!(excerpt.contains(", line 1]"), "{label} {excerpt}");
+        assert_eq!(
+            std::fs::read_to_string(hit["matches"][0]["recovery_path"].as_str().unwrap()).unwrap(),
+            raw
+        );
+    }
+}

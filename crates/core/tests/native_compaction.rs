@@ -87,7 +87,12 @@ async fn fixture(mode: u8) -> Fixture {
             if mode == 2 { std::future::pending::<()>().await; }
             if mode == 6 { released.notified().await; }
             if mode == 1 || mode == 6 { return (StatusCode::BAD_GATEWAY, Json(json!({"error":"incomplete"}))); }
-            (StatusCode::OK, Json(json!({"object":"response.compaction","output":window(),"usage":{"input_tokens":150,"output_tokens":77}})))
+            (StatusCode::OK, Json(json!({"object":"response.compaction","output":if mode==7 {json!([
+                {"type":"function_call","call_id":"old","name":"TaskGet","arguments":"{}"},
+                {"type":"function_call_output","call_id":"old","output":format!("old page!{}!","QUJD".repeat(256))},
+                {"role":"user","content":[{"type":"input_text","text":format!("<task-notification>\n<kind>monitor</kind>\n<event>!{}!</event>\n</task-notification>","QUJD".repeat(256))}]},
+                {"type":"compaction","encrypted_content":"opaque exact content"}
+            ])} else {window()},"usage":{"input_tokens":150,"output_tokens":77}})))
         }
     }));
     let captured = seen.clone();
@@ -141,7 +146,7 @@ async fn fixture(mode: u8) -> Fixture {
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let provider: Provider = serde_json::from_value(json!({"id":"gateway","name":"gateway","builtin_id":"openai","api_format":"openai","base_url":format!("http://{}/tools/codex/v1",listener.local_addr().unwrap()),"api_key":"gateway-key","enabled":true,"models":[{"id":"gpt-6-astra","name":"model","api":"openai-responses","enabled":true,"supports_web_search":false,"max_tokens":8192,"context_window":if mode == 3 {16000} else {256000}}]})).unwrap();
+    let provider: Provider = serde_json::from_value(json!({"id":"gateway","name":"gateway","builtin_id":"openai","api_format":"openai","base_url":format!("http://{}/tools/codex/v1",listener.local_addr().unwrap()),"api_key":"gateway-key","enabled":true,"models":[{"id":"gpt-6-astra","name":"model","api":"openai-responses","enabled":true,"supports_web_search":false,"max_tokens":8192,"context_window":if matches!(mode,3|7) {16000} else {256000}}]})).unwrap();
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -718,3 +723,6 @@ async fn base64_model_boundary_native_compaction_projects_stored_protocol_result
     server.abort();
     let _ = server.await;
 }
+
+#[path = "native_compaction/model_output.rs"]
+mod model_output;
