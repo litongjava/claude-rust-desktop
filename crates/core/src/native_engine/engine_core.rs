@@ -501,6 +501,10 @@ impl QueryEngine {
             .transpose()?;
         if let Some(checkpoint) = &mut checkpoint {
             checkpoint.options = options;
+            checkpoint.options.compaction_metrics = session
+                .map(|id| self.db_manager.open_session(id))
+                .transpose()?
+                .map(super::compaction_metrics::MetricsStore);
         }
         super::generation::summarize(provider, system, input, checkpoint.as_mut()).await
     }
@@ -545,8 +549,10 @@ impl QueryEngine {
             .await
             .resolve_selected(provider_id, model)
             .ok_or_else(|| anyhow!("Provider/model is unavailable: {provider_id}::{model}"))?;
-        let history = crate::runtime::SessionStore::new(self.db_manager.clone())
-            .model_history(session, &provider.provider.api_format)?;
+        let shard = self.db_manager.open_session(session)?;
+        let mut options = options;
+        options.compaction_metrics = Some(super::compaction_metrics::MetricsStore(shard.clone()));
+        let (history, _) = shard.read(|r| r.model_history(&provider.provider.api_format))?;
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
             return crate::services::compaction::native::generate(

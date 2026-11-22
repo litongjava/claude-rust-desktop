@@ -1,6 +1,7 @@
 use super::*;
 use crate::services::{compaction, compaction_requests};
 use rusqlite::params;
+use serde_json::Value;
 
 /// Only digests of provider configuration and fragment inputs reach SQLite.
 pub struct CheckpointKey {
@@ -51,6 +52,29 @@ impl CompactionClaim {
 }
 
 impl SessionWrite<'_> {
+    pub(crate) fn start_compaction_metrics(
+        &self,
+        snapshot: &Value,
+        metadata: &Value,
+    ) -> Result<Option<String>> {
+        let message: Option<String> = self.0.query_row(
+            "SELECT id FROM messages WHERE conversation_id=?1 ORDER BY sort_order DESC,rowid DESC LIMIT 1",
+            [self.1], |row| row.get(0),
+        ).optional()?;
+        if let Some(message) = &message {
+            self.finish_compaction_metrics(message, snapshot)?;
+            self.set_request_metadata(
+                snapshot["id"].as_str().context("Missing request ID")?,
+                metadata,
+            )?;
+        }
+        Ok(message)
+    }
+
+    pub(crate) fn finish_compaction_metrics(&self, message: &str, snapshot: &Value) -> Result<()> {
+        crate::db::request_repo::save_request(self.0, message, snapshot)
+    }
+
     pub fn request_compaction(&self, keep: &str, used_tokens: u64, window: u64) -> Result<()> {
         compaction_requests::validate(self.0, self.1, keep, used_tokens, window)?;
         self.0.execute(

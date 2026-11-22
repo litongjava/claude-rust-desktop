@@ -1269,6 +1269,20 @@ async fn generate_request(
     };
     let operation = async {
         let started = std::time::Instant::now();
+        let mut options = options;
+        let metrics = if options.compaction_metrics.is_some() {
+            let api = if provider.provider.builtin_id.is_some() {
+                super::provider_runtime::resolved_transport(&provider)?.1
+            } else if provider.provider.api_format == super::provider_manager::ApiFormat::Anthropic
+            {
+                "anthropic-messages"
+            } else {
+                "openai-completions"
+            };
+            super::compaction_metrics::CompactionMetrics::start(&mut options, &provider, api)?
+        } else {
+            None
+        };
         let (text, finish, completion) = if provider.provider.builtin_id.is_some()
             || matches!(
                 provider.provider.api_format,
@@ -1306,6 +1320,15 @@ async fn generate_request(
                 .next()
                 .context("Model returned no choices")?;
             let finish = choice.finish_reason.unwrap_or_default();
+            if let Some(metrics) = metrics {
+                let status = match finish.as_str() {
+                    "stop" | "end_turn" | "stop_sequence" | "tool_calls" | "tool_use" => {
+                        "completed"
+                    }
+                    _ => "incomplete",
+                };
+                metrics.finish(&serde_json::to_value(&response.usage)?, &finish, status)?;
+            }
             log_request(
                 label,
                 estimate,
@@ -1350,6 +1373,15 @@ async fn generate_request(
                 .as_ref()
                 .map(|usage| (usage.input_tokens, usage.output_tokens));
             let finish = response.stop_reason.unwrap_or_default();
+            if let Some(metrics) = metrics {
+                let status = match finish.as_str() {
+                    "stop" | "end_turn" | "stop_sequence" | "tool_calls" | "tool_use" => {
+                        "completed"
+                    }
+                    _ => "incomplete",
+                };
+                metrics.finish(&serde_json::to_value(&response.usage)?, &finish, status)?;
+            }
             // Anthropic usage carries no reasoning breakdown; it stays unknown.
             log_request(
                 label,

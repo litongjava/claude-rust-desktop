@@ -90,7 +90,7 @@ async fn fixture(mode: u8) -> Fixture {
             if mode == 2 { std::future::pending::<()>().await; }
             if mode == 6 { released.notified().await; }
             if mode == 1 || mode == 6 { return (StatusCode::BAD_GATEWAY, Json(json!({"error":"incomplete"}))); }
-            (StatusCode::OK, Json(json!({"object":"response.compaction","output":window(),"usage":{"input_tokens":150,"output_tokens":77}})))
+            (StatusCode::OK, Json(json!({"object":"response.compaction","output":window(),"usage":{"input_tokens":150,"input_tokens_details":{"cached_tokens":112},"output_tokens":77}})))
         }
     }));
     let captured = seen.clone();
@@ -222,6 +222,18 @@ async fn running_responses_turn_uses_native_compaction_before_local_truncation()
     let meta: Value = serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
     assert_eq!(meta["purpose"], "compaction");
     assert_eq!(meta["compaction_stage"], "native");
+    let measured: (i64, i64) = store
+        .db
+        .shard_sql(&id, |c| {
+            c.query_row(
+                "SELECT input_tokens, cache_read_tokens FROM model_requests WHERE id=?1",
+                [meta["model_request_id"].as_str().unwrap()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(measured, (150, 112));
     let body_path = meta_path
         .to_string_lossy()
         .replace(".meta.json", ".request.json");

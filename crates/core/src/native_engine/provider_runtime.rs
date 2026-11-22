@@ -110,7 +110,9 @@ fn resolved_base<'a>(configured: &'a str, entry: &'a Value, model: &'a Value) ->
 
 /// The catalog protocol and the API the shared transport dials for it. The
 /// Chat alias (`mistral-conversations`) is the same normalized protocol.
-fn resolved_transport(provider: &ResolvedProvider) -> Result<(&'static str, &'static str)> {
+pub(super) fn resolved_transport(
+    provider: &ResolvedProvider,
+) -> Result<(&'static str, &'static str)> {
     let (_, model) = metadata(provider)?;
     let protocol = provider
         .model

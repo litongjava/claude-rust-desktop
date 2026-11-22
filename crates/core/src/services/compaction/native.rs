@@ -122,6 +122,12 @@ pub(crate) async fn generate_messages_with_options(
         .connect_timeout(Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let mut options = options;
+    let mut metrics = crate::native_engine::compaction_metrics::CompactionMetrics::start(
+        &mut options,
+        provider,
+        "openai-responses-compact",
+    )?;
     let identity = crate::native_engine::request_identity::RequestIdentity::for_explicit(
         provider,
         "compaction",
@@ -160,6 +166,9 @@ pub(crate) async fn generate_messages_with_options(
         bytes.extend_from_slice(&chunk);
     }
     let result: Value = serde_json::from_slice(&bytes).context("Invalid native compaction JSON")?;
+    if let Some(metrics) = &mut metrics {
+        metrics.observe_usage(&result["usage"]);
+    }
     ensure!(
         result["object"] == "response.compaction",
         "Gateway did not return a native response.compaction result"
@@ -174,6 +183,9 @@ pub(crate) async fn generate_messages_with_options(
                 .is_some_and(|s| !s.is_empty())),
         "Native compaction output has no encrypted compaction item"
     );
+    if let Some(metrics) = metrics {
+        metrics.finish(&result["usage"], "compact", "completed")?;
+    }
     Ok(GeneratedSummary {
         text: "Native Responses compaction completed. The encrypted context is saved and will be restored for this provider/model. Earlier messages remain in session history.".into(),
         native: Some(json!({"api":"openai-responses","compaction":true,"items":items,"usage":result["usage"],

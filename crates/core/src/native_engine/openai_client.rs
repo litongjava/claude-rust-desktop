@@ -76,6 +76,8 @@ pub struct OpenAIChoice {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OpenAIUsage {
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,

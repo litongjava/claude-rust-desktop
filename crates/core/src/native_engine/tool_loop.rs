@@ -6185,6 +6185,10 @@ impl ToolLoopExecutor {
                             .request_options
                             .clone()
                             .compaction("native");
+                        if let Some(ExecutorHistory::Session(session)) = &self.executor_history {
+                            options.compaction_metrics =
+                                Some(super::compaction_metrics::MetricsStore(session.clone()));
+                        }
                         let mut record = super::request_recording::CompactionRecord::start(
                             &mut options,
                             "auto",
