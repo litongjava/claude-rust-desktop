@@ -339,7 +339,9 @@
       }
     ]
   },
-  "installed_agents": [],
+  "installed_agents": [
+    "claude"
+  ],
   "automation": {
     "mode": "auto"
   },
