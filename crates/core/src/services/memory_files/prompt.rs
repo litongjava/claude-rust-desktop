@@ -13,8 +13,6 @@ use std::borrow::Cow;
 struct IndexState {
     first: Option<String>,
     last_hash: Option<String>,
-    #[serde(default)]
-    boundary: Option<String>,
 }
 
 const INDEX: Setting<IndexState> = Setting::new("memory.prompt.index");
@@ -91,6 +89,38 @@ fn typed_query(message: &Value) -> Option<Cow<'_, str>> {
     Some(query)
 }
 
+impl FileMemory {
+    fn prompt_snapshot(&self, read_only: bool) -> Result<Option<crate::memory::files::Snapshot>> {
+        if self.directory.try_exists()? {
+            Ok(Some(self.store(read_only)?.prompt_snapshot()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn render_index(&self, snapshot: Option<&crate::memory::files::Snapshot>) -> String {
+        let index = snapshot.map_or("", |s| s.index.as_str());
+        let path = xml(&self.directory.join("MEMORY.md").to_string_lossy());
+        format!("<system-reminder>\n<project_memory>\nIndex: {path}\n{}\n{}\n</project_memory>\n</system-reminder>",
+            include_str!("../../prompt/file_memory.md"), index_excerpt(&xml(index)))
+    }
+
+    pub(crate) fn current_prompt_index(&self, read_only: bool) -> Result<Option<String>> {
+        let memory = match &self.session {
+            Some(shard) => {
+                Self::from_session(&self.context, shard.clone(), self.private_owner.as_deref())?
+            }
+            None => self.clone(),
+        };
+        if !memory.active() {
+            return Ok(None);
+        }
+        Ok(Some(
+            memory.render_index(memory.prompt_snapshot(read_only)?.as_ref()),
+        ))
+    }
+}
+
 fn receipt(boundary: Option<&str>, key: &str, occurrence: usize) -> Setting<Vec<String>> {
     Setting::memory_receipt(format!(
         "prompt.turn.{}.{key}.{occurrence}",
@@ -114,7 +144,11 @@ pub(crate) fn prepare(
     let boundary = messages
         .first()
         .filter(|m| m["origin"] == "compaction")
-        .map(|m| turn_context::key(&m["content"]));
+        .and_then(|m| m["id"].as_str());
+    let index_state = || match boundary {
+        Some(id) => Setting::memory_receipt(format!("prompt.index.boundary.{id}")),
+        None => INDEX,
+    };
     let target = slots.last().and_then(Option::as_ref);
     let (state, mut entries, recorded) = shard.read(|r| {
         let mut entries = Vec::new();
@@ -123,7 +157,7 @@ pub(crate) fn prepare(
             let Some(slot @ (key, occurrence)) = slot else {
                 continue;
             };
-            if let Some(blocks) = r.setting(receipt(boundary.as_deref(), key, *occurrence))? {
+            if let Some(blocks) = r.setting(receipt(boundary, key, *occurrence))? {
                 recorded |= target == Some(slot);
                 // A host can resubmit the same content and occurrence with a
                 // different origin. A receipt belongs only to human input.
@@ -137,7 +171,7 @@ pub(crate) fn prepare(
                 }
             }
         }
-        Ok((r.setting(INDEX)?, entries, recorded))
+        Ok((r.setting(index_state())?, entries, recorded))
     })?;
     let query = allow_new
         .then(|| messages.last().and_then(typed_query))
@@ -147,16 +181,11 @@ pub(crate) fn prepare(
             return Ok((state.first.clone(), entries));
         }
     }
-    let snapshot = match memory {
-        Some(m) if m.directory.try_exists()? => Some(m.store(read_only)?.prompt_snapshot()?),
-        _ => None,
-    };
-    let current = memory.map(|m| {
-        let index = snapshot.as_ref().map_or("", |s| s.index.as_str());
-        let path = xml(&m.directory.join("MEMORY.md").to_string_lossy());
-        format!("<system-reminder>\n<project_memory>\nIndex: {path}\n{}\n{}\n</project_memory>\n</system-reminder>",
-            include_str!("../../prompt/file_memory.md"), index_excerpt(&xml(index)))
-    });
+    let snapshot = memory
+        .map(|m| m.prompt_snapshot(read_only))
+        .transpose()?
+        .flatten();
+    let current = memory.map(|m| m.render_index(snapshot.as_ref()));
     let hash = memory.map(|m| {
         format!(
             "{}/{}",
@@ -170,23 +199,20 @@ pub(crate) fn prepare(
     };
 
     let (first, attachment) = shard.write(|w| {
-        let saved = w.setting(INDEX)?;
+        let saved = w.setting(index_state())?;
         let mut update = saved.is_none();
         let mut state = saved.unwrap_or_else(|| IndexState {
             first: current.clone(),
             last_hash: hash.clone(),
-            boundary: boundary.clone(),
         });
         let mut attachment = None;
         if let Some((key, occurrence)) = target.filter(|_| query.is_some()) {
-            let setting = || receipt(boundary.as_deref(), key, *occurrence);
+            let setting = || receipt(boundary, key, *occurrence);
             let blocks = match w.setting(setting())? {
                 Some(existing) => existing,
                 None => {
                     let mut blocks = Vec::new();
-                    if state.last_hash != hash
-                        || (state.boundary != boundary && current != state.first)
-                    {
+                    if state.last_hash != hash {
                         if let Some(index) = &current {
                             blocks.push(index.replacen(
                                 "<project_memory>",
@@ -195,7 +221,6 @@ pub(crate) fn prepare(
                             ));
                         }
                         state.last_hash = hash.clone();
-                        state.boundary = boundary.clone();
                         update = true;
                     }
                     blocks.extend(
@@ -217,7 +242,7 @@ pub(crate) fn prepare(
             }
         }
         if update {
-            w.set_setting(INDEX, &state)?;
+            w.set_setting(index_state(), &state)?;
         }
         Ok((state.first, attachment))
     })?;

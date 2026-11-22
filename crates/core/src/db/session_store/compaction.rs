@@ -381,16 +381,16 @@ fn legacy_fragments(
 impl SessionRepository<'_> {
     pub(crate) fn latest_compact_content(
         &self,
-    ) -> Result<Option<(String, Option<serde_json::Value>)>> {
+    ) -> Result<Option<(String, String, Option<serde_json::Value>)>> {
         self.read(|c,id| {
             let join=match self.0 {
                 owned::Backend::Admitted(_) => "LEFT JOIN native_boundaries b ON b.message_id=m.id",
                 owned::Backend::Shared(_,_) => "LEFT JOIN peripheral_settings b ON b.key='compaction.native.'||m.id",
             };
-            let mut q=c.prepare_cached(&format!("SELECT m.content,b.value FROM messages m {join}
+            let mut q=c.prepare_cached(&format!("SELECT m.id,m.content,b.value FROM messages m {join}
                 WHERE m.conversation_id=?1 AND m.is_compact_boundary=1 ORDER BY m.sort_order DESC,m.rowid DESC LIMIT 1"))?;
-            let row=q.query_row([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?))).optional()?;
-            row.map(|(text,native)|Ok((text,native.map(|s|serde_json::from_str(&s)).transpose()?))).transpose()
+            let row=q.query_row([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?))).optional()?;
+            row.map(|(message_id,text,native)|Ok((message_id,text,native.map(|s|serde_json::from_str(&s)).transpose()?))).transpose()
         })
     }
 }

@@ -775,7 +775,7 @@ pub(crate) fn apply_persisted_boundary(
     db: &impl crate::db::session_store::SessionAccess,
     id: &str,
     messages: &mut Vec<Value>,
-) -> Result<bool> {
+) -> Result<Option<String>> {
     // Native blocks are accepted only from the persisted boundary, never host-supplied JSON.
     for message in messages.iter_mut() {
         if let Some(object) = message.as_object_mut() {
@@ -783,7 +783,7 @@ pub(crate) fn apply_persisted_boundary(
         }
     }
     let boundary = db.select_session(id)?.latest_compact_content()?;
-    if let Some((content, native)) = boundary {
+    if let Some((message_id, content, native)) = boundary {
         let start = messages
             .iter()
             .rposition(|m| {
@@ -800,9 +800,9 @@ pub(crate) fn apply_persisted_boundary(
         if let Some(native) = native {
             messages[0]["provider_content"] = native;
         }
-        return Ok(true);
+        return Ok(Some(message_id));
     }
-    Ok(false)
+    Ok(None)
 }
 
 #[cfg(test)]

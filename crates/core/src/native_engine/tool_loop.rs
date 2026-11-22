@@ -120,6 +120,8 @@ mod tool_loading_tests;
 #[path = "tool_loading_restore_tests.rs"]
 mod tool_loading_restore_tests;
 
+#[path = "project_memory_context.rs"]
+mod project_memory_context;
 #[path = "multimodal.rs"]
 mod multimodal;
 #[path = "provider_transcript.rs"]
@@ -4080,7 +4082,10 @@ impl ToolLoopExecutor {
             let compressor = TieredCompressor::new();
             let compressed = compressor.compress(&self.messages);
             let original_len = self.messages.len();
-            self.messages = compressed;
+            if compressed != self.messages {
+                self.refresh_compacted_memory()?;
+                self.messages = compressed;
+            }
             tracing::info!(
                 module = "ToolLoop",
                 "Context compressed: {} -> {} messages",
@@ -4158,10 +4163,14 @@ impl ToolLoopExecutor {
             let compressor = TieredCompressor::new();
             let original_estimate = TokenCounter::estimate(&self.messages);
 
-            self.messages = compressor.compress_progressive(&self.messages, safe_limit, |msgs| {
+            let compressed = compressor.compress_progressive(&self.messages, safe_limit, |msgs| {
                 TokenCounter::estimate(msgs)
             });
 
+            if compressed != self.messages {
+                self.refresh_compacted_memory()?;
+                self.messages = compressed;
+            }
             let final_estimate = TokenCounter::estimate(&self.messages);
             tracing::info!(
                 module = "ToolLoop",
@@ -5333,13 +5342,11 @@ impl ToolLoopExecutor {
                     };
                     let level = compressor.determine_compression_level(&context_window);
                     if level != CompressionLevel::None {
-                        let conv_values: Vec<Value> = conversation_messages
-                            .iter()
-                            .map(serde_json::to_value)
-                            .collect::<std::result::Result<_, _>>()?;
-                        let (compressed, metadata) = compressor
+                        let mut input = conv_values;
+                        self.remove_compaction_indexes(&mut input);
+                        let (mut compressed, metadata) = compressor
                             .compress(
-                                conv_values,
+                                input,
                                 // The client adds the base prompt separately; keep existing system messages intact.
                                 None,
                                 level,
@@ -5347,6 +5354,7 @@ impl ToolLoopExecutor {
                             )
                             .await;
                         if metadata.was_compressed {
+                            self.add_compacted_memory(&mut compressed)?;
                             conversation_messages = compressed
                                 .into_iter()
                                 .map(serde_json::from_value)
@@ -6107,11 +6115,13 @@ impl ToolLoopExecutor {
                             "auto",
                             &serde_json::to_string(&conv_values)?,
                         );
+                        let mut input = conv_values;
+                        self.remove_compaction_indexes(&mut input);
                         let compacted =
                             crate::services::compaction::native::generate_messages_with_options(
                                 &self.provider,
                                 options,
-                                conversation_messages.clone(),
+                                input.into_iter().map(serde_json::from_value).collect::<serde_json::Result<_>>()?,
                                 self.system_prompt.as_deref().unwrap_or(""),
                                 self.conv_id.as_deref(),
                             )
@@ -6128,6 +6138,9 @@ impl ToolLoopExecutor {
                             reasoning_content: None,
                             provider_content: compacted.native,
                         }];
+                        if let Some(index) = self.refresh_compacted_memory()? {
+                            conversation_messages.push(serde_json::from_value(json!({"role":"user","content":index}))?);
+                        }
                     } else {
                         let compressor = ContextCompressor::new(None);
                         let context_window = ContextWindow {
@@ -6138,13 +6151,11 @@ impl ToolLoopExecutor {
                         };
                         let level = compressor.determine_compression_level(&context_window);
                         if level != CompressionLevel::None {
-                            let conv_values: Vec<Value> = conversation_messages
-                                .iter()
-                                .map(serde_json::to_value)
-                                .collect::<std::result::Result<_, _>>()?;
-                            let (compressed, metadata) = compressor
+                            let mut input = conv_values;
+                            self.remove_compaction_indexes(&mut input);
+                            let (mut compressed, metadata) = compressor
                                 .compress(
-                                    conv_values,
+                                    input,
                                     // The client adds the base prompt separately; keep existing system messages intact.
                                     None,
                                     level,
@@ -6152,6 +6163,7 @@ impl ToolLoopExecutor {
                                 )
                                 .await;
                             if metadata.was_compressed {
+                            self.add_compacted_memory(&mut compressed)?;
                                 conversation_messages = compressed
                                     .into_iter()
                                     .map(serde_json::from_value)

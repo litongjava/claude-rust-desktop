@@ -1350,7 +1350,8 @@ impl QueryEngine {
         let memory_session = selected.clone();
         let memory_context = plugin_context.clone();
         let mut memory_messages = request.messages.clone();
-        if applied_compaction {
+        if let Some(boundary_id) = &applied_compaction {
+            memory_messages[0]["id"] = serde_json::json!(boundary_id);
             memory_messages[0]["origin"] = serde_json::json!("compaction");
         }
         let (file_memory, project_memory, memory_turns) =
@@ -1609,7 +1610,7 @@ impl QueryEngine {
         .with_hooks(hooks)
         .with_goal_state(self.db_manager.clone())
         .with_context_boundary(request.context_boundary)
-        .with_applied_compaction(applied_compaction)
+        .with_applied_compaction(applied_compaction.is_some())
         .with_allowed_tools(agent.as_ref().and_then(|d| d.tools.clone()))
         .with_read_only_shell(agent.as_ref().is_some_and(|d| d.read_only_shell))
         .with_prompt_profile(prompt_profile)

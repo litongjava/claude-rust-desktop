@@ -795,6 +795,44 @@ mod tests {
             .is_empty());
     }
     #[test]
+    fn memory_text_boundary_rebuilds_the_current_scope_prefix() {
+        let (root, first) = fixture();
+        let second_root = root.path().join("other");
+        std::fs::create_dir(&second_root).unwrap();
+        let second = FileMemory::workspace(&first.context, &second_root).unwrap();
+        let shard = first.session.as_ref().unwrap();
+        let prepare = |memory, messages: &[Value]| {
+            prompt::prepare(shard, Some(memory), messages, true, false, 4096).unwrap()
+        };
+        for (memory, marker) in [(&first, "SCOPE-A"), (&second, "SCOPE-B")] {
+            memory.store(false).unwrap();
+            std::fs::write(memory.directory.join("MEMORY.md"), marker).unwrap();
+        }
+        let typed = json!({"role":"user","content":"hello","id":"u1"});
+        assert!(prepare(&first, &[typed.clone()])
+            .0
+            .unwrap()
+            .contains("SCOPE-A"));
+        let before = prepare(
+            &second,
+            &[typed, json!({"role":"user","content":"next","id":"u2"})],
+        );
+        assert!(before.0.unwrap().contains("SCOPE-A"));
+        let (prefix, turns) = prepare(
+            &second,
+            &[
+                json!({"role":"user","origin":"compaction","content":"summary","id":"boundary"}),
+                json!({"role":"user","content":"continue","id":"u3"}),
+            ],
+        );
+        let prefix = prefix.unwrap();
+        assert!(prefix.contains("SCOPE-B") && !prefix.contains("SCOPE-A"));
+        assert!(turns
+            .iter()
+            .all(|e| e.blocks.iter().all(|b| !b.contains("SCOPE-B"))));
+    }
+
+    #[test]
     fn file_memory_zero_hit_receipts_survive_restart_without_user_text() {
         let (_root, memory) = fixture();
         let first = json!({"role":"user","content":"preferences"});
