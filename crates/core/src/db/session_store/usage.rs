@@ -80,7 +80,10 @@ fn usage_days(
     };
     let mut q=conn.prepare(&format!(
             "SELECT started_at_ms,coalesce(ended_at_ms,started_at_ms),coalesce(model,''),
-             CASE WHEN {SPLIT_INPUT} THEN coalesce(input_tokens,0)
+             CASE WHEN {SPLIT_INPUT} OR
+                  (api_format='bedrock-converse-stream' AND
+                   total_tokens=input_tokens+output_tokens+coalesce(cache_read_tokens,0)+coalesce(cache_write_tokens,0))
+                  THEN coalesce(input_tokens,0)
                   ELSE max(0,coalesce(input_tokens,0)-coalesce(cache_read_tokens,0)-coalesce(cache_write_tokens,0)) END,
              coalesce(output_tokens,0),coalesce(cache_read_tokens,0),coalesce(cache_write_tokens,0),conversation_id,{origin}
              FROM {tables} WHERE started_at_ms IS NOT NULL"))?;

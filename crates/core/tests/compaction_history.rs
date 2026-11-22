@@ -499,3 +499,22 @@ async fn compaction_records_chat_cache_writes_in_their_own_bucket() {
     assert_eq!(details["cache_write_tokens"], 5);
     f.finish().await;
 }
+
+#[tokio::test]
+async fn historical_bedrock_daily_buckets_survive_a_compaction_fork() -> anyhow::Result<()> {
+    let f = Fixture::new(128_000).await;
+    let shard = f.store.db.open_session(&f.id)?;
+    shard.write(|w| {
+        let message = w.append("assistant", "Historical request")?;
+        w.normalized_request(&message, &json!({"id":"old-bedrock","model":"model","apiFormat":"bedrock-converse-stream","startedAt":1,"inputTokens":20,"outputTokens":3,"cacheReadTokens":75,"cacheWriteTokens":5,"totalTokens":103,"usage":{"prompt_tokens":20,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":75},"cache_creation_input_tokens":5}}))?;
+        w.set_request_metadata("old-bedrock", &json!({"kind":"compaction"}))
+    })?;
+    f.store.fork(&f.id)?;
+    let usage = f.store.db.usage(|| false)?;
+    assert!(usage.failures.is_empty());
+    assert_eq!(usage.days.len(), 1);
+    let day = &usage.days[0];
+    assert_eq!((day.requests, day.heat, day.tokens), (1, 103, [20, 3, 75, 5]));
+    f.finish().await;
+    Ok(())
+}
