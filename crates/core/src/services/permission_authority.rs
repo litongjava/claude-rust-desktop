@@ -165,7 +165,20 @@ mod tests {
             crate::services::session_messages::Consumer::attach(&context.paths.data_dir, &parent)
                 .unwrap()
                 .unwrap();
-        assert_eq!(consumer.target.drain(8).unwrap().len(), 1);
+        // A model-boundary poll can defer delivery when its short database
+        // contention budget expires. Wait for the real delivery before checking authority.
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let messages = consumer.target.drain(8).unwrap();
+                if !messages.is_empty() {
+                    break messages;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the peer message must be delivered before compaction");
+        assert_eq!(delivered.len(), 1);
         drop(consumer);
         let models = store.model_history(&parent, &ApiFormat::OpenAI).unwrap();
         assert!(serde_json::to_string(&models)
