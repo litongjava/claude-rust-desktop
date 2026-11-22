@@ -110,7 +110,7 @@ fn resolved_base<'a>(configured: &'a str, entry: &'a Value, model: &'a Value) ->
 
 /// The catalog protocol and the API the shared transport dials for it. The
 /// Chat alias (`mistral-conversations`) is the same normalized protocol.
-pub(super) fn resolved_transport(
+pub(crate) fn resolved_transport(
     provider: &ResolvedProvider,
 ) -> Result<(&'static str, &'static str)> {
     let (_, model) = metadata(provider)?;
@@ -134,13 +134,10 @@ pub(super) fn resolved_transport(
     }
 }
 
-/// The plain Responses endpoint used by the main turn, including catalog defaults.
-pub(crate) fn compact_base(provider: &ResolvedProvider) -> Option<&str> {
-    if resolved_transport(provider).ok()?.0 != "openai-responses" {
-        return None;
-    }
-    let (entry, model) = metadata(provider).ok()?;
-    Some(resolved_base(
+/// The endpoint base for the selected catalog model, including per-model overrides.
+pub(crate) fn catalog_base(provider: &ResolvedProvider) -> Result<&str> {
+    let (entry, model) = metadata(provider)?;
+    Ok(resolved_base(
         provider.provider.base_url.trim_end_matches('/'),
         entry,
         model,

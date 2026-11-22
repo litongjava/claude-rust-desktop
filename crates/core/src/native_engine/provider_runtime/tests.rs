@@ -1894,11 +1894,11 @@ fn native_compaction_resolves_the_main_catalog_endpoint_and_excludes_aliases() {
     p.model.api = None;
     assert!(crate::services::compaction::native::supports(&p));
     assert_eq!(
-        compact_base(&p),
-        Some("https://opencode.ai/inference/go/openai/v1")
+        catalog_base(&p).unwrap(),
+        "https://opencode.ai/inference/go/openai/v1"
     );
     for alias in ["openai-codex-responses", "azure-openai-responses"] {
         p.model.api = Some(alias.into());
-        assert!(compact_base(&p).is_none());
+        assert!(!crate::services::compaction::native::supports(&p));
     }
 }
