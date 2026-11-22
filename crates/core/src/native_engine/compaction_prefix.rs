@@ -42,6 +42,7 @@ pub(super) struct Capture {
     pub session: SessionDb,
     pub route: String,
     pub source: Source,
+    pub prompt_schema: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -56,12 +57,17 @@ pub(crate) struct SavedPrefix {
 
 impl Capture {
     pub fn save(&self, wire: &WireRequest) -> Result<()> {
+        let mut wire = wire.clone();
+        wire.allow_text_summary();
+        if let Some(schema) = &self.prompt_schema {
+            crate::structured_output::remove_prompt_instruction(&mut wire.body, schema);
+        }
         let saved = SavedPrefix {
             route: self.route.clone(),
             session: self.session.id().into(),
             complete_source: true,
             source: self.source.clone(),
-            wire: wire.clone(),
+            wire,
         };
         self.session
             .write(|w| w.set_setting(COMPACTION_PREFIX, &saved))

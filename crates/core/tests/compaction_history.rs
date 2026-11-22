@@ -35,7 +35,8 @@ impl Fixture {
             let compact = headers["x-dcl-request-kind"] == "compaction";
             let stream = body["stream"] == true;
             let responses = body.get("input").is_some();
-            let text = if compact { "Pending work is recorded." } else { "last answer" };
+            let structured = body["response_format"]["type"] == "json_schema" || body["messages"].to_string().contains("fixture always answers JSON");
+            let text = if structured { r#"{"ok":true}"# } else if compact { "Pending work is recorded." } else { "last answer" };
             seen.lock().unwrap().push(body);
             async move {
                 let usage = json!({"prompt_tokens":100,"completion_tokens":3,"total_tokens":103,"prompt_tokens_details":{"cached_tokens":80}});
@@ -83,10 +84,10 @@ impl Fixture {
         self.store.append(&self.id, role, text).unwrap();
     }
 
-    async fn main_turn(&self) {
+    async fn main_turn(&self, schema: Option<Value>) {
         let request: ChatRequest = serde_json::from_value(json!({"conversation_id":self.id,
             "messages":self.store.model_history(&self.id,&self.provider.api_format).unwrap(),
-            "system_prompt":"Custom session instructions","model":"model","provider_id":"fixture","workspace_path":self.root.path()})).unwrap();
+            "response_schema":schema,"system_prompt":"Custom session instructions","model":"model","provider_id":"fixture","workspace_path":self.root.path()})).unwrap();
         let mut stream = self
             .engine()
             .send_message_with_history(request, false)
@@ -101,7 +102,14 @@ impl Fixture {
                 "{event:?}"
             );
         }
-        self.append("assistant", "last answer");
+        self.append(
+            "assistant",
+            if schema.is_some() {
+                r#"{"ok":true}"#
+            } else {
+                "last answer"
+            },
+        );
     }
 
     async fn compact(&self) -> anyhow::Result<compaction::CompactionResult> {
@@ -131,7 +139,7 @@ async fn shortened_main_turn_summarizes_the_complete_durable_input() {
         f.append("assistant", &format!("earlier answer {i}"));
         f.append("user", &format!("later question {i}"));
     }
-    f.main_turn().await;
+    f.main_turn(None).await;
     f.compact().await.unwrap();
     {
         let calls = f.requests.lock().unwrap();
@@ -207,4 +215,40 @@ async fn check_opaque_fallback(window: usize, padding: &str) {
         }
     }
     f.finish().await;
+}
+
+#[tokio::test]
+async fn schema_constrained_main_turn_requires_a_text_summary_before_commit() {
+    for stubborn in [false, true] {
+        let f = Fixture::new(128_000).await;
+        f.append(
+            "user",
+            if stubborn {
+                "fixture always answers JSON"
+            } else {
+                "Continue work"
+            },
+        );
+        f.main_turn(Some(json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}))).await;
+        let before = f.store.history(&f.id).unwrap();
+        let result = f.compact().await;
+        let after = f.store.history(&f.id).unwrap();
+        {
+            let requests = f.requests.lock().unwrap();
+            assert_eq!(requests[0]["response_format"]["type"], "json_schema");
+            assert!(requests[1].get("response_format").is_none());
+            assert_eq!(requests[0]["tools"], requests[1]["tools"]);
+        }
+        if stubborn {
+            assert!(result.is_err());
+            assert_eq!(before, after);
+        } else {
+            result.unwrap();
+            assert!(after.last().unwrap()["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("Pending work is recorded."));
+        }
+        f.finish().await;
+    }
 }

@@ -2999,6 +2999,11 @@ impl ToolLoopExecutor {
                 Some(Capture {
                     session: session.clone(),
                     source: source.clone(),
+                    prompt_schema: self.response_schema.clone().filter(|_| {
+                        !crate::structured_output::provider_enforces_schema(
+                            &self.provider.provider.base_url,
+                        )
+                    }),
                     route: route(&self.provider),
                 })
             }

@@ -647,6 +647,7 @@ impl<'a, 'b> Summarizer<'a, 'b> {
         self.checkpoint
             .as_deref()
             .and_then(|cache| cache.get(&self.request_key(text, output)))
+            .filter(|text| is_summary_text(text))
     }
 
     fn session(&self) -> Option<String> {
@@ -739,6 +740,7 @@ impl<'a, 'b> Summarizer<'a, 'b> {
                 .await?
             }
         };
+        ensure!(is_summary_text(&summary), "Compaction returned a JSON value instead of a continuation summary; original history retained");
         // Only a complete, validated summary reaches the cache.
         if let Some(cache) = self.checkpoint.as_deref_mut() {
             cache.save(key, summary.clone())?;
@@ -1611,6 +1613,11 @@ async fn generate_request(
         validate_result(text, max_tokens, finish, completion)
     };
     generation_deadline(operation, short_deadline).await
+}
+
+fn is_summary_text(text: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(crate::structured_output::strip_code_fence(text))
+        .is_err()
 }
 
 /// Reject a finished response that carries no usable text, keeping the sizes,
