@@ -520,6 +520,7 @@ impl QueryEngine {
             system,
             input,
             instructions,
+            None,
             super::request_options::RequestOptions::from_db(
                 &self.db_manager,
                 Some(session),
@@ -537,6 +538,7 @@ impl QueryEngine {
         system: &str,
         input: &str,
         instructions: &str,
+        before: Option<&str>,
         options: super::request_options::RequestOptions,
     ) -> Result<crate::services::compaction::GeneratedSummary> {
         let provider = self
@@ -546,7 +548,8 @@ impl QueryEngine {
             .resolve_selected(provider_id, model)
             .ok_or_else(|| anyhow!("Provider/model is unavailable: {provider_id}::{model}"))?;
         let shard = self.db_manager.open_session(session)?;
-        let history = shard.read(|r| r.native_summary_history(&provider.provider.api_format))?;
+        let history =
+            shard.read(|r| r.native_summary_history(&provider.provider.api_format, before))?;
         crate::services::compaction::native::validate_history(&history, &provider)?;
         if crate::services::compaction::native::supports(&provider) {
             return crate::services::compaction::native::generate(

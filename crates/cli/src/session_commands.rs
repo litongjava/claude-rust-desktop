@@ -1,6 +1,7 @@
 //! Interactive session settings persisted alongside the shared conversation.
 use deepseek_code_core::db::session_store::{settings, SessionAccess, Stores};
 use crate::session::Session;
+use deepseek_code_core::services::compaction::CompactionTracker;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::runtime::RuntimePaths;
 #[cfg(test)]
@@ -751,37 +752,33 @@ pub fn is_context_overflow(error: &anyhow::Error) -> bool {
         .any(|needle| text.contains(needle))
 }
 
-/// As the reference CLI's reactive compact: when a request overflows the
-/// context window, drop the failed attempt, compact the earlier conversation
-/// the way autocompact does, and let the caller send the prompt again. False
-/// (with nothing changed) when there is no earlier conversation to compact.
+/// Summarize the prefix before the admitted input, then retry that same row.
 pub async fn reactive_compact(
     session: &Session,
-    prompt: &str,
+    admitted: Option<&str>,
     turn: &mut deepseek_code_core::db::turn_repo::TurnTimer,
-    queued: bool,
-) -> Result<bool> {
-    use deepseek_code_core::db::message_repo;
-    let rows = session.selected_session()?.repository().messages()?;
-    let start = rows.iter().rposition(|row| row.is_compact_boundary).unwrap_or(0);
-    let Some(index) = rows.iter().rposition(|row| row.role == "user") else { return Ok(false) };
-    if rows[index].content != prompt || index <= start + 1 {
-        return Ok(false);
+) -> Result<Option<String>> {
+    let shard = session.selected_session()?;
+    let input = match admitted {
+        Some(id) => id.to_owned(),
+        None => match shard.read(|r| r.queued_turn_input())? {
+            Some(id) => id,
+            None => return Ok(None),
+        },
+    };
+    let rows = shard.repository().messages()?;
+    let start = rows
+        .iter()
+        .rposition(|row| row.is_compact_boundary)
+        .unwrap_or(0);
+    if !rows.iter().skip(start + 2).any(|row| row.id == input) {
+        return Ok(None);
     }
     crate::compaction::notice("Context limit reached; compacting the conversation and retrying…");
-    let failed_start = if queued {
-        rows.get(index + 1)
-    } else {
-        rows.get(index)
-    };
-    if let Some(row) = failed_start {
-        session
-            .selected_session()?
-            .write(|w| w.rewind_failed_attempt(&row.id, &turn.record().turn_id))?;
-    }
+    shard.write(|w| w.discard_failed_segments(&turn.record().turn_id))?;
     turn.clear_segment();
-    compact_automatic(session, "", None).await?;
-    Ok(true)
+    compact_automatic(session, "", CompactionTracker::before_input(&input)).await?;
+    Ok(Some(input))
 }
 
 /// Run before assembling the next request so the compact boundary is reflected
@@ -794,7 +791,7 @@ pub async fn prepare_turn(session: &Session, context_window: Option<u32>, lease:
         let claim=shard.delivery_under_lease(lease)?.claim_compaction()?;
         if let Some(claim)=claim {
             crate::compaction::notice("Compacting the conversation as the model requested…");
-            compact_automatic(session, &claim.keep, Some(&claim)).await?;
+            compact_automatic(session, &claim.keep, CompactionTracker::for_claim(&claim)).await?;
             return Ok(());
         }
     }
@@ -815,15 +812,18 @@ pub async fn prepare_turn(session: &Session, context_window: Option<u32>, lease:
     crate::compaction::notice(&format!(
         "Auto-compacting conversation (estimated {estimated} tokens, threshold {threshold})…"
     ));
-    compact_automatic(session, "", None).await?;
+    compact_automatic(session, "", CompactionTracker::default()).await?;
     Ok(())
 }
 
 /// Both automatic entries retain the commit outcome across cancellation.
-async fn compact_automatic(session: &Session, instructions: &str, claim: Option<&deepseek_code_core::db::session_store::CompactionClaim>) -> Result<()> {
-    use deepseek_code_core::services::compaction::{compact_with_hooks_tracked, CompactionTracker};
+async fn compact_automatic(
+    session: &Session,
+    instructions: &str,
+    tracker: CompactionTracker,
+) -> Result<()> {
+    use deepseek_code_core::services::compaction::compact_with_hooks_tracked;
     let context = crate::services::context(&session.paths)?;
-    let tracker = claim.map(CompactionTracker::for_claim).unwrap_or_default();
     let state = session.binding_state();
     // The SDK frame reader owns stdin; terminal progress must not inspect it.
     let result = {

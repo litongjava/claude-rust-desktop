@@ -168,6 +168,7 @@
 1	crates/core/src/services/background_sessions.rs	spawn_at	authorize_attachment(root,&job,parent)
 1	crates/core/src/services/compaction.rs	apply_persisted_boundary	select_session(id)
 1	crates/core/src/services/compaction.rs	commit_with_context	select_session(&prepared.conversation_id)
+1	crates/core/src/services/compaction.rs	compact_hooks	select_session(id)
 1	crates/core/src/services/compaction.rs	count	select_session(session)
 1	crates/core/src/services/compaction.rs	fixture	open_session(&id)
 1	crates/core/src/services/compaction.rs	partial_summaries_branch_around_the_chosen_message	open_session(branch)

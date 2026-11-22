@@ -38,6 +38,12 @@ pub(super) fn queued_turn_input(c: &Connection) -> Result<Option<String>> {
     .optional()?)
 }
 
+impl SessionRead<'_> {
+    pub fn queued_turn_input(&self) -> Result<Option<String>> {
+        queued_turn_input(self.0)
+    }
+}
+
 pub struct CompactionClaim {
     pub(crate) id: String,
     incarnation: String,
@@ -318,7 +324,10 @@ impl SessionRepository<'_> {
         }
     }
 
-    pub(crate) fn prepare_compaction(&self) -> Result<compaction::PreparedCompaction> {
+    pub(crate) fn prepare_compaction(
+        &self,
+        before_input: Option<&str>,
+    ) -> Result<compaction::PreparedCompaction> {
         let incarnation = match &self.0 {
             owned::Backend::Admitted(shard) => Some(shard.incarnation().to_owned()),
             owned::Backend::Shared(_, _) => None,
@@ -332,7 +341,10 @@ impl SessionRepository<'_> {
                     .context("Session not found")?;
                 ensure!(!row.archived, "Session is archived");
             }
-            let before = if incarnation.is_some() {
+            let before = if let Some(id) = before_input {
+                ensure!(incarnation.is_some(), "Expected admitted session input");
+                Some(id.to_owned())
+            } else if incarnation.is_some() {
                 queued_turn_input(c)?
             } else {
                 None

@@ -813,25 +813,30 @@ impl SessionWrite<'_> {
         )
     }
     pub fn rewind_from(&self, message: &str) -> Result<()> {
-        self.remove_tail(message,None)
-    }
-
-    /// The retry will allocate a fresh segment under the original live turn.
-    pub fn rewind_failed_attempt(&self, message:&str, turn:&str)->Result<()> {
-        ensure!(self.0.prepare("SELECT 1 FROM execution_turns WHERE id=?1 AND conversation_id=?2 AND status='running'")?.exists([turn,self.1])?,
-            "Compaction retry lost the active turn");
-        self.remove_tail(message,Some(turn))
-    }
-
-    fn remove_tail(&self,message:&str,retained_turn:Option<&str>)->Result<()> {
         let order: i64 = self.0.query_row(
             "SELECT sort_order FROM messages WHERE id=?1",
             [message],
             |r| r.get(0),
         )?;
-        self.0.execute("DELETE FROM execution_turns WHERE id IS NOT ?2 AND id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order>=?1) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order<?1)", params![order,retained_turn])?;
+        self.0.execute("DELETE FROM execution_turns WHERE id IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order>=?1) AND id NOT IN (SELECT t.turn_id FROM message_turns t JOIN messages m ON m.id=t.message_id WHERE m.sort_order<?1)", [order])?;
         self.0
             .execute("DELETE FROM messages WHERE sort_order>=?1", [order])?;
+        self.2.set(true);
+        Ok(())
+    }
+
+    /// Only assistant segments belong to an attempt. A segment carrying delivered
+    /// input must stay replayable with its tool results and receipt.
+    pub fn discard_failed_segments(&self, turn: &str) -> Result<()> {
+        ensure!(self.0.prepare("SELECT 1 FROM execution_turns WHERE id=?1 AND conversation_id=?2 AND status='running'")?.exists([turn,self.1])?,
+            "Compaction retry lost the active turn");
+        self.0.execute(
+            "DELETE FROM messages WHERE role='assistant'
+             AND id IN (SELECT message_id FROM message_turns WHERE turn_id=?1)
+             AND NOT EXISTS (SELECT 1 FROM tool_calls t JOIN tool_queued_inputs q
+                 ON q.tool_call_id=t.id WHERE t.message_id=messages.id)",
+            [turn],
+        )?;
         self.2.set(true);
         Ok(())
     }
@@ -848,13 +853,15 @@ impl SessionRead<'_> {
     pub(crate) fn native_summary_history(
         &self,
         format: &crate::native_engine::provider_manager::ApiFormat,
+        before: Option<&str>,
     ) -> Result<Vec<Value>> {
         let (mut messages, _) = self.model_history(format)?;
-        if let Some(id) = super::compaction::queued_turn_input(self.0)? {
+        let queued = self.queued_turn_input()?;
+        if let Some(id) = before.or(queued.as_deref()) {
             let end = messages
                 .iter()
                 .position(|row| row["id"] == id)
-                .context("Queued input missing from native history")?;
+                .context("Admitted input missing from native history")?;
             messages.truncate(end);
         }
         for message in &mut messages {

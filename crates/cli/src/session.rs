@@ -239,6 +239,7 @@ impl<'a> TurnOrigin<'a> {
 // Attempt data is published only after optional recovery has settled.
 #[derive(Default)]
 struct TurnCompletion<'a> {
+    admitted_message: Option<String>,
     queued: Option<&'a deepseek_code_core::services::input_queue::QueueItem>,
     suggestion: Option<(
         deepseek_code_core::native_engine::suggestion::SuggestionCapture,
@@ -1994,8 +1995,8 @@ impl Session {
                         crate::compaction::notice(&format!("Could not save request attempt log: {log_error}"));
                     }
                     // Recovery errors must reach the same finalization as requests.
-                    match crate::session_commands::reactive_compact(self, prompt, &mut turn, completion.queued.is_some()).await {
-                        Ok(false) => {
+                    match crate::session_commands::reactive_compact(self, completion.admitted_message.as_deref(), &mut turn).await {
+                        Ok(None) => {
                             recovery_requests.clear();
                             Err(error)
                         }
@@ -2007,9 +2008,9 @@ impl Session {
                             }
                             Err(recovery_error)
                         }
-                        Ok(true) => {
+                        Ok(Some(admitted)) => {
                             let previous = completion.sdk_result.take();
-                            *completion = TurnCompletion { queued: completion.queued.take(), ..Default::default() };
+                            *completion = TurnCompletion { admitted_message: Some(admitted), queued: completion.queued.take(), ..Default::default() };
                             // Retrying after compaction stays inside this turn and
                             // keeps its ownership; a failure here would mean the
                             // lease was lost, so it must not be ignored.
@@ -2162,7 +2163,14 @@ impl Session {
             let init = self.sdk_init_message().await?;
             crate::sdk_messages::emit_init_once(|| init)?;
         }
-        crate::session_commands::prepare_turn(self, self.context_window().await, execution_lease.clone()).await?;
+        if completion.admitted_message.is_none() {
+            crate::session_commands::prepare_turn(
+                self,
+                self.context_window().await,
+                execution_lease.clone(),
+            )
+            .await?;
+        }
         self.permissions
             .set_session_rules(&self.id, crate::permission_commands::load(self)?);
         // Read the history and its compaction boundary in one store view, so the
@@ -2178,10 +2186,6 @@ impl Session {
             self.context_window().await,
         )? {
             crate::compaction::notice("Cleared older tool results to save context.");
-        }
-        if !hook_wake && completion.queued.is_none() {
-            let message = json!({"role":"user","origin":origin.tag(),"content":content.cloned().unwrap_or(json!(prompt))});
-            history.push(message);
         }
         let mut system = match &self.sdk_overrides.system_prompt {
             Some(prompt) => prompt.clone(),
@@ -2210,14 +2214,20 @@ impl Session {
         let mut checkpoint = if hook_wake || completion.queued.is_some() {
             None
         } else {
-            let user_message_id = origin
-                .admit(&self.selected_session()?, prompt, content)
-                .context("Persisting CLI user message")?;
-            history.last_mut().expect("submitted user message")["id"] = json!(user_message_id);
+            let user_message_id = match &completion.admitted_message {
+                Some(id) => id,
+                None => {
+                    let id = origin
+                        .admit(&self.selected_session()?, prompt, content)
+                        .context("Persisting CLI user message")?;
+                    history.push(json!({"role":"user","origin":origin.tag(),"id":id,"content":content.cloned().unwrap_or(json!(prompt))}));
+                    completion.admitted_message.insert(id)
+                }
+            };
             match deepseek_code_core::services::checkpoints::capture(
                 &self.paths.data_dir,
                 &self.id,
-                &user_message_id,
+                user_message_id,
                 cwd,
             ) {
                 Ok(capture) => Some(capture),

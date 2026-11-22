@@ -163,6 +163,7 @@ pub struct CommittedCompaction {
 /// cancelling caller reads the outcome instead of reporting an unsaved one.
 pub struct CompactionTracker {
     expected_request: Option<String>,
+    before_input: Option<String>,
     committed: std::sync::atomic::AtomicBool,
     outcome: std::sync::Mutex<Option<CommittedCompaction>>,
     /// The operation's monotonic start. Both the normal and the cancelled
@@ -175,6 +176,7 @@ impl Default for CompactionTracker {
     fn default() -> Self {
         Self {
             expected_request: None,
+            before_input: None,
             committed: std::sync::atomic::AtomicBool::new(false),
             outcome: std::sync::Mutex::new(None),
             started: std::time::Instant::now(),
@@ -183,6 +185,13 @@ impl Default for CompactionTracker {
 }
 
 impl CompactionTracker {
+    pub fn before_input(id: &str) -> Self {
+        Self {
+            before_input: Some(id.to_owned()),
+            ..Self::default()
+        }
+    }
+
     pub fn for_claim(claim: &crate::db::session_store::CompactionClaim) -> Self {
         Self { expected_request: Some(claim.id.clone()), ..Self::default() }
     }
@@ -379,8 +388,11 @@ pub(crate) fn transcript(
     ))
 }
 
-pub fn prepare(db: &impl crate::db::session_store::SessionAccess, id: &str) -> Result<PreparedCompaction> {
-    db.select_session(id)?.prepare_compaction()
+pub fn prepare(
+    db: &impl crate::db::session_store::SessionAccess,
+    id: &str,
+) -> Result<PreparedCompaction> {
+    db.select_session(id)?.prepare_compaction(None)
 }
 
 /// Commit only a completed summary of an unchanged transcript. Original rows remain intact.
@@ -572,6 +584,7 @@ pub async fn compact(
             PROMPT,
             &input,
             instructions,
+            prepared.before.as_deref(),
             options,
         )
         .await?;
@@ -709,6 +722,7 @@ pub async fn compact_with_hooks_tracked(
                     PROMPT,
                     &input,
                     &focus,
+                    tracker.and_then(|t| t.before_input.as_deref()),
                     options,
                 )
                 .await
@@ -741,9 +755,14 @@ where
         ["manual", "auto"].contains(&trigger),
         "Invalid compaction trigger"
     );
-    let prepared = prepare(&context.db, id)?;
-    if let Some(expected) = tracker.and_then(|t|t.expected_request.as_ref()) {
-        ensure!(prepared.pending_request.as_ref()==Some(expected), "Compaction request changed");
+    use crate::db::session_store::SessionAccess;
+    let before = tracker.and_then(|t| t.before_input.as_deref());
+    let prepared = context.db.select_session(id)?.prepare_compaction(before)?;
+    if let Some(expected) = tracker.and_then(|t| t.expected_request.as_ref()) {
+        ensure!(
+            prepared.pending_request.as_ref() == Some(expected),
+            "Compaction request changed"
+        );
     }
 
     let mut warnings = Vec::new();
