@@ -57,6 +57,7 @@ crates/core/src/services/input_queue.rs	Connection::open	1	dbe0e23324f3cec780b9f
 crates/core/src/services/input_queue.rs	with_conn	14	225b097397455614e3294fac400238b33043e9026a324ebba0c12444000cf9a2	Shared queue repository and isolated tests
 crates/core/src/services/local_coordination/paths.rs	DATABASE_FILE	2	cb5a49ce7c9409446a15c4b6526f1c930d82f0e19a434e1ce8cdae81b64c6796	Coordination registry filename
 crates/core/src/services/local_coordination/store.rs	Connection::open	5	a21bd5f04185154363ffd89b21bfe32eb020b0f98f815afa1134a998d499a255	Independent coordination registry and corruption fixtures
+crates/core/src/services/memory_files.rs	Connection::open	2	b742a7ac59205f819a87de2f622212882847fe35fd280e2773ed47495c75de46	Read-only import of legacy memory.sqlite3 settings and an isolated archive fixture
 crates/core/src/services/mod.rs	peripheral_settings	3	5e60a5962ac4aaefc92ce50197145f7993efaccc9048b0abaac070ce294d70d5	ServiceContext<DbManager> fixture setting adapters
 crates/core/src/services/mod.rs	with_conn	2	3eaea3f074a7ba4bccd75c03f8fd2213d8f37d69ea9b3e63bf1c3325f1624cf9	ServiceContext<DbManager> fixture setting adapters
 crates/core/src/services/permission_authority.rs	with_conn	1	bb5a8ce5afccd0e5afa26a1fb60e28129d536f826d665dca848eedca5eef43dc	DbManager parent-child inheritance adapter
