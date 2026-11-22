@@ -12,7 +12,7 @@ use base64::{
 /// Ordinary runs this long are data rather than identifiers or hashes.
 const RUN_THRESHOLD: usize = 1024;
 /// A `data:` URI payload is unambiguous, so it collapses earlier.
-const DATA_URI_THRESHOLD: usize = 256;
+pub(crate) const DATA_URI_THRESHOLD: usize = 256;
 /// Enough input to decode the first 64 bytes used for the type guess.
 const SAMPLE_CHARS: usize = 86;
 const SAMPLE_BYTES: usize = 64;
@@ -47,10 +47,27 @@ fn engine(url_safe: bool) -> GeneralPurpose {
 /// Replaces each qualifying run. Returns the rewritten text and how many runs
 /// were collapsed.
 pub(crate) fn collapse(text: &str) -> (String, usize) {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let mut out = String::new();
     let mut copied = 0;
-    let mut count = 0;
+    let runs = runs(text);
+    for run in &runs {
+        out.push_str(&text[copied..run.range.start]);
+        out.push_str(&placeholder(run.decoded_len, run.kind));
+        copied = run.range.end;
+    }
+    out.push_str(&text[copied..]);
+    (out, runs.len())
+}
+
+pub(crate) struct Run {
+    pub range: std::ops::Range<usize>,
+    pub decoded_len: usize,
+    pub kind: &'static str,
+}
+
+pub(crate) fn runs(text: &str) -> Vec<Run> {
+    let bytes = text.as_bytes();
+    let mut runs = Vec::new();
     let mut index = 0;
     // Remembers the last `data:` before the current position, so a payload
     // check does not rescan the prefix (keeping the whole pass linear).
@@ -86,16 +103,13 @@ pub(crate) fn collapse(text: &str) -> (String, usize) {
         let Some((decoded_len, kind)) = collapsed_run(data, padding) else {
             continue;
         };
-        out.push_str(&text[copied..start]);
-        out.push_str(&placeholder(decoded_len, kind));
-        copied = index;
-        count += 1;
+        runs.push(Run {
+            range: start..index,
+            decoded_len,
+            kind,
+        });
     }
-    if count == 0 {
-        return (text.to_owned(), 0);
-    }
-    out.push_str(&text[copied..]);
-    (out, count)
+    runs
 }
 
 /// The final note appended by Read and WebFetch when anything was replaced.

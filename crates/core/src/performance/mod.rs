@@ -834,6 +834,32 @@ pub fn retain_tool_output(root: &std::path::Path, output: &str, preview: &str) -
     retain_tool_output_with_ranges(root, output, preview, MODEL_TOOL_OUTPUT_BYTES).0
 }
 
+/// Share a stable, complete spill between model previews and history replay.
+pub(crate) fn save_tool_output(
+    root: &std::path::Path,
+    output: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let directory = root.join("tool-outputs");
+    std::fs::create_dir_all(&directory)?;
+    // Stable paths keep replayed requests identical and avoid duplicate spills.
+    let digest = ring::digest::digest(&ring::digest::SHA256, output.as_bytes());
+    let key: String = digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let path = directory.join(format!("{key}.txt"));
+    if std::fs::read(&path).is_ok_and(|bytes| bytes == output.as_bytes()) {
+        return Ok(path);
+    }
+    let mut file = tempfile::NamedTempFile::new_in(&directory)?;
+    file.write_all(output.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(&path)?;
+    Ok(path)
+}
+
 /// No preview ranges are returned if persisting fails and the full original is used.
 pub(crate) fn retain_tool_output_with_ranges(
     root: &std::path::Path,
@@ -844,31 +870,7 @@ pub(crate) fn retain_tool_output_with_ranges(
     if output == preview && output.len() <= limit {
         return (output.to_string(), Some(PreviewRanges::whole(output.len())));
     }
-    let persist = || -> std::io::Result<std::path::PathBuf> {
-        use std::io::Write;
-        let directory = root.join("tool-outputs");
-        std::fs::create_dir_all(&directory)?;
-        // Stable paths keep replayed requests identical and avoid duplicate spills.
-        let digest = ring::digest::digest(&ring::digest::SHA256, output.as_bytes());
-        let key: String = digest
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let path = directory.join(format!("{key}.txt"));
-        if std::fs::read(&path).is_ok_and(|bytes| bytes == output.as_bytes()) {
-            return Ok(path);
-        }
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)?;
-        file.write_all(output.as_bytes())?;
-        file.sync_all()?;
-        Ok(path)
-    };
-    match persist() {
+    match save_tool_output(root, output) {
         Ok(path) => {
             let note = format!(
                 "\nSaved tool result ({} bytes, may already be truncated by the tool): {}",
