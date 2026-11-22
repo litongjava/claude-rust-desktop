@@ -22,6 +22,12 @@ pub struct DailyUsage {
     pub heat: i128,
 }
 
+// Direct Anthropic usage reports uncached input. The normalized transports
+// store an inclusive prompt count, also used by session totals.
+const SPLIT_INPUT: &str = "CASE WHEN json_valid(usage_json) THEN
+    json_extract(usage_json,'$.input_tokens') IS NOT NULL AND json_extract(usage_json,'$.prompt_tokens') IS NULL
+    ELSE 0 END";
+
 impl SessionRead<'_> {
     pub fn cost(&self, config: &crate::config::AppConfig) -> Result<serde_json::Value> {
         let id: String =
@@ -38,10 +44,12 @@ fn usage_days(
     cancelled: &impl Fn() -> bool,
 ) -> Result<Vec<DailyUsage>> {
     let mut days = BTreeMap::new();
-    let mut q=conn.prepare(
+    let mut q=conn.prepare(&format!(
             "SELECT started_at_ms,coalesce(ended_at_ms,started_at_ms),coalesce(model,''),
-             coalesce(input_tokens,0),coalesce(output_tokens,0),coalesce(cache_read_tokens,0),coalesce(cache_write_tokens,0),conversation_id
-             FROM model_requests WHERE started_at_ms IS NOT NULL")?;
+             CASE WHEN {SPLIT_INPUT} THEN coalesce(input_tokens,0)
+                  ELSE max(0,coalesce(input_tokens,0)-coalesce(cache_read_tokens,0)-coalesce(cache_write_tokens,0)) END,
+             coalesce(output_tokens,0),coalesce(cache_read_tokens,0),coalesce(cache_write_tokens,0),conversation_id
+             FROM model_requests WHERE started_at_ms IS NOT NULL"))?;
     let mut rows = q.query([])?;
     while let Some(row) = rows.next()? {
         ensure!(!cancelled(), "Stats scan cancelled");
@@ -222,9 +230,9 @@ impl super::SessionRepository<'_> {
         self.read(|c,id| {
             let tx=if c.is_autocommit() {Some(c.unchecked_transaction()?)} else {None};
             let c=tx.as_deref().unwrap_or(c);
-            let mut stmt=c.prepare_cached("SELECT input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_duration_ms,
-                CASE WHEN json_valid(usage_json) THEN json_extract(usage_json,'$.input_tokens') IS NOT NULL AND json_extract(usage_json,'$.prompt_tokens') IS NULL ELSE 0 END
-                FROM model_requests WHERE conversation_id=?1")?;
+            let mut stmt=c.prepare_cached(&format!("SELECT input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,total_duration_ms,
+                {SPLIT_INPUT}
+                FROM model_requests WHERE conversation_id=?1"))?;
             let mut rows=stmt.query([id])?;
             let mut sums=[None::<i128>;5];
             let mut count=0u64;

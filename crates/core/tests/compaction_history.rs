@@ -408,3 +408,20 @@ async fn native_compaction_uses_the_main_cloudflare_route_and_authentication() {
     }
     f.finish().await;
 }
+
+#[tokio::test]
+async fn daily_stats_count_cached_compaction_input_once() {
+    let f = Fixture::new(128_000).await;
+    f.append("user", "Initial request");
+    f.append("assistant", "Initial response");
+    f.compact().await.unwrap();
+    {
+        let stats = f.store.db.usage(|| false).unwrap();
+        assert!(stats.failures.is_empty());
+        assert_eq!(stats.days.len(), 1);
+        assert_eq!(stats.days[0].tokens, [20, 3, 80, 0]);
+        assert_eq!(stats.days[0].heat, 103);
+        assert_eq!(stats.days[0].requests, 1);
+    }
+    f.finish().await;
+}
