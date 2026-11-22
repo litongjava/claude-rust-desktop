@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{info, warn};
+use tracing::info;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Data Types
@@ -110,13 +110,11 @@ impl MemExClient {
     }
 
     pub fn with_path(path: std::path::PathBuf) -> Self {
-        let local = local::LocalMemory { path };
-        let config = local.config().unwrap_or_else(|error| {
-            warn!("[Memory] Unable to load configuration: {}", error);
-            None
-        }).unwrap_or_default();
+        // Both frontends retain a handle for explicit archive operations.
+        // Constructing that handle during file-mode startup must not open SQLite.
         Self {
-            config: Arc::new(RwLock::new(config)), local,
+            config: Arc::new(RwLock::new(MemoryConfig::default())),
+            local: local::LocalMemory { path },
         }
     }
 

@@ -321,6 +321,7 @@ mod tests {
             .read("cli.md")
             .unwrap()
             .is_none());
+        assert!(!paths.data_dir.join("memory.sqlite3").exists());
         assert!(crate::args::Cli::try_parse_from([
             "dcl",
             "memory",
