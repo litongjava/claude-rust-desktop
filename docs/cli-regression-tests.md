@@ -915,15 +915,16 @@ cargo check --locked -p deepseek-code-desktop --all-targets
 
 ### I41. Bash、TaskGet 与 Monitor 的长 base64
 
-Run `cargo test --locked -p deepseek-code-core --lib -- base64_review` for the round-two regressions. Check both 512-byte pages of one run, two identical physical runs with clipped aliases, ordinary task and agent reports, valid and invalid 128 KiB candidates, a hard capture cut, recovery of all 140 line-index entries, and Monitor output past line 50. The history fixture checks the compaction transcript, raw fingerprint and Bash/TaskGet search excerpts.
+在最终模型文本上核对 Read/WebFetch 共用的第一轮判定规则。普通编码串阈值为 1024 字节，data URI 为 256 字节。页、快照和预览可能只包含原始命令输出的一部分。
 
 ```bash
-cargo test --locked -p deepseek-code-core --lib -- model_tool_output base64
-cargo test --locked -p deepseek-code-cli --test taskget_background cli_base64_foreground_and_background_results_recover_100_kib
+cargo test --locked -p deepseek-code-core --lib -- base64_model_boundary base64_i6_cut base64_review_history base64_shell_thresholds
+cargo test --locked -p deepseek-code-cli --test taskget_background cli_base64_model_boundary_resumes_100_kib_shell_results
 ```
 
-- 本地模型分别运行前台 Bash、后台 Bash 加 TaskGet，输出 100 KiB 连续 base64。核对真实请求中没有载荷，按占位符给出的路径、行号读回原文。TaskGet 快照的 stdout、output、result 副本只计一次。Monitor 用真实脚本打印同样大小的第二行，按通知给出的原子快照和行号核对完整内容。
-- 普通载荷在 1023/1024 字节、data URI 在 255/256 字节检查边界。保留短结果的原始格式；保存失败时保留原文。Bash schema 无 raw 参数。混合普通长文本和 base64 时，按实际可见字节核对 I6 的省略数，单独核对 base64 块数和编码字节数。
+- 前台 Bash、超时转后台、TaskGet 快照与分页（含超过 1 MiB 的 PTY 日志）、新旧 Monitor 事件均检查普通内容、编码块、行号、原文 SHA-256 和请求重放。前台与后台的 100 KiB CLI 夹具通过本地模型检查新进程恢复。
+- 用实际 I6 预览核对原有省略统计和保存路径，接触截断处的块带有 partial 说明。恢复文件逐字节等于折叠前的预览。会话目录无法写入时检查模型收到明确的读取错误，终端和存储仍保留原始结果。
+- 对旧的 TaskGet 页执行压缩和 ContextSearch，验证摘要冲突检测使用原始行，检索摘要保留可打开的路径。检查超过 8 MiB 的普通任务仍可分页检索。
 
 ## Shell 配置回归
 

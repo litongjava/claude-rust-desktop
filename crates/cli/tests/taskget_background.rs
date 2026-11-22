@@ -112,7 +112,7 @@ async fn respond(
             "Bash",
             &json!({
                 "command": if fixture.base64 {
-                    r#"node -e "process.stdout.write(Buffer.from('ABC').toString('base64').repeat(25600))""#
+                    r#"node -e "const s=Buffer.from('ABC').toString('base64');process.stdout.write([s.repeat(256),s.repeat(25600),s.repeat(256)].join('!'))""#
                 } else if fixture.foreground {
                     "node -e \"console.log('i6-start');console.log('.'.repeat(7500));console.log('error: hidden in the model preview');console.log('.'.repeat(7500));console.log('warning: duplicated tail')\""
                 } else if fixture.long_output {
@@ -168,6 +168,7 @@ async fn respond(
                 }),
             )
         }
+        3 if fixture.base64 => text_frames("background output observed"),
         3 => {
             let result = last_tool_result(&body)
                 .unwrap_or_else(|| panic!("TaskGet result missing in request {body}"));
@@ -217,7 +218,7 @@ enum OptOut {
 }
 
 #[tokio::test]
-async fn cli_base64_foreground_and_background_results_recover_100_kib() {
+async fn cli_base64_model_boundary_resumes_100_kib_shell_results() {
     for foreground in [true, false] {
         run_shell(
             Fixture {
@@ -350,50 +351,101 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         }
     );
     if fixture.base64 {
-        server.abort();
-        let view = last_tool_content(requests.last().unwrap()).unwrap();
-        assert!(
-            !view.contains("QUJD"),
-            "foreground={foreground}, preview starts with {:?}",
-            view.chars().take(512).collect::<String>()
-        );
-        assert!(
-            view.contains("base64: 1 block collapsed (100 KB)"),
-            "{view}"
-        );
-        assert!(!view.contains("Omitted output:"), "{view}");
-        let task: Value;
-        let body = if foreground {
-            view
-        } else {
-            task = serde_json::from_str(view).unwrap();
-            assert_eq!(task["status"], "completed");
-            task["stdout"].as_str().unwrap()
-        };
-        let (path, location) = body
-            .split_once("76800 bytes decoded, looks like text; full output: ")
+        use base64::Engine as _;
+        let live = last_tool_content(requests.last().unwrap())
+            .unwrap()
+            .to_owned();
+        drop(requests);
+        assert!(live.contains("base64 data omitted"), "{live}");
+        for fragment in live
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|s| s.len() >= 1024)
+        {
+            assert!(
+                base64::engine::general_purpose::STANDARD_NO_PAD
+                    .decode(fragment)
+                    .is_err(),
+                "canonical run in request ({})",
+                fragment.len()
+            );
+        }
+        let (path, line) = live
+            .split_once("; full text: ")
             .unwrap()
             .1
             .split_once(", line ")
             .unwrap();
-        let line = location
-            .split(']')
-            .next()
-            .unwrap()
-            .parse::<usize>()
-            .unwrap();
+        let line = line.split_once(']').unwrap().0.parse::<usize>().unwrap();
         let saved = std::fs::read_to_string(path).unwrap();
-        let blob = "QUJD".repeat(25600);
-        assert!(saved.lines().nth(line - 1).unwrap().contains(&blob));
-        if foreground {
-            assert_eq!(saved, blob);
-        } else {
-            assert_eq!(
-                serde_json::from_str::<Value>(&saved).unwrap()["stdout"],
-                blob
-            );
-        }
-        drop(requests);
+        assert!(saved
+            .lines()
+            .nth(line - 1)
+            .unwrap()
+            .contains(&"QUJD".repeat(256)));
+        let note = saved
+            .lines()
+            .find(|line| line.starts_with("Saved tool result ("))
+            .unwrap();
+        assert!(live.contains(note));
+        let i6_path = note.split_once("): ").unwrap().1;
+        assert!(std::fs::read_to_string(i6_path)
+            .unwrap()
+            .contains(&"QUJD".repeat(256)));
+
+        let public_events = String::from_utf8_lossy(&output.stdout);
+        assert!(public_events.contains(&"QUJD".repeat(256)));
+        assert!(!public_events.contains("[base64 data omitted"));
+        let paths = deepseek_code_core::runtime::RuntimePaths::new(data.clone()).unwrap();
+        let store = deepseek_code_core::runtime::SessionStore::new(paths.open_database().unwrap());
+        let raw = store
+            .db
+            .shard_sql(&id, |conn| {
+                conn.query_row(
+                    "SELECT output FROM tool_calls WHERE name=?1",
+                    [if foreground { "Bash" } else { "TaskGet" }],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        assert!(raw.contains(&"QUJD".repeat(256)));
+        assert!(!raw.contains("[base64 data omitted"));
+        drop(store);
+
+        let mut resume = Command::new(env!("CARGO_BIN_EXE_dcl"));
+        resume
+            .current_dir(root.path())
+            .args(["--print", "--output-format", "stream-json", "--data-dir"])
+            .arg(&data)
+            .arg("--path")
+            .arg(root.path())
+            .args([
+                "--provider",
+                "fixture",
+                "--model",
+                "fixture-model",
+                "--resume",
+                &id,
+                "Replay the fixture",
+            ])
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(60), resume.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let replay = fixture.requests.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            last_tool_content(&replay),
+            Some(live.as_str()),
+            "fresh process replay"
+        );
+        server.abort();
         let _ = server.await;
         return;
     }
