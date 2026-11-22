@@ -1293,3 +1293,129 @@ async fn memory_live_replay_bytes_after_clear_compression_and_steering() -> Resu
     assert!(rows[1] == rows[2], "live and resumed HTTP bodies differ");
     Ok(())
 }
+
+#[tokio::test]
+async fn memory_native_window_replays_opaque_item() -> Result<()> {
+    use crate::{
+        db::session_store::Stores,
+        services::{turn_context, memory_files::FileMemory},
+    };
+    use axum::{body::Bytes, routing::post, Router};
+    let id = "a6941486-a1e2-40c0-bf07-81acd915fe75";
+    async fn send(data: &std::path::Path, id: &str, base: &str) -> Result<()> {
+        let shard = Stores::open(data)?.open_session(id)?;
+        let mut p = responses_provider(base);
+        p.model.context_window = Some(6500);
+        let (msgs, b) = shard.read(|r| r.model_history(&ApiFormat::OpenAI))?;
+        let (idx, entries) = turn_context::replay(&shard, b.as_deref(), &msgs)?;
+        let (tx, _rx) = mpsc::channel(256);
+        let mut exec = ToolLoopExecutor::new(
+            p,
+            msgs,
+            None,
+            512,
+            tx,
+            data.display().to_string(),
+            ReasoningMode::Standard,
+        )
+        .with_conv_id(id.into())
+        .with_executor_history(ExecutorHistory::Session(shard))?
+        .with_session_reminders(crate::prompt::SessionReminders {
+            project_memory: idx,
+            ..Default::default()
+        })
+        .with_turn_context(entries)
+        .with_context_boundary(b);
+        exec.execute().await?;
+        Ok(())
+    }
+    if let Ok(data) = std::env::var("DCL_NATIVE_REPLAY_TEST_STORE") {
+        return send(
+            std::path::Path::new(&data),
+            id,
+            &std::env::var("DCL_NATIVE_REPLAY_TEST_ENDPOINT")?,
+        )
+        .await;
+    }
+    let root = tempfile::tempdir()?;
+    let data = root.path().join("data");
+    let ws = root.path().join("ws");
+    std::fs::create_dir(&ws)?;
+    let ctx = crate::services::session_messages::context(&data)?;
+    let mem = FileMemory::workspace(&ctx, &ws)?;
+    mem.put(
+        "fixture.md",
+        "---\nname: saffron\ndescription: saffron\nmetadata:\n  type: user\n---\nREVIEW_BODY\n",
+        None,
+    )?;
+    let idx = mem.directory.join("MEMORY.md");
+    std::fs::write(&idx, "OLD_INDEX")?;
+    let shard = ctx.db.create_code_session(&ws, "model", "provider", id)?;
+    shard.admit_prompt(&"old generated context. ".repeat(1600), None, "generated")?;
+    std::fs::write(&idx, "CURRENT_INDEX_7602")?;
+    shard.admit_prompt("saffron current input", None, "typed")?;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let bodies = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+    let save = bodies.clone();
+    let observer = shard.clone();
+    let events = responses_text_events("done");
+    let mut app = Router::new().route(
+        "/responses",
+        post(move |body: Bytes| {
+            let save = save.clone();
+            let observer = observer.clone();
+            let stream = events
+                .iter()
+                .map(|v| format!("data: {v}\n\n"))
+                .collect::<String>();
+            async move {
+                let stored = observer
+                    .read(|r| {
+                        let boundary = r
+                            .boundary_id()?
+                            .context("Generation arrived before boundary commit")?;
+                        r.native_compaction_boundary(&boundary)
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored["items"][0]["encrypted_content"], "opaque-1");
+                save.lock().unwrap().push(body.to_vec());
+                ([("content-type", "text/event-stream")], stream)
+            }
+        }),
+    );
+    let save = calls.clone();
+    app=app.route("/responses/compact",post(move |body:Bytes|{let save=save.clone();async move{
+        let mut log=save.lock().unwrap();log.push(body.to_vec());
+        axum::Json(json!({"object":"response.compaction","output":[{"type":"compaction","encrypted_content":format!("opaque-{}",log.len())}]}))
+    }}));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    send(&data, id, &url).await?;
+    let child = tokio::process::Command::new(std::env::current_exe()?)
+        .args(["memory_native_window_replays_opaque_item", "--nocapture"])
+        .env("DCL_NATIVE_REPLAY_TEST_STORE", &data)
+        .env("DCL_NATIVE_REPLAY_TEST_ENDPOINT", &url)
+        .kill_on_drop(true)
+        .output()
+        .await?;
+    server.abort();
+    let _ = server.await;
+    assert!(
+        child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+        "{child:?}"
+    );
+    let seen = bodies.lock().unwrap();
+    let jobs = calls.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "reopening the same history requested a second opaque item"
+    );
+    assert_eq!(seen[0], seen[1]);
+    assert!(std::str::from_utf8(&seen[0])?.contains("opaque-1"));
+    Ok(())
+}

@@ -48,6 +48,14 @@ impl ToolLoopExecutor {
         &mut self,
         shard: &crate::db::session_store::SessionDb,
     ) -> Result<()> {
+        self.reload_with_cut(shard, false).map(drop)
+    }
+
+    fn reload_with_cut(
+        &mut self,
+        shard: &crate::db::session_store::SessionDb,
+        native: bool,
+    ) -> Result<Option<crate::db::session_store::NativeWindow>> {
         if let Some(segment) = &self.parent_message_id {
             if !self.replay_tools.is_empty() {
                 ExecutorHistory::Session(shard.clone()).save_segment(
@@ -60,13 +68,23 @@ impl ToolLoopExecutor {
                 self.replay_tools.clear();
             }
         }
-        let (mut messages, boundary, (index, entries), (protected, pending)) = shard.read(|r| {
-            let (messages, boundary) = r.model_history(&self.provider.provider.api_format)?;
-            let context =
-                crate::services::turn_context::replay_at(shard, r, boundary.as_deref(), &messages)?;
-            let protection = r.protected_inputs(&messages)?;
-            Ok((messages, boundary, context, protection))
-        })?;
+        let (mut messages, boundary, (index, entries), (protected, pending), cut) =
+            shard.read(|r| {
+                let (messages, boundary) = r.model_history(&self.provider.provider.api_format)?;
+                let context = crate::services::turn_context::replay_at(
+                    shard,
+                    r,
+                    boundary.as_deref(),
+                    &messages,
+                )?;
+                let protection = r.protected_inputs(&messages)?;
+                let cut = native
+                    .then(|| {
+                        r.native_window(&messages, protection.0, self.parent_message_id.as_deref())
+                    })
+                    .transpose()?;
+                Ok((messages, boundary, context, protection, cut))
+            })?;
         if self.standalone_frontend {
             crate::services::compaction::microcompact(
                 shard,
@@ -86,7 +104,7 @@ impl ToolLoopExecutor {
         self.messages = messages;
         self.applied_compaction = boundary.is_some();
         self.context_boundary_id = boundary;
-        Ok(())
+        Ok(cut)
     }
 
     pub(super) fn reload_session_history(&mut self) -> Result<()> {
@@ -96,7 +114,12 @@ impl ToolLoopExecutor {
         self.reload_history(&shard)
     }
 
-    async fn compact_native_window(&self, mut input: Vec<Value>) -> Result<Vec<Value>> {
+    async fn compact_native_window(
+        &self,
+        shard: &crate::db::session_store::SessionDb,
+        cut: &crate::db::session_store::NativeWindow,
+        mut input: Vec<Value>,
+    ) -> Result<()> {
         use crate::native_engine::request_recording::CompactionRecord;
         let mut options = self
             .openai_client
@@ -117,16 +140,11 @@ impl ToolLoopExecutor {
             self.conv_id.as_deref(),
         )
         .await?;
+        let boundary = shard.commit_native_window(cut, &compacted)?;
         if let Some(record) = &mut record {
-            record.finish(&compacted, "in-flight-native-window");
+            record.finish(&compacted, &boundary);
         }
-        let mut result = vec![
-            json!({"role":"user", "content":compacted.text, "provider_content":compacted.native}),
-        ];
-        if let Some(index) = self.compacted_index() {
-            result.push(json!({"role":"user","content":index}));
-        }
-        Ok(result)
+        Ok(())
     }
 
     pub(super) async fn replay_window<M: serde::Serialize + serde::de::DeserializeOwned>(
@@ -158,10 +176,13 @@ impl ToolLoopExecutor {
         if estimated <= (limit * 70 / 100).min(capacity) && (native || estimated <= threshold) {
             return Ok(());
         }
+        let mut native_cut = None;
+        let mut persisted_len = durable_len;
         if let Some(ExecutorHistory::Session(shard)) = self.executor_history.clone() {
             let additions = window.split_off(durable_len);
-            self.reload_history(&shard)?;
+            native_cut = self.reload_with_cut(&shard, native)?;
             *window = render(self)?;
+            persisted_len = window.len();
             window.extend(additions);
             rows = values(window)?;
         }
@@ -178,20 +199,48 @@ impl ToolLoopExecutor {
             return Ok(());
         }
 
-        // Compress only the history preceding the current typed exchange. Its
-        // multimodal blocks, receipts and any following steers travel together.
-        // Responses renders its opaque boundary and frozen memory as separate rows.
-        let protected = self.protected_input.map(|at| {
-            at + usize::from(
-                native
-                    && at > 0
-                    && self
-                        .messages
+        if native {
+            let Some(ExecutorHistory::Session(shard)) = self.executor_history.clone() else {
+                anyhow::bail!("Native Responses compression requires durable session history");
+            };
+            let cut = native_cut.context("Missing native compaction snapshot")?;
+            if cut.prefix_len > 0 {
+                let extra_index = usize::from(
+                    self.messages
                         .first()
                         .is_some_and(|m| m["provider_content"]["compaction"] == true)
-                    && self.session_reminders.project_memory.is_some(),
-            )
-        });
+                        && self.session_reminders.project_memory.is_some(),
+                );
+                let end = cut.prefix_len + extra_index;
+                anyhow::ensure!(end <= persisted_len, "Invalid native compaction cut");
+                let mut suffix = rows.split_off(end);
+                if TokenCounter::estimate(&suffix) > capacity {
+                    crate::services::compaction::clear_tool_results(&mut suffix);
+                    anyhow::ensure!(TokenCounter::estimate(&suffix) <= capacity,
+                        "Context overflow: the current turn's admitted inputs exceed the model window");
+                }
+                self.compact_native_window(&shard, &cut, rows).await?;
+                let additions = window.split_off(persisted_len);
+                self.reload_history(&shard)?;
+                *window = render(self)?;
+                window.extend(additions);
+            }
+            let mut result = values(window)?;
+            if TokenCounter::estimate(&result) > capacity {
+                crate::services::compaction::clear_tool_results(&mut result);
+                anyhow::ensure!(TokenCounter::estimate(&result) <= capacity,
+                    "Context overflow: the admitted inputs and required context exceed the model window");
+                *window = result
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<serde_json::Result<_>>()?;
+            }
+            return Ok(());
+        }
+
+        // Compress only the history preceding the current typed exchange. Its
+        // multimodal blocks, receipts and any following steers travel together.
+        let protected = self.protected_input;
         let mut suffix = rows.split_off(protected.unwrap_or(rows.len()).min(rows.len()));
         if protected.is_some() && TokenCounter::estimate(&suffix) > capacity {
             crate::services::compaction::clear_tool_results(&mut suffix);
@@ -202,8 +251,6 @@ impl ToolLoopExecutor {
         }
         let mut compressed = if rows.is_empty() {
             Vec::new()
-        } else if native {
-            self.compact_native_window(rows).await?
         } else {
             let original = rows.clone();
             self.remove_compaction_indexes(&mut rows);
@@ -224,8 +271,7 @@ impl ToolLoopExecutor {
                 original
             }
         };
-        if !native
-            && protected.is_some()
+        if protected.is_some()
             && TokenCounter::estimate(&compressed) + TokenCounter::estimate(&suffix) > capacity
         {
             // Keep the summary and system context when the compressor's last

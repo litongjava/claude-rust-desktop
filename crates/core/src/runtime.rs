@@ -211,7 +211,7 @@ pub(crate) fn replay_history(
     format: &ApiFormat,
     native: impl Fn(&str) -> Result<Option<Value>>,
 ) -> Result<(Vec<Value>, Option<String>)> {
-    replay_history_with_ids(conn, id, format, native, false)
+    replay_history_with_ids(conn, id, format, native, false, None)
 }
 
 pub(crate) fn replay_history_with_ids(
@@ -220,6 +220,7 @@ pub(crate) fn replay_history_with_ids(
     format: &ApiFormat,
     native: impl Fn(&str) -> Result<Option<Value>>,
     include_provenance: bool,
+    before: Option<&str>,
 ) -> Result<(Vec<Value>, Option<String>)> {
     let mut history = Vec::new();
     let messages = message_repo::get_messages_by_conversation(conn, id)?;
@@ -228,7 +229,11 @@ pub(crate) fn replay_history_with_ids(
         .get(start)
         .filter(|m| m.is_compact_boundary)
         .map(|m| m.id.clone());
-    for message in messages.into_iter().skip(start) {
+    for message in messages
+        .into_iter()
+        .skip(start)
+        .take_while(|m| Some(m.id.as_str()) != before)
+    {
         if let Some(native) = native(&message.id)? {
             let mut row =
                 json!({"role":message.role,"content":message.content,"provider_content":native});

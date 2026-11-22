@@ -121,6 +121,82 @@ impl SessionRead<'_> {
     }
 }
 
+/// The physical transcript cut and its optimistic write fence are selected in
+/// the same snapshot. A tool-delivered input belongs to the whole assistant row.
+pub(crate) struct NativeWindow {
+    pub prefix_len: usize,
+    before: Option<String>,
+    fingerprint: String,
+}
+
+impl SessionRead<'_> {
+    pub(crate) fn native_window(
+        &self,
+        messages: &[serde_json::Value],
+        protected: Option<usize>,
+        segment: Option<&str>,
+    ) -> Result<NativeWindow> {
+        use crate::native_engine::provider_manager::ApiFormat;
+        let protected_row: Option<String> = if let Some(at) = protected {
+            let input = messages[at]["id"]
+                .as_str()
+                .context("Protected input has no identity")?;
+            Some(self.0.query_row(
+                "SELECT id FROM messages WHERE id=?1 UNION ALL
+                 SELECT t.message_id FROM tool_calls t JOIN tool_queued_inputs q ON t.id=q.tool_call_id
+                 JOIN json_each(q.inputs_json) j WHERE json_extract(j.value,'$.message_id')=?1 LIMIT 1",
+                [input], |r| r.get(0),
+            )?)
+        } else {
+            None
+        };
+        // An active assistant segment can precede a later steer. Keep it on
+        // the visible side so results written after compaction remain replayable.
+        let before: Option<String> = self.0.query_row(
+            "WITH cut AS (SELECT sort_order,rowid AS seq FROM messages WHERE is_compact_boundary
+                 ORDER BY sort_order DESC,rowid DESC LIMIT 1)
+             SELECT id FROM messages WHERE id IN (?1,?2) AND
+                 (NOT EXISTS(SELECT 1 FROM cut) OR (sort_order,rowid)>(SELECT sort_order,seq FROM cut))
+             ORDER BY sort_order,rowid LIMIT 1", params![protected_row, segment], |r| r.get(0),
+        ).optional()?;
+        let (prefix, boundary) =
+            self.model_history_before(&ApiFormat::OpenAI, before.as_deref())?;
+        let prefix_len = if boundary.is_some()
+            && prefix.len() == 1
+            && prefix[0]["provider_content"]["compaction"] == true
+        {
+            0 // Only the previously sealed opaque window precedes the protected exchange.
+        } else {
+            prefix.len()
+        };
+        let id: String = self
+            .0
+            .query_row("SELECT id FROM manifest", [], |r| r.get(0))?;
+        Ok(NativeWindow {
+            before,
+            prefix_len,
+            fingerprint: compaction::fingerprint(self.0, &id)?.0,
+        })
+    }
+}
+
+impl SessionDb {
+    pub(crate) fn commit_native_window(
+        &self,
+        cut: &NativeWindow,
+        summary: &compaction::GeneratedSummary,
+    ) -> Result<String> {
+        let _guard = self.hold_incarnation()?;
+        let memory = crate::services::memory_files::prompt::Admission::session(self)?;
+        self.write_locked("seal native Responses window", |w| {
+            ensure!(
+                compaction::fingerprint(w.0, w.1)?.0 == cut.fingerprint,
+                "Session changed during native compaction"
+            );
+            w.commit_summary(summary, &memory, cut.before.as_deref())
+        })
+    }
+}
 impl SessionDb {
     fn require_active_compaction(&self) -> Result<()> {
         let s = self;

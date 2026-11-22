@@ -10,6 +10,7 @@ mod admission;
 mod binding;
 pub(crate) mod boundary;
 mod compaction;
+pub(crate) use compaction::NativeWindow;
 mod directory;
 pub mod diagnostics;
 mod conversations;
