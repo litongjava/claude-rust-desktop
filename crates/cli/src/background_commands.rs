@@ -42,7 +42,7 @@ pub async fn handle(
             }
             session.allow_automatic_wake();
             if !wake_for_notifications(cli, session, input).await? {
-                session.turn(cli, "Continue the unfinished work in this conversation. Review the saved progress first and do not repeat completed operations.", input).await?;
+                session.turn_with_origin(cli, "Continue the unfinished work in this conversation. Review the saved progress first and do not repeat completed operations.", input, true).await?;
             }
         }
         "/btw" => {

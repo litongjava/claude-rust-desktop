@@ -180,6 +180,16 @@ pub(crate) fn identify(
                 if row["content"] == message["content"] {
                     if let Some(id) = row["id"].as_str() {
                         message["id"] = id.into();
+                        if let Some(meta) = r.message_metadata(id)? {
+                            let origin = meta["promptOrigin"]
+                                .as_str()
+                                .or_else(|| (meta["type"] == "hook").then_some("hook"));
+                            if let Some(origin) = origin {
+                                if origin != "user" || message["origin"].is_null() {
+                                    message["origin"] = origin.into();
+                                }
+                            }
+                        }
                     }
                     saved.next();
                     break;
@@ -292,7 +302,9 @@ pub(crate) fn prepare(
                         }
                     }
                     blocks.extend(
-                        recall.as_ref().map(|text| format!("<system-reminder>\n{text}</system-reminder>")),
+                        recall
+                            .as_ref()
+                            .map(|text| format!("<system-reminder>\n{text}</system-reminder>")),
                     );
                     let saved = Receipt {
                         index_hash: hash.clone(),

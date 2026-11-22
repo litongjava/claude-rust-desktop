@@ -91,6 +91,9 @@ pub struct Cli {
     pub permission_mode: PermissionModeArg,
     #[arg(skip)]
     pub permission_mode_explicit: bool,
+    /// The frontend submitted a generated continuation to this worker.
+    #[arg(long, hide = true, requires = "resume")]
+    pub generated_continuation: bool,
     /// The generation observed by the terminal requesting a process transfer.
     #[arg(long, hide = true, requires = "resume")]
     pub binding_generation: Option<u64>,

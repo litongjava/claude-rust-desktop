@@ -73,6 +73,7 @@ async fn run(
     protocol: &str,
     mode: &str,
     resume: Option<&str>,
+    generated: bool,
 ) -> std::process::Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_dcl"));
     command
@@ -106,7 +107,18 @@ async fn run(
     if let Some(id) = resume {
         command.args(["--resume", id]);
     }
-    command.args(["--", "中文测试 fixture preferences"]);
+    if generated {
+        command.args([
+            "--generated-continuation",
+            "--",
+            "Continue toward the goal: 中文测试 fixture preferences",
+        ]);
+    } else {
+        command.args([
+            "--",
+            "<system-reminder>中文测试 fixture preferences</system-reminder>",
+        ]);
+    }
     let output = tokio::time::timeout(Duration::from_secs(60), command.output())
         .await
         .expect("CLI timeout")
@@ -202,6 +214,7 @@ async fn scenario(protocol: &'static str, plan: bool) {
         protocol,
         if plan { "plan" } else { "dontAsk" },
         None,
+        false,
     )
     .await;
     {
@@ -287,6 +300,29 @@ async fn scenario(protocol: &'static str, plan: bool) {
         protocol,
         if plan { "plan" } else { "dontAsk" },
         Some(&id),
+        true,
+    )
+    .await;
+    {
+        let requests = mock.requests.lock().unwrap();
+        let generated = requests.last().unwrap()["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        let content = generated["content"].to_string();
+        assert!(content.contains("Continue toward the goal"));
+        assert!(!content.contains("Relevant project memory files:"));
+        assert!(!content.contains("manual-index-edit-on-resume"));
+    }
+    run(
+        &paths.data_dir,
+        &workspace,
+        &base,
+        protocol,
+        if plan { "plan" } else { "dontAsk" },
+        Some(&id),
+        false,
     )
     .await;
     let requests = mock.requests.lock().unwrap();

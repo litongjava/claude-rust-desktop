@@ -144,6 +144,19 @@ pub(crate) fn recall_queued(
 }
 
 // Attempt data is published only after optional recovery has settled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnOrigin { User, Generated, InitialHook, HookWake }
+
+impl TurnOrigin {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Generated => "generated",
+            Self::InitialHook | Self::HookWake => "hook",
+        }
+    }
+}
+
 #[derive(Default)]
 struct TurnCompletion {
     queued: Option<deepseek_code_core::services::input_queue::QueueItem>,
@@ -1579,6 +1592,12 @@ impl Session {
         prompt: &str,
         input: &mut Option<TerminalInput>,
     ) -> Result<()> {
+        self.turn_with_origin(cli, prompt, input, cli.generated_continuation).await
+    }
+
+    pub(crate) async fn turn_with_origin(
+        &self, cli: &Cli, prompt: &str, input: &mut Option<TerminalInput>, generated: bool,
+    ) -> Result<()> {
         use std::io::IsTerminal;
         self.apply_settings_permissions(cli)?;
         // Idle callers must check the resume gate before submitting a turn.
@@ -1597,8 +1616,7 @@ impl Session {
         }
         // Frontends record original human input before skill expansion/worker handoff.
         // A worker receives synthesized context and must never re-label it as user intent.
-        if std::env::var_os(deepseek_code_core::services::background_sessions::CONTROL_ENV)
-            .is_none()
+        if !generated && frontend
         {
             deepseek_code_core::services::permission_authority::record_user(
                 &self.store.db,
@@ -1641,9 +1659,10 @@ impl Session {
             && std::env::var("TERM").as_deref() != Ok("dumb")
             && !crate::display_commands::load(self)?.focus
         {
-            return crate::worker_frontend::turn(cli, self, prompt, input).await;
+            return crate::worker_frontend::turn(cli, self, prompt, input, generated).await;
         }
         let mut next = prompt.to_owned();
+        let mut origin = if generated { TurnOrigin::Generated } else { TurnOrigin::User };
         loop {
             let goal =
                 deepseek_code_core::services::session_goals::active(&self.store.db, &self.id)?;
@@ -1662,7 +1681,7 @@ impl Session {
                 }
             }
             let result = async {
-                Box::pin(self.run_turn(cli, &next, input)).await?;
+                Box::pin(self.run_turn_origin(cli, &next, input, origin, true)).await?;
                 if (input.is_none() || cli.output_format != OutputFormat::Text)
                     && std::env::var_os(
                         deepseek_code_core::services::background_sessions::CONTROL_ENV,
@@ -1685,7 +1704,7 @@ impl Session {
             }
             .await;
             match result {
-                Ok(Some(followup)) => next = followup,
+                Ok(Some(followup)) => { next = followup; origin = TurnOrigin::Generated; }
                 Ok(None) => break,
                 Err(error) => {
                     let discarded = deepseek_code_core::services::goal_proposals::discard(
@@ -1728,6 +1747,7 @@ impl Session {
                                 match crate::session_commands::wait_goal_retry(self, &goal.id).await
                                 {
                                     Ok(true) => {
+                                        origin = TurnOrigin::Generated;
                                         next = format!("Resume unfinished work toward the explicitly authorized goal: {}. Review existing progress first and do not repeat completed operations. Stay within existing permissions.", goal.condition);
                                         continue;
                                     }
@@ -1772,7 +1792,7 @@ impl Session {
     }
 
     pub async fn wake_hooks(&self, cli: &Cli, input: &mut Option<TerminalInput>) -> Result<()> {
-        Box::pin(self.run_turn_origin(cli, "", input, true, false, true)).await
+        Box::pin(self.run_turn_origin(cli, "", input, TurnOrigin::HookWake, true)).await
     }
 
     async fn run_turn(
@@ -1781,7 +1801,7 @@ impl Session {
         prompt: &str,
         input: &mut Option<TerminalInput>,
     ) -> Result<()> {
-        self.run_turn_origin(cli, prompt, input, false, false, true)
+        self.run_turn_origin(cli, prompt, input, TurnOrigin::User, true)
             .await
     }
 
@@ -1793,7 +1813,7 @@ impl Session {
         publish: bool,
     ) -> Result<()> {
         self.apply_settings_permissions(cli)?;
-        self.run_turn_origin(cli, prompt, input, false, true, publish)
+        self.run_turn_origin(cli, prompt, input, TurnOrigin::InitialHook, publish)
             .await
     }
 
@@ -1826,7 +1846,7 @@ impl Session {
         self.apply_settings_permissions(cli)?;
         let prompt=item.content.as_str().or_else(||item.content.pointer("/0/text").and_then(Value::as_str)).unwrap_or_default().to_owned();
         let mut completion=TurnCompletion{queued:Some(item),..Default::default()};
-        let result=self.run_and_finalize_turn(cli,&prompt,input,false,false,true,&mut completion).await;
+        let result=self.run_and_finalize_turn(cli,&prompt,input,TurnOrigin::User,true,&mut completion).await;
         match completion.stdout_failure { Some(failure)=>Err(failure.into()),None=>result }
     }
 
@@ -1835,13 +1855,12 @@ impl Session {
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
-        hook_wake: bool,
-        initial_hook: bool,
+        origin: TurnOrigin,
         publish: bool,
     ) -> Result<()> {
         let mut completion = TurnCompletion::default();
         let result = self
-            .run_and_finalize_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut completion)
+            .run_and_finalize_turn(cli, prompt, input, origin, publish, &mut completion)
             .await;
         match completion.stdout_failure {
             Some(failure) => Err(failure.into()),
@@ -1854,8 +1873,7 @@ impl Session {
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
-        hook_wake: bool,
-        initial_hook: bool,
+        origin: TurnOrigin,
         publish: bool,
         completion: &mut TurnCompletion,
     ) -> Result<()> {
@@ -1877,9 +1895,9 @@ impl Session {
         };
         let mut recovery_requests = Vec::new();
         let mut result = async {
-            let first = self.run_timed_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut turn, completion, turn_lease.clone()).await;
+            let first = self.run_timed_turn(cli, prompt, input, origin, publish, &mut turn, completion, turn_lease.clone()).await;
             match first {
-                Err(error) if completion.stdout_failure.is_none() && !hook_wake && !initial_hook && crate::session_commands::is_context_overflow(&error) => {
+                Err(error) if completion.stdout_failure.is_none() && !matches!(origin, TurnOrigin::HookWake | TurnOrigin::InitialHook) && crate::session_commands::is_context_overflow(&error) => {
                     recovery_requests.extend(completion.requests.iter().cloned());
                     if let Err(log_error) = crate::request_attempts::record(&self.paths.data_dir, &self.id, &json!({
                         "type":"request_turn_attempt_end", "turnId":turn.record().turn_id,
@@ -1908,7 +1926,7 @@ impl Session {
                             // Retrying after compaction stays inside this turn and
                             // keeps its ownership; a failure here would mean the
                             // lease was lost, so it must not be ignored.
-                            let result = self.run_timed_turn(cli, prompt, input, hook_wake, initial_hook, publish, &mut turn, completion, turn_lease.clone()).await;
+                            let result = self.run_timed_turn(cli, prompt, input, origin, publish, &mut turn, completion, turn_lease.clone()).await;
                             completion.sdk_result = Some(merge_attempt_results(previous, completion.sdk_result.take()));
                             result
                         }
@@ -2012,8 +2030,7 @@ impl Session {
         cli: &Cli,
         prompt: &str,
         input: &mut Option<TerminalInput>,
-        hook_wake: bool,
-        initial_hook: bool,
+        origin: TurnOrigin,
         publish: bool,
         turn: &mut deepseek_code_core::db::turn_repo::TurnTimer,
         completion: &mut TurnCompletion,
@@ -2021,6 +2038,7 @@ impl Session {
             std::sync::Arc<deepseek_code_core::services::session_messages::ExecutionLease>,
         >,
     ) -> Result<()> {
+        let hook_wake = origin == TurnOrigin::HookWake;
         let transcript = turn.history();
         // Captures the signal count synchronously, before any await. A Ctrl-C
         // delivered while an event is being handled is therefore still seen by
@@ -2063,10 +2081,7 @@ impl Session {
             .model_history_with_boundary(&self.id, &self.selected_provider().await?.provider.api_format)?;
         crate::session_commands::microcompact(self, &mut history, self.context_window().await)?;
         if !hook_wake && completion.queued.is_none() {
-            let mut message = json!({"role":"user","content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))});
-            if initial_hook {
-                message["origin"] = json!("hook");
-            }
+            let message = json!({"role":"user","origin":origin.tag(),"content":self.sdk_content.as_ref().cloned().unwrap_or(json!(prompt))});
             history.push(message);
         } else if completion
             .queued
@@ -2104,15 +2119,18 @@ impl Session {
         let mut checkpoint = if hook_wake || completion.queued.is_some() {
             None
         } else {
-            let user_message_id = if initial_hook {
-                self.store.append_hook_user(&self.id, prompt)
-            } else {
-                match &self.sdk_content {
-                    Some(content) => self.store.append_user_content(&self.id, prompt, content),
-                    None => self.store.append(&self.id, "user", prompt),
+            let user_message_id = self.selected_session()?.write(|w| {
+                if origin == TurnOrigin::InitialHook {
+                    return w.append_hook_user(prompt);
                 }
-            }
-            .context("Persisting CLI user message")?;
+                let id = match &self.sdk_content {
+                    Some(content) => w.append_user_content(prompt, content)?,
+                    None => w.append("user", prompt)?,
+                };
+                w.set_message_metadata(&id, &json!({"promptOrigin": origin.tag()}))?;
+                Ok(id)
+            }).context("Persisting CLI user message")?;
+            history.last_mut().expect("submitted user message")["id"] = json!(user_message_id);
             match deepseek_code_core::services::checkpoints::capture(
                 &self.paths.data_dir,
                 &self.id,

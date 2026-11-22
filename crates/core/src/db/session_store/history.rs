@@ -358,6 +358,7 @@ impl SessionWrite<'_> {
             &chrono::Utc::now().to_rfc3339(),
             self.next_order()?,
         )?;
+        self.set_message_metadata(id, &serde_json::json!({"promptOrigin":"user"}))?;
         permission_authority::record_conn(
             self.0,
             self.1,
