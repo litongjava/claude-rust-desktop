@@ -21,57 +21,19 @@ fn digest(messages: &[Value]) -> String {
 pub(crate) struct Source {
     count: usize,
     digest: String,
-    cleared_through: usize,
 }
 
 impl Source {
     pub(super) fn new(messages: &[Value]) -> Self {
-        let cleared_through = messages
-            .iter()
-            .rposition(crate::services::compaction::microcompact::has_cleared_result)
-            .map_or(0, |i| i + 1);
         Self {
             count: messages.len(),
             digest: digest(messages),
-            cleared_through,
         }
     }
 
-    fn suffix<'a>(&self, history: &'a [Value], last_tool: Option<&str>) -> Option<&'a [Value]> {
+    fn suffix<'a>(&self, history: &'a [Value]) -> Option<&'a [Value]> {
         let (base, tail) = history.split_at_checked(self.count)?;
-        if digest(base) != self.digest {
-            if self.cleared_through == 0 {
-                return None;
-            }
-            let mut replay = base.to_vec();
-            crate::services::compaction::microcompact::clear_tool_results(
-                replay.get_mut(..self.cleared_through)?,
-            );
-            if digest(&replay) != self.digest {
-                return None;
-            }
-        }
-        let Some(tool) = last_tool else {
-            return Some(tail);
-        };
-        // Session replay namespaces call IDs by the assistant message ID.
-        let matches = |id: &Value| {
-            id.as_str().is_some_and(|id| {
-                id == tool
-                    || id
-                        .strip_suffix(tool)
-                        .is_some_and(|prefix| prefix.ends_with(':'))
-            })
-        };
-        let end = tail.iter().position(|m| {
-            matches(&m["tool_call_id"])
-                || m["content"].as_array().is_some_and(|blocks| {
-                    blocks
-                        .iter()
-                        .any(|b| b["type"] == "tool_result" && matches(&b["tool_use_id"]))
-                })
-        })?;
-        Some(&tail[end + 1..])
+        (digest(base) == self.digest).then_some(tail)
     }
 }
 
@@ -79,7 +41,6 @@ impl Source {
 pub(super) struct Capture {
     pub session: SessionDb,
     pub route: String,
-    pub last_tool: Option<String>,
     pub source: Source,
 }
 
@@ -87,7 +48,8 @@ pub(super) struct Capture {
 pub(crate) struct SavedPrefix {
     route: String,
     session: String,
-    last_tool: Option<String>,
+    #[serde(default)]
+    complete_source: bool,
     source: Source,
     wire: WireRequest,
 }
@@ -97,7 +59,7 @@ impl Capture {
         let saved = SavedPrefix {
             route: self.route.clone(),
             session: self.session.id().into(),
-            last_tool: self.last_tool.clone(),
+            complete_source: true,
             source: self.source.clone(),
             wire: wire.clone(),
         };
@@ -127,10 +89,10 @@ pub(super) fn load(
     let Some(saved) = session.read(|r| r.setting(COMPACTION_PREFIX))? else {
         return Ok(None);
     };
-    if saved.session != session.id() || saved.route != route(provider) {
+    if !saved.complete_source || saved.session != session.id() || saved.route != route(provider) {
         return Ok(None);
     }
-    let Some(tail) = saved.source.suffix(history, saved.last_tool.as_deref()) else {
+    let Some(tail) = saved.source.suffix(history) else {
         return Ok(None);
     };
     let mut wire = saved.wire;
@@ -183,21 +145,15 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn prefix_requires_matching_history_and_the_last_included_tool_result() {
-        let mut history = vec![
+    fn prefix_requires_the_original_contents_of_every_covered_row() {
+        let history = vec![
             json!({"role":"tool","tool_call_id":"first","content":"x".repeat(1100)}),
             json!({"role":"user","content":"continue"}),
         ];
-        let mut main_input = history.clone();
-        crate::services::compaction::microcompact::clear_tool_results(&mut main_input[..1]);
-        let source = Source::new(&main_input);
-        history.extend([
-            json!({"role":"tool","tool_call_id":"assistant:last","content":"result"}),
-            json!({"role":"assistant","content":"final answer"}),
-        ]);
-        assert_eq!(source.suffix(&history, Some("last")), Some(&history[3..]));
-        assert!(source.suffix(&history, Some("unknown")).is_none());
-        history[1]["content"] = json!("rewritten");
-        assert!(source.suffix(&history, None).is_none());
+        let source = Source::new(&history[..1]);
+        assert_eq!(source.suffix(&history), Some(&history[1..]));
+        let mut shortened = history.clone();
+        crate::services::compaction::microcompact::clear_tool_results(&mut shortened);
+        assert!(Source::new(&shortened).suffix(&history).is_none());
     }
 }

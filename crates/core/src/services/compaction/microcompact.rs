@@ -35,12 +35,3 @@ pub fn clear_tool_results(messages: &mut [Value]) {
         }
     }
 }
-
-pub(crate) fn has_cleared_result(message: &Value) -> bool {
-    (message["role"] == "tool" && message["content"] == CLEARED_TOOL_RESULT)
-        || message["content"].as_array().is_some_and(|blocks| {
-            blocks
-                .iter()
-                .any(|b| b["type"] == "tool_result" && b["content"] == CLEARED_TOOL_RESULT)
-        })
-}
