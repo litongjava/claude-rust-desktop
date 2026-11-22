@@ -619,6 +619,7 @@ pub async fn summarize_part(
         .generate_replay_summary(
             db.open_session(id)?,
             provider,
+            model,
             PROMPT,
             "",
             prepared.messages.clone(),

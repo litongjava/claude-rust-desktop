@@ -33,6 +33,14 @@ impl Fixture {
     }
 
     async fn with_root(window: usize, root: tempfile::TempDir) -> Self {
+        Self::with_answer(window, root, |_| "Pending work is recorded.").await
+    }
+
+    async fn with_answer(
+        window: usize,
+        root: tempfile::TempDir,
+        answer: fn(&Value) -> &'static str,
+    ) -> Self {
         deepseek_code_core::config::OrchestrationConfig::init_global().unwrap();
         let paths = RuntimePaths::new(root.path().join("data")).unwrap();
         let store = SessionStore::new(paths.open_database().unwrap());
@@ -54,7 +62,7 @@ impl Fixture {
             let bedrock = body.get("inferenceConfig").is_some();
             let anthropic = headers.contains_key("anthropic-version");
             let structured = body["response_format"]["type"] == "json_schema" || body["messages"].to_string().contains("fixture always answers JSON");
-            let text = if structured { r#"{"ok":true}"# } else if compact { "Pending work is recorded." } else { "last answer" };
+            let text = if structured { r#"{"ok":true}"# } else if compact { answer(&body) } else { "last answer" };
             seen_routes.lock().unwrap().push((uri.path().to_owned(),headers));
             seen.lock().unwrap().push(body);
             async move {
@@ -128,9 +136,14 @@ impl Fixture {
     }
 
     async fn send_normal(&self, schema: Option<Value>) {
+        self.send_selected(&self.provider.models[0].id, schema)
+            .await;
+    }
+
+    async fn send_selected(&self, selector: &str, schema: Option<Value>) {
         let request: ChatRequest = serde_json::from_value(json!({"conversation_id":self.id,
             "messages":self.store.model_history(&self.id,&self.provider.api_format).unwrap(),
-            "response_schema":schema,"system_prompt":"Custom session instructions","model":self.provider.models[0].id,"effort":self.provider.models[0].effort,"provider_id":"fixture","workspace_path":self.root.path()})).unwrap();
+            "response_schema":schema,"system_prompt":"Custom session instructions","model":selector,"effort":self.provider.models[0].effort,"provider_id":"fixture","workspace_path":self.root.path()})).unwrap();
         let mut stream = self
             .engine()
             .send_message_with_history(request, false)
@@ -160,12 +173,19 @@ impl Fixture {
     }
 
     async fn compact(&self) -> anyhow::Result<compaction::CompactionResult> {
+        self.compact_selected(&self.provider.models[0].id).await
+    }
+
+    async fn compact_selected(
+        &self,
+        selector: &str,
+    ) -> anyhow::Result<compaction::CompactionResult> {
         compaction::compact(
             &self.engine(),
             &self.store.db,
             &self.id,
             "fixture",
-            &self.provider.models[0].id,
+            selector,
             "Keep pending work",
         )
         .await
@@ -723,6 +743,42 @@ async fn compaction_conflict_guard_and_partial_summary_include_the_structured_re
     let body = f.requests.lock().unwrap()[0].to_string();
     assert!(body.contains("APPROVED_REVIEW"));
     assert!(!body.contains("Initial request"));
+    f.finish().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn replay_preserves_the_virtual_context_window() -> anyhow::Result<()> {
+    const GATE: &str = "REQUIRES_QA_42";
+    let f = Fixture::with_answer(50_000, tempfile::tempdir()?, |body| {
+        if body["messages"].to_string().contains(GATE) {
+            GATE
+        } else {
+            "No QA gate was recorded."
+        }
+    })
+    .await;
+    f.append("user", &format!("{}{GATE}", "w".repeat(100_000)));
+    for i in 0..5 {
+        f.append("assistant", &format!("Earlier response {i}"));
+        f.append("user", &format!("Follow-up {i}"));
+    }
+    f.send_selected("model[1m]", None).await;
+    f.compact_selected("model[1m]").await?;
+    let history = f.store.model_history(&f.id, &f.provider.api_format)?;
+    {
+        let calls = f.requests.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0]["messages"].to_string().contains(GATE));
+        assert!(
+            calls[1]["messages"].to_string().contains(GATE),
+            "summary lost the QA gate"
+        );
+    }
+    assert!(history.last().unwrap()["content"]
+        .as_str()
+        .unwrap()
+        .contains(GATE));
     f.finish().await;
     Ok(())
 }
