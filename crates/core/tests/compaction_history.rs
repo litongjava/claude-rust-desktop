@@ -259,13 +259,28 @@ async fn check_opaque_fallback(window: usize, padding: &str) {
     f.provider.builtin_id = Some("openai".into());
     f.provider.models[0].api = Some("openai-responses".into());
     f.append("user", "Original durable requirement");
-    let boundary = f
-        .store
-        .append(&f.id, "user", "Native Responses compaction completed.")
-        .unwrap();
+    f.append("assistant", "Acknowledged the original requirement.");
     let items = json!([{"type":"compaction","id":"original","encrypted_content":"OPAQUE_WINDOW"}]);
-    f.store.db.open_session(&f.id).unwrap().write(|w| w.native_boundary(&boundary,
-        &json!({"compaction":true,"api":"openai-responses","items":items,"provider":"fixture","model":"model","base_url":f.provider.base_url}))).unwrap();
+    let shard = f.store.db.open_session(&f.id).unwrap();
+    shard
+        .write(|w| w.request_compaction("Keep the requirement", 50, 100))
+        .unwrap();
+    {
+        let owner = shard.delivery_owner().unwrap();
+        let claim = owner.claim_compaction().unwrap().unwrap();
+        owner
+            .finish_compaction(
+                &claim,
+                &compaction::GeneratedSummary {
+                    text: "Native Responses compaction completed.".into(),
+                    native: Some(
+                        json!({"compaction":true,"api":"openai-responses","items":items,
+                "provider":"fixture","model":"model","base_url":f.provider.base_url}),
+                    ),
+                },
+            )
+            .unwrap();
+    }
     f.append(
         "user",
         &format!("Durable correction after boundary {padding}"),
@@ -536,7 +551,14 @@ async fn compaction_records_chat_cache_writes_in_their_own_bucket() {
     assert!(usage.failures.is_empty());
     assert_eq!(usage.days.len(), 1);
     assert_eq!(usage.days[0].tokens, [20, 3, 75, 5]);
-    let (details, input, _) = f.store.db.open_session(&child).unwrap().repository().usage_totals(&[]).unwrap();
+    let (details, input, _) = f
+        .store
+        .db
+        .open_session(&child)
+        .unwrap()
+        .repository()
+        .usage_totals(&[])
+        .unwrap();
     assert_eq!(input, 100);
     assert_eq!(details["cache_write_tokens"], 5);
     f.finish().await;
@@ -556,7 +578,10 @@ async fn historical_bedrock_daily_buckets_survive_a_compaction_fork() -> anyhow:
     assert!(usage.failures.is_empty());
     assert_eq!(usage.days.len(), 1);
     let day = &usage.days[0];
-    assert_eq!((day.requests, day.heat, day.tokens), (1, 103, [20, 3, 75, 5]));
+    assert_eq!(
+        (day.requests, day.heat, day.tokens),
+        (1, 103, [20, 3, 75, 5])
+    );
     f.finish().await;
     Ok(())
 }
