@@ -464,16 +464,31 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
         );
         let start = fixture.requests.lock().unwrap().len();
         resume_fixture(&data, root.path(), &id, "/compact Keep the fixture command").await;
-        let compact = serde_json::to_string(&fixture.requests.lock().unwrap()[start..]).unwrap();
-        assert!(compact.contains("[base64 data omitted"));
-        check_shell_payload(&compact, "compaction request");
         let session_outputs = std::path::Path::new(path).parent().unwrap();
         let compaction_file = std::fs::read_dir(session_outputs)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .find(|file| std::fs::read(file).unwrap() == raw.as_bytes())
             .expect("the historical row was saved exactly before compaction");
-        assert!(compact.contains(compaction_file.to_str().unwrap()));
+        // The model receives the transcript as JSON text inside a user message.
+        let quoted_path = serde_json::to_string(&compaction_file).unwrap();
+        let transcript_path = &quoted_path[1..quoted_path.len() - 1];
+        let requests = fixture.requests.lock().unwrap();
+        let mut found_reference = false;
+        for request in &requests[start..] {
+            for message in request["messages"].as_array().unwrap() {
+                if let Some(text) = message["content"].as_str() {
+                    check_shell_payload(text, "compaction message");
+                    found_reference |=
+                        text.contains("[base64 data omitted") && text.contains(transcript_path);
+                }
+            }
+        }
+        assert!(
+            found_reference,
+            "the compaction request must name the stored row"
+        );
+        drop(requests);
         server.abort();
         let _ = server.await;
         return;
