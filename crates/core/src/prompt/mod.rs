@@ -57,7 +57,7 @@ pub fn default_system_prompt(_profile: PromptProfile) -> String {
 
 /// The CLI's constant runtime facts. They describe the frontend, so they travel
 /// in the first user message as their own reminder instead of the system prompt.
-pub const STANDALONE_FRONTEND: &str = "Standalone DeepSeek Code terminal: no Desktop window or Bridge server; use native tools directly. For an interactive command like `gcloud auth login`, tell the user to enter `! <command>` and its output appears here.";
+pub const STANDALONE_FRONTEND: &str = "Launched using the dcl command and running directly in a terminal.no Desktop window or Bridge server; use native tools directly. For an interactive command like `gcloud auth login`, tell the user to enter `! <command>` and its output appears here.";
 
 pub fn standalone_frontend_reminder() -> String {
     format!("<system-reminder>\n{STANDALONE_FRONTEND}\n</system-reminder>")
