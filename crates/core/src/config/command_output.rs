@@ -3,9 +3,8 @@ use std::path::Path;
 
 pub const KEY: &str = "summarize_long_command_output";
 const ENV: &str = "DEEPSEEK_CODE_SUMMARIZE_LONG_COMMAND_OUTPUT";
-const ORCHESTRATION: [&str; 3] = [
+const ORCHESTRATION: [&str; 2] = [
     "config/orchestration.toml",
-    "src-tauri/config/orchestration.toml",
     "../config/orchestration.toml",
 ];
 

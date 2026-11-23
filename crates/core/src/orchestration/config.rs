@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn the_bundled_engine_config_is_not_this_format() {
         // config/orchestration.toml belongs to crate::config::OrchestrationConfig.
-        let bundled = include_str!("../../../../src-tauri/config/orchestration.toml");
+        let bundled = include_str!("../../../../config/orchestration.toml");
         assert!(toml::from_str::<crate::config::OrchestrationConfig>(bundled).is_ok());
         assert!(!bundled.contains("[orchestrator]"));
     }

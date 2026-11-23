@@ -1374,7 +1374,7 @@ async fn streaming_process_handles_two_messages_before_eof_in_one_session() {
 /// A positive streaming idle deadline in the cwd config the child reads.
 fn write_stream_timeout_policy(root: &Path, idle_secs: u64, retries: u32, backoff_ms: u64) {
     std::fs::create_dir_all(root.join("config")).unwrap();
-    let config = include_str!("../../../src-tauri/config/orchestration.toml")
+    let config = include_str!("../../../config/orchestration.toml")
         .replace(
             "request_timeout_secs = 300",
             &format!("request_timeout_secs = {idle_secs}"),

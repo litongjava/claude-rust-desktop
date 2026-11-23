@@ -172,7 +172,6 @@ impl OrchestrationConfig {
         // Try several candidate paths
         let candidates = [
             "config/orchestration.toml",
-            "src-tauri/config/orchestration.toml",
             "../config/orchestration.toml",
         ];
         for path in &candidates {

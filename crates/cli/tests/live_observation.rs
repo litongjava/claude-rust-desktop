@@ -162,7 +162,7 @@ impl Project {
         // Keep retries out of the timing assertions; these fixtures never fail.
         std::fs::write(
             workspace.join("config/orchestration.toml"),
-            include_str!("../../../src-tauri/config/orchestration.toml")
+            include_str!("../../../config/orchestration.toml")
                 .replace("retry_base_backoff_ms = 2000", "retry_base_backoff_ms = 10"),
         )
         .unwrap();
