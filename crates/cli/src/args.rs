@@ -883,6 +883,8 @@ pub enum ConfigCommands {
     Reset,
     /// Import an old .claude-code/settings.json; the source is read-only.
     ImportLegacy { source: PathBuf },
+    /// Show or set the global long-term memory switch: on or off.
+    Memory { state: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]

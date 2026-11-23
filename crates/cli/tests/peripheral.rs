@@ -39,6 +39,20 @@ async fn run(path: &Path, args: &[&str]) -> Value {
 }
 
 #[tokio::test]
+async fn config_memory_switch_is_global_and_shared() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(run(dir.path(), &["config", "memory"]).await["enabled"], true);
+    assert_eq!(run(dir.path(), &["config", "memory", "off"]).await["enabled"], false);
+    assert_eq!(run(dir.path(), &["config", "memory"]).await["enabled"], false);
+    assert_eq!(run(dir.path(), &["config", "show"]).await["memory"]["enabled"], false);
+    assert!(!output(dir.path(), &["config", "memory", "sideways"]).await.status.success());
+    assert_eq!(run(dir.path(), &["config", "memory", "on"]).await["enabled"], true);
+    // The generic setting reaches the same switch.
+    assert!(output(dir.path(), &["config", "set", "memory.enabled", "false"]).await.status.success());
+    assert_eq!(run(dir.path(), &["config", "memory"]).await["enabled"], false);
+}
+
+#[tokio::test]
 async fn personal_memory_transfer_is_standalone_and_clear_requires_confirmation() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("legacy.json");

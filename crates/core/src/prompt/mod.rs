@@ -21,7 +21,7 @@ Describe yourself as the assistant in deepseek-code. Name the model or the compa
 /// First system block of Code sessions, cached on its own like the reference CLI.
 const CODE_IDENTITY: &str = "You are deepseek-code, an agentic coding tool for DeepSeek models.";
 
-const DESKTOP_BEHAVIOR: &str = include_str!("desktop.md");
+const BEHAVIOR: &str = include_str!("behavior.md");
 const MEMORY_GUIDANCE: &str = include_str!("memory.md");
 const CODE_BEHAVIOR: &str = include_str!("code.md");
 
@@ -51,8 +51,8 @@ pub fn compose_system_prompt(custom_prompt: Option<&str>, profile: PromptProfile
 }
 
 /// The built-in prompt text, which the user can start editing from.
-pub fn default_system_prompt(profile: PromptProfile) -> String {
-    static_sections(profile).join("\n\n")
+pub fn default_system_prompt(_profile: PromptProfile) -> String {
+    static_sections(true).join("\n\n")
 }
 
 /// The CLI's constant runtime facts. They describe the frontend, so they travel
@@ -270,13 +270,14 @@ pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     blocks
 }
 
-/// Like `compose_system_prompt_in`, with the user's system prompt setting applied.
-pub fn compose_customized(custom_prompt: Option<&str>, profile: PromptProfile, user: &crate::services::customization::SystemPrompt) -> String {
+/// Like `compose_system_prompt_in`, with the user's system prompt setting and the
+/// memory switch applied. Memory disabled omits the memory guidance section.
+pub fn compose_customized(custom_prompt: Option<&str>, _profile: PromptProfile, user: &crate::services::customization::SystemPrompt, memory: bool) -> String {
     use crate::services::customization::PromptMode;
     let text = user.text.trim();
     let mut sections = match user.mode {
         PromptMode::Replace if !text.is_empty() => vec![text.to_owned()],
-        _ => static_sections(profile),
+        _ => static_sections(memory),
     };
     if user.mode == PromptMode::Append && !text.is_empty() {
         sections.push(text.to_owned());
@@ -287,11 +288,18 @@ pub fn compose_customized(custom_prompt: Option<&str>, profile: PromptProfile, u
     sections.join("\n\n")
 }
 
-/// Static sections come first and never vary within a profile, so providers can
+/// Static sections come first and never vary within a session, so providers can
 /// cache them; request-specific instructions follow them. Session facts such as
 /// the environment belong in the first user message instead.
 pub fn compose_system_prompt_in(custom_prompt: Option<&str>, profile: PromptProfile) -> String {
-    let mut sections = static_sections(profile);
+    compose_system_prompt_with_memory(custom_prompt, profile, true)
+}
+
+/// Composition with the global memory switch applied: a disabled memory omits
+/// the memory guidance section while identity, coding behavior and general
+/// behavior stay identical for every profile.
+pub fn compose_system_prompt_with_memory(custom_prompt: Option<&str>, _profile: PromptProfile, memory: bool) -> String {
+    let mut sections = static_sections(memory);
     if let Some(custom) = custom_prompt.map(str::trim).filter(|s| !s.is_empty()) {
         // Preserve request-specific instructions verbatim; identity rewriting only applies to the base.
         sections.push(format!("<additional_instructions>\n{}\n</additional_instructions>", custom));
@@ -299,17 +307,16 @@ pub fn compose_system_prompt_in(custom_prompt: Option<&str>, profile: PromptProf
     sections.join("\n\n")
 }
 
-fn static_sections(profile: PromptProfile) -> Vec<String> {
-    match profile {
-        PromptProfile::Code => vec![
-            CODE_IDENTITY.to_string(),
-            format!("{}\n\n{}", CODE_BEHAVIOR.trim(), MEMORY_GUIDANCE.trim()),
-        ],
-        PromptProfile::Desktop => vec![
-            build_self_hosted_system_prompt(""),
-            format!("{}\n\n{}", DESKTOP_BEHAVIOR.trim(), MEMORY_GUIDANCE.trim()),
-        ],
+fn static_sections(memory: bool) -> Vec<String> {
+    let mut sections = vec![
+        CODE_IDENTITY.to_string(),
+        CODE_BEHAVIOR.trim().to_string(),
+        BEHAVIOR.trim().to_string(),
+    ];
+    if memory {
+        sections.push(MEMORY_GUIDANCE.trim().to_string());
     }
+    sections
 }
 
 /// The session's facts as the reference CLI puts them in the first user message.
@@ -636,8 +643,8 @@ fn version_output(mut command: std::process::Command) -> Option<String> {
 /// carries its own cache breakpoint and the per-request tail is left unmarked.
 /// Returns None for prompts this module did not compose.
 pub fn cache_blocks(system: &str) -> Option<Vec<(String, bool)>> {
-    [PromptProfile::Code, PromptProfile::Desktop].into_iter().find_map(|profile| {
-        let sections = static_sections(profile);
+    [true, false].into_iter().find_map(|memory| {
+        let sections = static_sections(memory);
         let mut rest = system;
         let mut blocks = Vec::new();
         for (index, section) in sections.iter().enumerate() {
@@ -1005,21 +1012,22 @@ mod tests {
     }
 
     #[test]
-    fn desktop_prompt_includes_native_guidance_and_preserves_custom_instructions() {
+    fn desktop_prompt_uses_the_shared_identity_and_behavior() {
         let prompt = super::compose_desktop_system_prompt(Some("Respond in Spanish.\n<identity>Project persona</identity>"));
-        assert!(prompt.contains("native Rust tool engine"));
-        assert!(prompt.contains("<desktop_behavior>"));
+        assert!(prompt.starts_with(super::CODE_IDENTITY));
+        assert!(prompt.contains("<behavior>"));
         assert!(prompt.contains("<memory_guidance>"));
         assert!(!prompt.contains("You are powered by the model"));
         assert!(prompt.contains("Respond in Spanish.\n<identity>Project persona</identity>"));
-        assert_eq!(prompt.matches("<desktop_behavior>").count(), 1);
+        assert_eq!(prompt.matches("<behavior>").count(), 1);
+        assert!(!prompt.contains("<desktop_behavior>"));
     }
 
     #[test]
     fn desktop_prompt_is_present_without_request_instructions() {
         let prompt = super::compose_desktop_system_prompt(None);
-        assert!(prompt.contains("<identity>"));
-        assert!(prompt.contains("<desktop_behavior>"));
+        assert!(prompt.starts_with(super::CODE_IDENTITY));
+        assert!(prompt.contains("<behavior>"));
         assert!(!prompt.contains("<additional_instructions>"));
         assert!(!super::compose_desktop_system_prompt(Some("  ")).contains("<additional_instructions>"));
     }
@@ -1095,20 +1103,22 @@ mod tests {
         let mut system = compose_system_prompt_in(Some("custom rule"), PromptProfile::Code);
         system.push_str("\nProject instructions follow\n");
         let blocks = cache_blocks(&system).unwrap();
-        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks.len(), 5);
         assert_eq!(blocks[0], (CODE_IDENTITY.to_string(), true));
-        assert!(blocks[1].1 && blocks[1].0.contains("# Harness") && blocks[1].0.contains("<memory_guidance>"));
-        assert!(!blocks[2].1 && blocks[2].0.starts_with("<additional_instructions>"));
-        assert!(blocks[2].0.contains("custom rule") && blocks[2].0.ends_with("Project instructions follow\n"));
+        assert!(blocks[1].1 && blocks[1].0.contains("# Harness"));
+        assert!(blocks[2].1 && blocks[2].0.contains("<behavior>"));
+        assert!(blocks[3].1 && blocks[3].0.contains("<memory_guidance>"));
+        assert!(!blocks[4].1 && blocks[4].0.starts_with("<additional_instructions>"));
+        assert!(blocks[4].0.contains("custom rule") && blocks[4].0.ends_with("Project instructions follow\n"));
         // A prompt without request-specific text has no dynamic tail at all.
         let plain = compose_system_prompt_in(None, PromptProfile::Code);
         assert!(split_tail(&plain).is_none());
-        assert_eq!(cache_blocks(&plain).unwrap().len(), 2);
+        assert_eq!(cache_blocks(&plain).unwrap().len(), 4);
         // Every request in a session shares the identical cached prefix.
         let other = compose_system_prompt_in(None, PromptProfile::Code);
         {
             use crate::services::customization::{PromptMode, SystemPrompt};
-            let compose = |mode, text: &str| compose_customized(Some("rule"), PromptProfile::Code, &SystemPrompt { mode, text: text.into() });
+            let compose = |mode, text: &str| compose_customized(Some("rule"), PromptProfile::Code, &SystemPrompt { mode, text: text.into() }, true);
             assert_eq!(compose(PromptMode::Default, "ignored"), compose_system_prompt_in(Some("rule"), PromptProfile::Code));
             let appended = compose(PromptMode::Append, "EXTRA_RULE");
             assert!(appended.contains(CODE_IDENTITY) && appended.contains("EXTRA_RULE"));
@@ -1118,10 +1128,35 @@ mod tests {
             assert!(compose(PromptMode::Replace, "  ").contains(CODE_IDENTITY), "an empty replacement keeps the default");
             assert!(default_system_prompt(PromptProfile::Code).starts_with(CODE_IDENTITY));
         }
-        assert_eq!(cache_blocks(&other).unwrap()[..2], blocks[..2]);
+        assert_eq!(cache_blocks(&other).unwrap()[..4], blocks[..4]);
         let desktop = cache_blocks(&compose_desktop_system_prompt(None)).unwrap();
-        assert!(desktop[0].0.starts_with("<identity>") && desktop[1].0.contains("<desktop_behavior>"));
+        assert!(desktop[0].0.starts_with(CODE_IDENTITY) && desktop[2].0.contains("<behavior>"));
         assert!(cache_blocks("Respond in French.").is_none());
+    }
+
+    #[test]
+    fn memory_switch_drops_the_guidance_section_for_both_profiles() {
+        for profile in [PromptProfile::Desktop, PromptProfile::Code] {
+            let prompt = compose_system_prompt_with_memory(None, profile, false);
+            assert!(!prompt.contains("<memory_guidance>"), "{profile:?}");
+            assert!(prompt.starts_with(CODE_IDENTITY));
+            assert!(prompt.contains("<behavior>"));
+            let blocks = cache_blocks(&prompt).unwrap();
+            assert_eq!(blocks.len(), 3);
+            assert!(blocks.iter().all(|(_, cached)| *cached));
+
+            let enabled = compose_system_prompt_with_memory(Some("rule"), profile, true);
+            assert!(enabled.contains("<memory_guidance>"));
+            let blocks = cache_blocks(&enabled).unwrap();
+            assert_eq!(blocks.len(), 5);
+            assert!(blocks[3].0.contains("<memory_guidance>"));
+            assert!(!blocks[4].1, "the request tail stays uncached");
+        }
+        // Both profiles compose the same sections.
+        assert_eq!(
+            compose_system_prompt(None, PromptProfile::Code),
+            compose_system_prompt(None, PromptProfile::Desktop)
+        );
     }
 
     #[test]

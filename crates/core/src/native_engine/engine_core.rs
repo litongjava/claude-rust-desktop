@@ -1106,11 +1106,19 @@ impl QueryEngine {
             .await?;
         }
         let customization = crate::services::customization::load(&plugin_context.paths.data_dir)?;
+        let memory_enabled = match crate::services::memory_files::config(&plugin_context) {
+            Ok(config) => config.enabled,
+            Err(error) => {
+                tracing::warn!(module = "Prompt", error = %error, "Memory setting unavailable; keeping memory guidance");
+                true
+            }
+        };
         let standalone_frontend = request.standalone_frontend;
         request.system_prompt = Some(crate::prompt::compose_customized(
             request.system_prompt.as_deref(),
             prompt_profile,
             &customization.system_prompt,
+            memory_enabled,
         ));
         let snapshot_root = plugin_context.paths.data_dir.clone();
         let snapshot_session = conv_id.clone();

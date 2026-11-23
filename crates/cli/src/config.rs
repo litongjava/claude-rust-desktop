@@ -458,7 +458,7 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
     paths.read_config()?; // Never overwrite a malformed Desktop config with defaults.
     match action {
         ConfigCommands::Show => {
-            let mut value = json!({"data_dir":paths.data_dir,"preferences":preferences(paths)?,"config":paths.read_config()?,"shell":deepseek_code_core::services::shell_settings::inspect(&paths.data_dir)?,"permissions.auto":deepseek_code_core::permissions::auto_config::load(&crate::services::context(paths)?)?,"tools":crate::tool_settings::rows(paths)?});
+            let mut value = json!({"data_dir":paths.data_dir,"preferences":preferences(paths)?,"config":paths.read_config()?,"shell":deepseek_code_core::services::shell_settings::inspect(&paths.data_dir)?,"permissions.auto":deepseek_code_core::permissions::auto_config::load(&crate::services::context(paths)?)?,"memory":deepseek_code_core::services::memory_files::config(&crate::services::context(paths)?)?,"tools":crate::tool_settings::rows(paths)?});
             value[deepseek_code_core::config::command_output::KEY] =
                 json!(deepseek_code_core::config::command_output::enabled(
                     Some(&paths.data_dir),
@@ -480,6 +480,15 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
             ) {
                 let enabled = value.parse::<bool>().context("Expected true or false")?;
                 deepseek_code_core::config::command_output::set(&paths.data_dir, enabled)?;
+                eprintln!("Updated {key}");
+                return Ok(());
+            }
+            if key == "memory.enabled" {
+                let enabled = value.parse::<bool>().context("Expected true or false")?;
+                let context = crate::services::context(paths)?;
+                let mut config = deepseek_code_core::services::memory_files::config(&context)?;
+                config.enabled = enabled;
+                deepseek_code_core::services::memory_files::save_config(&context, &config)?;
                 eprintln!("Updated {key}");
                 return Ok(());
             }
@@ -562,6 +571,19 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
             })?;
             save_preferences(paths, &prefs)?;
             eprintln!("Updated {key}");
+        }
+        ConfigCommands::Memory { state } => {
+            let context = crate::services::context(paths)?;
+            let mut config = deepseek_code_core::services::memory_files::config(&context)?;
+            if let Some(state) = state {
+                config.enabled = match state.trim().to_ascii_lowercase().as_str() {
+                    "on" | "enable" | "enabled" | "true" => true,
+                    "off" | "disable" | "disabled" | "false" => false,
+                    _ => bail!("Expected on or off"),
+                };
+                deepseek_code_core::services::memory_files::save_config(&context, &config)?;
+            }
+            crate::services::print(&config)?;
         }
         ConfigCommands::Reset => {
             ConfigManager::new(paths.data_dir.clone()).remove_provider("cli")?;

@@ -273,8 +273,11 @@ cargo test --locked -p deepseek-code-cli --bin dcl -- monitor_events_are_queued_
 2. `/memory` 菜单有 Long-term memories；列表可以搜索，`+ Add a memory` 能添加。
 3. 详情里 `e` 编辑后列表立即更新并保留重要性，`x` 删除，`←` 返回，`Esc` 关闭。
 4. `/memory` 的说明文件选项和 `/memory show` 不受影响。
+5. `dcl config memory` 输出当前开关；`dcl config memory off` 后 `config show` 的 `memory.enabled` 为 `false`，CLI 与 Desktop 新请求的系统提示词不再包含 `<memory_guidance>`，MEMORY.md 索引和记忆目录写入同时停止；`dcl config memory on` 和 `dcl config set memory.enabled true/false` 作用于同一开关。`cargo test --locked -p deepseek-code-cli --test peripheral config_memory_switch` 覆盖这些分支。
 
-#### 文件记忆 P1（独立 core 模块，尚未接入运行时）
+提示词分段由 `cargo test --locked -p deepseek-code-core --lib prompt::` 覆盖：Code 与 Desktop 都按“身份行、`code.md`、`behavior.md`、`memory.md`”组装，记忆关闭时省略第四段，`cache_blocks` 同时识别四段和三段布局并在 Anthropic 请求中分别设置缓存断点。
+
+#### 文件记忆（独立 core 模块）
 
 修改 `crates/core/src/memory/files/` 后运行 `cargo test --locked -j 2 -p deepseek-code-core --lib memory::files::tests:: -- --nocapture`，并运行现有 `cargo test --locked -j 2 -p deepseek-code-core --test memory_transfer --test dream`、`cargo test --locked -j 2 -p deepseek-code-cli --test peripheral`。构建/测试命令使用任务指定的 run_checked.py 和共享 Cargo 队列；保留完整日志、真实退出码、实际测试名和数量。
 
