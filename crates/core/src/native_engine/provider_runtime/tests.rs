@@ -43,7 +43,7 @@ fn requests_preserve_protocol_and_reasoning_replay() {
     let mut assistant = user();
     assistant.role = "assistant".into();
     assistant.provider_content = Some(
-        json!({"api":"openai-responses","items":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"},{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"}]}),
+        json!({"api":"openai-responses","provider":"test","model":"fixture-model","items":[{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"},{"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"}]}),
     );
     let body = messages::request(
         "openai-responses",
@@ -73,6 +73,115 @@ fn requests_preserve_protocol_and_reasoning_replay() {
     .unwrap();
     assert_eq!(body["thinking"]["type"], "enabled");
     assert_eq!(body["reasoning_effort"], "high");
+}
+
+#[test]
+fn foreign_reasoning_keeps_summary_and_drops_opaque_state() {
+    let p = provider("openai", "openai-responses", "http://localhost/v1");
+    let mut assistant = user();
+    assistant.role = "assistant".into();
+    assistant.provider_content = Some(json!({
+        "api":"openai-responses","provider":"other-account","model":"fixture-model",
+        "items":[
+            {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"opaque"},
+            {"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"opaque-2"},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+        ]
+    }));
+    let body = messages::request(
+        "openai-responses",
+        &p,
+        &Value::Null,
+        vec![user(), assistant],
+        Some("system"),
+        vec![],
+        4000,
+    )
+    .unwrap();
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 3);
+    assert!(input[1].get("encrypted_content").is_none());
+    assert_eq!(input[1]["summary"][0]["text"], "kept");
+    assert_eq!(input[2]["content"][0]["text"], "answer");
+}
+
+#[test]
+fn legacy_reasoning_without_an_issuer_is_treated_as_foreign() {
+    let p = provider("openai", "openai-responses", "http://localhost/v1");
+    let mut assistant = user();
+    assistant.role = "assistant".into();
+    assistant.provider_content = Some(json!({
+        "api":"openai-responses",
+        "items":[
+            {"type":"reasoning","id":"rs_old","summary":[{"type":"summary_text","text":"old"}],"encrypted_content":"opaque"},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+        ]
+    }));
+    let body = messages::request(
+        "openai-responses",
+        &p,
+        &Value::Null,
+        vec![assistant],
+        None,
+        vec![],
+        100,
+    )
+    .unwrap();
+    assert!(body["input"][0].get("encrypted_content").is_none());
+    assert_eq!(body["input"][0]["summary"][0]["text"], "old");
+}
+
+#[test]
+fn a_different_model_on_the_same_provider_is_foreign_too() {
+    let p = provider("openai", "openai-responses", "http://localhost/v1");
+    let mut assistant = user();
+    assistant.role = "assistant".into();
+    assistant.provider_content = Some(json!({
+        "api":"openai-responses","provider":"test","model":"older-model",
+        "items":[
+            {"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"kept"}],"encrypted_content":"opaque"},
+            {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+        ]
+    }));
+    let body = messages::request(
+        "openai-responses",
+        &p,
+        &Value::Null,
+        vec![assistant],
+        None,
+        vec![],
+        100,
+    )
+    .unwrap();
+    assert!(body["input"][0].get("encrypted_content").is_none());
+    assert_eq!(body["input"][0]["summary"][0]["text"], "kept");
+}
+
+#[test]
+fn foreign_anthropic_thinking_is_dropped_with_its_signature() {
+    let p = provider("claude", "anthropic-messages", "http://localhost");
+    let mut assistant = user();
+    assistant.role = "assistant".into();
+    assistant.provider_content = Some(json!({
+        "api":"anthropic-messages","provider":"other","model":"fixture-model",
+        "items":[
+            {"type":"thinking","thinking":"private","signature":"sig"},
+            {"type":"text","text":"done"}
+        ]
+    }));
+    let body = messages::request(
+        "anthropic-messages",
+        &p,
+        &Value::Null,
+        vec![assistant],
+        None,
+        vec![],
+        100,
+    )
+    .unwrap();
+    let content = body["messages"][0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1);
+    assert_eq!(content[0]["type"], "text");
 }
 
 #[test]

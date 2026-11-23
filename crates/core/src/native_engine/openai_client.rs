@@ -303,6 +303,12 @@ impl OpenAIClient {
                     }
                 }
             }
+            // Record the account and model that issued this provider-native block so a later
+            // turn can tell whether its opaque state is still replayable.
+            if let Some(object) = native.as_mut().and_then(Value::as_object_mut) {
+                object.insert("provider".into(), json!(provider.provider.id));
+                object.insert("model".into(), json!(provider.model.id));
+            }
             return Ok(OpenAIResponse { id: uuid::Uuid::new_v4().to_string(), object: "chat.completion".into(), created: 0, model: provider.model.id.clone(),
                 choices: vec![OpenAIChoice { index: 0, finish_reason: finish, message: OpenAIMessage { role: "assistant".into(), content: OpenAIContent::Text(text),
                     tool_calls: if calls.is_empty() { None } else { Some(calls.into_values().map(serde_json::from_value).collect::<std::result::Result<Vec<_>,_>>()?) }, tool_call_id: None,

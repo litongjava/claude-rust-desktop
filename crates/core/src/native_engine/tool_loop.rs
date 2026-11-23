@@ -6493,7 +6493,14 @@ impl ToolLoopExecutor {
 
                         request_trace.observe_openai(&event);
                         if let Some(content) = event.get("provider_content") {
-                            assistant_provider_content = Some(content.clone());
+                            // Opaque provider state belongs to the account and model that issued
+                            // it; record both so a later turn can decide whether to replay it.
+                            let mut native = content.clone();
+                            if let Some(object) = native.as_object_mut() {
+                                object.insert("provider".into(), json!(self.provider.provider.id));
+                                object.insert("model".into(), json!(self.provider.model.id));
+                            }
+                            assistant_provider_content = Some(native);
                         }
                         // Usage-only final chunks have no choices and must still be recorded.
                         if let Some(usage) = event.get("usage").filter(|usage| usage.is_object()) {
