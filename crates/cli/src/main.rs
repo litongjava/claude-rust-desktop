@@ -105,7 +105,6 @@ mod task_commands;
 #[allow(dead_code)]
 mod terminal;
 mod tool_settings;
-mod tools_menu;
 mod voice;
 mod worker_binding;
 use deepseek_code_core::db::session_store::GlobalSetting;
@@ -1497,9 +1496,13 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 continue;
             }
             if line.trim() == "/plugins" || line.trim() == "/skill-doctor" {
-                let start = if line.trim() == "/skill-doctor" { "skill-doctor" } else { "installed" };
+                let (scope, start) = if line.trim() == "/skill-doctor" {
+                    (plugins_panel::Scope::Skills, "skill-doctor")
+                } else {
+                    (plugins_panel::Scope::Plugins, "installed")
+                };
                 if terminal::picker::available() {
-                    match plugins_panel::run(start, &paths, &mut session, input.as_mut().unwrap()).await {
+                    match plugins_panel::run(scope, start, &paths, &mut session, input.as_mut().unwrap()).await {
                         Ok(true) => match reload_skill_commands(&paths, &session.workspace, &mut skills, &mut input).await {
                             Ok(count) => command_eprintln!("Reloaded: {count} skill commands."),
                             Err(error) => command_eprintln!("Error: {error:#}"),
@@ -1509,8 +1512,31 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     }
                 } else {
                     // Scripts and tests get the same Stats text without a terminal.
-                    match plugins_panel::load(&paths, &session).await {
-                        Ok(model) => command_eprintln!("{}", plugins_panel::stats_rows(&model, chrono::Utc::now(), true).join("\n")),
+                    match plugins_panel::load(&paths, &session, scope).await {
+                        Ok(model) => command_eprintln!("{}", plugins_panel::stats_rows(scope, &model, chrono::Utc::now(), true).join("\n")),
+                        Err(error) => command_eprintln!("Error: {error:#}"),
+                    }
+                }
+                continue;
+            }
+            if line.trim() == "/skills" {
+                if terminal::picker::available() {
+                    match plugins_panel::run(plugins_panel::Scope::Skills, "installed", &paths, &mut session, input.as_mut().unwrap()).await {
+                        Ok(true) => match reload_skill_commands(&paths, &session.workspace, &mut skills, &mut input).await {
+                            Ok(count) => command_eprintln!("Reloaded: {count} skill commands."),
+                            Err(error) => command_eprintln!("Error: {error:#}"),
+                        },
+                        Ok(false) => {},
+                        Err(error) => command_eprintln!("Error: {error:#}"),
+                    }
+                } else {
+                    // Scripts keep the full JSON listing.
+                    let manager = SkillsManager::with_path(paths.data_dir.join("skills"));
+                    match manager.load_skills().await {
+                        Ok(listed) => match serde_json::to_string_pretty(&listed) {
+                            Ok(text) => command_println!("{text}"),
+                            Err(error) => command_eprintln!("Error: {error:#}"),
+                        },
                         Err(error) => command_eprintln!("Error: {error:#}"),
                     }
                 }
@@ -1679,9 +1705,17 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 "/history" | "history" | ".history" => command_println!("{}", serde_json::to_string_pretty(&session.store.history(&session.id)?)?),
                 "/tools" | "tools" | ".tools" => {
                     let result = if terminal::picker::available() {
-                        tools_menu::run(&session.paths)
+                        plugins_panel::run(
+                            plugins_panel::Scope::Tools,
+                            "built-in",
+                            &paths,
+                            &mut session,
+                            input.as_mut().unwrap(),
+                        )
+                        .await
+                        .map(|_| ())
                     } else {
-                        tool_settings::print(&session.paths)
+                        tool_settings::print(&paths)
                     };
                     if let Err(error) = result { command_eprintln!("Tools: {error:#}"); }
                 },

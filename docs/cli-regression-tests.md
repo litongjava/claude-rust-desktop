@@ -318,7 +318,7 @@ cargo test --locked -p deepseek-code-cli --bin dcl -- monitor_events_are_queued_
 15. 请求级一致性：加载后让某个请求先遇到一次可重试错误，同一次逻辑请求的各次 HTTP 尝试携带相同的工具列表；请求快照的工具条目应逐项包含实际发送的名称、说明和参数 schema，token 估算应由该请求体重算得到相同结果；只有下一逻辑请求才按最新加载集合生成新列表，且加载后 schema 字节数确实增长。覆盖 OpenAI 与 Anthropic，并确认 Responses 适配结果。
 16. 实际压缩：先成功加载一个按需工具，执行一次真实压缩后重开会话，首个请求不再带该工具（摘要不能授权），模型重新加载后下一请求恢复。
 17. Responses 真实进程重启：用隔离数据目录 `config.json` 配置 Responses 适配供应商（模型 `api` 为 `openai-responses`，内置供应商 ID 为 `openai`），真实 `dcl` 进程加载后退出，`--resume` 新进程的首个 Responses 请求应包含此前加载的工具。不要用 `--base-url` 覆盖，它会清除内置供应商 ID。
-18. 命令改开关：在隔离数据目录执行 `dcl config set tools.<name>.enabled|on_demand true|false`，`dcl config show` 的 `tools` 项与文件内容一致；下一次模型请求的工具集合按新开关变化（两个都关的工具不出现且不能加载，只开启用的工具直接出现在请求里）。同一次写入把 `disabled_tools` 里的内置名折算成开关，非内置名保留。交互终端执行 `/tools`，用 `Space` 改“启用”、`Tab` 改“按需加载”，关闭面板后文件与面板一致；非终端下 `/tools` 打印文本清单。`crates/cli/src/tool_settings.rs` 的单元测试覆盖只改一个开关、双关、迁移保留非内置名和非法输入。
+18. 命令改开关：在隔离数据目录执行 `dcl config set tools.<name>.enabled|on_demand true|false`，`dcl config show` 的 `tools` 项与文件内容一致；下一次模型请求的工具集合按新开关变化（两个都关的工具不出现且不能加载，只开启用的工具直接出现在请求里）。同一次写入把 `disabled_tools` 里的内置名折算成开关，非内置名保留。交互终端执行 `/tools`，面板以 `Built-in / Skills / Mcp / Plugin` 四个标签打开：`Built-in` 用 `Space` 改“启用”、`Tab` 改“按需加载”；`Skills` 复用技能行；`Mcp` 复用服务器行（启动失败标记在行上，详情里给首行错误）；`Plugin` 只列插件包。关闭面板后文件与面板一致；非终端下 `/tools` 打印文本清单。`/skills` 打开同款整页面板（`Installed / Errors / Stats`，只含技能）；`/plugins` 打开同款面板但只列插件包；`/skills state`、`dcl config set tools...` 的脚本路径不变。`crates/cli/src/tool_settings.rs` 的单元测试覆盖只改一个开关、双关、迁移保留非内置名和非法输入；`plugins_panel::tests`（`cargo test --locked -p deepseek-code-cli --bin dcl plugins_panel::tests`）覆盖三种标题的标签栏、scope 过滤、插件统计和 MCP 失败标记。
 
 19. 精确名称：`ToolLoad` 接收 `{"names":["WebSearch","ListDir"]}`。数组含 1–64 个非空字符串，名称区分大小写，重复项按首次出现的位置处理。已在请求中或已加载的工具作为 `already_available` 返回，避免重复加载。未知或不可用的名称逐项报告；调用报错且本次不加载任何工具。测试还验证空数组、字符串、额外字段、大小写错误、关键词及 `select:` 输入。
 
@@ -607,7 +607,7 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 在有一个格式错误 `SKILL.md` 的工作区（例如 `.claude/skills/bad/SKILL.md` 的 frontmatter 不是有效 YAML）启动 `dcl`，并用本地模拟接口记录模型请求数：
 
 1. 输入 `/doctor errors`：输出列出该文件的 `skill definition:` 与 `definition skipped`，末尾说明可以用 `/doctor` 让模型协助；期间不产生新的模型请求。
-2. 输入 `/doctor skills`：输出与 `/plugins` 的 Stats 选项卡相同（每个技能的上下文开销、7 天 token、使用次数、最近使用，以及 MCP 服务的状态与开销），同样不产生模型请求。
+2. 输入 `/doctor skills`：输出与 `/skills` 的 Stats 选项卡相同（每个技能的上下文开销、7 天 token、使用次数、最近使用），同样不产生模型请求；MCP 状态与开销已移到 `/tools` 的 Mcp 标签。
 3. 输入 `/doctor skills now` 或 `/doctor prompt-audit`：仍交给 `doctor` skill 并调用模型，确认只有精确的 `/doctor skills` 和 `/doctor errors` 走本地路径。
 
 ### 第十一轮：SDK 回合内引导（mid-turn steering）

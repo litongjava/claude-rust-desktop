@@ -52,8 +52,9 @@ pub(crate) fn errors_text(checks: &[DoctorCheck], failed_mcp: &[(String, String)
 pub(crate) async fn run(name: &str, paths: &RuntimePaths, session: &Session) -> Result<String> {
     match name {
         "skills" => {
-            let model = plugins_panel::load(paths, session).await?;
-            Ok(plugins_panel::stats_rows(&model, chrono::Utc::now(), false).join("\n"))
+            let scope = plugins_panel::Scope::Skills;
+            let model = plugins_panel::load(paths, session, scope).await?;
+            Ok(plugins_panel::stats_rows(scope, &model, chrono::Utc::now(), false).join("\n"))
         }
         "errors" => {
             let mut failed_mcp = Vec::new();

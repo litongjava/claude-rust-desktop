@@ -6,7 +6,6 @@ use anyhow::{ensure, Result};
 use deepseek_code_core::{
     db::conversation_repo,
     runtime::{RuntimePaths, SessionStore},
-    skills::SkillsManager,
 };
 
 /// The whole conversation for the Ctrl+O transcript, as in the reference CLI:
@@ -796,14 +795,6 @@ pub async fn handle(
                 .db
                 .conversations()?;
             command_println!("{}", serde_json::to_string_pretty(&sessions)?);
-        }
-        "/skills" => {
-            ensure!(argument.trim().is_empty(), "Usage: /skills");
-            let manager = SkillsManager::with_path(paths.data_dir.join("skills"));
-            command_println!(
-                "{}",
-                serde_json::to_string_pretty(&manager.load_skills().await?)?
-            );
         }
         "/mcp" if argument.trim().is_empty() && crate::terminal::picker::available() => {
             crate::mcp_menu::run(session).await?;
