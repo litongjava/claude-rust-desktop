@@ -6,6 +6,7 @@
 //! built-in tools keep the resident/on-demand switches the Desktop page writes.
 use crate::session::Session;
 use crate::tool_settings;
+use crate::terminal::input::editor::Screen;
 use crate::terminal::input::TerminalInput;
 use crate::terminal::picker::{details_from_top, Entry, Key, Picked, Picker};
 use anyhow::Result;
@@ -1217,6 +1218,9 @@ pub(crate) async fn run(
     let mut show_disabled = false;
     let mut changed = false;
     let mut notice: Option<String> = None;
+    // Reused across picker calls so a Space toggle repaints the changed row
+    // instead of rebuilding and scrolling the whole view.
+    let mut frame = Screen::default();
     loop {
         // Errors and Stats are read-only pages.
         if matches!(scope, Scope::Plugins | Scope::Skills) && tab > 0 {
@@ -1236,11 +1240,24 @@ pub(crate) async fn run(
                     Some('>') => 1,
                     _ => return Ok(changed),
                 };
+            // The details view used its own frame; force the picker to repaint.
+            frame.reflow();
             tab = (tab as isize + step).rem_euclid(tabs.len() as isize) as usize;
             continue;
         }
 
         let rows = picker_rows(scope, tab, &model, show_disabled);
+        // Group headers are separators: start on the first row that acts.
+        if matches!(scope, Scope::Tools) {
+            if let Some((_, Target::Header)) = rows.get(selected) {
+                if let Some(next) = rows
+                    .iter()
+                    .position(|(_, target)| !matches!(target, Target::Header))
+                {
+                    selected = next;
+                }
+            }
+        }
         let entries: Vec<Entry> = rows
             .iter()
             .map(|(entry, _)| Entry {
@@ -1249,16 +1266,23 @@ pub(crate) async fn run(
             })
             .collect();
         let bar = tab_bar(scope.title(), tabs, tab);
+        // Keep the notice on the always-present heading line: a subtitle adds
+        // a row and shifts the whole list, which turns one toggle into a full
+        // repaint.
+        let heading = match &notice {
+            Some(note) => format!("{bar}  \u{b7}  {note}"),
+            None => bar,
+        };
         let (hint, keys) = picker_hint(scope, tab);
         let picker = Picker {
-            heading: &bar,
-            subtitle: notice.as_deref(),
+            heading: &heading,
+            subtitle: None,
             entries: &entries,
             search: true,
             hint,
             selected,
         };
-        let (index, key) = match picker.run_keys_filling(keys)? {
+        let (index, key) = match picker.run_keys_filling_with(keys, &mut frame)? {
             Picked::Key(Key::Left, _) => {
                 tab = (tab + tabs.len() - 1) % tabs.len();
                 continue;
@@ -1297,6 +1321,7 @@ pub(crate) async fn run(
                             changed = true;
                             model = load(paths, session, scope).await?;
                         }
+                        frame.reflow();
                     }
                     _ => {}
                 }
@@ -1306,6 +1331,7 @@ pub(crate) async fn run(
                     if let Some(plugin) = model.plugins.iter().find(|plugin| plugin.id == id) {
                         plugin_details(plugin, Utc::now())?;
                     }
+                    frame.reflow();
                     continue;
                 }
                 let enabled = model
@@ -1337,18 +1363,23 @@ pub(crate) async fn run(
                     Some(Key::Space) => {
                         set_mcp_state(paths, session, &server, space_mcp_state(current)).await?;
                     }
-                    None => match pick_mcp_state(&name, current)? {
-                        Some(McpStateChoice::State(state)) => {
-                            set_mcp_state(paths, session, &server, state).await?
-                        }
-                        Some(McpStateChoice::Details) => {
-                            if let Some(row) = model.mcp.iter().find(|server| server.name == name) {
-                                mcp_details(row, Utc::now())?;
+                    None => {
+                        let choice = pick_mcp_state(&name, current)?;
+                        frame.reflow();
+                        match choice {
+                            Some(McpStateChoice::State(state)) => {
+                                set_mcp_state(paths, session, &server, state).await?
                             }
-                            continue;
+                            Some(McpStateChoice::Details) => {
+                                if let Some(row) = model.mcp.iter().find(|server| server.name == name) {
+                                    mcp_details(row, Utc::now())?;
+                                }
+                                frame.reflow();
+                                continue;
+                            }
+                            None => continue,
                         }
-                        None => continue,
-                    },
+                    }
                     _ => continue,
                 }
                 changed = true;
@@ -1370,13 +1401,20 @@ pub(crate) async fn run(
                     tool_settings::Switch::Enabled => row.enabled,
                     tool_settings::Switch::OnDemand => row.on_demand,
                 };
-                notice = Some(match tool_settings::set(paths, &name, switch, !current) {
+                match tool_settings::set(paths, &name, switch, !current) {
                     Ok((name, saved)) => {
-                        format!("{name}: {}", tool_settings::summary(saved.loading(&name)))
+                        notice = Some(format!("{name}: {}", tool_settings::summary(saved.loading(&name))));
+                        // Update in memory: a full reload also reopens MCP and
+                        // would repaint the list for a single switch.
+                        if let Some(row) = model.tools.iter_mut().find(|tool| tool.name == name) {
+                            match switch {
+                                tool_settings::Switch::Enabled => row.enabled = !current,
+                                tool_settings::Switch::OnDemand => row.on_demand = !current,
+                            }
+                        }
                     }
-                    Err(error) => format!("{error:#}"),
-                });
-                model = load(paths, session, scope).await?;
+                    Err(error) => notice = Some(format!("{error:#}")),
+                }
             }
         }
     }

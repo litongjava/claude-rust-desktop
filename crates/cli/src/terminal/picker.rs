@@ -56,6 +56,16 @@ fn with_raw<T>(run: impl FnOnce(&mut dyn FnMut() -> io::Result<Option<Event>>) -
     }
     let mut reader = super::paste_input::Reader::new()?;
     let result = run(&mut || reader.next(std::time::Duration::from_millis(100)));
+    // A picker returns on key-down. Give the terminal time to deliver the
+    // matching key-up, then discard it: a half-arrived escape sequence read
+    // by the next picker looks like a bare Esc and closes the panel.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    for _ in 0..64 {
+        match reader.next(std::time::Duration::ZERO) {
+            Ok(Some(_)) => continue,
+            _ => break,
+        }
+    }
     drop(reader);
     if !raw {
         terminal::disable_raw_mode()?;
@@ -82,6 +92,13 @@ impl Picker<'_> {
         with_raw(|next| self.drive_keys(keys, true, next))
     }
 
+    /// Like `run_keys_filling`, but reuses `screen` so a caller that stays on
+    /// the same frame only repaints the lines that changed. The caller must
+    /// call `Screen::reflow` after another view has drawn over the frame.
+    pub fn run_keys_filling_with(&self, keys: &[Key], screen: &mut Screen) -> io::Result<Picked> {
+        with_raw(|next| self.drive_keys_with(keys, true, screen, next, true))
+    }
+
     fn drive(&self, next_event: &mut dyn FnMut() -> io::Result<Option<Event>>) -> io::Result<Option<usize>> {
         Ok(match self.drive_keys(&[], false, next_event)? {
             Picked::Entry(index) => Some(index),
@@ -91,6 +108,21 @@ impl Picker<'_> {
 
     fn drive_keys(&self, keys: &[Key], fill: bool, next_event: &mut dyn FnMut() -> io::Result<Option<Event>>) -> io::Result<Picked> {
         let mut screen = Screen::default();
+        self.drive_keys_with(keys, fill, &mut screen, next_event, false)
+    }
+
+    /// `keep_frame_on_key` leaves the drawn frame in place when a caller-owned
+    /// key is returned. A caller that redraws the same screen then repaints
+    /// only the changed rows; erasing first would leave the rest blank because
+    /// the screen still remembers the old frame.
+    fn drive_keys_with(
+        &self,
+        keys: &[Key],
+        fill: bool,
+        screen: &mut Screen,
+        next_event: &mut dyn FnMut() -> io::Result<Option<Event>>,
+        keep_frame_on_key: bool,
+    ) -> io::Result<Picked> {
         let mut query = String::new();
         let mut selected = self.selected;
         loop {
@@ -120,7 +152,9 @@ impl Picker<'_> {
                 _ => None,
             };
             if let Some(extra) = extra.filter(|extra| keys.contains(extra)) {
-                screen.suspend()?;
+                if !keep_frame_on_key {
+                    screen.suspend()?;
+                }
                 return Ok(Picked::Key(extra, shown.get(selected).copied()));
             }
             match key.code {
