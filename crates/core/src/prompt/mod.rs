@@ -67,8 +67,11 @@ pub fn standalone_frontend_reminder() -> String {
 pub const LOADABLE_TOOLS_LEAD_IN: &str =
     "Tools you can load with ToolLoad (pass exact names in the names array):";
 
-/// The lead-in of the reminder that lists the model-invocable skills.
-pub const SKILLS_LEAD_IN: &str = "Available skills: invoke the Skill tool with skill=name and optional args. Do not bypass Skill by reading its template: fork isolation and approved shell context must run through the tool.";
+/// The lead-in of the reminder that lists the model-invocable skills. This is
+/// the only place the invocation rule lives, so it names the exact argument,
+/// covers questions about skills themselves, and forbids reading a skill's
+/// files or the CLI instead.
+pub const SKILLS_LEAD_IN: &str = "Available skills: invoke the Skill tool with {\"skill\":\"<name>\"} and optional args; its instructions come back immediately in this turn. Use it when the user asks what a skill does, where skills live, or how to create or load one. Do not open a skill's SKILL.md or INSTRUCTIONS.md with Read or Bash instead: fork isolation and approved shell context must run through the tool.";
 
 /// The first sentence of a description, whitespace collapsed and cut to
 /// `limit` characters. The loadable-tool listing uses 100.
@@ -1443,6 +1446,23 @@ mod tests {
         for path in crate::session_files::files_for_session(root.path(), "recent") {
             assert!(path.exists(), "recent file pruned: {}", path.display());
         }
+    }
+
+    #[test]
+    fn skill_invocation_is_declared_in_the_reminder_not_the_system_prompt() {
+        let system = compose_system_prompt(None, PromptProfile::Desktop);
+        assert!(
+            !system.contains("read its instructions with an available tool"),
+            "the conflicting clause must not come back: {system}"
+        );
+        // code.md keeps the slash-command rule and must name the same tool.
+        assert!(system.contains("invoke it via Skill"));
+        assert!(SKILLS_LEAD_IN.contains("{\"skill\":\"<name>\"}"));
+        assert!(SKILLS_LEAD_IN.contains("Skill tool"));
+        assert!(!SKILLS_LEAD_IN.contains("ToolLoad"));
+        assert!(skills_reminder(&["- demo: Demo".to_owned()])
+            .unwrap()
+            .contains(SKILLS_LEAD_IN));
     }
 
     #[test]
