@@ -810,7 +810,96 @@ fn mcp_entries(model: &Model, show_disabled: bool) -> Vec<(Entry, Target)> {
     rows
 }
 
-/// Every built-in tool with its two switches and schema cost.
+/// Stable display groups for the built-in catalog. A tool missing here falls
+/// into "Other" instead of disappearing; `every_builtin_tool_has_one_group`
+/// keeps the map aligned with the catalog.
+const TOOL_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Files & workspace",
+        &[
+            "ApplyPatch",
+            "Edit",
+            "EnterWorktree",
+            "ExitWorktree",
+            "Glob",
+            "Grep",
+            "LSP",
+            "ListDir",
+            "MultiEdit",
+            "NotebookEdit",
+            "Read",
+            "Write",
+        ],
+    ),
+    ("Shell & system", &["Bash", "Monitor", "computer_use"]),
+    ("Web & services", &["GitHub", "ImageGenerate", "WebFetch", "WebSearch"]),
+    (
+        "Agents & delegation",
+        &[
+            "Agent",
+            "ClaudeCode",
+            "Codex",
+            "DeepSeekCode",
+            "ListAgents",
+            "SendMessage",
+            "team",
+        ],
+    ),
+    (
+        "Tasks & plans",
+        &[
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "TaskCreate",
+            "TaskGet",
+            "TaskInput",
+            "TaskList",
+            "TaskStop",
+            "TaskUpdate",
+            "TodoRead",
+            "TodoWrite",
+        ],
+    ),
+    (
+        "Automation",
+        &[
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "PluginRun",
+            "ProposeGoal",
+            "ReportFindings",
+            "ScheduleWakeup",
+            "ToolScript",
+            "Workflow",
+        ],
+    ),
+    (
+        "Context & interaction",
+        &[
+            "AskUserQuestion",
+            "CompactContext",
+            "Config",
+            "ContextSearch",
+            "Skill",
+            "SyntheticOutput",
+            "ToolLoad",
+            "brief",
+        ],
+    ),
+];
+
+const OTHER_TOOL_GROUP: &str = "Other";
+
+fn tool_group(name: &str) -> &'static str {
+    TOOL_GROUPS
+        .iter()
+        .find(|(_, names)| names.contains(&name))
+        .map_or(OTHER_TOOL_GROUP, |(group, _)| *group)
+}
+
+/// Every built-in tool with its two switches and schema cost, grouped so the
+/// 50+ row catalog stays scannable.
 fn tool_entries(model: &Model) -> Vec<(Entry, Target)> {
     let width = model
         .tools
@@ -819,34 +908,56 @@ fn tool_entries(model: &Model) -> Vec<(Entry, Target)> {
         .max()
         .unwrap_or(0)
         .clamp("tool".len(), 28);
-    let mut tools: Vec<&ToolRow> = model.tools.iter().collect();
-    tools.sort_by(|a, b| a.name.cmp(&b.name));
-    tools
-        .into_iter()
-        .map(|tool| {
-            let mark = if tool.enabled { "\u{2714}" } else { "\u{25cb}" };
-            let status = tool_settings::summary(ToolLoading {
-                enabled: tool.enabled,
-                on_demand: tool.on_demand,
-            });
-            let mut title = format!(
-                "{mark} {:<width$} Tool     {status} \u{b7} ~{} tok",
-                tool.name,
-                tool.context_tokens,
-                width = width
-            );
-            if tool.core {
-                title.push_str(" \u{b7} core");
-            }
-            (
-                Entry {
-                    title,
-                    detail: String::new(),
-                },
-                Target::Tool(tool.name.clone()),
-            )
-        })
-        .collect()
+    let mut rows = Vec::new();
+    let mut remaining: Vec<&ToolRow> = model.tools.iter().collect();
+    for (group, names) in TOOL_GROUPS {
+        let mut tools: Vec<&ToolRow> = remaining
+            .iter()
+            .copied()
+            .filter(|tool| names.contains(&tool.name.as_str()))
+            .collect();
+        if tools.is_empty() {
+            continue;
+        }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.push(header(group));
+        for tool in tools {
+            rows.push(tool_entry(tool, width));
+        }
+        remaining.retain(|tool| !names.contains(&tool.name.as_str()));
+    }
+    if !remaining.is_empty() {
+        remaining.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.push(header(OTHER_TOOL_GROUP));
+        for tool in remaining {
+            rows.push(tool_entry(tool, width));
+        }
+    }
+    rows
+}
+
+fn tool_entry(tool: &ToolRow, width: usize) -> (Entry, Target) {
+    let mark = if tool.enabled { "\u{2714}" } else { "\u{25cb}" };
+    let status = tool_settings::summary(ToolLoading {
+        enabled: tool.enabled,
+        on_demand: tool.on_demand,
+    });
+    let mut title = format!(
+        "{mark} {:<width$} Tool     {status} \u{b7} ~{} tok",
+        tool.name,
+        tool.context_tokens,
+        width = width
+    );
+    if tool.core {
+        title.push_str(" \u{b7} core");
+    }
+    (
+        Entry {
+            title,
+            detail: String::new(),
+        },
+        Target::Tool(tool.name.clone()),
+    )
 }
 
 /// The Errors tab. Skills lists unreadable skill files; Plugins has no failure
@@ -1388,6 +1499,55 @@ mod tests {
         assert_eq!(tab_bar("Plugins", &TABS, 0), "Plugins  [Installed]   Errors   Stats");
         assert_eq!(tab_bar("Skills", &TABS, 2), "Skills  Installed   Errors   [Stats]");
         assert_eq!(tab_bar("Tools", &TOOL_TABS, 1), "Tools  Built-in   [Skills]   Mcp   Plugin");
+    }
+
+    #[test]
+    fn every_builtin_tool_has_one_group() {
+        let total: usize = TOOL_GROUPS.iter().map(|(_, names)| names.len()).sum();
+        let grouped: std::collections::BTreeSet<String> = TOOL_GROUPS
+            .iter()
+            .flat_map(|(_, names)| names.iter().map(|name| (*name).to_owned()))
+            .collect();
+        assert_eq!(total, grouped.len(), "a tool is listed in two groups");
+        let catalog: std::collections::BTreeSet<String> = builtin_tool_catalog()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert_eq!(
+            catalog, grouped,
+            "classify new tools in TOOL_GROUPS or drop removed ones"
+        );
+        assert_eq!(tool_group("NoSuchTool"), OTHER_TOOL_GROUP);
+    }
+
+    #[test]
+    fn tool_rows_are_grouped_with_an_other_fallback() {
+        let tool = |name: &str| ToolRow {
+            name: name.to_owned(),
+            core: false,
+            enabled: false,
+            on_demand: true,
+            context_tokens: 10,
+        };
+        let model = Model {
+            skills: Vec::new(),
+            plugins: Vec::new(),
+            mcp: Vec::new(),
+            tools: vec![tool("Write"), tool("Bash"), tool("Agent"), tool("Mystery")],
+        };
+        let rows = tool_entries(&model);
+        let titles: Vec<&str> = rows.iter().map(|(entry, _)| entry.title.as_str()).collect();
+        assert_eq!(titles[0], "Files & workspace");
+        assert!(titles[1].contains("Write"), "{}", titles[1]);
+        assert_eq!(titles[2], "Shell & system");
+        assert!(titles[3].contains("Bash"), "{}", titles[3]);
+        assert_eq!(titles[4], "Agents & delegation");
+        assert!(titles[5].contains("Agent"), "{}", titles[5]);
+        assert_eq!(titles[6], OTHER_TOOL_GROUP);
+        assert!(titles[7].contains("Mystery"), "{}", titles[7]);
+        assert!(rows
+            .iter()
+            .any(|(_, target)| *target == Target::Tool("Mystery".to_owned())));
     }
 
     #[test]
