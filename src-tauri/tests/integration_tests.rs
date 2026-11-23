@@ -76,7 +76,8 @@ async fn test_stream_manager_creation() {
 
 #[tokio::test]
 async fn test_skills_manager_creation() {
-    let manager = SkillsManager::new();
+    let directory = tempfile::tempdir().unwrap();
+    let manager = SkillsManager::with_path(directory.path().join("skills"));
     let result = manager.install_bundled_skills();
     assert!(result.is_ok() || true);
 }

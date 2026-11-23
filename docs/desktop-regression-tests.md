@@ -116,9 +116,9 @@ Desktop 的自动压缩、手动压缩和局部摘要都调用 `crates/core` 的
 
 Desktop 的模型技能列表和 `Skill` 工具与 CLI 共用 `crates/core` 的发现入口，改动 `skills/discovery.rs`、`native_engine/engine_core.rs` 的技能列表或 `native_engine/skill_tool.rs` 时，除 `docs/cli-regression-tests.md` 的 N 节外，在桌面窗口确认：
 
-1. 用独立数据目录启动 Desktop，`CLAUDE_CONFIG_DIR` 指向空目录，只在 `<数据目录>/skills/<名称>/SKILL.md` 放一个技能，发送普通请求：模型的 `Available skills` 含该名称。
+1. 用独立数据目录启动 Desktop，只在 `<数据目录>/skills/<名称>/SKILL.md` 放一个技能，发送普通请求：模型的 `Available skills` 含该名称。
 2. 让模型调用 `Skill`：工具成功，说明中的技能目录是数据目录下的真实路径，引用 `references/...` 可读取。
-3. 同名技能放在工作区 `.claude/skills`、数据目录和 `~/.claude`：项目优先，其次数据目录，最后 Claude 用户；模型列表只出现一项，技能面板/斜杠名称一致。
+3. 同名技能放在工作区 `.agents/skills`、`.claude/skills` 和数据目录：按 `.agents` > `.claude` > 数据目录选择，模型列表只出现一项，技能面板/斜杠名称一致；`~/.claude` 不参与发现。
 4. `enabled: false` 与 `disable-model-invocation` 的显示和调用行为与 CLI 一致。
 5. `<数据目录>/skills/bundled`、`mcp` 中的同名副本不覆盖内置工作流。
 

@@ -118,11 +118,11 @@ pub fn installed_bundled_skills(data_dir: &Path) -> BTreeMap<String, PathBuf> {
 
 /// One resolver for the model-visible listing, the `Skill` tool and the CLI
 /// slash list. Precedence, lowest to highest: installed built-in skills under
-/// `<data dir>/skills/bundled`, other `<data dir>/skills` entries, then
-/// `<workspace>/.claude`. The data directory is the only user scope; the
-/// Claude-compatible user directory is not read. Data-directory names keep the
-/// pre-round-01 lowercase slugs (see [`scan_data_dir`]); built-in and project
-/// names keep their existing spelling.
+/// `<data dir>/skills/bundled`, other `<data dir>/skills` entries,
+/// `<workspace>/.claude`, then `<workspace>/.agents`. The data directory is the
+/// only user scope; the Claude-compatible user directory is not read.
+/// Data-directory names keep the pre-round-01 lowercase slugs (see
+/// [`scan_data_dir`]); built-in and project names keep their existing spelling.
 pub fn discover(data_dir: &Path, workspace: &Path) -> Result<BTreeMap<String, SkillCommand>> {
     Ok(discover_runtime_from(data_dir, workspace).0)
 }
@@ -148,6 +148,11 @@ pub fn discover_runtime_from(
         &mut commands,
         Some(&mut invalid),
     );
+    let _ = scan_config_impl(
+        &workspace.join(".agents"),
+        &mut commands,
+        Some(&mut invalid),
+    );
     super::states::apply_in(
         &mut commands,
         &super::states::load(data_dir),
@@ -167,6 +172,11 @@ pub fn discover_available_from(
     let mut invalid = Vec::new();
     let _ = scan_config_impl(
         &workspace.join(".claude"),
+        &mut commands,
+        Some(&mut invalid),
+    );
+    let _ = scan_config_impl(
+        &workspace.join(".agents"),
         &mut commands,
         Some(&mut invalid),
     );
@@ -190,6 +200,7 @@ fn log_invalid(invalid: &[PathBuf]) {
 pub fn discover_from(workspace: &Path) -> Result<BTreeMap<String, SkillCommand>> {
     let mut commands = BTreeMap::new();
     scan_config(&workspace.join(".claude"), &mut commands)?;
+    scan_config(&workspace.join(".agents"), &mut commands)?;
     Ok(commands)
 }
 
@@ -1021,6 +1032,38 @@ mod tests {
                 .replace('\\', "/")
         ));
         assert!(rendered.contains("references/setup.md"));
+    }
+
+    #[test]
+    fn runtime_discovery_reads_agents_skills_and_prefers_them_over_claude() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        let data = temp.path().join("data");
+        write_skill(
+            &workspace.join(".claude/skills"),
+            "shared",
+            "---\nname: shared\ndescription: CLAUDE\n---\nCLAUDE",
+        );
+        write_skill(
+            &workspace.join(".agents/skills"),
+            "shared",
+            "---\nname: shared\ndescription: AGENTS\n---\nAGENTS",
+        );
+        write_skill(
+            &workspace.join(".agents/skills"),
+            "agents-only",
+            "---\nname: agents-only\ndescription: ONLY\n---\nONLY",
+        );
+
+        let (found, invalid) = discover_runtime_from(&data, &workspace);
+        assert!(invalid.is_empty(), "{invalid:?}");
+        assert_eq!(found["shared"].description, "AGENTS");
+        assert!(found["shared"].path.starts_with(workspace.join(".agents")));
+        assert_eq!(found["agents-only"].description, "ONLY");
+
+        std::fs::remove_dir_all(workspace.join(".agents/skills/shared")).unwrap();
+        let (found, _) = discover_runtime_from(&data, &workspace);
+        assert_eq!(found["shared"].description, "CLAUDE");
     }
 
     #[test]
