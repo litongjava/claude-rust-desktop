@@ -3021,6 +3021,17 @@ async fn file_memory_tool_dispatch_preserves_path_rules_hooks_roles_and_plan() {
         .unwrap();
     let memory = FileMemory::session(&service, &session).unwrap();
     let path = memory.directory.join("test.md");
+    // The rule syntax treats a leading "/" as workspace-relative. On Unix an
+    // absolute path therefore starts with "//" after this prefix; a Windows
+    // drive path is already absolute. Strip the extended-length prefix the
+    // canonical temp directory may carry: rules are written in user-facing
+    // paths, and the matcher resolves the real path separately.
+    let display = path.to_string_lossy().into_owned();
+    let rule_path = if cfg!(windows) {
+        display.strip_prefix(r"\\?\").unwrap_or(&display).to_owned()
+    } else {
+        format!("/{display}")
+    };
     let input = json!({"file_path":path,"content":"---\nname: Testing\ndescription: Test preferences\nmetadata:\n  type: user\n---\nUse isolated fixtures\n"});
     let mut executor = executor(temp.path())
         .with_conv_id(session.clone())
@@ -3033,7 +3044,7 @@ async fn file_memory_tool_dispatch_preserves_path_rules_hooks_roles_and_plan() {
     pm.set_session_rules(
         &session,
         HashMap::from([(
-            format!("Write(/{})", path.display()),
+            format!("Write({rule_path})"),
             PermissionAction::Deny,
         )]),
     );
@@ -3048,7 +3059,7 @@ async fn file_memory_tool_dispatch_preserves_path_rules_hooks_roles_and_plan() {
     pm.set_session_rules(
         &session,
         HashMap::from([(
-            format!("Write(/{})", path.display()),
+            format!("Write({rule_path})"),
             PermissionAction::Confirm,
         )]),
     );
