@@ -3,9 +3,10 @@
 //! A skill without an entry gets its default state: [`SkillState::User`], except
 //! the bundled translation skills, which default to [`SkillState::UserOnly`],
 //! and installed built-in skills, which default to [`SkillState::Off`] except
-//! `skill-creator` and `codegraph` when CodeGraph is installed. Existing
-//! installations therefore keep a stored user choice until the user changes it,
-//! while a built-in the user never touched follows the current defaults.
+//! `skill-creator`, the repository tooling skills, and `codegraph` when CodeGraph
+//! is installed. Existing installations therefore keep a stored user choice
+//! until the user changes it, while a built-in the user never touched follows
+//! the current defaults.
 use crate::skills::discovery::SkillCommand;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -111,7 +112,10 @@ pub fn default_state(name: &str) -> SkillState {
 /// over this function, so a user choice survives upgrades and reinstallation.
 pub fn bundled_default_state(name: &str) -> SkillState {
     match name {
-        "skill-creator" => SkillState::User,
+        "skill-creator"
+        | "test-dcl"
+        | "llm-proxy-data-troubleshooting"
+        | "project-docs" => SkillState::User,
         "codegraph" if codegraph_installed() => SkillState::User,
         _ => SkillState::Off,
     }
@@ -396,12 +400,19 @@ mod tests {
     }
 
     #[test]
-    fn bundled_defaults_disable_every_builtin_except_skill_creator_and_installed_codegraph() {
+    fn bundled_defaults_enable_the_always_available_toolkit() {
         let _lock = PATH_ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let empty = tempfile::tempdir().unwrap();
         let _path = PathGuard::set(empty.path());
 
-        assert_eq!(bundled_default_state("skill-creator"), SkillState::User);
+        for name in [
+            "skill-creator",
+            "test-dcl",
+            "llm-proxy-data-troubleshooting",
+            "project-docs",
+        ] {
+            assert_eq!(bundled_default_state(name), SkillState::User, "{name}");
+        }
         for name in ["codegraph", "docx", "task-template", "translate-zh-en"] {
             assert_eq!(bundled_default_state(name), SkillState::Off, "{name}");
         }
