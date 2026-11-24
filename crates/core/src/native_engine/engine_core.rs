@@ -1290,6 +1290,8 @@ impl QueryEngine {
                 compaction_requests,
                 true,
                 true,
+                self.permission_host_available
+                    .load(std::sync::atomic::Ordering::Relaxed),
             );
             let catalog = customization.described(catalog);
             crate::native_engine::tool_loop::loadable_tool_lists(

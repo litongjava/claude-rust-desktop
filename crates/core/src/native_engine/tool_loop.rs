@@ -1294,8 +1294,12 @@ pub(crate) fn builtin_catalog_for_session(
     compaction_requests: bool,
     delegation: bool,
     workflow: bool,
+    interactive_user: bool,
 ) -> Vec<crate::tools::ToolDefinition> {
     let mut tools = get_tool_definitions();
+    if !interactive_user {
+        tools.retain(|tool| tool.name != "AskUserQuestion");
+    }
     if !session_search {
         tools.retain(|tool| tool.name != crate::tools::context_search::NAME);
     }
@@ -2430,10 +2434,13 @@ impl ToolLoopExecutor {
     /// The system prompt sent with this request. The loadable-tool and skill
     /// lists travel in the first user message, not here.
     fn request_system_prompt(&self) -> Option<String> {
-        self.system_prompt
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-            .map(str::to_owned)
+        let mut prompt = self.system_prompt.clone().unwrap_or_default();
+        if !self.permission_host_available {
+            prompt.push_str(
+                "\n\n# Interactive user\n- Interactive user: no (do not call AskUserQuestion)",
+            );
+        }
+        (!prompt.trim().is_empty()).then_some(prompt)
     }
 
     /// Validate the full list before granting any definitions to the next request.
@@ -3335,6 +3342,11 @@ impl ToolLoopExecutor {
     /// policy and before MCP or the user's own tools are added.
     fn builtin_catalog(&self) -> Vec<crate::tools::ToolDefinition> {
         let mut tools = get_tool_definitions();
+        if !self.permission_host_available {
+            // Asking the user needs a host that can answer. A non-interactive
+            // run must not be offered a tool that can only time out.
+            tools.retain(|tool| tool.name != "AskUserQuestion");
+        }
         if self.session_search_storage().is_none() {
             tools.retain(|tool| tool.name != crate::tools::context_search::NAME);
         }

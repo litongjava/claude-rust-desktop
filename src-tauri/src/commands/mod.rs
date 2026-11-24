@@ -1499,7 +1499,6 @@ pub async fn set_permission_mode(
         if mode_enum == PermissionMode::BypassPermissions && !perm_mgr.bypass_available() {
             return Err("Bypass is unavailable for this execution host".into());
         }
-        if mode_enum == PermissionMode::Auto { return Err("Auto permissions are currently a CLI/SDK extension; Desktop requires session-specific authority before enabling this mode".into()); }
         perm_mgr.set_mode(mode_enum);
         Ok(())
     } else {

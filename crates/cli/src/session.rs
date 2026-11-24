@@ -851,9 +851,11 @@ impl Session {
             PermissionModeArg::DontAsk => PermissionMode::DontAsk,
             PermissionModeArg::Auto => PermissionMode::Auto,
         };
+        // A default launch must not overwrite the stored mode of a resumed
+        // session; only flags that change authority explicitly do.
         let explicit_mode = cli.permission_mode_explicit
             || cli.dangerously_skip_permissions
-            || !matches!(cli.permission_mode, PermissionModeArg::Ask);
+            || cli.full_access;
         // Clear what exited processes left behind, so a crash cannot block this resume.
         let settled = if internal_worker {
             None
@@ -886,7 +888,7 @@ impl Session {
             anyhow::ensure!(cli.allowed_tools.is_empty() && cli.disallowed_tools.is_empty(), "This session has active background work; attach without launch tool rules, or stop the worker before changing them");
             anyhow::ensure!(!explicit_mode, "This session has active background work; resume without an explicit permission mode and use /tasks attach {} to change its mode", job.id);
         }
-        let selected_mode = if explicit_mode {
+        let mut selected_mode = if explicit_mode {
             selected_mode
         } else {
             deepseek_code_core::services::session_permission_mode::load(&store.db, &id)?
@@ -905,13 +907,27 @@ impl Session {
                     &selection.model,
                 )
                 .context("Main model unavailable")?;
-            deepseek_code_core::native_engine::auto_permissions::configured(
+            let configured = deepseek_code_core::native_engine::auto_permissions::configured(
                 &crate::services::context(paths)?,
                 &deepseek_code_core::native_engine::provider_manager::ResolvedProvider {
                     provider: provider.clone(),
                     model,
                 },
-            )?;
+            );
+            if let Err(error) = configured {
+                // Auto is the default, but it is only a valid mode with a
+                // configured classifier. Keep an ordinary launch usable and
+                // fall back to the manual mode; an explicit choice still
+                // reports why it cannot be honored.
+                anyhow::ensure!(
+                    !explicit_mode,
+                    "Auto mode is unavailable: {error:#}; configure permissions.auto or choose another mode"
+                );
+                eprintln!(
+                    "Auto mode is unavailable ({error:#}); using ask permissions for this session."
+                );
+                selected_mode = PermissionMode::AskPermissions;
+            }
         }
         if active_job.is_some() {
             permissions.set_mode(selected_mode);
@@ -3327,7 +3343,7 @@ async fn turn_answer(
     }
     progress.clear();
     let reader = input.as_mut().context(
-        "User input required in non-interactive mode; resume this session interactively",
+        "No interactive user is attached; state your assumption and continue or stop before an irreversible action",
     )?;
     eprintln!("\n{question}");
     read_answer(reader).await
@@ -4000,7 +4016,7 @@ mod event_tests {
         assert!(default.allow_dangerously_skip_permissions && !default.full_access);
         assert!(matches!(
             default.permission_mode,
-            crate::args::PermissionModeArg::Ask
+            crate::args::PermissionModeArg::Auto
         ));
         assert_eq!(
             next_mode("plan", default.allow_dangerously_skip_permissions),

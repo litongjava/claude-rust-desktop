@@ -15,7 +15,7 @@ use crate::memory::{MemExClient, MemorySearchRequest, MemoryIngestRequest, Memor
 use crate::native_engine::NativeEngine;
 use crate::native_engine::provider_manager::ProviderManager;
 use crate::notification::NotificationManager;
-use crate::permissions::{AuditLogger, PermissionManager};
+use crate::permissions::{AuditLogger, PermissionManager, PermissionMode};
 use crate::preview_engine::PreviewEngine;
 use crate::commands::SystemStatus;
 use crate::process::ProcessManager;
@@ -247,6 +247,8 @@ impl BridgeServer {
 
         let audit_logger = Arc::new(AuditLogger::new(1000));
         let permission_manager = Arc::new(PermissionManager::new(audit_logger));
+        // Desktop starts in Auto. Launch flags may still switch to bypass.
+        permission_manager.set_mode(PermissionMode::Auto);
         crate::launch_permissions::LaunchPermissions::default().apply(&permission_manager);
 
         // 注册 always_allow 检查器，使 PermissionManager 能够通过数据库检查始终允许规则

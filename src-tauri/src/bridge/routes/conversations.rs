@@ -286,7 +286,6 @@ async fn conversation_warm_handler(
     // may initialize an idle engine, but cannot change any running conversation.
     if let Some(mode) = req["permission_mode"].as_str() {
         let mode = PermissionMode::parse(mode).map_err(|_| StatusCode::BAD_REQUEST)?;
-        if mode == PermissionMode::Auto { return Err(StatusCode::NOT_IMPLEMENTED); }
         if mode == PermissionMode::BypassPermissions && !state.permission_manager.bypass_available() {
             return Err(StatusCode::FORBIDDEN);
         }

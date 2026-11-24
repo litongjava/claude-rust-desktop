@@ -120,6 +120,27 @@ fn the_request_carries_only_the_core_tools_by_default() {
     }
 }
 
+#[test]
+fn a_non_interactive_executor_is_not_offered_ask_user_question() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = executor(temp.path()).with_permission_host(false);
+    let names = names(&executor);
+    assert!(
+        !names.contains(&"AskUserQuestion".to_owned()),
+        "the tool can only time out here: {names:?}"
+    );
+    assert!(
+        !names.contains(&"ToolLoad".to_owned())
+            || loadable_reminder(&executor)
+                .is_none_or(|reminder| !reminder.contains("AskUserQuestion")),
+        "ToolLoad must not offer the question tool: {:?}",
+        loadable_reminder(&executor)
+    );
+    let prompt = executor.request_system_prompt().unwrap();
+    assert!(prompt.contains("# Interactive user"));
+    assert!(prompt.contains("- Interactive user: no (do not call AskUserQuestion)"));
+}
+
 #[tokio::test]
 async fn context_search_follows_loading_settings_and_session_scope() {
     use crate::runtime::{RuntimePaths, SessionStore};

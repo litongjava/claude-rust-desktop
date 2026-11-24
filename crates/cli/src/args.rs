@@ -111,7 +111,7 @@ pub struct Cli {
     /// Require a provider-enforced JSON result matching this JSON Schema string.
     #[arg(long, global = true)]
     pub json_schema: Option<String>,
-    #[arg(long, value_enum, default_value = "ask", global = true)]
+    #[arg(long, value_enum, default_value = "auto", global = true)]
     pub permission_mode: PermissionModeArg,
     #[arg(skip)]
     pub permission_mode_explicit: bool,
@@ -1077,11 +1077,9 @@ mod tests {
     }
     #[test]
     fn permission_mode_tracks_explicit_ask_without_confusing_default() {
-        assert!(
-            !super::Cli::try_parse_with_mode_source(["dcl"])
-                .unwrap()
-                .permission_mode_explicit
-        );
+        let default = super::Cli::try_parse_with_mode_source(["dcl"]).unwrap();
+        assert!(matches!(default.permission_mode, super::PermissionModeArg::Auto));
+        assert!(!default.permission_mode_explicit);
         assert!(
             super::Cli::try_parse_with_mode_source(["dcl", "--permission-mode", "ask"])
                 .unwrap()
