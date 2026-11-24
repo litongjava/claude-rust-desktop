@@ -185,6 +185,77 @@ fn foreign_anthropic_thinking_is_dropped_with_its_signature() {
 }
 
 #[test]
+fn responses_replays_plain_thinking_into_an_empty_native_item() {
+    let p = provider("openai", "openai-responses", "http://localhost/v1");
+    let mut assistant = user();
+    assistant.role = "assistant".into();
+    assistant.reasoning_content = Some("prior plan".into());
+    assistant.provider_content = Some(json!({
+        "api":"openai-responses","provider":"test","model":"fixture-model",
+        "items":[
+            {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"},
+            {"type":"function_call","call_id":"call_1","name":"read","arguments":"{}"}
+        ]
+    }));
+    let body = messages::request(
+        "openai-responses",
+        &p,
+        &Value::Null,
+        vec![assistant],
+        None,
+        vec![],
+        100,
+    )
+    .unwrap();
+    let input = body["input"].as_array().unwrap();
+    let reasoning: Vec<_> = input.iter().filter(|item| item["type"] == "reasoning").collect();
+    assert_eq!(reasoning.len(), 1);
+    assert_eq!(reasoning[0]["summary"][0]["text"], "prior plan");
+    assert_eq!(reasoning[0]["encrypted_content"], "opaque");
+}
+
+#[test]
+fn responses_adds_plain_thinking_without_native_items() {
+    let p = provider("openai", "openai-responses", "http://localhost/v1");
+    let mut assistant = user();
+    assistant.role = "assistant".into();
+    assistant.reasoning_content = Some("prior plan".into());
+    let body = messages::request(
+        "openai-responses",
+        &p,
+        &Value::Null,
+        vec![assistant],
+        None,
+        vec![],
+        100,
+    )
+    .unwrap();
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input[0]["type"], "reasoning");
+    assert_eq!(input[0]["summary"][0]["text"], "prior plan");
+    assert_eq!(input[1]["role"], "assistant");
+}
+
+#[test]
+fn chat_replays_reasoning_content() {
+    let p = provider("deepseek", "openai-completions", "http://localhost");
+    let mut assistant = user();
+    assistant.role = "assistant".into();
+    assistant.reasoning_content = Some("prior plan".into());
+    let body = messages::request(
+        "openai-completions",
+        &p,
+        &Value::Null,
+        vec![assistant],
+        None,
+        vec![],
+        100,
+    )
+    .unwrap();
+    assert_eq!(body["messages"][0]["reasoning_content"], "prior plan");
+}
+
+#[test]
 fn anthropic_stream_keeps_signatures_tools_and_cache_usage() {
     let mut s = events::State::default();
     let events = vec![

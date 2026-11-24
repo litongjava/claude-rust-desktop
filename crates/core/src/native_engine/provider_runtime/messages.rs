@@ -234,12 +234,21 @@ pub(in crate::native_engine) fn conversation_input(
                         // a session may switch either between turns. Unknown issuers are foreign.
                         let issued_here = native["provider"].as_str() == Some(provider_id)
                             && native["model"].as_str() == Some(model_id);
-                        let items = if native["compaction"] == true || issued_here {
+                        let mut items = if native["compaction"] == true || issued_here {
                             items.clone()
                         } else {
                             foreign_items(api, items)
                         };
                         if api == "openai-responses" {
+                            if let Some(thinking) = message.reasoning_content.as_deref().filter(|text| !text.trim().is_empty()) {
+                                if !has_reasoning_text(&items) {
+                                    if let Some(slot) = items.iter_mut().find(|item| item["type"] == "reasoning") {
+                                        slot["summary"] = json!([{"type": "summary_text", "text": thinking}]);
+                                    } else {
+                                        items.insert(0, reasoning_item(thinking));
+                                    }
+                                }
+                            }
                             input.extend(items);
                             if native["compaction"] == true { compact_prefix = input.len(); }
                         } else if api == "google-generative-ai" {
@@ -269,6 +278,11 @@ pub(in crate::native_engine) fn conversation_input(
             continue;
         }
         let mut content = parts(&message.content, api, message.role == "assistant")?;
+        if api == "openai-responses" && message.role == "assistant" {
+            if let Some(thinking) = message.reasoning_content.as_deref().filter(|text| !text.trim().is_empty()) {
+                input.push(reasoning_item(thinking));
+            }
+        }
         if let Some(calls) = &message.tool_calls {
             for call in calls {
                 if api == "openai-responses" {
@@ -302,6 +316,24 @@ pub(in crate::native_engine) fn conversation_input(
         input.extend(tail);
     }
     Ok(input)
+}
+
+/// Plain thinking is replayed as a readable summary item, never as opaque state.
+fn reasoning_item(text: &str) -> Value {
+    json!({"type": "reasoning", "id": format!("rs_{}", uuid::Uuid::new_v4()), "summary": [{"type": "summary_text", "text": text}]})
+}
+
+fn has_reasoning_text(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        item["type"] == "reasoning"
+            && ["summary", "content"].iter().any(|key| {
+                item[*key].as_array().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| part["text"].as_str().is_some_and(|text| !text.trim().is_empty()))
+                })
+            })
+    })
 }
 
 /// Keeps readable summaries but drops opaque state issued by another account or model.

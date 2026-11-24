@@ -267,6 +267,9 @@ pub(crate) fn replay_rows(
             );
             let mut row =
                 json!({"role":message.role,"content":message.content,"provider_content":native});
+            if let Some(thinking) = message.thinking.as_deref().filter(|text| !text.trim().is_empty()) {
+                row["reasoning_content"] = json!(thinking);
+            }
             if include_provenance {
                 row["id"] = json!(message.id);
                 row["origin"] = json!("compaction");
@@ -282,11 +285,17 @@ pub(crate) fn replay_rows(
         let nested =
             crate::services::tool_history::nested_ids_for_message(conn, &message.id)?;
         calls.retain(|tool| !nested.contains(&tool.id));
+        let mut thinking_replayed = false;
         if message.role == "assistant" && !calls.is_empty() {
             match format {
                 ApiFormat::OpenAI => {
                     let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
-                    history.push(json!({"role":"assistant","content":"","tool_calls":tool_calls}));
+                    let mut assistant = json!({"role":"assistant","content":"","tool_calls":tool_calls});
+                    if let Some(thinking) = message.thinking.as_deref().filter(|text| !text.trim().is_empty()) {
+                        assistant["reasoning_content"] = json!(thinking);
+                        thinking_replayed = true;
+                    }
+                    history.push(assistant);
                     for tool in &calls {
                         history.push(json!({
                             "role":"tool",
@@ -349,6 +358,11 @@ pub(crate) fn replay_rows(
             continue;
         };
         let mut item = json!({"role":message.role,"content":content});
+        if message.role == "assistant" && !thinking_replayed {
+            if let Some(thinking) = message.thinking.as_deref().filter(|text| !text.trim().is_empty()) {
+                item["reasoning_content"] = json!(thinking);
+            }
+        }
         if collapsed {
             item["_collapsed_monitor"] = Value::Bool(true);
         }
