@@ -176,6 +176,7 @@ impl<D> Clone for TaskStore<D> {
         }
     }
 }
+#[allow(private_bounds)]
 impl<D: TaskDatabase> TaskStore<D> {
     pub fn new(db: Arc<D>, data_dir: PathBuf) -> Self {
         let router = db.router_address().map(|address| RouterScope {

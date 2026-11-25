@@ -560,9 +560,9 @@ fn reap(child: std::process::Child) {
 }
 
 fn kill_exact(child: &mut std::process::Child) {
-    let pid = child.id();
     #[cfg(unix)]
     {
+        let pid = child.id();
         // The owner runs in its own process group; signal only that group.
         let _ = std::process::Command::new("kill")
             .args(["-9", "--", &format!("-{pid}")])
@@ -1047,7 +1047,7 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
         let mut flushed: std::collections::HashSet<String> = std::collections::HashSet::new();
         // A history or log write that fails must stop further side effects and
         // make the job fail; it must never be reported as a success.
-        let mut fail = |message: String| {
+        let fail = |message: String| {
             let mut slot = consumer_failure
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
@@ -1242,7 +1242,7 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
         if let Err(outcome) = outcome {
             let _ = outcome;
         }
-        append_line(
+        let _ = append_line(
             &log_path,
             &format!("persistence_failed {}\n", sanitize(&error)),
         );
@@ -1279,7 +1279,7 @@ async fn run_script(directory: &Path, spec: &JobSpec, state: &mut JobState) -> R
             state.calls_succeeded = succeeded;
             let cancelled = cancellation.is_cancelled();
             let message = format!("{error:#}");
-            append_line(
+            let _ = append_line(
                 &log_path,
                 &format!(
                     "{} {}\n",

@@ -9,9 +9,11 @@ use crate::services::{EnvironmentCredentials, ServiceContext};
 use crate::super_agent::role::{self, MemberRole, Role};
 use crate::super_agent::store::{EventAppend, StoreError, TaskStore};
 use crate::super_agent::{
-    ApprovalStatus, ApprovalType, EventType, NewEvent, NonGitStatus, Phase, RepoTarget, ReportKind,
+    ApprovalStatus, EventType, NewEvent, NonGitStatus, Phase, RepoTarget, ReportKind,
     TaskRecord, TaskSpec,
 };
+#[cfg(test)]
+use crate::super_agent::ApprovalType;
 use crate::tools::ToolDefinition;
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};

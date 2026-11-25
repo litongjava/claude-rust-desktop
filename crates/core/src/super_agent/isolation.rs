@@ -870,6 +870,7 @@ struct PayloadEntry {
     path: PathBuf,
     kind: SnapshotKind,
     size: u64,
+    #[cfg_attr(not(unix), allow(dead_code))]
     mode: Option<u32>,
     link_target: Option<String>,
 }

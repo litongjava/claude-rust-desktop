@@ -1277,7 +1277,7 @@ mod worker_config_tests {
     async fn resume_waits_for_continue_and_preserves_notifications() {
         use axum::{extract::State, routing::post, Json, Router};
         use clap::Parser;
-        use deepseek_code_core::{runtime::SessionStore, services::input_queue};
+        use deepseek_code_core::runtime::SessionStore;
         use std::sync::{Arc, Mutex};
 
         let requests = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));

@@ -7,7 +7,7 @@ use deepseek_code_core::runtime::RuntimePaths;
 #[cfg(test)]
 use deepseek_code_core::db::DbManager;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Settings {

@@ -2373,6 +2373,7 @@ impl Session {
                 .filter_map(|row| row["content"].as_str().map(str::to_owned))
                 .filter(|text| !crate::background_commands::is_notification(text))
                 .collect(),
+            Some(&self.paths.data_dir),
             initial_model_label,
             Some(prompt.to_owned()),
         )?
@@ -5565,6 +5566,7 @@ mod request_usage_tests {
 #[cfg(test)]
 #[path = "session_binding_tests.rs"]
 mod binding_tests;
+#[cfg(test)]
 #[path = "startup_contention_tests.rs"]
 mod startup_contention_tests;
 

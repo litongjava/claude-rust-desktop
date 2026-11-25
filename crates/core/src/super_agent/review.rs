@@ -3,8 +3,7 @@
 //! A Reviewer may inspect the current task's Coder session tree and the task's
 //! own artifacts. Authorization is checked from the durable task record at call
 //! time; a session ID supplied by the model never widens its own scope.
-use crate::db::{conversation_repo, message_repo};
-use crate::services::{feedback, subagents};
+use crate::services::feedback;
 use crate::super_agent::isolation::{SnapshotKind, SnapshotManifest};
 use crate::super_agent::model::{
     NonGitSubmission, ReportKind, ReviewStage, TaskRecord, TaskReviewReport,
@@ -15,7 +14,7 @@ use crate::tools::ToolDefinition;
 use anyhow::{ensure, Context, Result};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 const DEFAULT_LIMIT: usize = 20;

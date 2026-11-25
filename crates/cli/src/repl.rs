@@ -3,10 +3,7 @@
 use crate::fixture_sql::FixtureSql;
 use crate::session::Session;
 use anyhow::{ensure, Result};
-use deepseek_code_core::{
-    db::conversation_repo,
-    runtime::{RuntimePaths, SessionStore},
-};
+use deepseek_code_core::runtime::{RuntimePaths, SessionStore};
 
 /// The whole conversation for the Ctrl+O transcript, as in the reference CLI:
 /// each prompt, each answer under its time and model, its thinking and every

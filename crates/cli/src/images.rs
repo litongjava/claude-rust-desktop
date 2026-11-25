@@ -286,7 +286,7 @@ mod tests {
         let folder = dir.path().join("中文 图片项目");
         std::fs::create_dir(&folder).unwrap();
         let path = folder.join("红色 red.png");
-        std::fs::write(&path, b"x").unwrap();
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\n").unwrap();
         for quote in ['"', '\''] {
             let prompt = format!("INTEROP_SINGLE 请保留这张图片。 {quote}{}{quote} 然后描述图片", path.display());
             assert_eq!(image_paths(dir.path(), &prompt), [path.clone()]);

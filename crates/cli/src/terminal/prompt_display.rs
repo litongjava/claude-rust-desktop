@@ -4,6 +4,14 @@ use crossterm::style::{ResetColor, SetForegroundColor};
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
 
+/// Shared bottom composer contract between the idle editor and the live turn view:
+/// both pin the input box to the bottom with exactly one footer row beneath it.
+pub(crate) const COMPOSER_FOOTER_ROWS: usize = 1;
+/// Top border + bottom border + footer row around the editable input rows.
+pub(crate) const COMPOSER_CHROME_ROWS: usize = 2 + COMPOSER_FOOTER_ROWS;
+/// Total height of a single-row pinned input box (`rule, input, rule, footer`).
+pub(crate) const SINGLE_LINE_BOX_ROWS: usize = 1 + COMPOSER_CHROME_ROWS;
+
 /// Record a submitted prompt and return the exact rows to emit above the box.
 pub(crate) fn recorded_rows_at_width(
     history: &mut super::scrollback::Scrollback,

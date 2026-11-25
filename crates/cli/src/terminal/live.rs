@@ -1672,7 +1672,8 @@ impl Frame {
     }
     /// The hand-off output and the row the prompt continues on.
     fn hand_off_output(&mut self, rows: usize) -> Option<(String, u16)> {
-        let box_height = 3 + self.input_rows.max(1);
+        let box_height =
+            super::prompt_display::COMPOSER_CHROME_ROWS + self.input_rows.max(1);
         if !self.input_box || self.lines.len() < box_height || self.top.is_none() || rows < box_height + 4 {
             return None;
         }
@@ -1907,7 +1908,8 @@ impl Frame {
         };
         let draft_height = draft_rows.len();
         // Counted from the frame's end: the footer rule, the footer, then the rows below the cursor.
-        let cursor_from_end = 3 + draft_height - 1 - draft_cursor_row;
+        let cursor_from_end =
+            super::prompt_display::COMPOSER_CHROME_ROWS + draft_height - 1 - draft_cursor_row;
         let status = clip(&state.status_line(), width);
         let indicator = crate::terminal::style::mode_indicator(&state.mode);
         let mode = format!(
@@ -4621,6 +4623,17 @@ mod tests {
     }
 }
 
+/// Resolves the data directory root from a keybindings path in both layout v2
+/// (`<data_dir>/config/keybindings.json`) and flat test fixtures (`<dir>/keys.json`).
+fn tips_data_dir(keybindings: &std::path::Path) -> Option<&std::path::Path> {
+    let parent = keybindings.parent()?;
+    if parent.file_name().is_some_and(|name| name == "config") {
+        parent.parent()
+    } else {
+        Some(parent)
+    }
+}
+
 /// Unified API: exactly one of the live actor and legacy progress writes output.
 pub struct TurnDisplay {
     running_title: Option<super::title::RunningTitle>,
@@ -4647,7 +4660,15 @@ impl TurnDisplay {
         keybindings: &std::path::Path,
         history: Vec<String>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_initial(interactive, mode, keybindings, history, None, None)
+        Self::new_with_initial(
+            interactive,
+            mode,
+            keybindings,
+            history,
+            tips_data_dir(keybindings),
+            None,
+            None,
+        )
     }
 
     pub fn new_with_initial(
@@ -4655,6 +4676,7 @@ impl TurnDisplay {
         mode: &str,
         keybindings: &std::path::Path,
         history: Vec<String>,
+        data_dir: Option<&std::path::Path>,
         model_label: Option<String>,
         pinned_prompt: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -4663,7 +4685,9 @@ impl TurnDisplay {
                 mode,
                 crate::keybindings::load(keybindings)?,
                 history,
-                keybindings.parent().and_then(super::tips::next),
+                data_dir
+                    .or_else(|| tips_data_dir(keybindings))
+                    .and_then(super::tips::next),
                 model_label,
                 pinned_prompt,
             )
@@ -5126,6 +5150,34 @@ mod completion_tests {
         assert!(text.find("first").unwrap() < text.find("second").unwrap());
         assert!(text.contains("before"));
         assert!(!text.contains("failed"));
+    }
+
+    #[test]
+    fn tips_data_dir_resolves_layout_v2_config_dir_without_nesting_config_twice() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path();
+        let layout = deepseek_code_core::data_layout::DataLayout::from_root(data_dir);
+        let keybindings = layout.config_file("keybindings.json");
+        assert_eq!(tips_data_dir(&keybindings), Some(data_dir));
+        // Flat test fixture paths still resolve to their immediate parent.
+        let flat = data_dir.join("keys.json");
+        assert_eq!(tips_data_dir(&flat), Some(data_dir));
+
+        deepseek_code_core::data_layout::write_config_file(
+            layout.config_file("settings.json"),
+            r#"{"spinnerTipsEnabled":false}"#,
+        )
+        .unwrap();
+        assert!(
+            tips_data_dir(&keybindings)
+                .and_then(super::super::tips::next)
+                .is_none(),
+            "spinnerTipsEnabled:false in layout v2 config/settings.json must disable turn tips"
+        );
+        assert!(
+            !data_dir.join("config").join("config").exists(),
+            "tips resolution must never create nested config/config directories"
+        );
     }
 
     #[tokio::test]

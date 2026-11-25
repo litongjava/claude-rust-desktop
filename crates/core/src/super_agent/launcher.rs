@@ -29,7 +29,6 @@ use crate::super_agent::role::MemberRole;
 use crate::super_agent::store::TaskStore;
 use crate::super_agent::{Phase, TaskRecord};
 use anyhow::{anyhow, ensure, Context, Result};
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

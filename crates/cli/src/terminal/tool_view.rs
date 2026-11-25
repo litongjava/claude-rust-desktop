@@ -900,13 +900,17 @@ pub fn approval(
                         }
                     }
                     if let Some(save_name) = input["save_name"].as_str() {
-                        let target = workspace
-                            .map(|workspace| workspace.join("temp").join(save_name))
+                        let resolved = workspace.map(|workspace| {
+                            save_name
+                                .split(['/', '\\'])
+                                .filter(|part| !part.is_empty())
+                                .fold(workspace.join("temp"), |path, part| path.join(part))
+                        });
+                        let target = resolved
+                            .as_ref()
                             .map(|target| target.to_string_lossy().into_owned())
                             .unwrap_or_else(|| format!("<workspace>/temp/{save_name}"));
-                        let overwrite = workspace
-                            .map(|workspace| workspace.join("temp").join(save_name).exists())
-                            .unwrap_or(false);
+                        let overwrite = resolved.as_ref().is_some_and(|target| target.exists());
                         lines.push(change_view::muted(&format!(
                             "  Save script: {}{}",
                             printable(&target),
@@ -1253,7 +1257,12 @@ mod tests {
         assert!(text.contains("Working directory: src"), "{text}");
         assert!(text.contains("Environment:"), "{text}");
         assert!(text.contains("DCL_TEST=visible"), "{text}");
-        let target = workspace.path().join("temp/python/script/001.py");
+        let target = workspace
+            .path()
+            .join("temp")
+            .join("python")
+            .join("script")
+            .join("001.py");
         assert!(text.contains(&format!("Save script: {}", target.display())), "{text}");
         assert!(text.ends_with("This code requires approval\nDo you want to run this Python code?\n  1. Yes\n  2. No\n(1/y yes, 2/n no)"), "{text}");
         assert_eq!(menu.remember, None);

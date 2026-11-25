@@ -5,9 +5,11 @@
 //! synced) before the database exists, the schema and matching domain row are
 //! committed in one immediate transaction under `schema.lock`, and any
 //! inconsistent marker/database pair is reported instead of repaired.
+#![cfg_attr(not(unix), allow(dead_code))]
 
+#[cfg(unix)]
+use super::paths;
 use super::{
-    paths,
     types::{
         is_uuid, Activity, CoordResult, CoordinationError, Lifecycle, NativePath, OwnerRecord,
         ParticipantKind, ParticipantRole, Registration,
@@ -15,10 +17,13 @@ use super::{
     CoordinationPaths,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+#[cfg(unix)]
 use std::{
     ffi::OsStr,
     fs::File,
     io::{Read, Write},
+};
+use std::{
     path::Path,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };

@@ -934,7 +934,7 @@ impl Screen {
         rows: usize,
         history: &mut crate::terminal::scrollback::Scrollback,
     ) -> io::Result<Option<u16>> {
-        let box_lines: [DisplayLine; 4] = [
+        let box_lines: [DisplayLine; crate::terminal::prompt_display::SINGLE_LINE_BOX_ROWS] = [
             ("\u{2500}".repeat(width), TextStyle::Border),
             (prompt.to_owned(), TextStyle::Plain),
             ("\u{2500}".repeat(width), TextStyle::Border),
@@ -1581,7 +1581,7 @@ impl PromptEditor {
             let panel = self.details.render(width, panel_budget);
             let panel_height = panel.lines.len();
             let mut lines = panel.lines;
-            let footer_rows = 1;
+            let footer_rows = crate::terminal::prompt_display::COMPOSER_FOOTER_ROWS;
             // Five one-line entries at a time above the input box, as in the
             // reference CLI.
             let available = (rows as usize)

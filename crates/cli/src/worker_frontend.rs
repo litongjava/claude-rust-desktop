@@ -210,6 +210,7 @@ async fn single_turn(
         &deepseek_code_core::data_layout::DataLayout::from_root(&root)
             .config_file("keybindings.json"),
         history,
+        Some(root),
         Some(model_label),
         Some(prompt.to_owned()),
     )?
@@ -331,6 +332,7 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
         session.permission_mode(),
         &session.paths.layout().config_file("keybindings.json"),
         Vec::new(),
+        Some(&session.paths.data_dir),
         Some(model_label),
         None,
     )?

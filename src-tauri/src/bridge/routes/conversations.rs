@@ -54,8 +54,6 @@ async fn conversations_create(State(state): State<AppState>, Json(body): Json<Cr
     })))
 }
 
-pub(super) use deepseek_code_core::db::transcript::enriched_messages;
-
 /// Request snapshot fields that repeat across model requests: the system prompt
 /// and tool schemas are usually identical for every request in a session.
 const SHARED_SNAPSHOT_FIELDS: [&str; 3] = ["systemPrompt", "systemMessages", "tools"];

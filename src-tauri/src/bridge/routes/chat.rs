@@ -322,7 +322,7 @@ pub(super) async fn start_authorized_chat(
         let numbers=history.clone();
         let mut request_number = tokio::task::spawn_blocking(move || numbers.last_request_number())
             .await.ok().and_then(Result::ok).unwrap_or(0);
-        let mut terminal_event = None;
+        let terminal_event;
         let mut permission_watches = super::permission_watch::PermissionWatches::default();
         let mut full_text = String::new();
         let mut tools = Vec::new();

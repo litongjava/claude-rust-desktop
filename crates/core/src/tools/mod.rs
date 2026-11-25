@@ -112,9 +112,6 @@ pub fn run_internal_pty_role() -> anyhow::Result<Option<i32>> {
 }
 
 #[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

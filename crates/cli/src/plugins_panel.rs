@@ -838,6 +838,7 @@ const TOOL_GROUPS: &[(&str, &[&str])] = &[
         "Agents & delegation",
         &[
             "Agent",
+            "ClaudeCode",
             "Codex",
             "DeepSeekCode",
             "ListAgents",
@@ -891,6 +892,7 @@ const TOOL_GROUPS: &[(&str, &[&str])] = &[
 
 const OTHER_TOOL_GROUP: &str = "Other";
 
+#[cfg(test)]
 fn tool_group(name: &str) -> &'static str {
     TOOL_GROUPS
         .iter()

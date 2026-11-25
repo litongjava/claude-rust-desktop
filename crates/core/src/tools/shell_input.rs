@@ -15,8 +15,10 @@ use serde_json::{json, Value};
 use std::{
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
+#[cfg(unix)]
+use std::time::Instant;
 
 /// Bytes one call may write. Smaller than typical demand so a call stays bounded.
 pub(crate) const MAX_INPUT_BYTES: usize = 64 * 1024;

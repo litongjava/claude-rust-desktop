@@ -6,11 +6,10 @@
 use super::model::{
     decode_body, AgentRole, AgentStatus, Approval, ApprovalStatus, ApprovalType, CleanupStatus,
     Event, EventType, GateEvidence, HarnessAnalysisReport, ImplementationReport, NewEvent,
-    NonGitStatus, Phase, RepoTarget, Report, ReportKind, ReviewStage, ReviewVerdict, SessionRef,
+    NonGitStatus, Phase, RepoTarget, Report, ReportKind, ReviewStage, ReviewVerdict,
     Status, TaskRecord, TaskReviewReport, Unmet,
 };
 use serde_json::Value;
-use std::collections::BTreeSet;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Copy)]

@@ -1,9 +1,11 @@
 //! Durable same-project messages. Acknowledgement means committed context, not model processing.
 use super::{EnvironmentCredentials, ServiceContext};
 use crate::{
-    db::{conversation_repo, message_repo, BusyTimeoutGuard},
+    db::conversation_repo,
     runtime::RuntimePaths,
 };
+#[cfg(test)]
+use crate::db::BusyTimeoutGuard;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};

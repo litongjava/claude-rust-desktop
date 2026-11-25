@@ -6213,10 +6213,10 @@ impl ToolLoopExecutor {
             // One attempt of this model step. A stalled attempt that is replaced
             // must leave nothing behind, so the parser state belongs to the
             // attempt and is only committed here once it succeeds.
-            let mut has_tool_calls = false;
-            let mut assistant_content: Option<OpenAIContent> = None;
-            let mut assistant_reasoning: Option<String> = None;
-            let mut assistant_provider_content: Option<Value> = None;
+            let mut has_tool_calls;
+            let mut assistant_content: Option<OpenAIContent>;
+            let mut assistant_reasoning: Option<String>;
+            let mut assistant_provider_content: Option<Value>;
             let mut assistant_tool_calls: Vec<crate::native_engine::openai_client::OpenAIToolCall> =
                 Vec::new();
             let mut openai_tool_args: HashMap<usize, (String, String, String)> = HashMap::new();

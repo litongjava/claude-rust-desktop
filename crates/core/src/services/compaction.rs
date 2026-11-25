@@ -1,8 +1,10 @@
 //! Model-generated, append-only compaction shared by CLI and Desktop.
 use crate::{
-    db::{conversation_repo, message_repo, DbManager},
+    db::{conversation_repo, message_repo},
     native_engine::NativeEngine,
 };
+#[cfg(test)]
+use crate::db::DbManager;
 use anyhow::{ensure, Context, Result};
 use serde::Serialize;
 use serde_json::{json, Value};

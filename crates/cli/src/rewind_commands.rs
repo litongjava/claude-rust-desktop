@@ -2,7 +2,6 @@
 use crate::session::Session;
 use anyhow::{ensure, Context, Result};
 use deepseek_code_core::{
-    db::{conversation_repo, message_repo},
     runtime::RuntimePaths,
     services::{checkpoints, compaction},
 };

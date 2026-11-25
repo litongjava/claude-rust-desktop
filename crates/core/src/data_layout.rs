@@ -812,7 +812,7 @@ impl DataLayout {
     }
 
     fn final_warnings(&self) -> Result<Vec<String>> {
-        let mut warnings = self.legacy_warnings()?;
+        let warnings = self.legacy_warnings()?;
         if !warnings.is_empty() {
             tracing::warn!(
                 module = "DataLayout",

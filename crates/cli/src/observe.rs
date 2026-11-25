@@ -7,14 +7,12 @@
 use crate::session::Session;
 use deepseek_code_core::db::session_store::{SessionAccess,SessionRepository};
 use anyhow::Result;
-use deepseek_code_core::{
-    db::{message_repo, turn_repo},
-    services::session_messages,
-};
+use deepseek_code_core::db::{message_repo, turn_repo};
+#[cfg(test)]
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
-    sync::Arc,
     time::{Duration, Instant},
 };
 

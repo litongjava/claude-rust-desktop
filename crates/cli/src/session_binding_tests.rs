@@ -1,7 +1,6 @@
 #[cfg(test)]
 use crate::fixture_sql::FixtureSql;
 use super::{Cli, RuntimePaths, Selection, Session};
-use crate::binding_store;
 use serde_json::json;
 use std::ffi::OsString;
 

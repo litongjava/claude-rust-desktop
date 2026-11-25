@@ -214,6 +214,7 @@ pub fn unpack(archive: &Path, target: &Path) -> Result<()> {
             continue;
         }
         if kind.is_symlink() {
+            #[cfg_attr(not(unix), allow(unused_variables))]
             let link = entry.link_name()?.context("Symlink without a target")?;
             let _ = std::fs::remove_file(&dest);
             #[cfg(unix)]
