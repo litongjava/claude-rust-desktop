@@ -481,3 +481,291 @@ async fn pty_submit_keeps_bottom_box_fixed_across_first_turn_second_turn_and_ear
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn pty_slash_menu_typing_does_not_flash_underlying_rule_or_leak_rows() {
+    let long_reply = (1..=24)
+        .map(|i| format!("HISTORY_LINE_{i:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let model = MockModel::new(vec![long_reply.as_str(), "SECOND_REPLY_NEVER"]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(model.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    let data = root.path().join("data");
+    std::fs::create_dir_all(&workspace).unwrap();
+    write_fixture_config(&data, &workspace, &endpoint);
+
+    let mut pty = PtySession::spawn(&workspace, &data, &[]);
+
+    pty.wait_for(
+        Duration::from_secs(20),
+        "initial idle prompt",
+        |rows| {
+            is_horizontal_rule(&rows[ROWS as usize - 4])
+                && rows[ROWS as usize - 3].contains('❯')
+                && is_horizontal_rule(&rows[ROWS as usize - 2])
+        },
+        |_| {},
+    )
+    .await;
+
+    // Fill the viewport with one turn, then submit and cancel a second prompt so
+    // its horizontal divider rule sits directly behind the 5-row slash menu area.
+    pty.send(b"hello menu");
+    pty.wait_for(
+        Duration::from_secs(5),
+        "typed hello menu draft",
+        |rows| rows[ROWS as usize - 3].contains("hello menu"),
+        |_| {},
+    )
+    .await;
+    pty.send(b"\r");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while model.requests.load(Ordering::SeqCst) < 1 {
+            pty.pump_with(|_| {});
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("model request did not arrive");
+    model.release.notify_waiters();
+    pty.wait_for(
+        Duration::from_secs(15),
+        "idle prompt after first turn",
+        |rows| {
+            rows.iter().any(|row| row.contains("HISTORY_LINE_24"))
+                && rows.iter().any(|row| row.contains("· done"))
+                && !rows[ROWS as usize - 7..ROWS as usize - 4]
+                    .iter()
+                    .any(|row| row.contains("… ("))
+        },
+        |_| {},
+    )
+    .await;
+
+    pty.send(b"prompt behind menu");
+    pty.wait_for(
+        Duration::from_secs(5),
+        "second prompt draft",
+        |rows| rows[ROWS as usize - 3].contains("prompt behind menu"),
+        |_| {},
+    )
+    .await;
+    pty.send(b"\r");
+    pty.wait_for(
+        Duration::from_secs(15),
+        "second working frame before Esc",
+        |rows| {
+            rows[..ROWS as usize - 4]
+                .iter()
+                .any(|row| row.contains("prompt behind menu"))
+                && rows[ROWS as usize - 7..ROWS as usize - 4]
+                    .iter()
+                    .any(|row| row.contains("… ("))
+        },
+        |_| {},
+    )
+    .await;
+    // The 5-row overlay sits right above the composer's reserved blank row.
+    let menu_bottom = ROWS as usize - 5;
+    let menu_top = menu_bottom - 5;
+    pty.send(b"\x1b");
+    let idle_with_history = pty
+        .wait_for(
+            Duration::from_secs(10),
+            "idle prompt after Esc cancellation",
+            |rows| {
+                rows[0].contains("prompt behind menu")
+                    && rows[menu_bottom - 2].contains("Interrupted")
+                    && !rows[ROWS as usize - 7..ROWS as usize - 4]
+                        .iter()
+                        .any(|row| row.contains("… ("))
+            },
+            |_| {},
+        )
+        .await;
+    assert!(
+        idle_with_history[menu_top..menu_bottom]
+            .iter()
+            .any(|row| is_horizontal_rule(row)),
+        "expected a transcript rule behind the slash menu region ({menu_top}..{menu_bottom}):\n{}",
+        format_screen(&idle_with_history)
+    );
+
+    // 1. Type `/` and wait for the 5-row slash menu to cover the background.
+    pty.send(b"/");
+    let slash_screen = pty
+        .wait_for(
+            Duration::from_secs(5),
+            "slash menu after typing /",
+            |rows| {
+                rows[ROWS as usize - 3].contains("❯ /")
+                    && rows[menu_top..menu_bottom]
+                        .iter()
+                        .all(|row| row.contains('/'))
+            },
+            |_| {},
+        )
+        .await;
+    assert!(
+        !slash_screen[menu_top..menu_bottom]
+            .iter()
+            .any(|row| is_horizontal_rule(row)),
+        "slash menu should cover underlying rules:\n{}",
+        format_screen(&slash_screen)
+    );
+
+    // 2. Type `c` then `o`: both keep 5 visible menu rows. No intermediate
+    //    frame may drop the menu or flash the underlying horizontal rule.
+    for (ch, expected_input) in [(b"c", "❯ /c"), (b"o", "❯ /co")] {
+        let mut checked_frames = 0usize;
+        pty.send(ch);
+        pty.wait_for(
+            Duration::from_secs(5),
+            expected_input,
+            |rows| {
+                rows[ROWS as usize - 3].contains(expected_input)
+                    && rows[menu_top..menu_bottom]
+                        .iter()
+                        .all(|row| row.contains('/'))
+            },
+            |rows| {
+                checked_frames += 1;
+                assert!(
+                    !rows[menu_top..menu_bottom]
+                        .iter()
+                        .any(|row| is_horizontal_rule(row)),
+                    "underlying rule flashed while typing {expected_input}:\n{}",
+                    format_screen(rows)
+                );
+                assert!(
+                    rows[menu_top..menu_bottom]
+                        .iter()
+                        .all(|row| row.contains('/')),
+                    "slash menu disappeared while typing {expected_input}:\n{}",
+                    format_screen(rows)
+                );
+            },
+        )
+        .await;
+        assert!(
+            checked_frames > 0,
+            "expected at least one frame while typing {expected_input}"
+        );
+    }
+
+    // 3. Type `x` (`/cox` -> 1 matching row `/context`): uncovered rows restore
+    //    the transcript while the bottom menu row never flashes empty/rule.
+    pty.send(b"x");
+    let after_narrow = pty
+        .wait_for(
+            Duration::from_secs(5),
+            "narrowed single-row menu for /cox",
+            |rows| {
+                rows[ROWS as usize - 3].contains("❯ /cox")
+                    && rows[menu_bottom - 1].contains("/context")
+            },
+            |rows| {
+                assert!(
+                    rows[menu_bottom - 1].contains('/'),
+                    "bottom menu row flashed background while narrowing to /cox:\n{}",
+                    format_screen(rows)
+                );
+            },
+        )
+        .await;
+    assert!(
+        after_narrow[menu_top..menu_bottom - 1]
+            .iter()
+            .any(|row| is_horizontal_rule(row)),
+        "uncovered rows should cleanly restore the transcript rule:\n{}",
+        format_screen(&after_narrow)
+    );
+
+    // 4. Type `z` (`/coxz` -> 1-row "No commands match"): the bottom menu row
+    //    transitions in place without flashing background underneath.
+    pty.send(b"z");
+    pty.wait_for(
+        Duration::from_secs(5),
+        "no-match menu row for /coxz",
+        |rows| {
+            rows[ROWS as usize - 3].contains("❯ /coxz")
+                && rows[menu_bottom - 1].contains("No commands match")
+        },
+        |rows| {
+            assert!(
+                rows[menu_bottom - 1].contains('/')
+                    || rows[menu_bottom - 1].contains("No commands match"),
+                "bottom menu row flashed background while typing /coxz:\n{}",
+                format_screen(rows)
+            );
+        },
+    )
+    .await;
+
+    // 5. Press Backspace (`/coxz` -> `/cox` -> `/context` returns cleanly without flashing),
+    //    then Esc: overlay clears and transcript matches idle history without leaking menu rows.
+    pty.send(b"\x7f");
+    pty.wait_for(
+        Duration::from_secs(5),
+        "single-row menu restored after Backspace",
+        |rows| {
+            rows[ROWS as usize - 3].contains("❯ /cox")
+                && !rows[ROWS as usize - 3].contains("/coxz")
+                && rows[menu_bottom - 1].contains("/context")
+        },
+        |rows| {
+            assert!(
+                rows[menu_bottom - 1].contains('/')
+                    || rows[menu_bottom - 1].contains("No commands match"),
+                "bottom menu row flashed background on Backspace:\n{}",
+                format_screen(rows)
+            );
+        },
+    )
+    .await;
+
+    pty.send(b"\x1b");
+    let after_esc = pty
+        .wait_for(
+            Duration::from_secs(5),
+            "overlay cleared after Esc",
+            |rows| {
+                !rows[menu_top..menu_bottom]
+                    .iter()
+                    .any(|row| row.contains("/context") || row.contains("No commands match"))
+                    && rows[menu_top..menu_bottom]
+                        .iter()
+                        .any(|row| is_horizontal_rule(row))
+            },
+            |_| {},
+        )
+        .await;
+    assert_eq!(
+        after_esc[menu_top..menu_bottom],
+        idle_with_history[menu_top..menu_bottom],
+        "Esc should restore the exact background without leaking menu rows:\n{}",
+        format_screen(&after_esc)
+    );
+
+    // Clean exit.
+    pty.send(b"\x15/exit\r");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pty.child.try_wait().unwrap().is_none() {
+        pty.pump_with(|_| {});
+        if Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    server.abort();
+}

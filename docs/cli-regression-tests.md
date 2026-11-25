@@ -170,6 +170,20 @@ cargo test --locked -p deepseek-code-cli --test prompt_submit_stability -- --noc
 3. 首轮流式回复完成并交棒回空闲态、以及第二轮提交并在请求门控期按 `Esc` 取消期间，底部输入框边框与 footer 始终停留在同一组屏幕行，且请求期 `Esc` 可正常中断并返回空闲态。
 4. 满屏状态下提交与接管不会把旧输入框/旧 footer 滚进 transcript。
 
+### A4. 斜杠补全菜单输入不闪烁、不残留
+
+修改 `crates/cli/src/terminal/editor.rs` 的 `CommandOverlay` 或空闲输入事件循环后执行：
+
+```bash
+cargo test --locked -p deepseek-code-cli --bin dcl -- slash_menu_overlay startup_banner_and_slash_menu
+cargo test --locked -p deepseek-code-cli --test prompt_submit_stability -- --nocapture
+```
+
+1. 对话历史（含已提交提示词的白色 `────` 分隔线）紧邻空闲输入框上方时，输入 `/` 弹出 5 行命令补全菜单，再继续输入 `c`、`o`、`x` 与退格：
+   - 保持 5 行菜单期间，普通编辑/导航按键不先清空菜单再重画，中间帧不得闪出菜单底层的 `────` 分隔线或空白；
+   - 匹配行数收缩（如输入 `/cox` 变为 1 行 `No commands match`）时，仅恢复露出的背景行，仍被菜单覆盖的行原地更新且隐藏光标；
+   - 按 `Esc` 关闭或按 `Enter` 提交、以及输入框增高触发滚屏或缩放/鼠标操作前，菜单干净清除，历史与滚动缓冲中不残留任何菜单行。
+
 ### B. 运行中排队和撤回
 
 让模型运行一个较长的命令（如 `sleep 40`），在此期间操作：
@@ -859,7 +873,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 
 ## 按改动范围选择场景
 
-- `terminal/editor.rs`、`terminal/live.rs` 的按键处理：A、B、E1、E2、E3
+- `terminal/editor.rs`、`terminal/live.rs` 的按键处理：A、A3、A4、B、E1、E2、E3
 - `terminal/live.rs`、`terminal/scrollback.rs`、`terminal/change_view.rs`、`terminal/tool_view.rs` 的显示：B、C、E1
 - `repl.rs`：C4、D1、D2、D6、D7、D8–D10（恢复提示、完成耗时与运行中状态），以及 L（手动 `/compact` 的完成输出、提交前取消与 `post-commit-manual` 的提交后取消）
 - `terminal/input.rs` 的取消通道：L 的 `cancel-manual`、`cancel-empty-manual`、`cancel-invalid-manual`、`cancel-merge-manual`、`post-commit-manual`，并在真实终端确认 `Esc` 不滞留到下一个提示、等待期间 `Ctrl+O` 仍能打开完整记录

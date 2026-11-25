@@ -275,11 +275,11 @@ impl HistoryView {
         cursor_row: usize,
         cursor_col: usize,
         size: (u16, u16),
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let mut frame = Vec::new();
         self.draw_to(&mut frame, composer, cursor_row, cursor_col, size)?;
         if frame == self.previous {
-            return Ok(());
+            return Ok(false);
         }
         let mut out = crate::terminal_output::stderr_locked();
         out.write_all(b"\x1b[?2026h")?;
@@ -287,7 +287,7 @@ impl HistoryView {
         out.write_all(b"\x1b[?2026l")?;
         out.flush()?;
         self.previous = frame;
-        Ok(())
+        Ok(true)
     }
 
     fn draw_to(

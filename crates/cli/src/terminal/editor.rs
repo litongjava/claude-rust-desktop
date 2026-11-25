@@ -21,6 +21,18 @@ struct CommandOverlay {
     top: usize,
 }
 impl CommandOverlay {
+    fn clear_to(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.draw_to(out, &[], 0, &[])
+    }
+
+    /// Drops cached screen state after another full-screen repaint replaced
+    /// the overlay rows directly.
+    fn discard(&mut self) {
+        self.previous.clear();
+        self.saved.clear();
+        self.top = 0;
+    }
+
     fn draw_to(
         &mut self,
         out: &mut impl Write,
@@ -34,27 +46,102 @@ impl CommandOverlay {
         if self.previous == menu && (menu.is_empty() || self.top == top) {
             return Ok(());
         }
-        out.write_all(b"\x1b[?2026h\x1b7")?;
+        let old_top = self.top;
+        let old_end = old_top + self.saved.len();
+        let new_end = top + shown;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"\x1b[?2026h\x1b[?25l\x1b7");
+        // Only restore rows exposed when the overlay shrinks or moves.
+        // Repainting the background beneath rows that stay covered flashes
+        // underlying transcript rules on terminals without sync output.
         for (index, text) in self.saved.iter().enumerate() {
-            write!(out, "\x1b[{};1H\x1b[0m{}\x1b[K", self.top + index + 1, text)?;
+            let row = old_top + index;
+            if row < top || row >= new_end {
+                write!(frame, "\x1b[{};1H\x1b[0m{}\x1b[K", row + 1, text)?;
+            }
         }
-        self.saved = background.iter().skip(top).take(shown).cloned().collect();
-        self.top = top;
+        let next_saved: Vec<String> = (top..new_end)
+            .map(|row| {
+                if row >= old_top && row < old_end {
+                    self.saved[row - old_top].clone()
+                } else {
+                    background.get(row).cloned().unwrap_or_default()
+                }
+            })
+            .collect();
+        let no_color = std::env::var_os("NO_COLOR").is_some();
         for (index, (text, style)) in menu.iter().enumerate() {
+            let row = top + index;
+            if row >= old_top
+                && row < old_end
+                && self.previous.get(row - old_top) == Some(&(text.clone(), *style))
+            {
+                continue;
+            }
             let color = match style {
                 TextStyle::Selected => crate::terminal::style::selected(),
                 _ => crate::terminal::style::muted(),
             };
-            write!(out, "\x1b[{};1H\x1b[0m", top + index + 1)?;
-            if std::env::var_os("NO_COLOR").is_none() {
-                queue!(out, SetForegroundColor(color))?;
+            write!(frame, "\x1b[{};1H\x1b[0m", row + 1)?;
+            if !no_color {
+                queue!(frame, SetForegroundColor(color))?;
             }
-            write!(out, "{text}\x1b[0m\x1b[K")?;
+            write!(frame, "{text}\x1b[0m\x1b[K")?;
         }
-        out.write_all(b"\x1b8\x1b[?2026l")?;
+        frame.extend_from_slice(b"\x1b8\x1b[?25h\x1b[?2026l");
+        out.write_all(&frame)?;
         out.flush()?;
+        self.saved = next_saved;
+        self.top = top;
         self.previous = menu.to_vec();
         Ok(())
+    }
+}
+
+/// Keys that only update the draft or slash-menu selection in place, without
+/// scrolling, switching views, opening modals, or submitting the prompt.
+fn keeps_overlay_in_place(
+    key: crossterm::event::KeyEvent,
+    buffer_empty: bool,
+    has_items: bool,
+    matches_selected_command: bool,
+    history_active: bool,
+    compact_mode: bool,
+) -> bool {
+    if history_active && !compact_mode {
+        return false;
+    }
+    if crate::terminal::scrollback::compact_key(key)
+        || crate::terminal::transcript_pager::HistoryView::is_navigation(key)
+        || crate::keybindings::is_cycle_permission(key)
+    {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        return false;
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return matches!(
+            key.code,
+            KeyCode::Char('a' | 'e' | 'u' | 'k' | 'y' | '_' | '7' | '/' | '-')
+        );
+    }
+    match key.code {
+        KeyCode::Char('?') if buffer_empty => false,
+        KeyCode::Char(_) => true,
+        KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End => !buffer_empty,
+        KeyCode::Up | KeyCode::Down => has_items || !buffer_empty,
+        KeyCode::Tab => !key.modifiers.contains(KeyModifiers::SHIFT),
+        KeyCode::Esc => has_items || !buffer_empty,
+        KeyCode::Enter => {
+            !key.modifiers.contains(KeyModifiers::SHIFT) && has_items && !matches_selected_command
+        }
+        _ => false,
     }
 }
 
@@ -620,6 +707,14 @@ impl Screen {
         self.invalidated = true;
         self.previous.clear();
         self.top = None;
+    }
+    /// Whether drawing `line_count` rows will scroll, clear, or shift `self.top`.
+    /// Callers clear overlays above the composer only when this is true.
+    fn will_reposition(&self, line_count: usize, rows: usize) -> bool {
+        let rows = rows.max(1);
+        let height = line_count.min(rows).max(1);
+        let top = rows - height;
+        self.invalidated || self.height != height || self.top != Some(top as u16)
     }
     pub(crate) fn draw(&mut self, lines: &[DisplayLine], row: usize, col: usize) -> io::Result<()> {
         // The editor redraws on every poll; an unchanged frame writes nothing.
@@ -1417,6 +1512,7 @@ impl PromptEditor {
             if yielded.load(std::sync::atomic::Ordering::Acquire) {
                 self.pending_draft = buffer.text();
                 self.pending_cursor = Some(buffer.cursor);
+                command_overlay.clear_to(&mut crate::terminal_output::stderr_locked())?;
                 drop(subagents.take());
                 history_view.close()?;
                 screen.clear()?;
@@ -1444,6 +1540,7 @@ impl PromptEditor {
                     let Ok(notice) = notices.try_recv() else {
                         break;
                     };
+                    command_overlay.clear_to(&mut crate::terminal_output::stderr_locked())?;
                     history_view.close()?;
                     screen.finish("", "", &mut above)?;
                     write_notice(
@@ -1796,6 +1893,7 @@ impl PromptEditor {
             let input_row = panel_height + menu_height + cursor_row - first + 1;
             history_view.set_pinned(&pinned.text, width);
             if crate::terminal::scrollback::compact() && !history_view.active() {
+                command_overlay.clear_to(&mut crate::terminal_output::stderr_locked())?;
                 history_view.refresh(&[], &above.presentation(), width);
                 history_view.show_compact((rows as usize).saturating_sub(lines.len()))?;
             }
@@ -1822,10 +1920,15 @@ impl PromptEditor {
                         }
                     })
                     .collect();
-                if !selection.retained() {
-                    history_view.draw(&composer, input_row, cursor_col, (cols, rows))?;
+                if !selection.retained()
+                    && history_view.draw(&composer, input_row, cursor_col, (cols, rows))?
+                {
+                    command_overlay.discard();
                 }
             } else if !selection.retained() {
+                if screen.will_reposition(lines.len(), rows as usize) {
+                    command_overlay.clear_to(&mut crate::terminal_output::stderr_locked())?;
+                }
                 if screen.height == 0 && above.needs_separator() {
                     if let Some(top) = screen.top {
                         execute!(crate::terminal_output::stderr(), MoveTo(0, top))?;
@@ -1901,9 +2004,17 @@ impl PromptEditor {
             let Some(event) = read_editor_event(&mut input_reader)? else {
                 continue;
             };
-            // Remove the overlay before an event can resize, scroll or repaint
-            // its background. Otherwise a menu row can enter the transcript.
-            command_overlay.draw_to(&mut crate::terminal_output::stderr_locked(), &[], 0, &[])?;
+            // Remove the overlay before an event that can resize, scroll, open
+            // a modal/view, or repaint its background. Ordinary typing and menu
+            // navigation keep the overlay in place so it updates without
+            // flashing the background underneath.
+            if !matches!(&event, Event::Key(_))
+                || agent_detail.is_some()
+                || crate::terminal::shortcuts::requested_in_input(&event, buffer.chars.is_empty())
+                || matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Left | KeyCode::Right))
+            {
+                command_overlay.clear_to(&mut crate::terminal_output::stderr_locked())?;
+            }
             if matches!(&event, Event::Key(key) if key.kind != KeyEventKind::Release && key.modifiers.contains(KeyModifiers::ALT) && matches!(key.code, KeyCode::Left | KeyCode::Right))
             {
                 if let Some((context, session)) = &self.subagent_context {
@@ -2309,6 +2420,18 @@ impl PromptEditor {
                         crate::keybindings::Resolution::Key(key) => key,
                         crate::keybindings::Resolution::Consumed => continue,
                     };
+                    let matches_selected_command =
+                        !items.is_empty() && text == entries[items[selected]].0;
+                    if !keeps_overlay_in_place(
+                        key,
+                        buffer.chars.is_empty(),
+                        !items.is_empty(),
+                        matches_selected_command,
+                        history_view.active(),
+                        crate::terminal::scrollback::compact(),
+                    ) {
+                        command_overlay.clear_to(&mut crate::terminal_output::stderr_locked())?;
+                    }
                     if crate::terminal::scrollback::compact_key(key) {
                         crate::terminal::scrollback::toggle_compact();
                         history_view.close()?;
@@ -2887,6 +3010,178 @@ mod tests {
         assert!(output.contains("message 18"));
         assert!(output.contains("message 19"));
         assert!(!output.contains('\n'));
+    }
+
+    #[test]
+    fn slash_menu_overlay_updates_in_place_without_flashing_background_rules() {
+        let mut terminal = vt100::Parser::new(24, 80, 0);
+        let rule = "─".repeat(40);
+        let mut background: Vec<String> = (0..24).map(|i| format!("message {i}")).collect();
+        background[16] = rule.clone();
+        background[18] = rule.clone();
+        for (row, text) in background.iter().enumerate() {
+            terminal.process(format!("\x1b[{};1H{text}\x1b[K", row + 1).as_bytes());
+        }
+        let original: Vec<String> = terminal.screen().rows(0, 80).collect();
+
+        let mut overlay = CommandOverlay::default();
+        let initial = vec![
+            ("/clear".into(), TextStyle::Selected),
+            ("/compact".into(), TextStyle::Muted),
+            ("/config".into(), TextStyle::Muted),
+            ("/context".into(), TextStyle::Muted),
+            ("/copy".into(), TextStyle::Muted),
+        ];
+        let mut output = Vec::new();
+        overlay
+            .draw_to(&mut output, &initial, 20, &background)
+            .unwrap();
+        terminal.process(&output);
+        assert_eq!(overlay.top, 15);
+        assert!(!String::from_utf8_lossy(&output).contains(&rule));
+
+        // Typing another character keeps the same 5-row span: covered
+        // background rules must never be rewritten, and unchanged rows stay put.
+        let narrowed = vec![
+            ("/compact".into(), TextStyle::Selected),
+            ("/config".into(), TextStyle::Muted),
+            ("/context".into(), TextStyle::Muted),
+            ("/copy".into(), TextStyle::Muted),
+            ("/cost".into(), TextStyle::Muted),
+        ];
+        output.clear();
+        overlay
+            .draw_to(&mut output, &narrowed, 20, &background)
+            .unwrap();
+        let diff = String::from_utf8(output.clone()).unwrap();
+        assert!(diff.contains("\x1b[?25l") && diff.contains("\x1b[?25h"));
+        assert!(
+            !diff.contains(&rule),
+            "covered background rule must not flash during in-place update: {diff:?}"
+        );
+        assert!(!diff.contains("message 15"));
+        assert!(!diff.contains("message 19"));
+        terminal.process(&output);
+        assert_eq!(terminal.screen().rows(0, 80).nth(15).unwrap().trim(), "/compact");
+        assert_eq!(terminal.screen().rows(0, 80).nth(19).unwrap().trim(), "/cost");
+
+        // Shrinking to 1 row restores only exposed rows (15..19) and overwrites
+        // row 19 directly without flashing message 19 first.
+        let empty_match = vec![("  No commands match \"/cx\"".into(), TextStyle::Muted)];
+        output.clear();
+        overlay
+            .draw_to(&mut output, &empty_match, 20, &background)
+            .unwrap();
+        let shrink = String::from_utf8(output.clone()).unwrap();
+        assert!(shrink.contains("message 15"));
+        assert!(shrink.contains(&rule));
+        assert!(
+            !shrink.contains("message 19"),
+            "row still covered by menu must not flash its background: {shrink:?}"
+        );
+        terminal.process(&output);
+        assert_eq!(terminal.screen().rows(0, 80).nth(16).unwrap().trim(), rule);
+        assert!(terminal
+            .screen()
+            .rows(0, 80)
+            .nth(19)
+            .unwrap()
+            .contains("No commands match"));
+
+        // Clearing restores the last covered row so the screen matches the original.
+        output.clear();
+        overlay.clear_to(&mut output).unwrap();
+        terminal.process(&output);
+        assert_eq!(terminal.screen().rows(0, 80).collect::<Vec<_>>(), original);
+    }
+
+    #[test]
+    fn slash_menu_overlay_keeps_editing_keys_in_place_and_clears_layout_events() {
+        let key = |code, modifiers| crossterm::event::KeyEvent::new(code, modifiers);
+        assert!(keeps_overlay_in_place(
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(keeps_overlay_in_place(
+            key(KeyCode::Backspace, KeyModifiers::NONE),
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(keeps_overlay_in_place(
+            key(KeyCode::Down, KeyModifiers::NONE),
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(keeps_overlay_in_place(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!keeps_overlay_in_place(
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            false,
+            true,
+            true,
+            false,
+            false
+        ));
+        assert!(!keeps_overlay_in_place(
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!keeps_overlay_in_place(
+            key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!keeps_overlay_in_place(
+            key(KeyCode::BackTab, KeyModifiers::SHIFT),
+            false,
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!keeps_overlay_in_place(
+            key(KeyCode::Char('c'), KeyModifiers::NONE),
+            false,
+            true,
+            false,
+            true,
+            false
+        ));
+
+        let mut screen = Screen::pinned();
+        let lines = frame_lines();
+        assert!(screen.will_reposition(lines.len(), 20));
+        screen
+            .draw_pinned_to(&mut Vec::new(), &lines, 1, 3, 20, 4)
+            .unwrap();
+        assert!(!screen.will_reposition(lines.len(), 20));
+        assert!(screen.will_reposition(lines.len() + 1, 20));
+        assert!(screen.will_reposition(lines.len() - 1, 20));
+        screen.invalidated = true;
+        assert!(screen.will_reposition(lines.len(), 20));
     }
 
     #[test]
