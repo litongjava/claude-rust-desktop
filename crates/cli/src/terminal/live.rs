@@ -1483,6 +1483,8 @@ struct Frame {
     /// stays right below the transcript, where its finished form is written,
     /// while the input box keeps the bottom rows.
     padding: usize,
+    /// Screen row of the bottom-right content corner, just above the input box.
+    content_bottom: Option<u16>,
     /// Whether the frame ends with the input box, rather than a menu question.
     input_box: bool,
     /// Rows of the input text in the current frame.
@@ -1833,6 +1835,8 @@ impl Frame {
         }
         lines.splice(content_rows..content_rows, std::iter::repeat_n(String::new(), padding));
         input_row += padding;
+        self.content_bottom =
+            (padding > 0).then_some((top + content_rows + padding - 1) as u16);
         for (index, line) in lines.iter().enumerate() {
             if !repaint && self.lines.get(index) == Some(line) {
                 continue;
@@ -2054,6 +2058,7 @@ impl Frame {
                 .saturating_sub(choice_cursor.map_or(cursor_from_end, |(row, _)| row));
             let cursor_column = choice_cursor.map_or(draft_column.min(width), |(_, column)| column);
             self.lines = lines.clone();
+            self.content_bottom = None;
             self.history_view
                 .draw(&lines, input_row, cursor_column, size)?;
             return Ok(());
@@ -2189,6 +2194,27 @@ fn write(text: &str) -> io::Result<()> {
     output.write_all(b"\x1b[?2026l")?;
     output.flush()
 }
+fn paint_selection_badge(
+    screen: &Frame,
+    selection: &super::mouse_selection::Selection,
+    selection_copy: Option<(usize, bool)>,
+    badge: &mut super::corner_badge::CornerBadge,
+) -> io::Result<()> {
+    if screen.history_view.active() {
+        return badge.clear();
+    }
+    let text = if selection.retained() {
+        Some(super::corner_badge::copy_hint())
+    } else {
+        selection_copy
+            .map(|(characters, copied)| super::corner_badge::copy_result(characters, copied))
+    };
+    match text.zip(screen.content_bottom) {
+        Some((text, row)) => badge.show(row, &text),
+        None => badge.clear(),
+    }
+}
+
 fn run(
     state: &mut State,
     screen: &mut Frame,
@@ -2204,12 +2230,29 @@ fn run(
     let mut agent_preview = String::new();
     let mut agent_click: Option<(usize, Instant)> = None;
     let mut copy_click = super::mouse_selection::CopyClick::default();
+    let mut copy_feedback_at: Option<Instant> = None;
+    let mut selection_copy: Option<(usize, bool)> = None;
+    let mut selection_copy_at: Option<Instant> = None;
+    let mut badge = super::corner_badge::CornerBadge::default();
     let mut drag_mouse = None;
     let mut last_drag = Instant::now();
     let mut input_reader = super::paste_input::Reader::new()?;
     screen.draw(state)?;
     loop {
         let mut dirty = false;
+        if state.copy_feedback.is_some()
+            && copy_feedback_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            state.copy_feedback = None;
+            copy_feedback_at = None;
+            dirty = true;
+        }
+        if selection_copy.is_some()
+            && selection_copy_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            selection_copy = None;
+            selection_copy_at = None;
+        }
         while !selection.retained() {
             match updates.try_recv() {
                 Ok(Update::Copy(number, command, body)) => {
@@ -2241,6 +2284,7 @@ fn run(
                         // Feedback occupies the existing footer, so copying
                         // never moves the running tool or allocates notice rows.
                         state.copy_feedback = Some(text);
+                        copy_feedback_at = None;
                     } else if command.trim() == "/status" || command.trim().starts_with("/tasks") {
                         if state.status_page.is_none() {
                             execute!(crate::terminal_output::stderr(), terminal::EnterAlternateScreen)?;
@@ -2633,8 +2677,24 @@ fn run(
             }
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if selection.retained()
+                        && key.modifiers.is_empty()
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if selection.copy_retained()? {
+                            if let Some((characters, copied)) = selection.take_copy_feedback() {
+                                selection_copy = Some((characters, copied));
+                                selection_copy_at = Some(Instant::now());
+                            }
+                            screen.draw(state)?;
+                            continue;
+                        }
+                    }
                     selection.clear()?;
                     state.copy_feedback = None;
+                    copy_feedback_at = None;
+                    selection_copy = None;
+                    selection_copy_at = None;
                     if state.draft.cursor < state.draft.paste_end
                         || matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Home)
                     {
@@ -2994,6 +3054,12 @@ fn run(
                         } else {
                             selection.screen_event(mouse, snapshot.clone())?
                         };
+                        if let Some((characters, copied)) = selection.take_copy_feedback() {
+                            selection_copy = Some((characters, copied));
+                            selection_copy_at = Some(Instant::now());
+                            screen.draw(state)?;
+                            continue;
+                        }
                         if let Some(click) = event {
                             if click.kind == MouseEventKind::Down(MouseButton::Left) {
                                 if (click.row as usize) < screen.history_view.header_rows(page) {
@@ -3037,7 +3103,14 @@ fn run(
                             *row = text.clone();
                         }
                     }
-                    let Some(mouse) = selection.screen_event(mouse, snapshot.clone())? else {
+                    let event = selection.screen_event(mouse, snapshot.clone())?;
+                    if let Some((characters, copied)) = selection.take_copy_feedback() {
+                        selection_copy = Some((characters, copied));
+                        selection_copy_at = Some(Instant::now());
+                        screen.draw(state)?;
+                        continue;
+                    }
+                    let Some(mouse) = event else {
                         continue;
                     };
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -3213,6 +3286,11 @@ fn run(
                     )?;
                 }
             }
+        }
+        if subagents.is_none() && state.status_page.is_none() && state.agent_detail.is_none() {
+            paint_selection_badge(screen, &selection, selection_copy, &mut badge)?;
+        } else {
+            badge.clear()?;
         }
     }
 }

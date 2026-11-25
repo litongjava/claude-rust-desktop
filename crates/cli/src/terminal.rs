@@ -201,6 +201,7 @@ pub mod vim;
 mod display_path;
 mod file_review;
 pub(crate) mod scrollback;
+mod corner_badge;
 mod mouse_selection;
 mod pinned_prompt;
 pub mod style;

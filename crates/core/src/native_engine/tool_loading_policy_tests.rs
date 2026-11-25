@@ -712,11 +712,13 @@ fn names_outside_the_catalog_keep_their_legacy_meaning() {
     .unwrap();
     executor.mcp_tools = vec![
         crate::tools::ToolDefinition {
+            summary: None,
             name: "mcp__fixture__tool".into(),
             description: "a server tool".into(),
             input_schema: json!({"type":"object","properties":{}}),
         },
         crate::tools::ToolDefinition {
+            summary: None,
             name: "mcp__fixture__other".into(),
             description: "another server tool".into(),
             input_schema: json!({"type":"object","properties":{}}),

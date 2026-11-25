@@ -15,7 +15,21 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         // `TaskOutput` is not advertised. Its dispatch alias remains below for
         // old transcripts and is not discoverable through ToolLoad.
         ("TaskStop", "Stop a task by ID. A managed shell, Monitor, Agent, Workflow or ToolScript job gets a cancellation request and stops through its owner; a shell's process tree is terminated with it. Any other task record is marked cancelled without touching a process. Cancellation is requested rather than confirmed, so use TaskGet to see the final status.",json!({"task_id":{"description":"ID of the task to stop, as returned when it started.","type":"string"},"shell_id":{"description":"Old alias for `task_id`; use `task_id`.","type":"string"}}),vec![]),
-    ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition {name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).chain(std::iter::once(super::shell_input::definition())).collect()
+    ].into_iter().map(|(name,description,properties,required)| super::ToolDefinition { summary: task_summary(name).map(str::to_owned),name:name.into(),description:description.into(),input_schema:json!({"type":"object","properties":properties,"required":required})}).chain(std::iter::once(super::shell_input::definition())).collect()
+}
+
+/// The one-line listing text for each task tool.
+fn task_summary(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "TaskCreate" => "Create a durable session task",
+        "TaskGet" => "Read a durable session task by ID, including its output and owner",
+        "TaskList" => "List durable session tasks",
+        "TaskUpdate" => "Update a durable session task",
+        "TaskStop" => "Stop a task by ID",
+        "TodoWrite" => "Replace the session durable todo list",
+        "TodoRead" => "Read the session durable todo list",
+        _ => return None,
+    })
 }
 
 pub fn is_task(name: &str) -> bool {

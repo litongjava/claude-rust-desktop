@@ -235,6 +235,7 @@ pub fn definitions(role: Role, member: Option<MemberRole>) -> Vec<ToolDefinition
     let mut definitions = Vec::new();
     if role.is_router() {
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpCreate".into(),
             description: "Create one Super Agent task from a complete specification. Returns task and pair IDs. The host prepares the isolated workspace, launches the Coder and requests plan approval; the task is not complete until the host verifies its evidence.".into(),
             input_schema: json!({
@@ -263,6 +264,7 @@ pub fn definitions(role: Role, member: Option<MemberRole>) -> Vec<ToolDefinition
             }),
         });
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpList".into(),
             description: "List this Router's tasks with phase, status and review round. Optionally filter by status (QUEUED, RUNNING, WAITING_USER, BLOCKED, RECOVERING, PAUSED, COMPLETED, FAILED, CANCELLED).".into(),
             input_schema: text(
@@ -272,6 +274,7 @@ pub fn definitions(role: Role, member: Option<MemberRole>) -> Vec<ToolDefinition
             ),
         });
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpShow".into(),
             description: "Show one task's summary, sessions, pending approvals and report/evidence references. It does not return full transcripts.".into(),
             input_schema: text(
@@ -281,6 +284,7 @@ pub fn definitions(role: Role, member: Option<MemberRole>) -> Vec<ToolDefinition
             ),
         });
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpSend".into(),
             description: "Send a message to this task's current Coder or Reviewer through the session message queue. The member must already have a session.".into(),
             input_schema: text(
@@ -294,6 +298,7 @@ pub fn definitions(role: Role, member: Option<MemberRole>) -> Vec<ToolDefinition
             ),
         });
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpUpdateSpec".into(),
             description: "Replace the task specification. The host increments the spec version, invalidates earlier reports and returns the task to planning and approval.".into(),
             input_schema: text(
@@ -303,6 +308,7 @@ pub fn definitions(role: Role, member: Option<MemberRole>) -> Vec<ToolDefinition
             ),
         });
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpAnswer".into(),
             description: "Resolve an existing pending approval for this Router's task. It cannot create authorization: the approval must exist, be pending and match the current spec and permission policy version.".into(),
             input_schema: text(
@@ -318,11 +324,13 @@ pub fn definitions(role: Role, member: Option<MemberRole>) -> Vec<ToolDefinition
     }
     if member.is_some() {
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpSubmit".into(),
             description: "Submit the task report for the current role. Coder: plan, implementation, integration. Reviewer: review, harness. The payload must match the typed schema for that kind; the host validates it and records the event without applying state.".into(),
             input_schema: submit_schema(),
         });
         definitions.push(ToolDefinition {
+            summary: None,
             name: "CrpProposeTask".into(),
             description: "Propose unrelated work discovered during this task. The Router decides whether it becomes a task.".into(),
             input_schema: text(

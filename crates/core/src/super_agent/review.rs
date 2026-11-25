@@ -38,6 +38,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }
         }
         ToolDefinition {
+            summary: None,
             name: description.into(),
             input_schema: json!({
                 "type":"object",
@@ -50,6 +51,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
     };
     vec![
         ToolDefinition {
+            summary: None,
             name: "SessionMetadata".into(),
             description: "Read metadata for a Coder session in this task's session tree. Returns no transcript.".into(),
             input_schema: json!({
@@ -62,6 +64,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         page("SessionMessages", json!({}), &["session_id"]),
         page("SessionEvents", json!({"type":{"type":"string"}}), &["session_id"]),
         ToolDefinition {
+            summary: None,
             name: "SessionChildren".into(),
             description: "List the current and previous Coder sessions plus recorded child sessions descending from them.".into(),
             input_schema: json!({
@@ -72,6 +75,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: None,
             name: "ArtifactRead".into(),
             description: "Read one report body or one stored artifact of the current task (maximum 64 KiB). Paths and cross-task artifacts are rejected.".into(),
             input_schema: json!({

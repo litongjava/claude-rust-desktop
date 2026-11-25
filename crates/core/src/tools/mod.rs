@@ -122,13 +122,22 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// One line for the loadable-tool listing. It is shown as written (only
+    /// whitespace is collapsed) and never cut, so a tool can keep a detail that
+    /// its first description sentence does not carry. Without it the listing
+    /// falls back to the complete `description`; `Customization::tool_summaries`
+    /// overrides both. It is never serialized: request bodies, snapshots and
+    /// cached tool JSON keep their exact bytes.
+    #[serde(default, skip_serializing)]
+    pub summary: Option<String>,
 }
 
 pub fn get_tool_definitions() -> Vec<ToolDefinition> {
     let bash_tool = shell_tool_description::bash_tool();
     let mut defs = vec![
         image_generation::definition(),
-        ToolDefinition { name: "Skill".into(), description: "Invoke a skill by name. The available skills are listed in a system reminder in the conversation, one line each with an optional description and execution context. Pass the exact name from that list without a leading slash; plugin-provided skills use the plugin:skill form. args is optional and is passed to the skill's template. A skill marked context: fork runs in an isolated child conversation and returns its result. Call this tool rather than opening a skill's file yourself; the tool supplies shell context and fork isolation.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"description":"Exact skill name from the reminder, without a leading slash; plugin skills use plugin:skill.","type":"string"},"args":{"description":"Optional arguments passed to the skill's template.","type":"string"}},"required":["skill"],"additionalProperties":false}) },
+        ToolDefinition {
+        summary: Some("Invoke a skill by name; its instructions come back in this turn".into()), name: "Skill".into(), description: "Invoke a skill by name. The available skills are listed in a system reminder in the conversation, one line each with an optional description and execution context. Pass the exact name from that list without a leading slash; plugin-provided skills use the plugin:skill form. args is optional and is passed to the skill's template. A skill marked context: fork runs in an isolated child conversation and returns its result. Call this tool rather than opening a skill's file yourself; the tool supplies shell context and fork isolation.".into(), input_schema:serde_json::json!({"type":"object","properties":{"skill":{"description":"Exact skill name from the reminder, without a leading slash; plugin skills use plugin:skill.","type":"string"},"args":{"description":"Optional arguments passed to the skill's template.","type":"string"}},"required":["skill"],"additionalProperties":false}) },
         notebook::definition(),
         lsp::definition(),
         // `worktree` stays dispatchable for older transcripts; the model sees Enter/ExitWorktree.
@@ -139,6 +148,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         crate::services::compaction_requests::definition(),
         context_search::definition(),
         ToolDefinition {
+            summary: Some("Load deferred tools by their exact names so the next request carries them".into()),
             name: TOOL_LOAD_NAME.into(),
             description: "Load deferred tools by their exact, case-sensitive names. Use the names listed in the conversation's system reminder and pass them as an array, for example {\"names\":[\"ListDir\",\"WebFetch\"]}. Call the loaded tools starting with the next model request. Tool loading does not grant permission to run a tool.".into(),
             input_schema: serde_json::json!({
@@ -157,6 +167,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Execute an installed, enabled plugin command with OS user permissions".into()),
             name: "PluginRun".into(),
             description: "Execute an installed, enabled plugin command with OS user permissions. Requires execution approval.".into(),
             input_schema: serde_json::json!({"type":"object","properties":{"plugin":{"type":"string"},"command":{"type":"string"},"input":{}},"required":["plugin","command"]}),
@@ -164,6 +175,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         github::definition(),
         read::definition(),
         ToolDefinition {
+            summary: Some("Create a file or replace its whole contents".into()),
             name: "Write".to_string(),
             description: "Create a file or replace its whole contents with UTF-8 text. Missing parent directories are created. If the path already exists, read it in this conversation first and leave it unchanged since, or the call is refused. For a partial change to an existing file, use Edit or MultiEdit instead. The result reports the resolved path and how many bytes were written.".to_string(),
             input_schema: serde_json::json!({
@@ -177,6 +189,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Replace one exact string in a workspace file".into()),
             name: "Edit".to_string(),
             description: "Change a file by replacing an exact string. Read the file first in this conversation and leave it unchanged since, or the call is refused. old_string must match exactly once, indentation included, unless replace_all is true. LF and CRLF compare as equal, and replacements keep the file's existing line-ending style. A miss or duplicate match returns an error and writes nothing. Exclude the line-number prefix that Read adds; match only the file text.".to_string(),
             input_schema: serde_json::json!({
@@ -192,6 +205,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Run a shell command in the session shell; background and detached runs survive the call".into()),
             name: "Bash".to_string(),
             description: bash_tool.description().to_owned(),
             input_schema: serde_json::json!({
@@ -213,6 +227,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Run a script in the background and get notified for each matching output line".into()),
             name: "Monitor".to_string(),
             description: format!("Runs a shell script in the background for this session and streams its output to you: every stdout line becomes a notification that wakes you, so you never poll. Lines within 200 ms arrive together. Use it to watch logs, builds, CI or any condition over time: write a script that prints a line only when something you would act on happens (for example `tail -f app.log | grep --line-buffered ERROR`, or a polling loop that echoes on change). Each pipe stage must flush per line. stderr is logged, not notified. The monitor expires after timeout_ms (default 30 min, max 60 min). Set max_runtime_ms to keep watching the same live script for another timeout_ms at each deadline, up to that total runtime. A renewal can send one notification, with at most one renewal notice per minute. You are notified when the monitor exits, expires or is stopped. More than 30 output events a minute stops it, so filter tightly. It runs only while this session runs. TaskStop with its task_id stops it. For a single 'tell me when X finishes', use Bash run_in_background instead.{}", bash_tool.monitor_suffix()),
             input_schema: serde_json::json!({
@@ -230,6 +245,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         python::definition(),
         ToolDefinition {
+            summary: Some("List the contents of a directory".into()),
             name: "ListDir".to_string(),
             description: "List the contents of a directory.".to_string(),
             input_schema: serde_json::json!({
@@ -241,6 +257,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Read a web page and answer a prompt from it with the session model".into()),
             name: "WebFetch".to_string(),
             description: "Read a web page and answer prompt from it with the session's model. The result is that answer, not the page markup or the raw response body. http(s) only; public http is upgraded to https. Local and private addresses need the user's approval unless the session is in bypass mode. Same-host redirects are followed; a cross-host redirect is returned for you to fetch. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page; a successful download is reused for fifteen minutes. When you need the exact response body, such as from a local JSON endpoint, run curl or a similar command through Bash instead.".to_string(),
             input_schema: serde_json::json!({
@@ -255,6 +272,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Search the web with the provider native search, or its public adapter when configured".into()),
             name: "WebSearch".to_string(),
             description: "Use the provider's native web search, or its public adapter when configured. Each call returns at most eight results with a title, URL and snippet. allowed_domains keeps matching hosts and blocked_domains drops them; both include subdomains. The query must be non-empty and at most 2,000 characters. If the provider has no native search or has search disabled, the call fails with a settings error; do not report that as a successful search. Use the system prompt date to judge recency.".to_string(),
             input_schema: serde_json::json!({
@@ -270,6 +288,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         },
         apply_patch_tool::definition(),
         ToolDefinition {
+            summary: Some("Apply several exact replacements to one file in a single call".into()),
             name: "MultiEdit".to_string(),
             description: "Apply several exact replacements to one file in a single call. Edits run in order against the working text, and the file is written only if every edit succeeds; one failure returns the failing edit's error and leaves the file unchanged. Read the file first and leave it unchanged since. Each old_string must be unique unless its replace_all is true, and LF and CRLF compare as equal.".to_string(),
             input_schema: serde_json::json!({
@@ -292,6 +311,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Ask the user up to four questions and wait for the answers".into()),
             name: "AskUserQuestion".to_string(),
             description: "Ask when a decision belongs to the user: the request, the code and sensible defaults leave it open, and the answer changes what you do next. The schema allows 1-4 questions per call; each question has a short header, 2-4 options with a label and a description, and an optional multiSelect flag. Put your recommended option first. If a conventional default or something you can check settles it, decide yourself, say why, and continue.".to_string(),
             input_schema: serde_json::json!({
@@ -334,6 +354,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            summary: Some("Control the computer: move the mouse, click, type text, press keys and take screenshots".into()),
             name: "computer_use".to_string(),
             description: "Control the computer: move mouse, click, type text, press keys, take screenshots. Use this to interact with the desktop GUI. Screenshots are saved locally; results contain screenshot_path (absolute path) and mime_type, not Base64 image data.".to_string(),
             input_schema: serde_json::json!({
@@ -1921,5 +1942,20 @@ mod retired_tool_tests {
         for retired in ["memory_search", "memory_ingest"] {
             assert!(!names.iter().any(|name| name == retired), "{retired}: {names:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    /// The loadable-tool listing shows `summary`; a missing one falls back to the
+    /// whole description, so every advertised built-in must carry one.
+    #[test]
+    fn every_advertised_tool_carries_a_listing_summary() {
+        let missing = crate::native_engine::tool_loop::builtin_tool_catalog()
+            .into_iter()
+            .filter(|tool| tool.summary.as_deref().is_none_or(|text| text.trim().is_empty()))
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+        assert!(missing.is_empty(), "tools without a summary: {missing:?}");
     }
 }

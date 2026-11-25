@@ -185,6 +185,25 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 3. `cargo test --locked -p deepseek-code-cli --bin dcl terminal::scrollback` 覆盖真实工具名分类（包括 PowerShell 和全部编辑工具）、同名计数、宽度截断/剩余调用数、失败数、组级状态、模式重开和 reasoning 不算工具。自定义标题包含 Bash/Read 文本不能改变工具分类。
 4. 本地 mock 返回未知名称的 `ToolLoad` 调用（例如 12 个 `✈️`），确认结果记为失败。恢复会话，在 64 列打开紧凑模式并调整到 32 列。CLI 应继续运行，摘要按终端列宽保留完整字素和右括号。在 `terminal::tool_view`、`terminal::scrollback`、`terminal::progress` 中回归 CJK、变体选择符、ZWJ emoji 和组合字符，包括极窄列宽。
 
+### C3. 拖动选择与右击复制（SSH/tmux）
+
+1. 在提示符、模型输出和 `Ctrl+O` 记录里按住左键拖动：出现反色选择，松开后高亮保留，输入框上方内容区右下角显示 `按 c 复制`（英文界面为 `Press c to copy`）；在保留的选择上右击或按 `c`，所选文本进入剪贴板，高亮消失，同一位置显示 `已复制 N 个字符`（英文为 `Copied N characters`），且 `c` 不会插入草稿。提示约 2 秒后自动消失，按任意键也会立即消失；底部状态栏保持默认。提示行不得出现反色或其他背景色。没有选区时再次右击不复制、不报错，按 `c` 正常输入。
+2. 复制失败的路径在内容区显示 `复制失败`，选择同样取消；滚轮、左键点击展开、单双击状态行复制保持原行为。
+3. 本地桌面终端：右击后粘贴应得到原文，包含中文和换行；本地会话仍优先使用系统剪贴板。
+4. 在 tmux 中运行（含 SSH 远程主机）：tmux 需已开启 `set -g mouse on`，应用才能收到鼠标事件；拖动选择后右击，`tmux show-buffer` 应为所选文本，屏幕上不再保留反色高亮，内容区右下角显示 `已复制 N 个字符`。外层终端支持 OSC 52 时，`load-buffer -w` 也应把同一文本送到本地剪贴板。即使远端存在 `pbcopy`/`xclip`，也不能只写远端剪贴板。
+5. 运行中的反馈还要单独验证：模型流式输出时拖动选择并右击，内容区右下角提示出现且流式输出继续；等待约 2 秒确认提示自动消失。分别用 `LC_ALL=zh_CN.UTF-8` 和 `en_US.UTF-8`（或 `config.json` 的 `language`）启动，确认中英文提示都正确，且提示行没有背景色。`Ctrl+O` 全页记录和文件差异页仍在各自页脚显示 `Copied N characters to clipboard`。
+6. 自动回归（分别执行）：
+
+   ```bash
+   cargo test --locked -p deepseek-code-cli --bin dcl terminal::mouse_selection::tests::
+   cargo test --locked -p deepseek-code-cli --bin dcl terminal::file_review
+   cargo test --locked -p deepseek-code-cli --bin dcl terminal::transcript_pager
+   cargo test --locked -p deepseek-code-cli --bin dcl editor_keeps_right_click_events_for_selection_copy
+   cargo test --locked -p deepseek-code-cli --bin dcl extended_commands::tests::clipboard
+   ```
+
+7. 平台说明：Windows ConPTY 的右击由 crossterm 鼠标事件驱动；macOS/Linux 的 SSH+tmux 需要真实终端复验，不能用本机单测替代。
+
 ### D. 中途关闭后恢复
 
 这些场景都要在关闭后立刻恢复一次，因为被杀的前端留下的占用记录要几秒后才过期。
@@ -311,7 +330,7 @@ cargo test --locked -p deepseek-code-cli --bin dcl -- monitor_events_are_queued_
 8. 真实进程重启：加载工具后退出 `dcl`，用 `--resume` 打开同一会话，首个请求就应包含该工具；在同一数据目录新建会话则不应包含。
 9. Responses 协议：使用带 Responses 适配的供应商模型，确认首请求不含按需工具、加载后的下一请求带真实参数结构、工具能实际执行，且恢复后的首个请求已带此前加载的工具。
 10. 运行中改配置：在模型响应期间把常驻工具改成“仅按需加载”，该轮后续调用应被拒绝并提示先加载，且下一次请求不再带该工具。
-11. `tool_descriptions`：模型读到修改后的说明，`ToolLoad` 返回相同的工具说明。
+11. `tool_descriptions`：模型读到修改后的说明，`ToolLoad` 返回相同的工具说明；未设置 `tool_summaries` 时，可加载目录里的这一行也使用该说明。
 12. `system_prompt`：`replace` 和 `append` 生效，环境信息仍然存在。
 13. 文件语法错误时这一轮报错退出；删除文件后恢复默认。
 14. 按需加载后的权限：先加载一个需要审批的工具（例如 `Write`），拒绝审批时工具不执行、目标文件不产生，拒绝结果进入下一次请求；审批等待期间取消本轮，不执行工具也不再发起请求。
@@ -322,7 +341,7 @@ cargo test --locked -p deepseek-code-cli --bin dcl -- monitor_events_are_queued_
 
 19. 精确名称：`ToolLoad` 接收 `{"names":["WebSearch","ListDir"]}`。数组含 1–64 个非空字符串，名称区分大小写，重复项按首次出现的位置处理。已在请求中或已加载的工具作为 `already_available` 返回，避免重复加载。未知或不可用的名称逐项报告；调用报错且本次不加载任何工具。测试还验证空数组、字符串、额外字段、大小写错误、关键词及 `select:` 输入。
 
-20. 工具目录：每次真实请求的系统提示词（OpenAI 的 system 消息、Anthropic 的 `system`、Responses 的 `instructions`）包含当前可加载的内置工具名和一句话用途，并说明 `ToolLoad` 只能加载这里列出的内置工具。目录与本次请求的工具 schema 来自同一份设置和目录快照，描述覆盖一致。内置目录省略常驻、已加载、两个开关都关、代理未允许及自定义工具。MCP 按需目录使用相同的加载资格判断，省略已加载、旧禁用列表中的工具及代理未获授权的工具。两部分都要求本次请求携带 `ToolLoad`。成功加载后，定义从下一次请求起可调用，本次响应中的调用会被拒绝。是否声称可加载取决于本次请求是否真的有可调用的 `ToolLoad`：两个开关都关或按需但尚未加载时，目录说明它不可用且不列出可加载名称；有 `ToolLoad` 但没有可加载工具时如实说明；受限代理没有 `ToolLoad` 时仍只直接暴露已授权的按需工具。已删除的 Git 工具和 `smart_project_scan` 不在目录中，直接调用返回 `Unknown tool`；Git 命令仍可通过 `Bash` 在临时仓库中执行。自动回归：`cargo test --locked -p deepseek-code-core --lib tool_loading_tests::every_transport_sends_a_dynamic_directory_of_loadable_builtins`、`tool_loading_tests::a_request_without_callable_tool_load_does_not_promise_loading`、`tool_loading_tests::an_empty_directory_is_reported_truthfully`、`tool_loading_tests::removed_git_tools_cannot_be_restored_configured_or_called` 与 `tools::directory_edit_regressions::git_commands_run_through_bash_after_the_native_tools_are_removed`。
+20. 工具目录：每次真实请求的系统提示词（OpenAI 的 system 消息、Anthropic 的 `system`、Responses 的 `instructions`）包含当前可加载的内置工具名和一句话用途，并说明 `ToolLoad` 只能加载这里列出的内置工具。目录与本次请求的工具 schema 来自同一份设置和目录快照，描述覆盖一致。内置目录省略常驻、已加载、两个开关都关、代理未允许及自定义工具。MCP 按需目录使用相同的加载资格判断，省略已加载、旧禁用列表中的工具及代理未获授权的工具。两部分都要求本次请求携带 `ToolLoad`。成功加载后，定义从下一次请求起可调用，本次响应中的调用会被拒绝。是否声称可加载取决于本次请求是否真的有可调用的 `ToolLoad`：两个开关都关或按需但尚未加载时，目录说明它不可用且不列出可加载名称；有 `ToolLoad` 但没有可加载工具时如实说明；受限代理没有 `ToolLoad` 时仍只直接暴露已授权的按需工具。已删除的 Git 工具和 `smart_project_scan` 不在目录中，直接调用返回 `Unknown tool`；Git 命令仍可通过 `Bash` 在临时仓库中执行。目录每行按 `tool_summaries`、`tool_descriptions`、工具自身 `summary`、完整 `description` 的顺序取文本；只折叠空白，不截断也不加省略号。内置工具各自带一条 `summary`（缺少时 `tools::summary_tests::every_advertised_tool_carries_a_listing_summary` 失败），MCP 与自定义工具没有 summary，显示完整说明。自动回归：`cargo test --locked -p deepseek-code-core --lib tool_loading_tests::every_transport_sends_a_dynamic_directory_of_loadable_builtins`、`tool_loading_tests::a_request_without_callable_tool_load_does_not_promise_loading`、`tool_loading_tests::an_empty_directory_is_reported_truthfully`、`tool_loading_tests::removed_git_tools_cannot_be_restored_configured_or_called`、`tool_loading_tests::the_loadable_reminder_shows_custom_text_uncut_and_the_whole_description_otherwise`、`tools::summary_tests::every_advertised_tool_carries_a_listing_summary` 与 `tools::directory_edit_regressions::git_commands_run_through_bash_after_the_native_tools_are_removed`。
 
 21. 显示：SDK `system/init` 和模型工具列表使用 `ToolLoad`。CLI 普通模式、进度行、紧凑分组以及恢复后的滚动记录显示 `ToolLoad(Read, Grep)`。长列表截断且保留右括号。64 列的紧凑模式保留 `ToolLoad(…)`，展开和折叠两种状态均可验证。回退活动行显示带名称的调用标签。浏览器工作明细和轨迹使用相同名称格式。
 
@@ -920,7 +939,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `native_engine/tool_loop.rs` 的错误与请求快照路径：K、H
 - `native_engine/generation.rs`、`services/compaction.rs`、`services/compaction/`：L，以及 E5
 - `native_engine/tool_call_ids.rs`（发给模型的请求体）：E1、E6；确认只改写超长调用 ID，未提供 `tool_calls`、`content` 等字段的消息不会被补成 `null`
-- `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
+- `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择；右击复制后会取消选中并提示结果）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
 - `skills/discovery.rs`、`native_engine/skill_tool.rs`、`native_engine/engine_core.rs` 的技能发现与模型列表、`cli/skill_commands.rs`：N
 - 其他范围：至少跑 E
 

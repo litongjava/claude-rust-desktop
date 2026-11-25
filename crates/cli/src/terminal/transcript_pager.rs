@@ -406,13 +406,24 @@ fn pager(
     let mut search: Option<String> = None;
     let mut query = String::new();
     let mut redraw = true;
+    let mut copy_feedback: Option<String> = None;
     let mut selection = super::mouse_selection::Selection::default();
     loop {
         let footer_rows = if help { HELP.len() + 1 } else { 2 };
         let page = (size.1 as usize).saturating_sub(footer_rows).max(1);
         top = top.min(all.len().saturating_sub(page));
         if redraw {
-            draw(out, &all, top, page, size, help, search.as_deref(), color, footer)?;
+            draw(
+                out,
+                &all,
+                top,
+                page,
+                size,
+                help,
+                search.as_deref(),
+                color,
+                copy_feedback.as_deref().unwrap_or(footer),
+            )?;
         }
         // Only an event changes the page; idle polls draw nothing.
         let Some(event) = next_event()? else {
@@ -420,6 +431,7 @@ fn pager(
             continue;
         };
         if super::shortcuts::requested(&event) {
+            copy_feedback = None;
             selection.clear()?;
             let mut background = vec![String::new(); size.1 as usize];
             for (index, row) in all.iter().skip(top).take(page).enumerate() { background[index] = row.styled.clone(); }
@@ -430,6 +442,7 @@ fn pager(
         redraw = true;
         let key = match event {
             Event::Resize(cols, rows_count) => {
+                copy_feedback = None;
                 selection.discard();
                 size = (cols, rows_count);
                 all = transcript_rows(lines, logged, (cols as usize).saturating_sub(1).max(10), color);
@@ -440,9 +453,13 @@ fn pager(
                     let mut snapshot = vec![String::new(); size.1 as usize];
                     for (index, row) in all.iter().skip(top).take(page).enumerate() { snapshot[index] = row.styled.clone(); }
                     selection.event(mouse, snapshot)?;
-                    redraw = false;
+                    copy_feedback = selection
+                        .take_copy_feedback()
+                        .map(|(characters, copied)| super::mouse_selection::copy_message(characters, copied));
+                    redraw = copy_feedback.is_some();
                     continue;
                 }
+                copy_feedback = None;
                 selection.clear()?;
                 match mouse.kind {
                     MouseEventKind::ScrollUp => top = wheel_top(top, true),
@@ -451,7 +468,22 @@ fn pager(
                 }
                 continue;
             }
-            Event::Key(key) if key.kind != KeyEventKind::Release => key,
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                if selection.retained()
+                    && key.modifiers.is_empty()
+                    && key.code == KeyCode::Char('c')
+                {
+                    if selection.copy_retained()? {
+                        copy_feedback = selection.take_copy_feedback().map(|(characters, copied)| {
+                            super::mouse_selection::copy_message(characters, copied)
+                        });
+                        redraw = true;
+                        continue;
+                    }
+                }
+                copy_feedback = None;
+                key
+            }
             _ => continue,
         };
         selection.clear()?;

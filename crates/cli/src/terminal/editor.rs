@@ -956,6 +956,20 @@ fn move_screen_row(out: &mut impl Write, current: &mut usize, target: usize) -> 
     Ok(())
 }
 
+fn editor_mouse_event(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            // A right click on a retained drag selection copies it.
+            | MouseEventKind::Down(MouseButton::Right)
+            | MouseEventKind::Up(MouseButton::Right)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+    )
+}
+
 fn read_editor_event(
     reader: &mut crate::terminal::paste_input::Reader,
 ) -> io::Result<Option<Event>> {
@@ -964,14 +978,7 @@ fn read_editor_event(
             return Ok(None);
         };
         if let Event::Mouse(mouse) = &event {
-            if !matches!(
-                mouse.kind,
-                MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::Up(MouseButton::Left)
-                    | MouseEventKind::Drag(MouseButton::Left)
-                    | MouseEventKind::ScrollUp
-                    | MouseEventKind::ScrollDown
-            ) {
+            if !editor_mouse_event(mouse.kind) {
                 continue;
             }
         }
@@ -1195,6 +1202,9 @@ impl PromptEditor {
         let mut last_state = (buffer.chars.clone(), buffer.cursor);
         let mut kill_hint = false;
         let mut copy_feedback: Option<String> = None;
+        let mut selection_copy: Option<(usize, bool)> = None;
+        let mut selection_copy_at: Option<std::time::Instant> = None;
+        let mut badge = crate::terminal::corner_badge::CornerBadge::default();
         let mut clear_esc: Option<std::time::Instant> = None;
         // Read once per prompt; ctrl+t toggles whether they show.
         let todo_list = self.todos.as_ref().map(|todos| todos()).unwrap_or_default();
@@ -1250,6 +1260,13 @@ impl PromptEditor {
         // Files may have changed since the last prompt; list them again on `@`.
         self.files = None;
         loop {
+            if selection_copy.is_some()
+                && selection_copy_at
+                    .is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+            {
+                selection_copy = None;
+                selection_copy_at = None;
+            }
             if yielded.load(std::sync::atomic::Ordering::Acquire) {
                 self.pending_draft = buffer.text();
                 self.pending_cursor = Some(buffer.cursor);
@@ -1716,6 +1733,23 @@ impl PromptEditor {
                     agent_scroll,
                 )?;
             }
+            let badge_text = if selection.retained() {
+                Some(crate::terminal::corner_badge::copy_hint())
+            } else {
+                selection_copy
+                    .map(|(characters, copied)| {
+                        crate::terminal::corner_badge::copy_result(characters, copied)
+                    })
+            };
+            let badge_row = if history_view.active() {
+                rows.checked_sub(lines.len() as u16 + 1)
+            } else {
+                screen.top.and_then(|top| top.checked_sub(1))
+            };
+            match badge_text.zip(badge_row) {
+                Some((text, row)) => badge.show(row, &text)?,
+                None => badge.clear()?,
+            }
             let Some(event) = read_editor_event(&mut input_reader)? else {
                 continue;
             };
@@ -1972,6 +2006,11 @@ impl PromptEditor {
                         } else {
                             selection.screen_event(mouse, snapshot.clone())?
                         };
+                        if let Some((characters, copied)) = selection.take_copy_feedback() {
+                            selection_copy = Some((characters, copied));
+                            selection_copy_at = Some(std::time::Instant::now());
+                            continue;
+                        }
                         if let Some(click) = selected {
                             if click.kind == MouseEventKind::Down(MouseButton::Left) {
                                 if (click.row as usize) < history_view.header_rows(page) {
@@ -2008,7 +2047,13 @@ impl PromptEditor {
                             *row = text.clone();
                         }
                     }
-                    let Some(mouse) = selection.screen_event(mouse, snapshot.clone())? else {
+                    let event = selection.screen_event(mouse, snapshot.clone())?;
+                    if let Some((characters, copied)) = selection.take_copy_feedback() {
+                        selection_copy = Some((characters, copied));
+                        selection_copy_at = Some(std::time::Instant::now());
+                        continue;
+                    }
+                    let Some(mouse) = event else {
                         continue;
                     };
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left)
@@ -2094,6 +2139,18 @@ impl PromptEditor {
                     menu_hidden = false;
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if selection.retained()
+                        && key.modifiers.is_empty()
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if selection.copy_retained()? {
+                            if let Some((characters, copied)) = selection.take_copy_feedback() {
+                                selection_copy = Some((characters, copied));
+                                selection_copy_at = Some(std::time::Instant::now());
+                            }
+                            continue;
+                        }
+                    }
                     selection.clear()?;
                     if buffer.cursor < buffer.paste_end
                         || matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Home)
@@ -2136,6 +2193,8 @@ impl PromptEditor {
                     }
                     restored = false;
                     copy_feedback = None;
+                    selection_copy = None;
+                    selection_copy_at = None;
                     let killing = control && matches!(key.code, KeyCode::Char('u' | 'k'));
                     if killing {
                         let cut: String = if key.code == KeyCode::Char('u') {
@@ -2731,6 +2790,14 @@ mod tests {
         assert_eq!(background_label(3, 0).as_deref(), Some("3 shells \u{b7} \u{2193} to manage"));
         assert_eq!(background_label(0, 1).as_deref(), Some("1 monitor \u{b7} \u{2193} to manage"));
         assert_eq!(background_label(4, 2).as_deref(), Some("4 shells, 2 monitors \u{b7} \u{2193} to manage"));
+    }
+
+    #[test]
+    fn editor_keeps_right_click_events_for_selection_copy() {
+        assert!(editor_mouse_event(MouseEventKind::Down(MouseButton::Right)));
+        assert!(editor_mouse_event(MouseEventKind::Up(MouseButton::Right)));
+        assert!(editor_mouse_event(MouseEventKind::Down(MouseButton::Left)));
+        assert!(!editor_mouse_event(MouseEventKind::Moved));
     }
 
     #[test]
