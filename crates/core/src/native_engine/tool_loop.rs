@@ -1230,9 +1230,10 @@ fn shell_state_input(
     mode: crate::permissions::PermissionMode,
 ) -> Value {
     let mut input = input.clone();
-    // Monitor runs through the same shell path, so it gets the same sandbox
-    // policy and cwd handling.
-    if matches!(name, "Bash" | "Monitor") {
+    // Monitor runs through the same shell path and Python has its own
+    // interpreter, so both get the same sandbox policy. Python ignores the
+    // shell cwd state below.
+    if matches!(name, "Bash" | "Monitor" | "Python") {
         if let (Some(root), Some(session)) = (
             search_config_path.and_then(std::path::Path::parent),
             conv_id,
@@ -7635,3 +7636,38 @@ mod shell_cwd_tests {
 
 #[path = "toolscript_approval.rs"]
 pub(crate) mod toolscript_approval;
+
+#[cfg(test)]
+mod shell_state_input_tests {
+    use super::shell_state_input;
+    use crate::permissions::PermissionMode;
+    use serde_json::json;
+
+    #[test]
+    fn python_gets_the_sandbox_policy_like_bash() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("settings.json"),
+            json!({"sandbox": {"enabled": true}}).to_string(),
+        )
+        .unwrap();
+        let search = root.path().join("config.json");
+        let cwd = workspace.path().to_str().unwrap();
+        let input = |name: &str| {
+            shell_state_input(
+                name,
+                &json!({"code": "print(1)", "command": "echo ok"}),
+                cwd,
+                Some(&search),
+                Some("session"),
+                PermissionMode::AskPermissions,
+            )
+        };
+        for name in ["Bash", "Python"] {
+            let value = input(name);
+            assert!(value["__sandbox"].is_object(), "{name}");
+        }
+        assert!(input("Read").get("__sandbox").is_none());
+    }
+}

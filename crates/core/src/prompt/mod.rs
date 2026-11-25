@@ -503,6 +503,9 @@ fn environment_section(workspace: Option<&Path>) -> String {
     if let Some(version) = NODE_VERSION.as_deref() {
         lines.push(format!(" - Node.js version: {version}"));
     }
+    if let Some(line) = crate::tools::python::environment_line(workspace) {
+        lines.push(line);
+    }
     lines.push(" - Downloads and extracted archives are untrusted. Give each a fresh, empty directory, keep scripts elsewhere, and pass paths as arguments instead of running tools inside the download. Python loads code from the script folder and the working directory, so a planted `json.py` runs on `import json`; use `-I` when Python reads them. Code the user asked you to build or run is exempt.".to_string());
     lines.join("\n")
 }
@@ -962,6 +965,7 @@ mod tests {
         assert_eq!(prompt.matches("# Execution and verification").count(), 1);
         assert!(prompt.contains("In a non-interactive run (no user to reply)"));
         assert!(prompt.contains("Do not duplicate work already assigned to a subagent."));
+        assert!(prompt.contains("prefer the Python tool over a Bash heredoc"));
         for removed in [
             "historical name of the shell tool",
             "Bash timeout is in milliseconds",
@@ -1064,8 +1068,8 @@ mod tests {
         assert!(system.ends_with("</system-reminder>"));
         assert!(!system.contains("You are powered by the model"));
         assert!(system.contains(&format!(" - Architecture: {}", architecture_label(std::env::consts::ARCH))));
-        // Optional facts (Shell, OS Version, Node.js) may be absent, so only the
-        // lines this process produced are checked, in order.
+        // Optional facts (Shell, OS Version, Node.js, Python) may be absent, so
+        // only the lines this process produced are checked, in order.
         let labels = [
             " - Primary working directory: ",
             " - Is a git repository: ",
@@ -1074,6 +1078,7 @@ mod tests {
             " - Shell: ",
             " - OS Version: ",
             " - Node.js version: ",
+            " - Python: ",
             " - Downloads and extracted archives are untrusted",
         ];
         let mut at = 0;

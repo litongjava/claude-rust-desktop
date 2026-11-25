@@ -836,6 +836,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `crates/cli/tests/conpty_worker.rs`、`crates/cli/tests/fixtures/conpty-console.ps1`：见“Windows ConPTY”中的并发启动与进程树清理场景。Linux 仅检查此测试目标可以编译。
 - `memory.rs`、`display_commands.rs`、`crates/core/src/memory`：G
 - `services/customization.rs`、`prompt/`、`native_engine/tool_loop.rs`：H，以及 SDK 测试
+- `tools/python.rs`、`services/python_settings.rs`、`prompt/` 的 Python 环境行、`native_engine/model_tool_output.rs` 的 Python 渲染：P（Python 工具），以及 H（工具加载、权限与自定义）
 - `tools/context_search.rs`、`db/context_search_repo.rs`、`db/context_search_index.rs` 与 ContextSearch 的工具注册：H、L 和下文“压缩后检索当前会话（ContextSearch）”。
 - `crates/core/src/skills/discovery.rs`、`crates/core/src/native_engine/engine_core.rs` 的技能列表、`crates/core/src/native_engine/skill_tool.rs`：N
 - `crates/core/src/skills/mod.rs` 的 bundled 安装、`bundled.rs`、`bundled_resources.rs`、`bundled_manifest.rs`、`skill_creator.rs`、`skills/bundled/`：O（安装与 `ensure_installed` 的旧占位迁移见 N、O 两节）
@@ -1637,3 +1638,32 @@ For unstamped worker submissions, run `unstamped_worker_adopts_the_authoritative
 - 用交互终端连接本机 mock，主回复报告缓存命中。确认输入框出现灰字，退出并恢复同一会话，再次出现同一条灰字且请求计数不变。按 Tab 接受后退出，再次恢复应无灰字。检查会话消息只含用户实际提交的内容和主回复。
 
 I39 第二轮：在本地 HTTP 服务上挂起上轮建议，再从同一 SDK 或另一进程提交新回合。下一回合可立即进入；返回 503 后不得重发旧前缀。Linux 单回合前台 Worker 在建议应答前应完成前台任务并释放租约。以目录内置 ID 指向自定义 Responses/Gemini 地址时，零缓存读取只发主请求。用 `cargo test --locked -p deepseek-code-cli --test sdk prompt_suggestion` 和 `cargo test --locked -p deepseek-code-core --lib suggestion::` 检查。记录目录的 Round 2 脚本另覆盖首发前等待录制锁、域名映射与跨进程切换绑定。
+
+### P Python 工具
+
+自动检查：
+
+```bash
+cargo test --locked -p deepseek-code-core --lib tools::python::tests
+cargo test --locked -p deepseek-code-core --test python_tool
+cargo test --locked -p deepseek-code-core --lib python_settings
+cargo test --locked -p deepseek-code-core --lib permissions::patterns::tests
+cargo test --locked -p deepseek-code-core --lib python_output_consumes
+cargo test --locked -p deepseek-code-core --lib python_gets_the_sandbox_policy
+cargo test --locked -p deepseek-code-core --test advanced_tools
+cargo test --locked -p deepseek-code-cli --bin dcl python_approval
+cargo test --locked -p deepseek-code-cli --bin dcl tool_previews_are_bounded
+cargo test --locked -p deepseek-code-cli --bin dcl shell_configuration_is_shared
+```
+
+手工/真实模型检查：
+
+1. 用 `ToolLoad` 加载 `Python`，下一次请求才调用。直接调用应被拒绝；两个开关都关时目录、加载和调用都不出现。新会话提出纯 Python 片段/数值实验时，模型应先 `ToolLoad {"names":["Python"]}`，而不是用 Bash heredoc 或 `python -c`；`python -m`/带参数的脚本仍走 Bash。
+2. `print(1)` 得到 `stdout:"1\n"`、`exit_code:0`、`script_saved:false`，且没有 `script_path`。检查 `__file__` 是真实 `.py` 路径，stdin 为空时 `input()` 立即得到 EOF。
+3. `env` 中的变量在 `os.environ` 可见；`PYTHONPATH` 能导入工作区模块，工作区始终在 `sys.path` 中。非零退出码和 stderr 原样返回。
+4. `save_name:"python/script/001.py"` 写到 `<workspace>/temp/python/script/001.py`，自动建目录、可覆盖旧文件，结果含 `script_saved:true` 与绝对 `script_path`；重复执行覆盖内容。目标为符号链接时拒绝。
+5. 指定 `interpreter` 或 `conda` 时结果回显实际路径；同时传两者报错。`python.path` 可通过 `dcl config set python.path ...` 设置，`dcl config show` 可见，空值清除。
+6. 前台超时后进程被清理并返回 `timed_out:true`；后台任务返回 task id，`TaskGet` 能读到输出，`TaskStop` 能停止。后台未保存的临时脚本不会在前台清理阶段删除。
+7. 开启沙箱（Linux/macOS）后 Python 被解释器级包装，网络允许列表和主机审批与 Bash 相同；Windows 上明确报错。计划模式拒绝 Python；`Python(*)` 和裸 `Python` 放行任意代码，`Python(import *)` 只按前缀匹配。
+8. 模型预览按 `interpreter:`（仅与请求不同或有工作区虚拟环境覆盖时）→ `script:` → `Exit code:` → 小写 `stdout:`/`stderr:` 顺序显示，路径是单反斜杠，不落入 `Metadata:`。
+9. CLI 审批框显示完整代码、`env`、`cwd`、`interpreter`/`conda` 和 `save_name` 目标；不提供 Allow for Session。工具调用摘要显示 `Python(description | 首行代码或保存路径)`，不再只有描述。`/permissions allow Python(*)` 后的调用不再询问。

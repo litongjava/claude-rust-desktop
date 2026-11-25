@@ -458,7 +458,7 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
     paths.read_config()?; // Never overwrite a malformed Desktop config with defaults.
     match action {
         ConfigCommands::Show => {
-            let mut value = json!({"data_dir":paths.data_dir,"preferences":preferences(paths)?,"config":paths.read_config()?,"shell":deepseek_code_core::services::shell_settings::inspect(&paths.data_dir)?,"permissions.auto":deepseek_code_core::permissions::auto_config::load(&crate::services::context(paths)?)?,"memory":deepseek_code_core::services::memory_files::config(&crate::services::context(paths)?)?,"tools":crate::tool_settings::rows(paths)?});
+            let mut value = json!({"data_dir":paths.data_dir,"preferences":preferences(paths)?,"config":paths.read_config()?,"shell":deepseek_code_core::services::shell_settings::inspect(&paths.data_dir)?,"python":deepseek_code_core::services::python_settings::load(&paths.data_dir)?,"permissions.auto":deepseek_code_core::permissions::auto_config::load(&crate::services::context(paths)?)?,"memory":deepseek_code_core::services::memory_files::config(&crate::services::context(paths)?)?,"tools":crate::tool_settings::rows(paths)?});
             value[deepseek_code_core::config::command_output::KEY] =
                 json!(deepseek_code_core::config::command_output::enabled(
                     Some(&paths.data_dir),
@@ -471,6 +471,11 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
             if let Some(field) = key.strip_prefix("shell.") {
                 deepseek_code_core::services::shell_settings::set(&paths.data_dir, field, value)?;
                 eprintln!("Updated {key}; applies to the next command or new terminal");
+                return Ok(());
+            }
+            if let Some(field) = key.strip_prefix("python.") {
+                deepseek_code_core::services::python_settings::set(&paths.data_dir, field, value)?;
+                eprintln!("Updated {key}; applies to the next Python tool call");
                 return Ok(());
             }
             if matches!(
@@ -646,6 +651,19 @@ mod budget_tests {
         assert_eq!(settings.tool_default, "pwsh");
         assert_eq!(settings.terminal_default, "auto");
         assert!(run(&paths, &ConfigCommands::Set { key: "shell.bashPath".into(), value: "does-not-exist".into() }).is_err());
+        run(&paths, &ConfigCommands::Set { key: "python.path".into(), value: "/opt/python".into() }).unwrap();
+        assert_eq!(
+            deepseek_code_core::services::python_settings::load(&paths.data_dir)
+                .unwrap()
+                .path
+                .as_deref(),
+            Some("/opt/python")
+        );
+        run(&paths, &ConfigCommands::Set { key: "python.path".into(), value: String::new() }).unwrap();
+        assert_eq!(
+            deepseek_code_core::services::python_settings::load(&paths.data_dir).unwrap().path,
+            None
+        );
     }
 
     #[test]

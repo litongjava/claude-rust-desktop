@@ -382,7 +382,7 @@ fn render_with_spans(
     }
     if !matches!(
         name,
-        "Bash" | "Read" | "Write" | "Edit" | "MultiEdit" | "ApplyPatch"
+        "Bash" | "Python" | "Read" | "Write" | "Edit" | "MultiEdit" | "ApplyPatch"
     ) {
         return output.into();
     }
@@ -449,6 +449,46 @@ fn render_with_spans(
         let requested_shell = fields
             .remove("shell")
             .and_then(|shell| shell.as_str().map(str::to_owned));
+        let python = name == "Python";
+        if python {
+            // The interpreter is only news when it is not the one requested, or
+            // when a project environment replaced the default silently.
+            if let Some(Value::String(path)) = fields.remove("interpreter") {
+                let requested = fields
+                    .remove("interpreter_requested")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                let source = fields
+                    .remove("interpreter_source")
+                    .and_then(|value| value.as_str().map(str::to_owned));
+                let changed = fields
+                    .remove("interpreter_changed")
+                    .and_then(|value| value.as_bool());
+                let show = match changed {
+                    Some(changed) => changed,
+                    None => match requested.as_deref() {
+                        Some(requested) => !same_path(requested, &path),
+                        None => matches!(
+                            source.as_deref(),
+                            Some("VIRTUAL_ENV" | "CONDA_PREFIX" | "venv")
+                        ),
+                    },
+                };
+                if show {
+                    parts.push(format!("interpreter: {path}"));
+                }
+            } else {
+                fields.remove("interpreter_source");
+                fields.remove("interpreter_requested");
+                fields.remove("interpreter_changed");
+            }
+            if let Some(Value::String(path)) = fields.remove("script_path") {
+                parts.push(format!("script: {path}"));
+            }
+            fields.remove("script_saved");
+        }
+        // Python's interpreter/script lines are not a status; an empty run still
+        // says it completed.
+        let status_start = parts.len();
         // A zero exit code is the normal case; only a failure needs naming.
         let mut exit_shown = false;
         if fields.get("exit_code").is_none_or(Value::is_null) {
@@ -521,7 +561,12 @@ fn render_with_spans(
             })
             .count()
             .max(1);
-        for (index, (key, label)) in [("stdout", "Output"), ("stderr", "Stderr")]
+        let (stdout_label, stderr_label) = if python {
+            ("stdout", "stderr")
+        } else {
+            ("Output", "Stderr")
+        };
+        for (index, (key, label)) in [("stdout", stdout_label), ("stderr", stderr_label)]
             .into_iter()
             .enumerate()
         {
@@ -534,9 +579,13 @@ fn render_with_spans(
                 }
             }
         }
+        if python && bodies.is_empty() && parts.len() == status_start {
+            parts.push("(Completed with no output)".into());
+        }
         // Without a status line or a second stream, the `Output:` label adds
-        // nothing: the body is simply the command's output.
-        if prefix.is_empty() && parts.is_empty() && fields.is_empty() {
+        // nothing: the body is simply the command's output. Python keeps its
+        // lowercase `stdout:` label even when it is the only line.
+        if !python && prefix.is_empty() && parts.is_empty() && fields.is_empty() {
             if let [(0, label_len, ranges)] = span_parts.as_slice() {
                 spans[0] = Some(BodySpan {
                     start: 0,
@@ -580,7 +629,10 @@ fn tool_load_content(output: &str) -> Option<String> {
 }
 
 pub(super) fn is_shell_result(name: &str) -> bool {
-    matches!(name, "Bash" | "PowerShell" | "TaskGet" | "TaskOutput")
+    matches!(
+        name,
+        "Bash" | "Python" | "PowerShell" | "TaskGet" | "TaskOutput"
+    )
 }
 
 pub(super) fn metadata_path(root: &Path, id: &str) -> std::path::PathBuf {
@@ -677,7 +729,7 @@ fn command_preview_with_room(
     digest: &mut Option<String>,
 ) -> String {
     use command_output_summary::Stream;
-    let bash = name == "Bash";
+    let shell_like = matches!(name, "Bash" | "Python");
     let capture = match metadata {
         Some(CommandMetadata::Shell(s)) => Some(s),
         _ => None,
@@ -688,10 +740,10 @@ fn command_preview_with_room(
     };
     let cleaned = render(name, raw, None);
     let mut spans = [None, None];
-    let draft = if bash && root.is_some() {
+    let draft = if shell_like && root.is_some() {
         render_with_spans(name, raw, Some(LONG_COMMAND_OUTPUT_BYTES), &mut spans)
     } else {
-        if bash {
+        if shell_like {
             render_with_spans(name, raw, None, &mut spans);
         }
         cleaned.clone()
@@ -713,7 +765,7 @@ fn command_preview_with_room(
     if task && value["metadata"]["interaction"] == "pty" {
         return base;
     }
-    if !bash && value.get("model_output_summary").is_some() {
+    if !shell_like && value.get("model_output_summary").is_some() {
         return base;
     }
     let json_end = raw.len() - json.len() + input.byte_offset();
@@ -846,7 +898,7 @@ fn command_preview_with_room(
                 // A legacy Bash transcript may lack raw capture metadata. A
                 // replacement could represent just one byte; qualify only
                 // when even the lower bound reaches the threshold.
-                if bash
+                if shell_like
                     || (task && value["metadata"]["managed_shell"] == true)
                     || value["output_gap"]["reason"] == "invalid_utf8"
                 {
@@ -861,15 +913,15 @@ fn command_preview_with_room(
         return base;
     }
 
-    let json_result = !bash && base == raw && base.len() <= MODEL_TOOL_OUTPUT_BYTES;
+    let json_result = !shell_like && base == raw && base.len() <= MODEL_TOOL_OUTPUT_BYTES;
     let outer = retained.unwrap_or_else(|| {
-        if bash {
+        if shell_like {
             // Without a spill, the retained result is the full cleaned output.
             render_with_spans(name, raw, None, &mut spans);
         }
         PreviewRanges::whole(cleaned.len())
     });
-    let serialized_elided = if bash || json_result {
+    let serialized_elided = if shell_like || json_result {
         0
     } else {
         cleaned.len().saturating_sub(outer.kept())
@@ -1114,6 +1166,21 @@ fn visible_ranges(
         }
     }
     visible
+}
+
+/// Compare a requested interpreter with the resolved path. A bare program name
+/// differs from the absolute path it resolved to; an absolute path is unchanged.
+fn same_path(left: &str, right: &str) -> bool {
+    let normalize = |value: &str| {
+        let value = value.replace('\\', "/");
+        let value = value.trim_end_matches('/');
+        if cfg!(windows) {
+            value.to_ascii_lowercase()
+        } else {
+            value.to_owned()
+        }
+    };
+    normalize(left) == normalize(right)
 }
 
 /// The executable name a shell path or request resolves to. Both separators
@@ -1581,6 +1648,125 @@ mod tests {
             render("Bash", &raw, None),
             "Command failed\nStderr:\ndenied\n"
         );
+    }
+
+    #[test]
+    fn python_output_consumes_interpreter_and_script_with_lowercase_labels() {
+        assert!(is_shell_result("Python"));
+        let script = r"D:\project\temp\python\script\001.py";
+        let result = |interpreter: &str, source: &str, requested: Option<&str>| {
+            let mut value = json!({
+                "success": true,
+                "exit_code": 0,
+                "stdout": "hello\n",
+                "stderr": "",
+                "stdout_truncated": false,
+                "stderr_truncated": false,
+                "shell": "python",
+                "interpreter": interpreter,
+                "interpreter_source": source,
+                "interpreter_changed": requested.is_some_and(|requested| requested != interpreter)
+                    || (requested.is_none() && source == "venv"),
+                "script_saved": true,
+                "script_path": script
+            });
+            if let Some(requested) = requested {
+                value["interpreter_requested"] = json!(requested);
+            }
+            render("Python", &value.to_string(), None)
+        };
+        // A workspace virtualenv is the default, but it replaced PATH silently.
+        assert_eq!(
+            result("/usr/bin/python3", "venv", None),
+            format!("interpreter: /usr/bin/python3\nscript: {script}\nstdout:\nhello\n")
+        );
+        // An absolute request that resolved to itself is not news.
+        assert_eq!(
+            result("/usr/bin/python3", "parameter", Some("/usr/bin/python3")),
+            format!("script: {script}\nstdout:\nhello\n")
+        );
+        // A bare name and a conda environment resolve to a concrete path.
+        assert_eq!(
+            result("/opt/py/bin/python", "parameter", Some("python")),
+            format!("interpreter: /opt/py/bin/python\nscript: {script}\nstdout:\nhello\n")
+        );
+        assert_eq!(
+            result(r"C:\envs\data\python.exe", "conda", Some("data")),
+            format!("interpreter: C:\\envs\\data\\python.exe\nscript: {script}\nstdout:\nhello\n")
+        );
+        // A PATH default needs no line, and a temporary script has no path.
+        let temporary = json!({
+            "success": true,
+            "exit_code": 0,
+            "stdout": "hello\n",
+            "stderr": "",
+            "shell": "python",
+            "interpreter": "/usr/bin/python3",
+            "interpreter_source": "PATH",
+            "script_saved": false
+        })
+        .to_string();
+        assert_eq!(render("Python", &temporary, None), "stdout:\nhello\n");
+
+        // A default `.venv` is already in the environment block, so it is not
+        // news even though the source is `venv`.
+        let default_venv = json!({
+            "success": true,
+            "exit_code": 0,
+            "stdout": "hello\n",
+            "interpreter": "/repo/.venv/bin/python",
+            "interpreter_source": "venv",
+            "interpreter_changed": false,
+            "script_saved": false
+        })
+        .to_string();
+        assert_eq!(render("Python", &default_venv, None), "stdout:\nhello\n");
+
+        let failed = json!({
+            "success": false,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": "Traceback (most recent call last):\n",
+            "interpreter": "/usr/bin/python3",
+            "interpreter_source": "PATH",
+            "script_saved": true,
+            "script_path": script
+        })
+        .to_string();
+        assert_eq!(
+            render("Python", &failed, None),
+            format!(
+                "script: {script}\nExit code: 1\nstderr:\nTraceback (most recent call last):\n"
+            )
+        );
+
+        let empty = json!({
+            "success": true,
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "interpreter": "/usr/bin/python3",
+            "interpreter_source": "PATH",
+            "script_saved": true,
+            "script_path": script
+        })
+        .to_string();
+        assert_eq!(
+            render("Python", &empty, None),
+            format!("script: {script}\n(Completed with no output)")
+        );
+        for hidden in [
+            "Metadata:",
+            "interpreter_source",
+            "interpreter_changed",
+            "script_saved",
+            "shell",
+        ] {
+            assert!(
+                !render("Python", &failed, None).contains(hidden),
+                "{hidden}"
+            );
+        }
     }
 
     #[test]

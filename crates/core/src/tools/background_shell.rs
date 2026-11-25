@@ -460,11 +460,16 @@ pub(super) fn session_environment() -> Result<Option<String>> {
 }
 
 pub(super) fn shell_settings() -> Result<crate::services::shell_settings::ShellSettings> {
-    let root = match CONTEXT.try_with(Clone::clone).ok().flatten() {
-        Some((root, _)) => root,
-        None => crate::runtime::resolve_default_data_dir()?,
-    };
-    crate::services::shell_settings::load(&root)
+    crate::services::shell_settings::load(&settings_root()?)
+}
+
+/// The data directory of the owning session, or the process default outside
+/// an engine turn. Tools that read `settings.json` share this resolution.
+pub(crate) fn settings_root() -> Result<PathBuf> {
+    match CONTEXT.try_with(Clone::clone).ok().flatten() {
+        Some((root, _)) => Ok(root),
+        None => crate::runtime::resolve_default_data_dir(),
+    }
 }
 
 static ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

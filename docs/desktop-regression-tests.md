@@ -183,6 +183,7 @@ Desktop 的模型技能列表和 `Skill` 工具与 CLI 共用 `crates/core` 的�
 - `crates/core` 的摘要实现（`native_engine/generation.rs`、`services/compaction*`）：D3，以及 `cli-regression-tests.md` 的 L 节
 - 语音输入（`VoiceInput`、`peripheral.rs` 的 `voice_transcribe`）：Desktop 中配置音频转写后端，录音 5 秒后停止并转写，文本正确；录音以二进制传给后端（无 JSON 数字数组）。浏览器的 HTTP 页面点击麦克风弹出“需要 HTTPS”。
 - `features/trajectory/`（工具调用分组）：D6
+- `ToolPermissionPrompt`、`ToolCallDisplay`、`ToolDiffView`、`AssistantMessage` 的 Python 分支：D1，以及下方“Python 工具审批与展示”
 - `crates/core` 的技能发现、模型技能列表和 `Skill` 工具：D4，以及 `cli-regression-tests.md` 的 N 节
 - 其他范围：至少跑 D1
 
@@ -201,3 +202,22 @@ A 节旧流程适用于显式 Legacy archive 入口；默认 Project memories �
 5. 在临时 data-dir 中为各 scope 的 `MEMORY.md` 和正文写不同标记。对照 Desktop 实际模型请求：首条用户消息在项目指令之后依次是 global、可选 team、project、仅子代理的 subagent、当前 session；各有路径，无自动附加的正文，也无父 session 泄漏。编辑两份索引后，下次请求仅新增一条合并提醒，冻结首条不变；重复发送不新增提醒。手动 compact 后索引各一次，无边界前提醒；关闭重开会话比较相同历史前缀，再改一个索引确认仅它产生新提醒。构建检查不等于此 WebView 场景通过。
 6. Plan Read 成功，Write/Edit/ApplyPatch 删除拒绝；Router/Coder 门禁、显式 deny/ask 与 hooks 不被目录免确认绕过。禁用记忆后不注入，配置远程 HTTP 后只有远程工具可加载；本地工具目录不得残留 memory_search/ingest。
 7. 自动化组件覆盖文件编辑、CAS 参数、冲突草稿、删除取消和显式旧归档入口；这不代表原生 Desktop/WebView2、Windows reparse 和服务器/手机操作已验证。
+
+## Python 工具审批与展示
+
+自动检查：
+
+```bash
+npx tsc --noEmit
+npm run test:run -- src/components/ToolPermissionPrompt.test.tsx
+```
+
+在真实 Desktop/WebView 中：
+
+1. 用 `ToolLoad` 加载 `Python`，在 ask 模式触发调用。审批框标题为 “Python code”，显示完整代码、描述、`env` 的 `KEY=value`、`cwd`、`interpreter` 或 `conda`，以及 `Will write: <当前项目工作区>/temp/<save_name>` 的绝对路径；不显示 “Allow for Session”。
+2. 选择 Allow 后，工具调用摘要显示 “Run Python” 和 `description | 首行代码或保存路径`；展开详情能看到代码、运行参数和输出。`ToolDiffView` 的 Python 视图显示代码块、运行参数和 stdout/stderr。
+3. 选择 **Cancel turn** 终止整个回合；选择 **Deny** 只拒绝当前调用，模型继续回答。审批接口报错时弹窗保留并显示原因。
+4. 计划模式发起 Python 调用被拒绝；切出 Plan 模式后可正常审批。
+5. 开启沙箱（Linux/macOS）后 Python 仍被包装；Windows 上显示明确的“不支持沙箱”错误，不静默在沙箱外执行。
+6. `save_name` 的目标已存在时审批仍显示同一路径；批准后文件被覆盖，结果为 `script_saved:true` 且 `script_path` 是绝对路径。目标为符号链接时工具报错，不写入。
+7. 后台 Python 调用完成后，`TaskGet` 的结果和 `/tasks` 中的任务名使用描述或保存名，不包含整段代码。

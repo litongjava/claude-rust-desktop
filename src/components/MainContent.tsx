@@ -2444,7 +2444,7 @@ const MainContent = ({ onNewChat, resetKey, tunerConfig, onOpenDocument, onArtif
         </div>
       )}
 
-      {toolPermissionDialog && !permissionApproval && <ToolPermissionPrompt key={toolPermissionDialog.request_id} request={toolPermissionDialog} onCancel={async () => {
+      {toolPermissionDialog && !permissionApproval && <ToolPermissionPrompt key={toolPermissionDialog.request_id} request={toolPermissionDialog} workspace={(() => { const project = projectList.find(project => project.id === (activeId ? currentProjectId : pendingProjectId)); return project?.workspace_path || project?.path; })()} onCancel={async () => {
         const current = toolPermissionDialog;
         if (!await handleStop()) throw new Error('Turn cancellation could not be confirmed');
         setToolPermissionDialog(pending => pending?.request_id === current.request_id ? null : pending);

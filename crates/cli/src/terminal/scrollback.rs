@@ -725,7 +725,7 @@ impl Scrollback {
             };
             failed += usize::from(*error);
             let kind = match name.as_str() {
-                "Bash" | "PowerShell" => Some(0),
+                "Bash" | "PowerShell" | "Python" => Some(0),
                 "Read" => Some(1),
                 "Grep" => Some(2),
                 "Glob" => Some(3),

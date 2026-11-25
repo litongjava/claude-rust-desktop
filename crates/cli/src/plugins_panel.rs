@@ -832,13 +832,12 @@ const TOOL_GROUPS: &[(&str, &[&str])] = &[
             "Write",
         ],
     ),
-    ("Shell & system", &["Bash", "Monitor", "computer_use"]),
+    ("Shell & system", &["Bash", "Monitor", "Python", "computer_use"]),
     ("Web & services", &["GitHub", "ImageGenerate", "WebFetch", "WebSearch"]),
     (
         "Agents & delegation",
         &[
             "Agent",
-            "ClaudeCode",
             "Codex",
             "DeepSeekCode",
             "ListAgents",

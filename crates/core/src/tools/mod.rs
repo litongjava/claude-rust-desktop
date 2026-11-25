@@ -64,6 +64,7 @@ mod monitor_completion;
 pub(crate) mod output_page;
 pub(crate) mod path_scope;
 pub(crate) mod provider_search;
+pub mod python;
 mod pty_bash;
 #[cfg(target_os = "linux")]
 pub(crate) mod pty_gate;
@@ -227,6 +228,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
+        python::definition(),
         ToolDefinition {
             name: "ListDir".to_string(),
             description: "List the contents of a directory.".to_string(),
@@ -469,6 +471,9 @@ pub fn execute_tool(name: &str, input: serde_json::Value, cwd: &str) -> Result<s
         name != "Monitor",
         "Monitor requires the asynchronous tool entry point"
     );
+    if name == "Python" {
+        return python::execute_blocking(input, cwd);
+    }
     tool_dispatch!(name, input, cwd,
         Bash => tool_bash(input, cwd),
         WebFetch => tool_web_fetch_blocking(input),
@@ -484,6 +489,9 @@ pub async fn execute_tool_async(
     let input = directory_input(name, input, cwd)?;
     if name == "Monitor" {
         return tool_bash_async(monitor_input(input)?, cwd).await;
+    }
+    if name == "Python" {
+        return python::execute(input, cwd).await;
     }
     if name == "computer_use" {
         return tool_computer_use_async(input).await;

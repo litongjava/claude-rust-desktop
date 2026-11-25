@@ -425,7 +425,7 @@ struct Choice {
 }
 impl Choice {
     fn command_preview(&self) -> bool {
-        self.preview.first().is_some_and(|line| matches!(change_view::plain(std::slice::from_ref(line)).trim(), "Bash command" | "PowerShell command"))
+        self.preview.first().is_some_and(|line| matches!(change_view::plain(std::slice::from_ref(line)).trim(), "Bash command" | "PowerShell command" | "Python code"))
     }
     fn click_preview(&mut self, row: usize, total: usize) -> bool {
         if !self.command_preview() || row < 3 || row >= total.saturating_sub(self.options.len() + 2) {
@@ -4611,7 +4611,7 @@ impl TurnDisplay {
             let next = self.numbers.values().copied().max().unwrap_or(0) + 1;
             let number = Some(*self.numbers.entry(id.to_owned()).or_insert(next));
             let header = super::tool_view::numbered(vec![change_view::tool_call(&label, "", false)], number);
-            live.tool_started(id, header.into_iter().next().unwrap_or_else(|| change_view::tool_call(&label, "", false)), matches!(name, "Bash" | "PowerShell"));
+            live.tool_started(id, header.into_iter().next().unwrap_or_else(|| change_view::tool_call(&label, "", false)), matches!(name, "Bash" | "PowerShell" | "Python"));
             let activity = super::tool_view::task_output_activity(name, input)
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("Running {label}"));
