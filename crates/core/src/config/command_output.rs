@@ -35,7 +35,8 @@ fn resolve(
     ]
     .into_iter()
     .chain(data_dir.into_iter().flat_map(|dir| {
-        ["settings.json", "config.json", "customization.json"].map(|file| dir.join(file))
+        let layout = crate::data_layout::DataLayout::from_root(&dir);
+        ["settings.json", "config.json", "customization.json"].map(|file| layout.config_file(file))
     }));
     if json
         .filter_map(|path| std::fs::read_to_string(path).ok())
@@ -92,9 +93,9 @@ mod tests {
         assert!(enabled(None));
         assert!(!enabled(Some("false")));
         for path in [
-            data.join("settings.json"),
-            data.join("config.json"),
-            data.join("customization.json"),
+            crate::data_layout::DataLayout::from_root(&data).config_file("settings.json"),
+            crate::data_layout::DataLayout::from_root(&data).config_file("config.json"),
+            crate::data_layout::DataLayout::from_root(&data).config_file("customization.json"),
             workspace.join(".claude/settings.json"),
             workspace.join(".claude/settings.local.json"),
         ] {
@@ -123,7 +124,7 @@ mod tests {
             assert!(enabled(None));
         }
 
-        std::fs::write(data.join("settings.json"), r#"{"shell":{"toolDefault":"bash"},"tools":{"summarize_long_command_output":false,"other":true}}"#).unwrap();
+        crate::data_layout::write_config_file(crate::data_layout::DataLayout::from_root(&data).config_file("settings.json"), r#"{"shell":{"toolDefault":"bash"},"tools":{"summarize_long_command_output":false,"other":true}}"#).unwrap();
         set(&data, false).unwrap();
         assert!(!enabled(None));
         set(&data, true).unwrap();

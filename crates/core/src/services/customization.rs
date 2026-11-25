@@ -107,7 +107,7 @@ pub struct Customization {
 }
 
 pub fn path(data_dir: &Path) -> PathBuf {
-    data_dir.join(FILE)
+    crate::data_layout::DataLayout::from_root(&data_dir).config_file(FILE)
 }
 
 /// A missing file means no customization. A damaged one is reported, not ignored,
@@ -122,10 +122,12 @@ pub fn load(data_dir: &Path) -> Result<Customization> {
 
 fn write(data_dir: &Path, customization: &Customization, builtin: &[String]) -> Result<()> {
     customization.validate(builtin)?;
-    std::fs::create_dir_all(data_dir)?;
-    let mut file = tempfile::NamedTempFile::new_in(data_dir)?;
+    let path = path(data_dir);
+    let directory = path.parent().context("Customization has no parent")?;
+    std::fs::create_dir_all(directory)?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
     std::io::Write::write_all(&mut file, &serde_json::to_vec_pretty(customization)?)?;
-    file.persist(path(data_dir))?;
+    file.persist(path)?;
     Ok(())
 }
 
@@ -439,7 +441,7 @@ mod tests {
             r#"{"tool_loading":{"Grep":{"enabled":"no","on_demand":true}}}"#,
             r#"{"tool_loading":{"Grep":true}}"#,
         ] {
-            std::fs::write(path(dir.path()), body).unwrap();
+            crate::data_layout::write_config_file(path(dir.path()), body).unwrap();
             assert!(load(dir.path()).is_err(), "{body}");
         }
     }
@@ -467,7 +469,7 @@ mod tests {
         let builtin = vec!["Write".to_owned(), "Glob".to_owned()];
         let legacy = json!({"disabled_tools":["Write","Glob","mcp__old__tool"],
             "tool_descriptions":{"Glob":"search with the old name"}});
-        std::fs::write(path(dir.path()), legacy.to_string()).unwrap();
+        crate::data_layout::write_config_file(path(dir.path()), legacy.to_string()).unwrap();
 
         let prompt = SystemPrompt { mode: PromptMode::Append, text: "Be brief".into() };
         let saved = save_prompt(dir.path(), &prompt, &builtin).unwrap();
@@ -483,7 +485,7 @@ mod tests {
         let builtin = vec!["Write".to_owned(), "Glob".to_owned()];
         let legacy = json!({"disabled_tools":["Write","Glob","mcp__old__tool"],
             "tool_descriptions":{"Glob":"search with the old name"}});
-        std::fs::write(path(dir.path()), legacy.to_string()).unwrap();
+        crate::data_layout::write_config_file(path(dir.path()), legacy.to_string()).unwrap();
 
         // The page only touched Glob and kept the old description.
         let submitted = Customization {

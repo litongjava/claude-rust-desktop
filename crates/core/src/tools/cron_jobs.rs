@@ -200,7 +200,7 @@ fn claim(root: &Path, jobs_file: &Path) -> Result<Option<crate::fs::OwnedFileLoc
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     jobs_file.hash(&mut hash);
-    let directory = root.join("cron-locks");
+    let directory = root.join("state/locks/cron");
     std::fs::create_dir_all(&directory)?;
     let file = std::fs::OpenOptions::new()
         .write(true)

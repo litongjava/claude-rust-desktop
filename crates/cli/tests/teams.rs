@@ -243,9 +243,9 @@ async fn cli_creates_spawns_and_disbands_a_team_standalone() {
     assert_eq!(directives, 2);
 
     // A successful TeamDelete removes the persisted team directory.
-    let team_path = data.join("teams").join("cli-team").join("config.json");
+    let team_path = data.join("data/teams").join("cli-team").join("config.json");
     assert!(
-        !data.join("teams").join("cli-team").exists(),
+        !data.join("data/teams").join("cli-team").exists(),
         "team file: {:?}",
         std::fs::read_to_string(team_path).unwrap_or_default()
     );

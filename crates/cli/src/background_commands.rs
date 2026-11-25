@@ -90,7 +90,7 @@ pub async fn handle(
             deepseek_code_core::services::permission_authority::record_user(&session.store.db, &child_id, &serde_json::json!(prompt))?;
             let workspace = session
                 .store
-                .workspace(&child_id, &paths.data_dir.join("workspaces"))?;
+                .workspace(&child_id, &paths.data_dir.join("data/workspaces"))?;
             let executable = std::env::current_exe()?;
             let provider = session.launch_provider().await?;
             let arguments = arguments(cli, paths, session, &child_id, prompt, origin, &provider)?;
@@ -1293,8 +1293,8 @@ mod worker_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::write(
-            paths.data_dir.join("settings.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("settings.json"),
             r#"{"disableAllHooks":true}"#,
         )
         .unwrap();
@@ -1450,9 +1450,22 @@ mod worker_config_tests {
         };
         let cli = Cli::parse_from(["dcl"]);
         let session = Session::open(&cli, &paths, selection, None).await.unwrap();
-        std::fs::create_dir_all(paths.data_dir.join("tasks")).unwrap();
-        std::fs::write(paths.data_dir.join("tasks").join(format!("{}.sqlite3", session.id)), b"not a SQLite database").unwrap();
-        assert!(deepseek_code_core::tools::background_shell::collect_completed(&paths.data_dir, &session.id).is_err());
+        std::fs::create_dir_all(paths.data_dir.join("data/session-tasks")).unwrap();
+        std::fs::write(
+            paths
+                .data_dir
+                .join("data/session-tasks")
+                .join(format!("{}.sqlite3", session.id)),
+            b"not a SQLite database",
+        )
+        .unwrap();
+        assert!(
+            deepseek_code_core::tools::background_shell::collect_completed(
+                &paths.data_dir,
+                &session.id
+            )
+            .is_err()
+        );
         assert!(collect_completed(&session).is_ok());
         session.close().await.unwrap();
     }
@@ -1536,8 +1549,8 @@ mod worker_config_tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
         std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::write(
-            paths.data_dir.join("settings.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("settings.json"),
             r#"{"disableAllHooks":true}"#,
         )
         .unwrap();

@@ -286,7 +286,8 @@ pub struct ConfigManager {
 
 impl ConfigManager {
     pub fn new(config_dir: PathBuf) -> Self {
-        let config_path = config_dir.join("config.json");
+        let config_path =
+            crate::data_layout::DataLayout::new(config_dir).config_file("config.json");
         let config = if config_path.exists() {
             std::fs::read_to_string(&config_path)
                 .ok()
@@ -404,9 +405,17 @@ mod tests {
             desktop.get_config().default_provider_id.as_deref(),
             Some("shared")
         );
-        std::fs::write(root.path().join("cli.json"), r#"{"model":"shared::model"}"#).unwrap();
+        crate::data_layout::write_config_file(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("cli.json"),
+            r#"{"model":"shared::model"}"#,
+        )
+        .unwrap();
         assert_eq!(desktop.saved_cli_model().as_deref(), Some("shared::model"));
-        std::fs::write(root.path().join("config.json"), "invalid").unwrap();
+        crate::data_layout::write_config_file(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+            "invalid",
+        )
+        .unwrap();
         assert!(desktop.reload().is_err());
         assert_eq!(desktop.get_config().default_provider_id.as_deref(), Some("shared"));
     }

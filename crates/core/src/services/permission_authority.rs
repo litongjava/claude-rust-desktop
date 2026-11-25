@@ -119,7 +119,7 @@ mod tests {
         let child = store
             .derive_owned_child(
                 &parent,
-                &context.paths.data_dir.join("workspaces"),
+                &context.paths.data_dir.join("data/workspaces"),
                 root.path(),
             )
             .unwrap();

@@ -340,10 +340,43 @@ async fn run(cli: &mut Cli) -> Result<()> {
         None => deepseek_code_core::runtime::resolve_default_data_dir()?,
     };
     let paths = RuntimePaths::new(absolute(data_dir)?)?;
+    // Read-only commands must not initialize a data directory the user only
+    // pointed at. Export migrates an existing v1 root before reading it.
+    if cli.info {
+        println!(
+            "dcl {}\nOS: {}\nProject: {}\nData: {}\nEngine: deepseek-code-core (direct; no Bridge)",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::current_dir()?.display(),
+            paths.data_dir.display()
+        );
+        return Ok(());
+    }
     if let Some(Commands::Sessions {
         action: SessionCommands::Export { id, output },
-    }) = &cli.command {
+    }) = &cli.command
+    {
+        if paths.data_dir.join("global.db").is_file() || paths.data_dir.join("sessions").is_dir() {
+            let outcome = paths.layout().migrate_if_needed()?;
+            if !outcome.warnings.is_empty() {
+                eprintln!(
+                    "Data layout warning: unexpected entries remain in {}: {}",
+                    paths.data_dir.display(),
+                    outcome.warnings.join(", ")
+                );
+            }
+        }
         return session_export::run(&paths.data_dir, id, output.as_deref());
+    }
+    // The layout must be settled before logs, resource samples or databases are
+    // opened: every one of them writes into a category directory.
+    let outcome = paths.layout().migrate_if_needed()?;
+    if !outcome.warnings.is_empty() {
+        eprintln!(
+            "Data layout warning: unexpected entries remain in {}: {}",
+            paths.data_dir.display(),
+            outcome.warnings.join(", ")
+        );
     }
     // The coordination root resolves against the launch directory, before `-C`,
     // and the same absolute root is exported for every host child later.
@@ -381,8 +414,8 @@ async fn run(cli: &mut Cli) -> Result<()> {
     std::env::set_var(deepseek_code_core::runtime::DATA_DIR_ENV, &paths.data_dir);
     debug_logging::configure_terminal(
         paths
-            .data_dir
-            .join("logs")
+            .layout()
+            .logs()
             .join(format!("cli-{}.log", std::process::id())),
     )?;
     if let Some(path) = &cli.path {
@@ -391,20 +424,11 @@ async fn run(cli: &mut Cli) -> Result<()> {
     if cli.debug.is_some() || cli.debug_file.is_some() {
         let log = cli.debug_file.clone().unwrap_or_else(|| {
             paths
-                .data_dir
+                .layout()
+                .debug_logs()
                 .join(format!("debug-{}.log", uuid::Uuid::new_v4()))
         });
         debug_logging::configure_filtered(log, cli.debug.as_deref().unwrap_or(""))?;
-    }
-    if cli.info {
-        println!(
-            "dcl {}\nOS: {}\nProject: {}\nData: {}\nEngine: deepseek-code-core (direct; no Bridge)",
-            env!("CARGO_PKG_VERSION"),
-            std::env::consts::OS,
-            std::env::current_dir()?.display(),
-            paths.data_dir.display()
-        );
-        return Ok(());
     }
     let mut skill_prompt = None;
     match &cli.command {
@@ -1137,7 +1161,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
         let mut presence: Option<(String, deepseek_code_core::services::session_messages::PresenceLease)> = None;
         terminal::STARTED.get_or_init(std::time::Instant::now);
         terminal::title::start();
-        if let Some(speed) = std::fs::read_to_string(paths.data_dir.join("scroll-speed")).ok().and_then(|text| text.trim().parse::<usize>().ok()).filter(|speed| (1..=20).contains(speed)) {
+        if let Some(speed) = std::fs::read_to_string(paths.layout().config_file("scroll-speed")).ok().and_then(|text| text.trim().parse::<usize>().ok()).filter(|speed| (1..=20).contains(speed)) {
             terminal::SCROLL_SPEED.store(speed, std::sync::atomic::Ordering::Relaxed);
         }
         'repl: loop {
@@ -1184,7 +1208,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             let mut shown_suggestion = ghost.as_ref().map(|ghost| ghost.saved.clone());
             reader.set_suggestion(ghost);
             skills = skill_commands::load_for_workspace(&paths, &session.workspace).await?;
-            if let Err(error) = input.as_mut().unwrap().set_keybindings(&paths.data_dir.join("keybindings.json")) {
+            if let Err(error) = input.as_mut().unwrap().set_keybindings(&paths.layout().config_file("keybindings.json")) {
                 command_eprintln!("Keybindings: {error:#}");
             }
             let display = display_commands::load(&session)?;
@@ -1575,13 +1599,13 @@ async fn run(cli: &mut Cli) -> Result<()> {
             }
             if command == "/scroll-speed" {
                 // As in the reference CLI: lines per mouse wheel notch, kept.
-                let file = paths.data_dir.join("scroll-speed");
+                let file = paths.layout().config_file("scroll-speed");
                 match argument.trim() {
                     "" => command_eprintln!("Scroll speed: {} lines per wheel notch. /scroll-speed 1-20 changes it.", terminal::SCROLL_SPEED.load(std::sync::atomic::Ordering::Relaxed)),
                     value => match value.parse::<usize>().ok().filter(|speed| (1..=20).contains(speed)) {
                         Some(speed) => {
                             terminal::SCROLL_SPEED.store(speed, std::sync::atomic::Ordering::Relaxed);
-                            if let Err(error) = std::fs::write(&file, speed.to_string()) { command_eprintln!("Scroll speed set for this session; not saved: {error}"); }
+                            if let Err(error) = deepseek_code_core::data_layout::write_config_file(&file, speed.to_string()) { command_eprintln!("Scroll speed set for this session; not saved: {error}"); }
                             else { command_eprintln!("Scroll speed: {speed} lines per wheel notch."); }
                         }
                         None => command_eprintln!("Usage: /scroll-speed 1-20"),

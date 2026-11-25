@@ -206,7 +206,7 @@ pub fn prepare_environment(
 ) -> Result<PreparedEnvironment> {
     ensure!(!plans.is_empty(), "A task needs at least one target");
     super::store::validate_task_id(task_id).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let task_dir = data_dir.join("super-agent").join(task_id);
+    let task_dir = data_dir.join("tasks/super-agent").join(task_id);
     if let Some(store) = store {
         if !store
             .repos(task_id)

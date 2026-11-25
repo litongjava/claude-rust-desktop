@@ -853,7 +853,7 @@ pub(crate) fn retain_tool_output_with_ranges(
     if output == preview && output.len() <= limit {
         return (output.to_string(), Some(PreviewRanges::whole(output.len())));
     }
-    match save_output_in(&root.join("tool-outputs"), output.as_bytes()) {
+    match save_output_in(&root.join("cache/tool-outputs"), output.as_bytes()) {
         Ok(path) => {
             let note = format!(
                 "\nSaved tool result ({} bytes, may already be truncated by the tool): {}",

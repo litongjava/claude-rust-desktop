@@ -188,8 +188,8 @@ async fn fixture_server(fixture: Fixture) -> (String, tokio::task::JoinHandle<()
 }
 
 fn write_providers(data: &Path, base: &str) {
-    std::fs::write(
-        data.join("providers.json"),
+    deepseek_code_core::data_layout::write_config_file(
+        data.join("config/providers.json"),
         json!([{
             "id":"fixture","name":"Fixture","base_url":base,"api_key":"fixture-only",
             "api_format":"openai","enabled":true,

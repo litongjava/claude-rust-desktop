@@ -1,4 +1,4 @@
-//! Per-skill states stored in `<data dir>/skill-states.json`.
+//! Per-skill states stored in `<data dir>/config/skill-states.json`.
 //!
 //! A skill without an entry gets its default state: [`SkillState::User`], except
 //! the bundled translation skills, which default to [`SkillState::UserOnly`],
@@ -64,7 +64,7 @@ struct SkillStatesFile {
 /// that every skill stays at its default; an unknown label only skips its own
 /// entry.
 pub fn load(data_dir: &Path) -> BTreeMap<String, SkillState> {
-    let path = data_dir.join(FILE_NAME);
+    let path = crate::data_layout::DataLayout::from_root(data_dir).config_file(FILE_NAME);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return BTreeMap::new(),
@@ -191,16 +191,17 @@ pub fn get(data_dir: &Path, name: &str) -> SkillState {
 pub fn set(data_dir: &Path, name: &str, state: SkillState) -> Result<()> {
     let mut states = load(data_dir);
     states.insert(name.to_owned(), state);
-    std::fs::create_dir_all(data_dir)
-        .with_context(|| format!("Creating {}", data_dir.display()))?;
+    let layout = crate::data_layout::DataLayout::from_root(data_dir);
+    std::fs::create_dir_all(layout.config_root())
+        .with_context(|| format!("Creating {}", layout.config_root().display()))?;
     let file = SkillStatesFile {
         skills: states
             .into_iter()
             .map(|(name, state)| (name, state.label().to_owned()))
             .collect(),
     };
-    let path = data_dir.join(FILE_NAME);
-    let temp = data_dir.join(TEMP_NAME);
+    let path = layout.config_file(FILE_NAME);
+    let temp = layout.config_file(TEMP_NAME);
     let mut text = serde_json::to_string_pretty(&file)?;
     text.push('\n');
     std::fs::write(&temp, text).with_context(|| format!("Writing {}", temp.display()))?;
@@ -276,12 +277,14 @@ mod tests {
     fn missing_or_invalid_file_means_every_skill_is_user() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(get(dir.path(), "anything"), SkillState::User);
+        let config = crate::data_layout::DataLayout::from_root(dir.path()).config_root();
+        std::fs::create_dir_all(&config).unwrap();
 
-        std::fs::write(dir.path().join(FILE_NAME), "not json").unwrap();
+        std::fs::write(config.join(FILE_NAME), "not json").unwrap();
         assert_eq!(get(dir.path(), "anything"), SkillState::User);
 
         std::fs::write(
-            dir.path().join(FILE_NAME),
+            config.join(FILE_NAME),
             r#"{"skills":{"known":"name-only","future":"brand-new"}}"#,
         )
         .unwrap();
@@ -302,9 +305,14 @@ mod tests {
         assert_eq!(states.get("b"), Some(&SkillState::Off));
         assert_eq!(states.get("c"), Some(&SkillState::User));
 
-        let text = std::fs::read_to_string(dir.path().join(FILE_NAME)).unwrap();
+        let text = std::fs::read_to_string(
+            crate::data_layout::DataLayout::from_root(dir.path()).config_file(FILE_NAME),
+        )
+        .unwrap();
         assert!(text.contains("\"c\": \"user\""), "{text}");
-        assert!(!dir.path().join(TEMP_NAME).exists());
+        assert!(!crate::data_layout::DataLayout::from_root(dir.path())
+            .config_file(TEMP_NAME)
+            .exists());
     }
 
     #[test]

@@ -112,8 +112,10 @@ fn first_chat_retries_once_after_execution_lease_failure() -> Result<()> {
     let root = tempfile::tempdir()?;
     let stores = Stores::open(root.path())?;
     let id = uuid::Uuid::new_v4().to_string();
-    let directory = root.path().join("session-execution-locks");
-    if directory.is_dir() { std::fs::remove_dir(&directory)?; }
+    let directory = root.path().join("state/locks/session-execution");
+    if directory.is_dir() {
+        std::fs::remove_dir(&directory)?;
+    }
     std::fs::write(&directory, "unavailable")?;
     let content = json!("first turn");
     assert!(stores

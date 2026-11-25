@@ -1098,7 +1098,10 @@ async fn tool_computer_use_async(input: serde_json::Value) -> Result<serde_json:
     let result = manager.execute_action(action).await?;
     let screenshot = match result.screenshot.as_deref().filter(|data| !data.is_empty()) {
         Some(data) => {
-            let directory = crate::runtime::resolve_default_data_dir()?.join("screenshots");
+            let directory = crate::data_layout::DataLayout::from_root(
+                &crate::runtime::resolve_default_data_dir()?,
+            )
+            .screenshots();
             Some(screenshot_file::save(&directory, data)?)
         }
         None => None,
@@ -1440,7 +1443,7 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
     let _ = pty_size;
     if detach {
         let directory = crate::runtime::resolve_default_data_dir()?
-            .join("detached-shells")
+            .join("tasks/detached-shells")
             .join(uuid::Uuid::new_v4().to_string());
         let mut result = bash_process::start_detached(cmd, &directory, display_shell)?;
         std::fs::write(directory.join("command.txt"), command.as_bytes())?;

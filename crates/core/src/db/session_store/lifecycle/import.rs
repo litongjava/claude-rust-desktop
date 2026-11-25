@@ -478,7 +478,7 @@ impl Stores {
             return Ok(result);
         }
         let batch = Uuid::new_v4().to_string();
-        let backup = self.root.path.join("backups").join(&batch);
+        let backup = self.root.layout().backups().join(&batch);
         fs::create_dir_all(&backup)?;
         self.global().read(|c| {
             c.execute(

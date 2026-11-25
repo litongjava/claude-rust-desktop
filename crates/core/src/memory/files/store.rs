@@ -179,7 +179,7 @@ impl FileMemoryStore {
     /// Before the first store write there may already be hand-authored files,
     /// but no state directory or lock. Never bootstrap these just to list them.
     pub fn project_snapshot(data_dir: &Path, scope: &MemoryScope) -> Result<Snapshot> {
-        let state = data_dir.join("memory/state").join(scope.key());
+        let state = data_dir.join("data/memory/state").join(scope.key());
         let missing = |e: &MemoryFileError| matches!(e, MemoryFileError::Io(e) if e.kind() == std::io::ErrorKind::NotFound);
         match super::scoped_directory(data_dir, &state, true) {
             Err(e) if missing(&e) => (),
@@ -189,7 +189,7 @@ impl FileMemoryStore {
             }
         }
         let directory = data_dir
-            .join("memory/projects")
+            .join("data/memory/projects")
             .join(scope.key())
             .join("memory");
         let directory = match super::scoped_directory(data_dir, &directory, true) {
@@ -259,7 +259,9 @@ impl FileMemoryStore {
         if options.cancelled.load(Ordering::Acquire) {
             return Err(MemoryFileError::Cancelled);
         }
-        let root = SafeDir::root(data_dir)?.child_mode("memory", read_only)?;
+        let root = SafeDir::root(data_dir)?
+            .child_mode("data", read_only)?
+            .child_mode("memory", read_only)?;
         let state = root
             .child_mode("state", read_only)?
             .child_mode(scope.key(), read_only)?;

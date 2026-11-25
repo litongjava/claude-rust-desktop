@@ -310,8 +310,8 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
     // Keep the raw historical snapshot below the automatic compaction threshold
     // so the fixture can inspect replay and then request compaction explicitly.
     let context_window = if fixture.base64 { 1_000_000 } else { 128_000 };
-    std::fs::write(
-        data.join("providers.json"),
+    deepseek_code_core::data_layout::write_config_file(
+        data.join("config/providers.json"),
         json!([{
             "id":"fixture","name":"Fixture","base_url":base,"api_key":"fixture-only",
             "api_format":"openai","enabled":true,
@@ -341,7 +341,8 @@ async fn run_shell(fixture: Fixture, opt_out: OptOut) {
             String::from_utf8_lossy(&result.stderr)
         );
         let file: Value =
-            serde_json::from_slice(&std::fs::read(data.join("settings.json")).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(data.join("config/settings.json")).unwrap())
+                .unwrap();
         assert_eq!(file["summarize_long_command_output"], false);
         cmd.args(["--input-format", "stream-json"]);
     }
@@ -720,8 +721,8 @@ async fn paged_run(raw_size: Option<usize>) {
         .route("/v1/chat/completions", post(respond_paged))
         .with_state(fixture.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    std::fs::write(
-        data.join("providers.json"),
+    deepseek_code_core::data_layout::write_config_file(
+        data.join("config/providers.json"),
         json!([{
             "id":"page-fixture","name":"Page Fixture","base_url":base,"api_key":"fixture-only",
             "api_format":"openai","enabled":true,

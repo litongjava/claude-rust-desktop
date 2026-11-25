@@ -931,7 +931,7 @@ mod tests {
 
     fn launch_arguments(root: &Path, job: &str) -> Vec<String> {
         let launch =
-            std::fs::read_to_string(root.join("background-tasks").join(job).join("launch.json"))
+            std::fs::read_to_string(root.join("tasks/background").join(job).join("launch.json"))
                 .unwrap();
         let launch: Value = serde_json::from_str(&launch).unwrap();
         launch["arguments"]
@@ -1188,7 +1188,7 @@ mod tests {
             canonical.canonicalize().unwrap()
         );
         let launch = std::fs::read_to_string(
-            data.join("background-tasks")
+            data.join("tasks/background")
                 .join(&handle.job_id)
                 .join("launch.json"),
         )

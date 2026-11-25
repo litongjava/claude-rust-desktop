@@ -773,7 +773,7 @@ fn pasted_images_file(data_dir: &std::path::Path, session: &str) -> Option<std::
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
         .then(|| {
             data_dir
-                .join("pasted-images")
+                .join("data/pasted-images")
                 .join(format!("{session}.json"))
         })
 }

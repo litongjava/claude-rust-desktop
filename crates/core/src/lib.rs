@@ -13,6 +13,7 @@ pub mod skills;
 pub mod git;
 pub mod github;
 pub mod config;
+pub mod data_layout;
 pub mod fs;
 pub mod terminal;
 pub mod process;

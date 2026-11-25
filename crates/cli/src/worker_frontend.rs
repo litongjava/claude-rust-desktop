@@ -79,7 +79,7 @@ fn log_job_observation(root: &std::path::Path, id: &str, message: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(root.join("background-tasks").join(id).join("stderr.log"))
+        .open(root.join("tasks/background").join(id).join("stderr.log"))
     {
         let _ = writeln!(file, "{} {message}", chrono::Utc::now().to_rfc3339());
     }
@@ -206,7 +206,8 @@ async fn single_turn(
     let mut display = TurnDisplay::new(
         true,
         session.permission_mode(),
-        &root.join("keybindings.json"),
+        &deepseek_code_core::data_layout::DataLayout::from_root(&root)
+            .config_file("keybindings.json"),
         history,
     )?.with_workspace(&session.workspace);
     display.restore_numbers(session)?;
@@ -316,12 +317,16 @@ fn activate_goal_proposal(session: &Session, job: &str) -> Result<Option<String>
 /// Attach to durable events only: never submit or recreate a worker request.
 pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<TerminalInput>) -> Result<()> {
     let job = jobs::get(&session.paths.data_dir, id)?;
-    let _participants = jobs::hold_attachment(&session.paths.data_dir, &job, &session.selected_session()?)?;
-    let workspace = session.store.workspace(&job.session_id, &session.paths.data_dir.join("workspaces"))?;
+    let _participants =
+        jobs::hold_attachment(&session.paths.data_dir, &job, &session.selected_session()?)?;
+    let workspace = session.store.workspace(
+        &job.session_id,
+        &session.paths.data_dir.join("data/workspaces"),
+    )?;
     let mut display = TurnDisplay::new(
         true,
         session.permission_mode(),
-        &session.paths.data_dir.join("keybindings.json"),
+        &session.paths.layout().config_file("keybindings.json"),
         Vec::new(),
     )?.with_workspace(&workspace);
     display.restore_numbers(session)?;
@@ -417,7 +422,7 @@ async fn present(
     if let Err(error) = &result {
         use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(
-            root.join("background-tasks")
+            root.join("tasks/background")
                 .join(&job.id)
                 .join("stderr.log"),
         ) {
@@ -1252,7 +1257,7 @@ mod failure_tests {
         let stores = paths.open_database().unwrap();
         let parent = stores.open_session(&job.parent_session_id).unwrap();
         let target = stores.open_session(&job.session_id).unwrap();
-        let dir = paths.data_dir.join("background-tasks").join(&job.id);
+        let dir = paths.data_dir.join("tasks/background").join(&job.id);
         std::fs::write(
             dir.join("session-owners.json"),
             serde_json::json!({
@@ -1339,13 +1344,13 @@ mod failure_tests {
         frontend.decide(&proposal.id, true, &paths.data_dir, &session.workspace, &session.permissions).unwrap();
         drop(frontend);
         let id = uuid::Uuid::new_v4().to_string();
-        let directory = paths.data_dir.join("background-tasks").join(&id);
+        let directory = paths.data_dir.join("tasks/background").join(&id);
         std::fs::create_dir_all(&directory).unwrap();
         let mut job = jobs::Job { id: id.clone(), foreground: false, parent_session_id: parent.clone(), session_id: parent.clone(),
             title: "idle child".into(), status: "completed".into(), supervisor_pid: None, child_pid: None,
             started_ms: 1, heartbeat_ms: 2, finished_ms: Some(2), exit_code: Some(0), error: None, launched: true };
         let source_id = uuid::Uuid::new_v4().to_string();
-        let source_directory = paths.data_dir.join("background-tasks").join(&source_id);
+        let source_directory = paths.data_dir.join("tasks/background").join(&source_id);
         std::fs::create_dir_all(&source_directory).unwrap();
         let mut source_job = job.clone();
         source_job.id = source_id.clone(); source_job.status = "running".into(); source_job.finished_ms = None;
@@ -1416,7 +1421,7 @@ mod failure_tests {
             error: None,
             launched: true,
         };
-        let directory = paths.data_dir.join("background-tasks").join(&id);
+        let directory = paths.data_dir.join("tasks/background").join(&id);
         std::fs::create_dir_all(&directory).unwrap();
         let state = serde_json::to_vec(&job).unwrap();
         std::fs::write(directory.join("state.json"), &state).unwrap();
@@ -1518,7 +1523,7 @@ mod failure_tests {
             events
         );
         assert!(!directory.join("cancel").exists());
-        assert!(!paths.data_dir.join("session-workers").exists());
+        assert!(!paths.data_dir.join("state/workers").exists());
         let expected = store.db.open_session(&parent).unwrap();
         let other = uuid::Uuid::new_v4().to_string();
         std::fs::write(
@@ -1558,7 +1563,7 @@ mod failure_tests {
         .await
         .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let directory = paths.data_dir.join("background-tasks").join(&id);
+        let directory = paths.data_dir.join("tasks/background").join(&id);
         std::fs::create_dir_all(&directory).unwrap();
         let job = jobs::Job {
             id: id.clone(),
@@ -1618,7 +1623,7 @@ mod failure_tests {
         .await
         .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let directory = paths.data_dir.join("background-tasks").join(&id);
+        let directory = paths.data_dir.join("tasks/background").join(&id);
         std::fs::create_dir_all(&directory).unwrap();
         let job = jobs::Job {
             id: id.clone(),
@@ -1894,7 +1899,7 @@ mod failure_tests {
         .await
         .unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        let directory = paths.data_dir.join("background-tasks").join(&id);
+        let directory = paths.data_dir.join("tasks/background").join(&id);
         std::fs::create_dir_all(&directory).unwrap();
         let job = jobs::Job {
             id: id.clone(),
@@ -2109,7 +2114,7 @@ mod failure_tests {
         assert_eq!(unsafe { kill(pid as std::ffi::c_int, SIGINT) }, 0);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let _ = release_tx.send(());
-        let cancel = data.join("background-tasks").join(&id).join("cancel");
+        let cancel = data.join("tasks/background").join(&id).join("cancel");
         assert!(
             signal_wait_for_path(&cancel, 10),
             "a Ctrl-C received during a tick was lost: no {}",
@@ -2143,7 +2148,7 @@ mod failure_tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         // SAFETY: sending a signal to the child this test started.
         assert_eq!(unsafe { kill(pid as std::ffi::c_int, SIGTERM) }, 0);
-        let cancel = data.join("background-tasks").join(&id).join("cancel");
+        let cancel = data.join("tasks/background").join(&id).join("cancel");
         assert!(
             signal_wait_for_path(&cancel, 10),
             "SIGTERM did not cancel the worker: no {}",

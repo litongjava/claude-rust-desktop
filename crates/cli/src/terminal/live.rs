@@ -5033,7 +5033,13 @@ mod completion_tests {
             conn.execute("UPDATE manifest SET message_count=(SELECT count(*) FROM messages),content_revision=content_revision+1",[])?;
                 Ok(())
         }).unwrap().unwrap();
-        let mut display = TurnDisplay::new(false, "ask", &paths.data_dir.join("keybindings.json"), vec![]).unwrap();
+        let mut display = TurnDisplay::new(
+            false,
+            "ask",
+            &paths.layout().config_file("keybindings.json"),
+            vec![],
+        )
+        .unwrap();
         display.restore_numbers(&session).unwrap();
         assert_eq!(display.numbers.len(), 2);
         assert_eq!(display.numbers.values().copied().max(), Some(2));

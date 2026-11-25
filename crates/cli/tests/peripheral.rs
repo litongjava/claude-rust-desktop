@@ -85,7 +85,11 @@ async fn auto_dream_host_is_shared_and_stoppable_between_processes() {
     let dir = tempfile::tempdir().unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider = json!({"id":"fixture","name":"Fixture","base_url":format!("http://{}",listener.local_addr().unwrap()),"api_key":"fixture","api_format":"openai","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]});
-    std::fs::write(dir.path().join("providers.json"),json!([provider]).to_string()).unwrap();
+    deepseek_code_core::data_layout::write_config_file(
+        dir.path().join("config/providers.json"),
+        json!([provider]).to_string(),
+    )
+    .unwrap();
     let app = Router::new().route("/v1/chat/completions", post(|| async {Json(json!({"id":"r","object":"chat.completion","created":0,"model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":"Project uses PostgreSQL."},"finish_reason":"stop"}]}))}));
     let server = tokio::spawn(async move {axum::serve(listener,app).await.unwrap()});
     let source=dir.path().join("memory.json");

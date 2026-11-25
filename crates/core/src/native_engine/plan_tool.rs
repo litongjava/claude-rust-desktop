@@ -38,7 +38,7 @@ impl ToolLoopExecutor {
         if let Some((parent, _)) = &self.delegation_parent {
             return Some(parent.clone());
         }
-        let root = self.search_config_path.as_deref()?.parent()?;
+        let root = crate::data_layout::data_root_of(self.search_config_path.as_deref()?)?;
         let session = self.conv_id.as_deref()?;
         // Only a live worker control channel can supply a cross-process parent.
         // Historical relationships alone must not re-enable bypass on resume.
@@ -49,7 +49,7 @@ impl ToolLoopExecutor {
     }
 
     fn plan_document_owner(&self, tool: &str, input: &Value) -> Option<String> {
-        let root = self.search_config_path.as_deref()?.parent()?;
+        let root = crate::data_layout::data_root_of(self.search_config_path.as_deref()?)?;
         let session = self.conv_id.as_deref()?;
         if plans::is_document_tool(root, session, tool, input) {
             return Some(session.to_owned());
@@ -73,7 +73,7 @@ impl ToolLoopExecutor {
         let context = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
             .and_then(|root| crate::services::session_messages::context(root).ok());
         let mode = self
             .delegation_parent
@@ -132,7 +132,7 @@ impl ToolLoopExecutor {
             let input = &actual;
             if let PermissionResult::Denied(reason) = self.check_permission(tool, input, id).await { anyhow::bail!("{reason}"); }
             anyhow::ensure!(self.is_plan_document_tool(tool, input), "Plan permission or file path changed; retry the operation");
-            let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).context("Plan storage unavailable")?;
+            let root = self.search_config_path.as_deref().and_then(crate::data_layout::data_root_of).context("Plan storage unavailable")?;
             let owner = self.plan_document_owner(tool, input).context("Plan session unavailable")?;
             let session = owner.as_str();
             if tool == "Read" {
@@ -189,7 +189,7 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
             .ok_or_else(|| anyhow!("Plan storage unavailable"))?
             .to_path_buf();
         let session = self
@@ -541,7 +541,10 @@ mod tests {
                     ReasoningMode::Standard,
                 )
                 .with_conv_id("child".into())
-                .with_search_config_path(root.path().join("settings.json"))
+                .with_search_config_path(
+                    crate::data_layout::DataLayout::from_root(&root.path())
+                        .config_file("settings.json"),
+                )
                 .with_permission_manager(child.clone());
                 let input = json!({});
                 let waiters = executor.get_answer_waiters();
@@ -634,7 +637,10 @@ mod tests {
                 ReasoningMode::Standard,
             )
             .with_conv_id("plan-session".into())
-            .with_search_config_path(root.path().join("settings.json"))
+            .with_search_config_path(
+                crate::data_layout::DataLayout::from_root(&root.path())
+                    .config_file("settings.json"),
+            )
             .with_permission_manager(manager.clone());
             let (_, output, failed) = executor
                 .execute_tool_call("EnterPlanMode", &json!({}), "enter")
@@ -750,7 +756,9 @@ mod tests {
             ReasoningMode::Standard,
         )
         .with_conv_id("file-session".into())
-        .with_search_config_path(root.join("settings.json"))
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root).config_file("settings.json"),
+        )
         .with_permission_manager(manager.clone());
         (executor, rx, manager)
     }

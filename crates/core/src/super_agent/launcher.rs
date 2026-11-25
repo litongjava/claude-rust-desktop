@@ -341,7 +341,7 @@ impl Launcher {
             self.context
                 .paths
                 .data_dir
-                .join("super-agent")
+                .join("tasks/super-agent")
                 .join(&task.task_id)
                 .join("workspace")
         };
@@ -1916,7 +1916,7 @@ impl Launcher {
             .context
             .paths
             .data_dir
-            .join("super-agent")
+            .join("tasks/super-agent")
             .join(&task.task_id)
             .join(format!("review-workspace-{}", task.review_round));
         std::fs::create_dir_all(&workspace)?;
@@ -1967,7 +1967,7 @@ impl Launcher {
             .context
             .paths
             .data_dir
-            .join("super-agent")
+            .join("tasks/super-agent")
             .join(&task.task_id)
             .join(format!(
                 "final-review-workspace-s{}-r{}",

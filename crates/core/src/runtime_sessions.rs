@@ -64,9 +64,14 @@ impl SessionStore<Stores> {
         let parent = root
             .parent()
             .context("Workspace root has no parent directory")?;
+        let expected = self.db.layout().data_root().canonicalize()?;
+        let actual = parent.canonicalize()?;
         ensure!(
-            root.ends_with("workspaces") && parent.canonicalize()? == self.db.data_dir(),
-            "Workspace root differs from the session data root"
+            root.ends_with("workspaces") && actual == expected,
+            "Workspace root differs from the session data root: root={} parent={} expected={}",
+            root.display(),
+            actual.display(),
+            expected.display()
         );
         self.db.open_session(id)
     }
@@ -119,7 +124,7 @@ mod tests {
         std::fs::create_dir(&project)?;
         let store = SessionStore::new(RuntimePaths::new(data.clone())?.open_database()?);
         let id = store.create(&project, "model", "provider")?;
-        let root = data.join("..").join("data").join("workspaces");
+        let root = data.join("data").join("workspaces");
         assert!(!root.exists());
         assert_eq!(
             store.workspace(&id, &root)?.canonicalize()?,

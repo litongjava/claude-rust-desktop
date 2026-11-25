@@ -999,7 +999,7 @@ impl ShellCwdReset {
                 && !session.contains(['/', '\\']),
             "Invalid session ID for shell state"
         );
-        let directory = data_dir.join("shell-cwd");
+        let directory = data_dir.join("state/shell-cwd");
         let Some(names) = fs.list(&directory)? else {
             return Ok(Self {
                 backups: Vec::new(),
@@ -1235,17 +1235,18 @@ fn shell_state_input(
     // shell cwd state below.
     if matches!(name, "Bash" | "Monitor" | "Python") {
         if let (Some(root), Some(session)) = (
-            search_config_path.and_then(std::path::Path::parent),
+            search_config_path.and_then(crate::data_layout::data_root_of),
             conv_id,
         ) {
-            input["__cwd_state"] = json!(root.join("shell-cwd").join(session).to_string_lossy());
-            let _ = std::fs::create_dir_all(root.join("shell-cwd"));
+            input["__cwd_state"] =
+                json!(root.join("state/shell-cwd").join(session).to_string_lossy());
+            let _ = std::fs::create_dir_all(root.join("state/shell-cwd"));
             let settings = crate::tools::sandbox::settings(root, std::path::Path::new(cwd));
             if let Some(policy) = crate::tools::sandbox::effective_policy(
                 &settings,
                 std::path::Path::new(cwd),
                 root,
-                &[root.join("shell-cwd")],
+                &[root.join("state/shell-cwd")],
                 mode,
             ) {
                 input["__sandbox"] = policy;
@@ -1439,7 +1440,7 @@ async fn execute_builtin_tool(
         );
     }
     if let Some(tool) = search_config_path
-        .and_then(|path| path.parent())
+        .and_then(crate::data_layout::data_root_of)
         .and_then(|root| crate::services::customization::load(root).ok())
         .and_then(|customization| customization.custom_tool(name).cloned())
     {
@@ -1447,7 +1448,7 @@ async fn execute_builtin_tool(
     }
     if name == "PluginRun" {
         let root = search_config_path
-            .and_then(|p| p.parent())
+            .and_then(crate::data_layout::data_root_of)
             .ok_or_else(|| anyhow!("Plugin storage is unavailable"))?;
         let context = crate::services::ServiceContext::open(
             crate::runtime::RuntimePaths::new(root.to_path_buf())?,
@@ -1978,7 +1979,7 @@ impl ToolLoopExecutor {
         let Some(root) = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
             .map(std::path::Path::to_path_buf)
         else {
             return failed("ToolScript needs an interactive session data directory.".into());
@@ -2816,7 +2817,7 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent);
+            .and_then(crate::data_layout::data_root_of);
         crate::db::model_results::result_override(
             name,
             raw,
@@ -2835,7 +2836,7 @@ impl ToolLoopExecutor {
             id,
             self.search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent),
+                .and_then(crate::data_layout::data_root_of),
             std::path::Path::new(self.get_workspace_cwd()),
         )
     }
@@ -2884,7 +2885,7 @@ impl ToolLoopExecutor {
             &mut model,
             self.search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent),
+                .and_then(crate::data_layout::data_root_of),
             self.conv_id.as_deref().unwrap_or_default(),
         ) {
             self.record_tool_usage(name);
@@ -3093,7 +3094,7 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent);
+            .and_then(crate::data_layout::data_root_of);
         if let Some(root) = root.filter(|root| {
             model_output::is_shell_result(tool_name) && self.summary_enabled(Some(root))
         }) {
@@ -3179,7 +3180,8 @@ impl ToolLoopExecutor {
         if !matches!(name, "TaskOutput" | "TaskGet" | "TaskStop") {
             return None;
         }
-        let root = self.search_config_path.as_ref()?.parent()?.to_owned();
+        let root =
+            crate::data_layout::data_root_of(self.search_config_path.as_ref()?)?.to_path_buf();
         let session = self.conv_id.clone()?;
         let input = input.clone();
         tokio::time::timeout(
@@ -3210,7 +3212,7 @@ impl ToolLoopExecutor {
         let Some(root) = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
         else {
             return false;
         };
@@ -3260,7 +3262,7 @@ impl ToolLoopExecutor {
         let saved = match (
             self.search_config_path
                 .as_deref()
-                .and_then(|path| path.parent()),
+                .and_then(crate::data_layout::data_root_of),
             self.conv_id.as_deref(),
         ) {
             (Some(root), Some(session)) => {
@@ -3333,7 +3335,7 @@ impl ToolLoopExecutor {
         match self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
         {
             Some(root) => crate::services::customization::load(root),
             None => Ok(Default::default()),
@@ -3395,7 +3397,7 @@ impl ToolLoopExecutor {
     /// The agent-type block under `heading`, or None when the saved definitions
     /// cannot be read so the description stays as it is.
     fn agent_type_listing(&self, heading: &str) -> Option<String> {
-        let root = self.search_config_path.as_deref()?.parent()?;
+        let root = crate::data_layout::data_root_of(self.search_config_path.as_deref()?)?;
         match crate::services::session_messages::context(root)
             .and_then(|context| crate::services::agents::list(&context))
         {
@@ -3602,7 +3604,7 @@ impl ToolLoopExecutor {
             &self.permission_manager,
             self.search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent),
+                .and_then(crate::data_layout::data_root_of),
         ) {
             (Some(db), Some(session), Some(permissions), Some(root)) => {
                 crate::services::goal_proposals::available(
@@ -3793,7 +3795,7 @@ impl ToolLoopExecutor {
                 let Some(root) = self
                     .search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent)
+                    .and_then(crate::data_layout::data_root_of)
                 else {
                     return super::auto_permissions::manual_fallback(
                         self.auto_manual_interactive,
@@ -3962,7 +3964,7 @@ impl ToolLoopExecutor {
             let root = self
                 .search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent)
+                .and_then(crate::data_layout::data_root_of)
                 .ok_or_else(|| anyhow!("Missing hook wake root"))?;
             let session = self.conv_id.as_deref().unwrap_or_default();
             anyhow::ensure!(
@@ -4035,7 +4037,7 @@ impl ToolLoopExecutor {
         let context = self
             .search_config_path
             .as_deref()
-            .and_then(|p| p.parent())
+            .and_then(crate::data_layout::data_root_of)
             .map(|root| (root.to_path_buf(), self.conv_id.clone().unwrap_or_default()));
         let history = self.session_search_storage();
         let (options, recorded_parent) = match &history {
@@ -4044,11 +4046,14 @@ impl ToolLoopExecutor {
             None => (super::request_options::RequestOptions::for_session(self.conv_id.as_deref()),None)
         };
         let parent_session = recorded_parent.or_else(|| {
-            if matches!(history, Some(ExecutorHistory::Session(_))) {return None;}
-            let session=self.conv_id.as_deref()?;
-            let root=self.search_config_path.as_deref()?.parent()?;
-            let dir=crate::services::background_sessions::worker_directory(root,session).ok()??;
-            let job=crate::services::background_sessions::read_job(&dir).ok()?;
+            if matches!(history, Some(ExecutorHistory::Session(_))) {
+                return None;
+            }
+            let session = self.conv_id.as_deref()?;
+            let root = crate::data_layout::data_root_of(self.search_config_path.as_deref()?)?;
+            let dir =
+                crate::services::background_sessions::worker_directory(root, session).ok()??;
+            let job = crate::services::background_sessions::read_job(&dir).ok()?;
             (job.parent_session_id != session).then_some(job.parent_session_id)
         });
         self.openai_client.request_options = options.clone();
@@ -4079,7 +4084,7 @@ impl ToolLoopExecutor {
         if let Some(root) = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
         {
             messages.extend(crate::services::async_hooks::drain_shared(root, session));
         }
@@ -4092,7 +4097,7 @@ impl ToolLoopExecutor {
         self.mcp_states = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
             .map(crate::mcp::states::load)
             .unwrap_or_default();
         self.mcp_tools.clear();
@@ -4112,7 +4117,7 @@ impl ToolLoopExecutor {
         let (Some(root), Some(session)) = (
             self.search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent),
+                .and_then(crate::data_layout::data_root_of),
             self.conv_id.as_deref(),
         ) else {
             return Ok(());
@@ -4168,7 +4173,7 @@ impl ToolLoopExecutor {
             if let (Some(root), Some(session)) = (
                 self.search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent),
+                    .and_then(crate::data_layout::data_root_of),
                 self.conv_id.as_deref(),
             ) {
                 let path = crate::services::plans::path(root, session)?;
@@ -4178,7 +4183,9 @@ impl ToolLoopExecutor {
 
         if !self.durable_user_input {
             if let (Some(root), Some(session)) = (
-                self.search_config_path.as_deref().and_then(|p| p.parent()),
+                self.search_config_path
+                    .as_deref()
+                    .and_then(crate::data_layout::data_root_of),
                 self.conv_id.as_deref(),
             ) {
                 self.durable_user_input =
@@ -4609,7 +4616,7 @@ impl ToolLoopExecutor {
                 match (
                     self.search_config_path
                         .as_deref()
-                        .and_then(std::path::Path::parent),
+                        .and_then(crate::data_layout::data_root_of),
                     self.conv_id.as_deref(),
                 ) {
                     (Some(root), Some(session)) => crate::tools::teams::execute(
@@ -4636,7 +4643,7 @@ impl ToolLoopExecutor {
             let result = match (
                 self.search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent),
+                    .and_then(crate::data_layout::data_root_of),
                 self.conv_id.as_deref(),
             ) {
                 (Some(root), Some(session)) => crate::services::session_messages::context(root)
@@ -4704,7 +4711,7 @@ impl ToolLoopExecutor {
             let result = match (
                 self.search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent),
+                    .and_then(crate::data_layout::data_root_of),
                 self.conv_id.as_deref(),
             ) {
                 (Some(root), Some(session)) => crate::services::session_messages::context(root)
@@ -4904,7 +4911,7 @@ impl ToolLoopExecutor {
             let result = match (
                 self.search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent)
+                    .and_then(crate::data_layout::data_root_of)
                     .map(std::path::Path::to_path_buf),
                 self.conv_id.clone(),
             ) {
@@ -4932,7 +4939,7 @@ impl ToolLoopExecutor {
             let result = match (
                 self.search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent),
+                    .and_then(crate::data_layout::data_root_of),
                 self.conv_id.as_deref(),
             ) {
                 (Some(root), Some(session)) => crate::tools::wakeup::execute(
@@ -4956,7 +4963,7 @@ impl ToolLoopExecutor {
             let result = match (
                 self.search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent),
+                    .and_then(crate::data_layout::data_root_of),
                 self.conv_id.as_deref(),
             ) {
                 (Some(root), Some(session)) => crate::tools::cron_jobs::execute(
@@ -4981,7 +4988,7 @@ impl ToolLoopExecutor {
         }
         if crate::tools::tasks::is_task(tool_name) {
             let result = async {
-                let root = self.search_config_path.as_deref().and_then(std::path::Path::parent).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
+                let root = self.search_config_path.as_deref().and_then(crate::data_layout::data_root_of).ok_or_else(|| anyhow!("Task runtime directory unavailable"))?;
                 let session = self.conv_id.as_deref().ok_or_else(|| anyhow!("Task session unavailable"))?;
                 let identity = crate::services::teams::identity(root, session)?;
                 let payload = |task: &Value| {
@@ -5184,7 +5191,7 @@ impl ToolLoopExecutor {
     }
 
     fn file_state_store(&self) -> Option<std::path::PathBuf> {
-        let root = self.search_config_path.as_deref()?.parent()?;
+        let root = crate::data_layout::data_root_of(self.search_config_path.as_deref()?)?;
         Some(super::file_state::store(root, self.conv_id.as_deref()?))
     }
 
@@ -7356,7 +7363,7 @@ mod shell_cwd_tests {
     #[test]
     fn an_authorized_move_stages_only_that_sessions_shell_cwd() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7397,7 +7404,7 @@ mod shell_cwd_tests {
     #[test]
     fn a_failed_move_restores_the_exact_shell_state() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7422,7 +7429,7 @@ mod shell_cwd_tests {
     #[test]
     fn a_second_staging_failure_restores_every_staged_entry() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7452,7 +7459,7 @@ mod shell_cwd_tests {
     #[test]
     fn a_staging_failure_reports_rollback_failures_and_keeps_the_backup() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7486,7 +7493,7 @@ mod shell_cwd_tests {
     #[test]
     fn a_listing_failure_leaves_every_shell_state_untouched() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7512,7 +7519,7 @@ mod shell_cwd_tests {
     #[test]
     fn one_failed_restore_still_attempts_the_remaining_entries() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7540,7 +7547,7 @@ mod shell_cwd_tests {
     #[test]
     fn a_recreated_active_state_is_not_overwritten_by_restore() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7572,7 +7579,7 @@ mod shell_cwd_tests {
     #[test]
     fn a_link_failure_never_replaces_a_state_created_at_that_moment() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7607,7 +7614,7 @@ mod shell_cwd_tests {
     #[test]
     fn a_commit_cleanup_failure_never_restores_the_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("shell-cwd");
+        let directory = temp.path().join("state/shell-cwd");
         std::fs::create_dir_all(&directory).unwrap();
         write(&directory, "session-a", "/old/review-1");
         write(&directory, "session-a.wsl-0123456789abcdef", "/old/wsl");
@@ -7649,12 +7656,13 @@ mod shell_state_input_tests {
     fn python_gets_the_sandbox_policy_like_bash() {
         let root = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("settings.json"),
+        crate::data_layout::write_config_file(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("settings.json"),
             json!({"sandbox": {"enabled": true}}).to_string(),
         )
         .unwrap();
-        let search = root.path().join("config.json");
+        let search =
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json");
         let cwd = workspace.path().to_str().unwrap();
         let input = |name: &str| {
             shell_state_input(

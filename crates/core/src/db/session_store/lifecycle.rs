@@ -968,9 +968,12 @@ impl Stores {
                     FROM conversations c LEFT JOIN conversation_private_workspace_bindings b ON b.child_id=c.id WHERE c.id=?2",[&op.id,source])?;
             }
             if saved.child {
-                tx.execute("INSERT INTO session_execution_parents(child_id,parent_id,parent_incarnation)
-                            SELECT ?1,id,incarnation FROM conversations WHERE id=?2",[&op.id,source])?;
-                let root = self.root.path.join("workspaces");
+                tx.execute(
+                    "INSERT INTO session_execution_parents(child_id,parent_id,parent_incarnation)
+                            SELECT ?1,id,incarnation FROM conversations WHERE id=?2",
+                    [&op.id, source],
+                )?;
+                let root = self.root.layout().workspaces();
                 let parent_path = copy::workspace(tx, &root, source)?;
                 let child_path = copy::workspace(tx, &root, &op.id)?;
                 let actual = parent_path.canonicalize()?;
@@ -1202,8 +1205,14 @@ impl Stores {
     }
 
     fn quarantine_orphans(&self) -> Result<()> {
-        let _sweep =
-            layout::lock_existing(&self.root.path.join("session-locks/.orphan-sweep"), true)?;
+        let _sweep = layout::lock_existing(
+            &self
+                .root
+                .layout()
+                .lock_path("session")
+                .join(".orphan-sweep"),
+            true,
+        )?;
         let quarantine = self.sessions().join(".quarantine");
         // The sweep lock also serializes cleanup after a killed WAL inspection.
         let mut has_quarantine = false;

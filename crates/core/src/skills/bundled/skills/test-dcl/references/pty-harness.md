@@ -107,5 +107,6 @@ which is how tab switching and toggles are exercised.
 - Kill the process (`terminate()`) if `/exit` does not end it, or the next test
   contends for the same session locks.
 - A toggle test must inspect the data directory: tool switches land in
-  `<data>/customization.json`, skill states in `skill-states.json`, plugin and
-  MCP state elsewhere. Do not infer a write from the panel's check mark alone.
+  `<data>/config/customization.json`, skill states in `<data>/config/skill-states.json`,
+  plugin and MCP state elsewhere. Do not infer a write from the panel's check
+  mark alone.

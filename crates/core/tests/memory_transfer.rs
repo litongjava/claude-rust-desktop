@@ -6,7 +6,7 @@ use std::sync::Arc;
 async fn legacy_preview_backup_roundtrip_recall_and_conflict_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let client = Arc::new(MemExClient::with_path(
-        dir.path().join("memory.sqlite3"),
+        dir.path().join("data/memory.sqlite3"),
     ));
     let legacy = json!([{"id":"old", "memory_type":"Knowledge", "content":"Project uses PostgreSQL", "importance":0.8, "timestamp":"2026-10-15T00:00:00Z", "tags":["architecture"], "metadata":{"nested":{"a":1}}, "embedding":[0.1]}]);
     let preview = client.import_archive(legacy.clone(), true).await.unwrap();
@@ -56,7 +56,7 @@ async fn legacy_preview_backup_roundtrip_recall_and_conflict_rollback() {
 #[tokio::test]
 async fn export_is_complete_even_when_memory_disabled() {
     let dir = tempfile::tempdir().unwrap();
-    let client = MemExClient::with_path(dir.path().join("memory.sqlite3"));
+    let client = MemExClient::with_path(dir.path().join("data/memory.sqlite3"));
     for n in 0..105 {
         client
             .ingest(&format!("Memory {n}"), Some(0.8), None)

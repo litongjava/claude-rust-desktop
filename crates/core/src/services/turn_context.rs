@@ -64,7 +64,8 @@ pub fn locate(messages: &[Value]) -> Vec<Option<(String, usize)>> {
 }
 
 fn file(root: &Path, session: &str) -> PathBuf {
-    root.join("turn-context").join(format!("{session}.jsonl"))
+    root.join("tasks/turn-context")
+        .join(format!("{session}.jsonl"))
 }
 
 pub fn load(root: &Path, session: &str) -> Result<Vec<Entry>> {

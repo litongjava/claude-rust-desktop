@@ -109,7 +109,7 @@ async fn test_notification_manager_creation() {
 #[tokio::test]
 async fn test_logger_creation() {
     let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let log_dir = temp_dir.path().join("logs");
+    let log_dir = temp_dir.path().join("diagnostics/logs");
     let _logger = Logger::new(log_dir);
     assert!(true);
 }

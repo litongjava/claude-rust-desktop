@@ -522,7 +522,7 @@ fn show(runtime: &ToolRuntime, input: Value) -> Result<Value> {
         "pending_approvals": pending,
         "reports": reports,
         "repositories": repos,
-        "evidence_dir": runtime.data_dir.join("super-agent").join(&task.task_id).display().to_string()
+        "evidence_dir": runtime.data_dir.join("tasks/super-agent").join(&task.task_id).display().to_string()
     }))
 }
 

@@ -170,8 +170,8 @@ async fn python_tool_runs_files_env_saves_and_times_out() {
 
     // settings.python.path is authoritative: a stale path errors instead of
     // silently falling back to PATH.
-    std::fs::write(
-        data.path().join("settings.json"),
+    deepseek_code_core::data_layout::write_config_file(
+        data.path().join("config/settings.json"),
         json!({"python": {"path": "/definitely/missing/python"}}).to_string(),
     )
     .unwrap();
@@ -181,5 +181,5 @@ async fn python_tool_runs_files_env_saves_and_times_out() {
     let error = format!("{error:#}");
     assert!(error.contains("python.path"), "{error}");
     assert!(error.contains("/definitely/missing/python"), "{error}");
-    std::fs::remove_file(data.path().join("settings.json")).unwrap();
+    std::fs::remove_file(data.path().join("config/settings.json")).unwrap();
 }

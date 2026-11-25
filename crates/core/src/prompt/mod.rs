@@ -1595,7 +1595,11 @@ mod tests {
         let frozen = date_for_session(root.path(), "s");
         assert_eq!(date_for_session(root.path(), "s"), frozen);
         assert!(reminder_date(&frozen).is_some());
-        std::fs::write(root.path().join("environment/s.date.txt"), date_reminder("2020-01-01")).unwrap();
+        std::fs::write(
+            root.path().join("cache/environment/s.date.txt"),
+            date_reminder("2020-01-01"),
+        )
+        .unwrap();
         let frozen = date_for_session(root.path(), "s");
         assert_eq!(frozen, date_reminder("2020-01-01"));
 

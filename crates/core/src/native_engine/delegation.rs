@@ -259,7 +259,7 @@ fn agent_memory(
         "Invalid agent type for memory scope"
     );
     let directory = match scope {
-        "user" => root.join("agent-memory").join(agent),
+        "user" => root.join("data/agent-memory").join(agent),
         "project" => workspace.join(".claude/agent-memory").join(agent),
         "local" => workspace.join(".claude/agent-memory-local").join(agent),
         _ => anyhow::bail!("Invalid agent memory scope"),
@@ -401,7 +401,11 @@ impl ToolLoopExecutor {
                 .map(|(id, _)| id.clone())
                 .collect()
         };
-        let Some(root) = self.search_config_path.as_deref().and_then(|p| p.parent()) else {
+        let Some(root) = self
+            .search_config_path
+            .as_deref()
+            .and_then(crate::data_layout::data_root_of)
+        else {
             return;
         };
         let Ok(context) = crate::services::session_messages::context(root) else {
@@ -466,7 +470,7 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(|path| path.parent())
+            .and_then(crate::data_layout::data_root_of)
             .context("Runtime unavailable")?;
         let context = crate::services::session_messages::context(root)?;
         let saved: Value = context
@@ -723,7 +727,7 @@ impl ToolLoopExecutor {
             let root = self
                 .search_config_path
                 .as_deref()
-                .and_then(|path| path.parent())
+                .and_then(crate::data_layout::data_root_of)
                 .context("Runtime unavailable")?;
             let context = crate::services::session_messages::context(root)?;
             let saved: Value = context
@@ -751,7 +755,7 @@ impl ToolLoopExecutor {
         let default_for = self
             .search_config_path
             .as_deref()
-            .and_then(|path| path.parent())
+            .and_then(crate::data_layout::data_root_of)
             .and_then(|data_dir| fill_default_model(&mut input, data_dir));
         if input["run_in_background"] == true && schema.is_none() && tools.is_none() {
             return Box::pin(self.spawn_background_agent(&input, tool_use_id)).await;
@@ -830,7 +834,7 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(|p| p.parent())
+            .and_then(crate::data_layout::data_root_of)
             .context("Runtime directory is unavailable")?
             .to_path_buf();
         let context = ServiceContext::open(
@@ -944,7 +948,7 @@ impl ToolLoopExecutor {
             "Foreground child history belongs to another session"
         );
         let (workspace, project, profile) = shard.scoped_stores().engine_workspace(
-            &root.join("workspaces"),
+            &root.join("data/workspaces"),
             id,
             Some(&self.workspace_cwd),
         )?;
@@ -994,11 +998,9 @@ impl ToolLoopExecutor {
             })
             .collect::<Vec<_>>();
         let experience_enabled = crate::experience::enabled(context);
-        let experience_workspace = (!crate::experience::is_internal_workspace(
-            &workspace,
-            &root.join("workspaces"),
-        ))
-        .then(|| workspace.clone());
+        let experience_workspace =
+            (!crate::experience::is_internal_workspace(&workspace, &root.join("data/workspaces")))
+                .then(|| workspace.clone());
         let scanned = experience_workspace
             .as_deref()
             .map(crate::experience::scan)
@@ -1053,7 +1055,7 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(|p| p.parent())
+            .and_then(crate::data_layout::data_root_of)
             .context("Runtime directory is unavailable")?;
         let context = ServiceContext::open(
             RuntimePaths::new(root.to_path_buf())?,
@@ -1206,7 +1208,7 @@ impl ToolLoopExecutor {
                     .context("Private workspace has no root")?
                     .to_path_buf()
             } else {
-                context.paths.data_dir.join("workspaces")
+                context.paths.data_dir.join("data/workspaces")
             };
             let child = sessions.derive_owned_child(
                 parent,
@@ -1428,7 +1430,7 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(std::path::Path::parent)
+            .and_then(crate::data_layout::data_root_of)
             .context("Runtime unavailable")?;
         let session = self
             .conv_id
@@ -1619,7 +1621,7 @@ impl ToolLoopExecutor {
             let cleanup_root = self
                 .search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent)
+                .and_then(crate::data_layout::data_root_of)
                 .map(std::path::Path::to_path_buf);
             let child_id = id.clone();
             // Boxing alone still polls the child on the parent's deep tool-call stack.
@@ -1722,9 +1724,11 @@ impl ToolLoopExecutor {
                             let mut state = (*state).clone();
                             state.provider_id = launch_provider.provider.id.clone();
                             state.model = launch_provider.model.id.clone();
-                            let manager = crate::native_engine::provider_manager::ProviderManager::in_memory(
-                                Vec::new(), context.paths.data_dir.join("providers.json"),
-                            );
+                            let manager =
+                                crate::native_engine::provider_manager::ProviderManager::in_memory(
+                                    Vec::new(),
+                                    context.paths.layout().config_file("providers.json"),
+                                );
                             manager.binding.install(state)?;
                             let mut retained = launch_provider;
                             retained.provider.lease = manager.binding.resolve(None)

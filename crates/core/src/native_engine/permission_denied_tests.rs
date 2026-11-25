@@ -27,7 +27,7 @@ fn hooks(root: &std::path::Path, retry: Value) -> HookRunner {
     let output = json!({"hookSpecificOutput":{"hookEventName":"PermissionDenied","retry":retry}})
         .to_string();
     let updated = json!({"hookSpecificOutput":{"hookEventName":"PreToolUse","updatedInput":{"url":"https://example.invalid/final","prompt":"fixture"}}}).to_string();
-    std::fs::write(root.join("settings.json"), json!({"hooks":{
+    crate::data_layout::write_config_file(crate::data_layout::DataLayout::from_root(&root).config_file("settings.json"), json!({"hooks":{
         "PreToolUse":[{"matcher":"^WebFetch$","hooks":[{"type":"command","command":emit(&updated),"shell":if cfg!(windows){"powershell"}else{"sh"}}]}],
         "PermissionDenied":[{"matcher":"^WebFetch$","hooks":[{"type":"command","command":capture+&emit(&output),"shell":if cfg!(windows){"powershell"}else{"sh"}}]}]
     }}).to_string()).unwrap();

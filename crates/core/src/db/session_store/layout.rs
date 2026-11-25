@@ -818,14 +818,19 @@ pub(super) fn checkpoint(path: &Path, kind: i32) -> Result<()> {
 }
 
 pub(super) fn open_root(root: &Path) -> Result<(String, bool)> {
-    let path = root.join("global.db");
-    let stage = root.join(".global-staging");
-    let locks = root.join("session-locks");
+    let layout = crate::data_layout::DataLayout::from_root(&root);
+    let path = layout.global_db();
+    let stage = layout.staging();
+    let locks = layout.lock_path("session");
     let marker = locks.join(".initialized");
+    let sessions = layout.sessions();
     if !path.try_exists()? || stage.try_exists()? {
         // This lock lives outside the removable namespace. Established v1 roots
         // do not need it unless finishing their own interrupted bootstrap.
-        let bootstrap = root.join(".session-bootstrap");
+        let bootstrap = layout.bootstrap();
+        if let Some(parent) = bootstrap.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let may_start = !path.try_exists()? && !marker.try_exists()?;
         let guard = File::options()
             .read(true)
@@ -855,9 +860,10 @@ pub(super) fn open_root(root: &Path) -> Result<(String, bool)> {
                 }
             } else {
                 ensure!(
-                    !locks.try_exists()? && !root.join("sessions/.staging").try_exists()?,
+                    !locks.try_exists()? && !sessions.join(".staging").try_exists()?,
                     "Missing global database for existing session layout"
                 );
+                fs::create_dir_all(stage.parent().unwrap())?;
                 fs::create_dir(&stage)?;
                 sync_dir(root)?;
             }
@@ -871,14 +877,10 @@ pub(super) fn open_root(root: &Path) -> Result<(String, bool)> {
                     .sync_all()?;
             }
             sync_dir(&locks)?;
-            for name in [
-                "sessions/.staging",
-                "sessions/.trash",
-                "sessions/.quarantine",
-            ] {
-                fs::create_dir_all(root.join(name))?;
+            for name in [".staging", ".trash", ".quarantine"] {
+                fs::create_dir_all(sessions.join(name))?;
             }
-            sync_dir(&root.join("sessions"))?;
+            sync_dir(&sessions)?;
             let staged = stage.join("global.db");
             let uuid = Uuid::new_v4().to_string();
             initialize(&staged, GLOBAL, |tx| {

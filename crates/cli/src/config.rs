@@ -92,7 +92,7 @@ impl Selection {
 }
 
 fn preferences(paths: &RuntimePaths) -> Result<Value> {
-    let path = paths.data_dir.join("cli.json");
+    let path = paths.layout().config_file("cli.json");
     if !path.exists() {
         return Ok(json!({}));
     }
@@ -125,14 +125,13 @@ thread_local! {
 }
 
 fn save_preferences(paths: &RuntimePaths, value: &Value) -> Result<()> {
-    std::fs::create_dir_all(&paths.data_dir)?;
-    let path = paths.data_dir.join("cli.json");
+    let path = paths.layout().config_file("cli.json");
+    let directory = path.parent().context("CLI preferences have no parent")?;
+    std::fs::create_dir_all(directory)?;
     let json = serde_json::to_vec_pretty(value)?;
     // A crash or a failed write must leave the previous file usable, so the new
     // content goes to a temporary file and replaces the old one in one step.
-    let temporary = paths
-        .data_dir
-        .join(format!("cli.json.{}.tmp", uuid::Uuid::new_v4()));
+    let temporary = directory.join(format!("cli.json.{}.tmp", uuid::Uuid::new_v4()));
     let commit = || -> Result<()> {
         std::fs::write(&temporary, &json)?;
         #[cfg(unix)]
@@ -683,7 +682,11 @@ mod budget_tests {
             default_model(&paths),
             Some(("cli".into(), "fixture-model".into()))
         );
-        std::fs::write(paths.data_dir.join("cli.json"), r#"{"model":"broken"}"#).unwrap();
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("cli.json"),
+            r#"{"model":"broken"}"#,
+        )
+        .unwrap();
         assert_eq!(default_model(&paths), None);
     }
 
@@ -754,9 +757,17 @@ mod search_tests {
             default_model(&paths),
             Some(("second".into(), "fixture-model".into()))
         );
-        std::fs::write(paths.data_dir.join("cli.json"), r#"{"model":"unqualified"}"#).unwrap();
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("cli.json"),
+            r#"{"model":"unqualified"}"#,
+        )
+        .unwrap();
         assert_eq!(default_model(&paths), None);
-        std::fs::write(paths.data_dir.join("cli.json"), "not json").unwrap();
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("cli.json"),
+            "not json",
+        )
+        .unwrap();
         assert_eq!(default_model(&paths), None);
     }
 
@@ -765,7 +776,7 @@ mod search_tests {
         let root = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(root.path().join("data")).unwrap();
         save_default_model(&paths, "first", "model-a").unwrap();
-        let path = paths.data_dir.join("cli.json");
+        let path = paths.layout().config_file("cli.json");
         let before = std::fs::read(&path).unwrap();
 
         FAIL_PREFERENCE_COMMIT.with(|flag| flag.set(true));
@@ -796,7 +807,7 @@ mod search_tests {
             let root = tempfile::tempdir().unwrap();
             let paths = RuntimePaths::new(root.path().join("data")).unwrap();
             save_default_model(&paths, "one", "model-a").unwrap();
-            let mode = std::fs::metadata(paths.data_dir.join("cli.json"))
+            let mode = std::fs::metadata(paths.layout().config_file("cli.json"))
                 .unwrap()
                 .permissions()
                 .mode()
@@ -814,8 +825,10 @@ mod search_tests {
         set("search.model", "deepseek-pro").unwrap();
         assert!(set("search.base_url", "ftp://example.com").is_err());
         assert!(set("search.other", "x").is_err());
-        let saved: deepseek_code_core::config::AppConfig =
-            serde_json::from_slice(&std::fs::read(paths.data_dir.join("config.json")).unwrap()).unwrap();
+        let saved: deepseek_code_core::config::AppConfig = serde_json::from_slice(
+            &std::fs::read(paths.layout().config_file("config.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(saved.deepseek_search.api_key, "search-key");
         assert_eq!(saved.deepseek_search.model, "deepseek-pro");
         assert_eq!(saved.deepseek_search.base_url, "https://api.deepseek.com/anthropic/v1");

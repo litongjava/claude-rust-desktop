@@ -20,7 +20,7 @@ pub fn path(root: &Path, session: &str) -> Result<PathBuf> {
     let directory = root
         .canonicalize()
         .context("Plan data directory is unavailable")?
-        .join("plans");
+        .join("tasks/plans");
     for ancestor in directory.ancestors() {
         check_node(ancestor, true)?;
     }
@@ -389,7 +389,7 @@ mod tests {
         assert!(save(root.path(), "one", &"x".repeat(MAX_PLAN_BYTES + 1)).is_err());
         assert!(path(root.path(), "../escape")
             .unwrap()
-            .starts_with(root.path().canonicalize().unwrap().join("plans")));
+            .starts_with(root.path().canonicalize().unwrap().join("tasks/plans")));
     }
     #[test]
     fn document_tools_are_exact_scoped_bounded_and_atomic() {

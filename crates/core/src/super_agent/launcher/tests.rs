@@ -333,7 +333,7 @@ async fn a_crash_after_the_reservation_reuses_the_same_identity() {
     assert!(fixture.child_sessions().is_empty());
     assert!(!fixture
         .data
-        .join("background-tasks")
+        .join("tasks/background")
         .join(&reserved.job_id)
         .exists());
     assert_eq!(fixture.child_runs(), 0);
@@ -370,7 +370,7 @@ async fn a_crash_after_session_allocation_continues_the_same_session() {
     assert!(fixture.task().coder.session_id.is_none());
     assert!(!fixture
         .data
-        .join("background-tasks")
+        .join("tasks/background")
         .join(&reserved.job_id)
         .exists());
     assert_eq!(fixture.child_runs(), 0);

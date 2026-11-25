@@ -23,7 +23,9 @@ fn executor(root: &std::path::Path) -> ToolLoopExecutor {
     )
     .with_conv_id("tool-loading-fixture".into())
     .with_permission_manager(manager)
-    .with_search_config_path(root.join("config.json"))
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&root).config_file("config.json"),
+    )
 }
 
 fn write_switches(root: &std::path::Path, tools: &[(&str, bool, bool)]) {
@@ -157,7 +159,7 @@ async fn context_search_follows_loading_settings_and_session_scope() {
         "without session storage ContextSearch is not in the catalog"
     );
 
-    let db = RuntimePaths::new(temp.path().join("data"))
+    let db = RuntimePaths::new(temp.path().join("session-store"))
         .unwrap()
         .open_database()
         .unwrap();
@@ -1370,7 +1372,8 @@ fn a_restricted_agent_without_discovery_still_receives_its_granted_tools() {
 #[test]
 fn damaged_settings_fail_the_request_instead_of_reopening_every_tool() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("customization.json"), "{broken").unwrap();
+    std::fs::create_dir_all(temp.path().join("config")).unwrap();
+    std::fs::write(temp.path().join("config/customization.json"), "{broken").unwrap();
     let executor = executor(temp.path());
     let error = executor.tool_definitions().unwrap_err().to_string();
     assert!(error.contains("customization.json"), "{error}");
@@ -1629,7 +1632,9 @@ async fn a_restored_search_reaches_the_first_responses_request() {
         root.path().to_string_lossy().into_owned(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(root.path().join("config.json"));
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+    );
     let (text, _) = tokio::time::timeout(Duration::from_secs(20), executor.execute())
         .await
         .unwrap()
@@ -1696,7 +1701,9 @@ async fn a_settings_change_during_a_turn_revokes_the_old_exposure() {
         root.path().to_string_lossy().into_owned(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(root.path().join("config.json"));
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+    );
     let (text, _) = tokio::time::timeout(Duration::from_secs(20), executor.execute())
         .await
         .unwrap()
@@ -1809,7 +1816,9 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
             root.path().to_string_lossy().into_owned(),
             ReasoningMode::Standard,
         )
-        .with_search_config_path(root.path().join("config.json"));
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+        );
         let (text, _) = tokio::time::timeout(Duration::from_secs(20), executor.execute())
             .await
             .unwrap()
@@ -1936,7 +1945,11 @@ async fn a_settings_change_while_a_loaded_tool_is_called_follows_the_current_swi
                                 "enabled_without_on_demand" => {
                                     write_switches(&dir, &[("ListDir", true, false)])
                                 }
-                                _ => std::fs::write(dir.join("customization.json"), b"{").unwrap(),
+                                _ => {
+                                    std::fs::create_dir_all(dir.join("config")).unwrap();
+                                    std::fs::write(dir.join("config/customization.json"), b"{")
+                                        .unwrap()
+                                }
                             }
                             tool_call_events("openai", "list-1", "ListDir", json!({"path":"."}))
                         }
@@ -1960,7 +1973,9 @@ async fn a_settings_change_while_a_loaded_tool_is_called_follows_the_current_swi
             root.path().to_string_lossy().into_owned(),
             ReasoningMode::Standard,
         )
-        .with_search_config_path(root.path().join("config.json"))
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+        )
         .with_permission_manager({
             let manager = crate::runtime::default_permissions();
             manager.set_mode(crate::permissions::PermissionMode::BypassPermissions);
@@ -2086,7 +2101,9 @@ async fn every_transport_moves_the_loadable_tool_list_to_the_first_message() {
             root.path().to_string_lossy().into_owned(),
             ReasoningMode::Standard,
         )
-        .with_search_config_path(root.path().join("config.json"));
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+        );
         let reminder = loadable_reminder(&executor).expect("the initial switches list tools");
         executor = executor.with_context_reminders(vec![reminder.clone()]);
         let (text, _) = tokio::time::timeout(Duration::from_secs(20), executor.execute())
@@ -2162,8 +2179,9 @@ async fn every_transport_lists_only_loadable_mcp_tools_when_the_loader_is_presen
     for format in ["anthropic", "openai", "responses"] {
         for loader_enabled in [true, false] {
             let root = tempfile::tempdir().unwrap();
-            std::fs::write(
-                root.path().join("customization.json"),
+            crate::data_layout::write_config_file(
+                crate::data_layout::DataLayout::from_root(&root.path())
+                    .config_file("customization.json"),
                 json!({
                     "disabled_tools": [disabled],
                     "tool_loading": {"ToolLoad": {"enabled": loader_enabled, "on_demand": false}}
@@ -2211,7 +2229,9 @@ async fn every_transport_lists_only_loadable_mcp_tools_when_the_loader_is_presen
                 root.path().to_string_lossy().into_owned(),
                 ReasoningMode::Standard,
             )
-            .with_search_config_path(root.path().join("config.json"))
+            .with_search_config_path(
+                crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+            )
             .with_allowed_tools(Some(vec![
                 "ToolLoad".into(),
                 eligible.into(),
@@ -2341,7 +2361,9 @@ async fn an_empty_loadable_set_produces_no_reminder() {
             root.path().to_string_lossy().into_owned(),
             ReasoningMode::Standard,
         )
-        .with_search_config_path(root.path().join("config.json"))
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+        )
         .with_allowed_tools(Some(
             allowed.iter().map(|name| (*name).to_owned()).collect(),
         ));
@@ -2398,7 +2420,9 @@ async fn a_request_without_callable_tool_load_does_not_promise_loading() {
             root.path().to_string_lossy().into_owned(),
             ReasoningMode::Standard,
         )
-        .with_search_config_path(root.path().join("config.json"));
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+        );
         let (text, _) = tokio::time::timeout(Duration::from_secs(20), executor.execute())
             .await
             .unwrap()
@@ -2511,7 +2535,9 @@ async fn a_loaded_tool_still_asks_for_approval_and_a_denial_leaves_no_trace() {
         root.path().to_string_lossy().into_owned(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(root.path().join("config.json"))
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+    )
     .with_permission_manager(manager);
     executor.permission_host_available = true;
     let mailbox = executor.permission_mailbox.clone();
@@ -2638,7 +2664,9 @@ async fn cancelling_an_approval_stops_the_turn_without_running_the_tool() {
         root.path().to_string_lossy().into_owned(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(root.path().join("config.json"))
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+    )
     .with_permission_manager(manager);
     executor.permission_host_available = true;
     let task = tokio::spawn(async move { executor.execute().await });
@@ -2720,7 +2748,9 @@ async fn cancelling_a_running_loaded_tool_terminates_it_and_stops_the_turn() {
         root.path().to_string_lossy().into_owned(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(root.path().join("config.json"))
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+    )
     .with_permission_manager({
         let manager = crate::runtime::default_permissions();
         manager.set_mode(crate::permissions::PermissionMode::BypassPermissions);
@@ -2826,7 +2856,9 @@ async fn every_attempt_of_a_request_shares_one_tool_schema_and_estimation() {
             root.path().to_string_lossy().into_owned(),
             ReasoningMode::Standard,
         )
-        .with_search_config_path(root.path().join("config.json"));
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("config.json"),
+        );
         let (text, _) = timeout(Duration::from_secs(40), executor.execute())
             .await
             .unwrap_or_else(|_| panic!("{format}: the retried request timed out"))
@@ -3054,7 +3086,7 @@ async fn file_memory_tool_dispatch_preserves_path_rules_hooks_roles_and_plan() {
     use crate::permissions::{rules::PermissionAction, PermissionMode, PermissionResult};
     use crate::services::{memory_files::FileMemory, EnvironmentCredentials, ServiceContext};
     let temp = tempfile::tempdir().unwrap();
-    let paths = crate::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+    let paths = crate::runtime::RuntimePaths::new(temp.path().join("session-store")).unwrap();
     let service = ServiceContext::open(paths, Arc::new(EnvironmentCredentials)).unwrap();
     let session = crate::runtime::SessionStore::new(service.db.clone())
         .create(temp.path(), "fixture", "fixture")

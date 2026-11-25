@@ -60,7 +60,7 @@ fn listing_an_authored_index_without_topics_preserves_all_39_bytes() {
     assert_eq!(fs::read(&index).unwrap(), authored);
     assert_eq!(listed["index"], std::str::from_utf8(authored).unwrap());
     assert_eq!(listed["generation"], 0);
-    assert!(!data.join("memory/state").exists());
+    assert!(!data.join("data/memory/state").exists());
 
     fs::write(dir.join("topic.md"), note("Topic", "body")).unwrap();
     let preview = files(&["repair"]);
@@ -70,7 +70,7 @@ fn listing_an_authored_index_without_topics_preserves_all_39_bytes() {
         .unwrap()
         .contains("[Topic](topic.md)"));
     assert_eq!(fs::read(&index).unwrap(), authored);
-    assert!(!data.join("memory/state").exists());
+    assert!(!data.join("data/memory/state").exists());
     let applied = files(&[
         "repair",
         "--confirm",
@@ -228,8 +228,9 @@ async fn scenario(protocol: &'static str, plan: bool) {
         "- [中文 preferences](preferences.md)\n",
     )
     .unwrap();
-    let legacy =
-        deepseek_code_core::memory::MemExClient::with_path(paths.data_dir.join("memory.sqlite3"));
+    let legacy = deepseek_code_core::memory::MemExClient::with_path(
+        paths.data_dir.join("data/memory.sqlite3"),
+    );
     legacy
         .ingest(
             "中文测试 legacy-unassigned-must-not-recall",
