@@ -20,6 +20,10 @@ fn windows() -> bool {
     cfg!(windows)
 }
 
+fn tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
 fn missing_language_server() -> bool {
     let workspace = std::env::current_dir().unwrap_or_default();
     deepseek_code_core::tools::lsp_servers::LANGUAGES
@@ -49,6 +53,7 @@ const TIPS: &[Tip] = &[
     Tip { id: "team-sync", text: "dcl team-sync shares team memories through a self-hosted server", cooldown: 25, relevant: always },
     Tip { id: "status", text: "/status shows the session, model, permission mode and servers in use", cooldown: 15, relevant: always },
     Tip { id: "windows-shell", text: "On Windows the Bash tool runs PowerShell; ask for PowerShell syntax when it matters", cooldown: 15, relevant: windows },
+    Tip { id: "tmux-mouse", text: "In tmux, run `tmux set -g mouse on` to use drag selection and right-click copy", cooldown: 8, relevant: tmux },
 ];
 
 fn enabled(data_dir: &Path) -> bool {

@@ -185,6 +185,21 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 3. `cargo test --locked -p deepseek-code-cli --bin dcl terminal::scrollback` 覆盖真实工具名分类（包括 PowerShell 和全部编辑工具）、同名计数、宽度截断/剩余调用数、失败数、组级状态、模式重开和 reasoning 不算工具。自定义标题包含 Bash/Read 文本不能改变工具分类。
 4. 本地 mock 返回未知名称的 `ToolLoad` 调用（例如 12 个 `✈️`），确认结果记为失败。恢复会话，在 64 列打开紧凑模式并调整到 32 列。CLI 应继续运行，摘要按终端列宽保留完整字素和右括号。在 `terminal::tool_view`、`terminal::scrollback`、`terminal::progress` 中回归 CJK、变体选择符、ZWJ emoji 和组合字符，包括极窄列宽。
 
+### C3. 拖动选择与右击复制（SSH/tmux）
+
+1. 在提示符、模型输出和 `Ctrl+O` 记录里按住左键拖动：出现反色选择，松开后高亮保留；在保留的选择上右击，所选文本进入剪贴板，高亮仍在，可以再次右击复制。
+2. 没有选择时右击不复制、不报错；滚轮、左键点击展开、单双击状态行复制保持原行为。
+3. 本地桌面终端：右击后粘贴应得到原文，包含中文和换行；本地会话仍优先使用系统剪贴板。
+4. 在 tmux 中运行（含 SSH 远程主机）：tmux 需已开启 `set -g mouse on`，应用才能收到鼠标事件；拖动选择后右击，`tmux show-buffer` 应为所选文本。外层终端支持 OSC 52 时，`load-buffer -w` 也应把同一文本送到本地剪贴板。即使远端存在 `pbcopy`/`xclip`，也不能只写远端剪贴板。
+5. 自动回归（两条命令分别执行）：
+
+   ```bash
+   cargo test --locked -p deepseek-code-cli --bin dcl terminal::mouse_selection::tests::
+   cargo test --locked -p deepseek-code-cli --bin dcl extended_commands::tests::clipboard
+   ```
+
+6. 平台说明：Windows ConPTY 的右击由 crossterm 鼠标事件驱动；macOS/Linux 的 SSH+tmux 需要真实终端复验，不能用本机单测替代。
+
 ### D. 中途关闭后恢复
 
 这些场景都要在关闭后立刻恢复一次，因为被杀的前端留下的占用记录要几秒后才过期。
@@ -920,7 +935,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `native_engine/tool_loop.rs` 的错误与请求快照路径：K、H
 - `native_engine/generation.rs`、`services/compaction.rs`、`services/compaction/`：L，以及 E5
 - `native_engine/tool_call_ids.rs`（发给模型的请求体）：E1、E6；确认只改写超长调用 ID，未提供 `tool_calls`、`content` 等字段的消息不会被补成 `null`
-- `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
+- `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择；拖动松开或右击保留的选择都会复制）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
 - `skills/discovery.rs`、`native_engine/skill_tool.rs`、`native_engine/engine_core.rs` 的技能发现与模型列表、`cli/skill_commands.rs`：N
 - 其他范围：至少跑 E
 

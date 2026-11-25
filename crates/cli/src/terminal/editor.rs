@@ -956,6 +956,20 @@ fn move_screen_row(out: &mut impl Write, current: &mut usize, target: usize) -> 
     Ok(())
 }
 
+fn editor_mouse_event(kind: MouseEventKind) -> bool {
+    matches!(
+        kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            // A right click on a retained drag selection copies it.
+            | MouseEventKind::Down(MouseButton::Right)
+            | MouseEventKind::Up(MouseButton::Right)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+    )
+}
+
 fn read_editor_event(
     reader: &mut crate::terminal::paste_input::Reader,
 ) -> io::Result<Option<Event>> {
@@ -964,14 +978,7 @@ fn read_editor_event(
             return Ok(None);
         };
         if let Event::Mouse(mouse) = &event {
-            if !matches!(
-                mouse.kind,
-                MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::Up(MouseButton::Left)
-                    | MouseEventKind::Drag(MouseButton::Left)
-                    | MouseEventKind::ScrollUp
-                    | MouseEventKind::ScrollDown
-            ) {
+            if !editor_mouse_event(mouse.kind) {
                 continue;
             }
         }
@@ -2731,6 +2738,14 @@ mod tests {
         assert_eq!(background_label(3, 0).as_deref(), Some("3 shells \u{b7} \u{2193} to manage"));
         assert_eq!(background_label(0, 1).as_deref(), Some("1 monitor \u{b7} \u{2193} to manage"));
         assert_eq!(background_label(4, 2).as_deref(), Some("4 shells, 2 monitors \u{b7} \u{2193} to manage"));
+    }
+
+    #[test]
+    fn editor_keeps_right_click_events_for_selection_copy() {
+        assert!(editor_mouse_event(MouseEventKind::Down(MouseButton::Right)));
+        assert!(editor_mouse_event(MouseEventKind::Up(MouseButton::Right)));
+        assert!(editor_mouse_event(MouseEventKind::Down(MouseButton::Left)));
+        assert!(!editor_mouse_event(MouseEventKind::Moved));
     }
 
     #[test]
