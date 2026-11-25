@@ -50,6 +50,7 @@ pub enum Picked {
 }
 
 fn with_raw<T>(run: impl FnOnce(&mut dyn FnMut() -> io::Result<Option<Event>>) -> io::Result<T>) -> io::Result<T> {
+    crate::terminal::release_handoff();
     let raw = terminal::is_raw_mode_enabled()?;
     if !raw {
         terminal::enable_raw_mode()?;

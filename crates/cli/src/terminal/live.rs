@@ -133,6 +133,17 @@ impl LiveTurn {
         history: Vec<String>,
         tip: Option<String>,
     ) -> Option<Self> {
+        Self::start_with_initial(mode, bindings, history, tip, None, None)
+    }
+
+    pub fn start_with_initial(
+        mode: &str,
+        bindings: crate::keybindings::Keybindings,
+        history: Vec<String>,
+        tip: Option<String>,
+        model_label: Option<String>,
+        pinned_prompt: Option<String>,
+    ) -> Option<Self> {
         if crate::terminal::screen_reader()
             || !io::stdin().is_terminal()
             || !io::stdout().is_terminal()
@@ -142,9 +153,9 @@ impl LiveTurn {
             return None;
         }
         *crate::terminal::TURN_COMPLETION.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // The first frame clears from the cursor down, over any input box the
-        // previous turn left for the prompt.
-        crate::terminal::take_handoff();
+        // Take over any input box the idle prompt left on the bottom rows so
+        // the first live frame paints in place without erasing the box first.
+        let handoff = crate::terminal::take_handoff();
         let (updates, receiver) = mpsc::channel();
         let (actions, action_receiver) = async_mpsc::unbounded_channel();
         let (ready, initialized) = mpsc::sync_channel(1);
@@ -165,18 +176,26 @@ impl LiveTurn {
             state.history = history;
             state.history_index = state.history.len();
             state.tip = tip;
+            if let Some(label) = model_label {
+                state.model_label = label;
+            }
             let scrollback = super::scrollback::Scrollback::take();
             // The welcome banner is outside conversation history. On the first
             // turn, keep it in place instead of shifting the whole screen down.
             let aligned = scrollback.has_welcome();
+            let pinned_text = pinned_prompt
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or_else(|| scrollback.latest_prompt().to_owned());
             let pinned = super::pinned_prompt::PinnedPrompt {
-                text: scrollback.latest_prompt().to_owned(),
+                text: pinned_text,
                 ..Default::default()
             };
             let mut screen = Frame {
                 scrollback,
                 pinned,
                 aligned,
+                top: handoff,
+                handed_off: handoff.is_some(),
                 ..Frame::default()
             };
             // Publish terminal loss before dropping the action and answer senders.
@@ -1479,6 +1498,9 @@ struct Frame {
     logs: Vec<(String, usize)>,
     /// Screen row of the frame's first line; the transcript ends right above.
     top: Option<u16>,
+    /// True when taking over a bottom input box left by the idle editor so the
+    /// first live frame overwrites it in place without a full clear-down.
+    handed_off: bool,
     /// Blank rows between the live content and the status line. The content
     /// stays right below the transcript, where its finished form is written,
     /// while the input box keeps the bottom rows.
@@ -1772,6 +1794,7 @@ impl Frame {
     ) -> Option<String> {
         let rows = (size.1 as usize).max(1);
         let mut out = std::mem::take(&mut self.pending);
+        let handed_off = std::mem::take(&mut self.handed_off);
         if self.top.is_none() || self.size != size {
             // The first frame, a terminal reflow after a resize, or a
             // full-screen view in between: the cursor shows where we are.
@@ -1779,12 +1802,25 @@ impl Frame {
                 // Recompute hit targets without discarding conversation history.
                 self.scrollback.reflow(size.0 as usize);
             }
-            let cursor_y = cursor_y();
-            let top = if self.lines.is_empty() { cursor_y } else { cursor_y.saturating_sub(self.input_row) };
-            let top = top.min(rows - 1);
-            out.push_str(&format!("\x1b[{};1H\x1b[J", top + 1));
-            self.top = Some(top as u16);
-            self.lines.clear();
+            if handed_off && self.size == (0, 0) {
+                let top = self.top.unwrap_or(0).min(rows.saturating_sub(1) as u16) as usize;
+                let log_rows: usize = self.logs.iter().map(|(_, height)| height).sum();
+                let lift = (top + log_rows + lines.len()).saturating_sub(rows).min(top);
+                // Clear the retained idle box only before scrolling up so it
+                // never enters scrollback; otherwise overwrite in place.
+                if lift > 0 {
+                    out.push_str(&format!("\x1b[{};1H\x1b[J", top + 1));
+                }
+                self.top = Some(top as u16);
+                self.lines.clear();
+            } else {
+                let cursor_y = cursor_y();
+                let top = if self.lines.is_empty() { cursor_y } else { cursor_y.saturating_sub(self.input_row) };
+                let top = top.min(rows - 1);
+                out.push_str(&format!("\x1b[{};1H\x1b[J", top + 1));
+                self.top = Some(top as u16);
+                self.lines.clear();
+            }
         }
         // Scroll before writing the new rows. ConPTY paints what is pending
         // right before each scroll, so the first scroll comes before any
@@ -3689,6 +3725,74 @@ mod tests {
     }
 
     #[test]
+    fn live_first_frame_takes_over_idle_handoff_without_clear_down_or_box_shift() {
+        let mut terminal = vt100::Parser::new(24, 80, 200);
+        terminal.process(b"WELCOME\r\nworkspace\r\n\r\n-----\r\n> hello\r\n-----\r\n\r\n");
+        // Paint the idle handoff box on the bottom 4 rows (rows 20..24).
+        terminal.process(b"\x1b[21;1Hrule\x1b[22;1H> draft\x1b[23;1Hrule\x1b[24;1Hfooter");
+        let before = screen(&terminal);
+        let mut frame = Frame {
+            top: Some(7),
+            handed_off: true,
+            aligned: true,
+            ..Frame::default()
+        };
+        let mut lines = composer("working");
+        let input_row = lines.len() - 3;
+        let output = frame
+            .place(lines.drain(..).collect(), 0, input_row, 2, (80, 24), &mut || {
+                panic!("handoff takeover must not query cursor position")
+            })
+            .expect("first live frame should render");
+        assert!(
+            !output.contains("\x1b[J"),
+            "handoff takeover with room must not clear-down over the bottom box: {output:?}"
+        );
+        terminal.process(output.as_bytes());
+        let after = screen(&terminal);
+        assert_eq!(after[0], "WELCOME");
+        assert_eq!(after[4], "> hello");
+        assert_eq!(after[17], "working");
+        assert_eq!(after[18], "hint");
+        for row in 20..24 {
+            assert_eq!(after[row], before[row], "bottom box row {row} moved on takeover");
+        }
+    }
+
+    #[test]
+    fn live_first_frame_handoff_on_full_screen_scrolls_without_leaking_old_box() {
+        let mut terminal = vt100::Parser::new(14, 80, 200);
+        for index in 0..10 {
+            terminal.process(format!("transcript {index}\r\n").as_bytes());
+        }
+        // Bottom 4 rows hold the idle handoff box (rows 10..14).
+        terminal.process(b"\x1b[11;1H-----\x1b[12;1H> old\x1b[13;1H-----\x1b[14;1HOLD_FOOTER");
+        let mut frame = Frame {
+            top: Some(10),
+            handed_off: true,
+            aligned: true,
+            ..Frame::default()
+        };
+        let lines = composer("working");
+        let input_row = lines.len() - 3;
+        let output = frame
+            .place(lines, 0, input_row, 2, (80, 14), &mut || {
+                panic!("handoff takeover must not query cursor position")
+            })
+            .expect("first live frame should render");
+        terminal.process(output.as_bytes());
+        let after = screen(&terminal);
+        assert_eq!(after[5], "transcript 9");
+        assert_eq!(after[7], "working");
+        assert_eq!(after[8], "hint");
+        assert_eq!(after[13], "footer");
+        assert!(
+            !after[..6].iter().any(|row| row.contains("OLD_FOOTER")),
+            "old handoff footer must not leak into transcript: {after:?}"
+        );
+    }
+
+    #[test]
     fn unchanged_frames_write_nothing_and_scrolls_precede_new_rows() {
         let mut terminal = vt100::Parser::new(20, 80, 200);
         let mut frame = Frame::default();
@@ -4543,12 +4647,25 @@ impl TurnDisplay {
         keybindings: &std::path::Path,
         history: Vec<String>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_initial(interactive, mode, keybindings, history, None, None)
+    }
+
+    pub fn new_with_initial(
+        interactive: bool,
+        mode: &str,
+        keybindings: &std::path::Path,
+        history: Vec<String>,
+        model_label: Option<String>,
+        pinned_prompt: Option<String>,
+    ) -> anyhow::Result<Self> {
         let live = if interactive {
-            LiveTurn::start(
+            LiveTurn::start_with_initial(
                 mode,
                 crate::keybindings::load(keybindings)?,
                 history,
                 keybindings.parent().and_then(super::tips::next),
+                model_label,
+                pinned_prompt,
             )
         } else {
             None

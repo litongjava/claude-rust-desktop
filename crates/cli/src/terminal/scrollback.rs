@@ -536,6 +536,10 @@ impl Scrollback {
     }
     /// Keep prompt text and its disclosure target together across turns.
     pub(crate) fn prompt(&mut self, text: &str) -> (usize, Vec<String>) {
+        let width = crate::terminal::size().0.saturating_sub(1) as usize;
+        self.prompt_at_width(text, width)
+    }
+    pub(crate) fn prompt_at_width(&mut self, text: &str, width: usize) -> (usize, Vec<String>) {
         if let Some(summary) = crate::background_commands::notification_text(text) {
             let lines = summary.lines().map(change_view::body).collect::<Vec<_>>();
             let (id, rows) = self.block(lines.clone(), lines);
@@ -546,7 +550,6 @@ impl Scrollback {
         if !text.trim_start().starts_with('/') {
             self.latest_prompt = text.to_owned();
         }
-        let width = crate::terminal::size().0.saturating_sub(1) as usize;
         let (short, full) = prompt_lines(text, width);
         let (id, rows) = self.block(short, full);
         self.blocks[id].prompt = Some(text.to_owned());
@@ -554,7 +557,11 @@ impl Scrollback {
         (id, rows)
     }
     pub(crate) fn record_prompt(&mut self, text: &str) -> Vec<String> {
-        let (id, content) = self.prompt(text);
+        let width = crate::terminal::size().0.saturating_sub(1) as usize;
+        self.record_prompt_at_width(text, width)
+    }
+    pub(crate) fn record_prompt_at_width(&mut self, text: &str, width: usize) -> Vec<String> {
+        let (id, content) = self.prompt_at_width(text, width);
         let mut rows = Vec::new();
         if self.logged.is_empty() || self.needs_separator() {
             self.push(String::new(), None);
@@ -1111,7 +1118,7 @@ fn rendered_at_width(lines: &[Line], width: usize) -> Vec<String> {
 }
 
 /// Screen rows a written line takes at `columns`, style escapes excluded.
-fn screen_rows(text: &str, columns: usize) -> usize {
+pub(crate) fn screen_rows(text: &str, columns: usize) -> usize {
     let columns = columns.max(1);
     text.split("\r\n")
         .map(|line| {
