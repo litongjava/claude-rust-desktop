@@ -1202,6 +1202,7 @@ impl PromptEditor {
         let mut last_state = (buffer.chars.clone(), buffer.cursor);
         let mut kill_hint = false;
         let mut copy_feedback: Option<String> = None;
+        let mut copy_feedback_at: Option<std::time::Instant> = None;
         let mut clear_esc: Option<std::time::Instant> = None;
         // Read once per prompt; ctrl+t toggles whether they show.
         let todo_list = self.todos.as_ref().map(|todos| todos()).unwrap_or_default();
@@ -1257,6 +1258,13 @@ impl PromptEditor {
         // Files may have changed since the last prompt; list them again on `@`.
         self.files = None;
         loop {
+            if copy_feedback.is_some()
+                && copy_feedback_at
+                    .is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(2))
+            {
+                copy_feedback = None;
+                copy_feedback_at = None;
+            }
             if yielded.load(std::sync::atomic::Ordering::Acquire) {
                 self.pending_draft = buffer.text();
                 self.pending_cursor = Some(buffer.cursor);
@@ -1983,6 +1991,7 @@ impl PromptEditor {
                             copy_feedback = Some(
                                 crate::terminal::mouse_selection::copy_message(characters, copied),
                             );
+                            copy_feedback_at = Some(std::time::Instant::now());
                             continue;
                         }
                         if let Some(click) = selected {
@@ -2026,6 +2035,7 @@ impl PromptEditor {
                         copy_feedback = Some(
                             crate::terminal::mouse_selection::copy_message(characters, copied),
                         );
+                        copy_feedback_at = Some(std::time::Instant::now());
                         continue;
                     }
                     let Some(mouse) = event else {
@@ -2156,6 +2166,7 @@ impl PromptEditor {
                     }
                     restored = false;
                     copy_feedback = None;
+                    copy_feedback_at = None;
                     let killing = control && matches!(key.code, KeyCode::Char('u' | 'k'));
                     if killing {
                         let cut: String = if key.code == KeyCode::Char('u') {
@@ -2456,6 +2467,7 @@ impl PromptEditor {
                                         crate::extended_commands::copy_session_id(session)
                                             .unwrap_or_else(|error| format!("{error:#}")),
                                     );
+                                    copy_feedback_at = None;
                                     buffer.set("");
                                     menu_hidden = true;
                                     continue;

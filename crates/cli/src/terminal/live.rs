@@ -2204,12 +2204,20 @@ fn run(
     let mut agent_preview = String::new();
     let mut agent_click: Option<(usize, Instant)> = None;
     let mut copy_click = super::mouse_selection::CopyClick::default();
+    let mut copy_feedback_at: Option<Instant> = None;
     let mut drag_mouse = None;
     let mut last_drag = Instant::now();
     let mut input_reader = super::paste_input::Reader::new()?;
     screen.draw(state)?;
     loop {
         let mut dirty = false;
+        if state.copy_feedback.is_some()
+            && copy_feedback_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2))
+        {
+            state.copy_feedback = None;
+            copy_feedback_at = None;
+            dirty = true;
+        }
         while !selection.retained() {
             match updates.try_recv() {
                 Ok(Update::Copy(number, command, body)) => {
@@ -2241,6 +2249,7 @@ fn run(
                         // Feedback occupies the existing footer, so copying
                         // never moves the running tool or allocates notice rows.
                         state.copy_feedback = Some(text);
+                        copy_feedback_at = None;
                     } else if command.trim() == "/status" || command.trim().starts_with("/tasks") {
                         if state.status_page.is_none() {
                             execute!(crate::terminal_output::stderr(), terminal::EnterAlternateScreen)?;
@@ -2635,6 +2644,7 @@ fn run(
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     selection.clear()?;
                     state.copy_feedback = None;
+                    copy_feedback_at = None;
                     if state.draft.cursor < state.draft.paste_end
                         || matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Home)
                     {
@@ -2997,6 +3007,7 @@ fn run(
                         if let Some((characters, copied)) = selection.take_copy_feedback() {
                             state.copy_feedback =
                                 Some(super::mouse_selection::copy_message(characters, copied));
+                            copy_feedback_at = Some(Instant::now());
                             screen.draw(state)?;
                             continue;
                         }
@@ -3047,6 +3058,7 @@ fn run(
                     if let Some((characters, copied)) = selection.take_copy_feedback() {
                         state.copy_feedback =
                             Some(super::mouse_selection::copy_message(characters, copied));
+                        copy_feedback_at = Some(Instant::now());
                         screen.draw(state)?;
                         continue;
                     }
