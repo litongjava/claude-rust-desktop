@@ -4,6 +4,7 @@
 use super::*;
 use crate::db::session_store::Stores;
 use crate::runtime::{RuntimePaths, SessionStore};
+use base64::Engine;
 
 fn restore_executor(paths: &RuntimePaths, messages: Vec<Value>) -> ToolLoopExecutor {
     let _ = crate::config::OrchestrationConfig::init_global();
@@ -278,4 +279,58 @@ fn failed_read_cannot_authorize_an_edit_and_the_successful_read_survives_resume(
         .contains("modified"));
     assert!(!paths.data_dir.join("cache/file-state").exists());
     Ok(())
+}
+
+/// A stored tool image whose declared type disagrees with its bytes must be
+/// repaired during replay. It used to fail the whole turn before the request
+/// was sent, leaving the session unable to continue.
+#[test]
+fn mislabelled_tool_image_is_repaired_when_history_is_replayed() {
+    let _ = crate::config::OrchestrationConfig::init_global();
+    let dir = tempfile::tempdir().unwrap();
+    let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
+    let store = SessionStore::new(Arc::new(paths.open_stores().unwrap()));
+    let session = store.create(dir.path(), "fixture", "fixture").unwrap();
+    store
+        .append(&session, "user", "Look at the screenshot")
+        .unwrap();
+    let assistant = store.append(&session, "assistant", "").unwrap();
+
+    let webp = base64::engine::general_purpose::STANDARD.encode(b"RIFF\x00\x00\x00\x00WEBP");
+    let display = "Image file shot.png (image/png, 12 bytes)";
+    let content = json!([
+        {"type":"image","source":{"type":"base64","media_type":"image/png","data":webp}},
+        {"type":"text","text":display}
+    ])
+    .to_string();
+    record_call(&store, &session, &assistant, "call-image", "Read", display);
+    let tool_id: String = store
+        .db
+        .fixture_shard(&session, |conn| {
+            conn.query_row(
+                "SELECT id FROM tool_calls WHERE message_id=?1",
+                [&assistant],
+                |row| row.get(0),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    store
+        .db
+        .fixture_shard(&session, |conn| {
+            conn.execute(
+                "INSERT INTO mcp_tool_outputs (conversation_id,tool_use_id,content_json,metadata_json,display_text,is_error,model_content_json) VALUES (?1,?4,?2,'{}',?3,0,?2)",
+                rusqlite::params![session, content, display, tool_id],
+            )
+        })
+        .unwrap()
+        .unwrap();
+
+    for format in [ApiFormat::OpenAI, ApiFormat::Anthropic] {
+        let history = store.model_history(&session, &format).unwrap();
+        let text = serde_json::to_string(&history).unwrap();
+        assert!(text.contains("image/webp"), "{format:?}: {text}");
+        // The provider boundary accepts the repaired block instead of failing.
+        super::multimodal::normalize_messages(&history).unwrap();
+    }
 }

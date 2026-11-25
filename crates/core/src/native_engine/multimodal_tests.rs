@@ -130,7 +130,7 @@ async fn first_send_raw_cli_images_reach_actual_model_requests() {
 #[tokio::test]
 async fn protocol_normalization_and_retained_compression_preserve_images() {
     for anthropic in [false, true] {
-        let (mut engine, _events) = executor("http://127.0.0.1:1", "openai", mixed_content());
+        let (engine, _events) = executor("http://127.0.0.1:1", "openai", mixed_content());
         let messages: Vec<Value> = if anthropic {
             engine
                 .build_anthropic_messages()
@@ -168,13 +168,21 @@ async fn protocol_normalization_and_retained_compression_preserve_images() {
             };
             assert_content(&content, anthropic);
         }
-        let (mut engine, _events) = executor(
+        let (engine, _events) = executor(
             "http://127.0.0.1:1",
             "openai",
             json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"broken"}}]),
         );
-        assert!(engine.build_openai_messages().is_err());
-        assert!(engine.build_anthropic_messages().is_err());
+        // One unusable image degrades to text; it must not fail the whole turn.
+        let openai = serde_json::to_string(&engine.build_openai_messages().unwrap()).unwrap();
+        assert!(openai.contains("Image omitted"));
+        let (engine, _events) = executor(
+            "http://127.0.0.1:1",
+            "openai",
+            json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"broken"}}]),
+        );
+        let anthropic = serde_json::to_string(&engine.build_anthropic_messages().unwrap()).unwrap();
+        assert!(anthropic.contains("Image omitted"));
     }
 }
 
