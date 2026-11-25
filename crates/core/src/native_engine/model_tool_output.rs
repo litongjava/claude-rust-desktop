@@ -50,7 +50,9 @@ impl super::ToolLoopExecutor {
             .map(|input| {
                 let original = super::monitor_notification(&input.text).then(|| input.text.clone());
                 let content = input.model_content(
-                    self.search_config_path.as_deref().and_then(Path::parent),
+                    self.search_config_path
+                        .as_deref()
+                        .and_then(crate::data_layout::data_root_of),
                     self.conv_id.as_deref().unwrap_or_default(),
                 );
                 if original
@@ -68,7 +70,10 @@ impl super::ToolLoopExecutor {
     /// retains its original size until the provider builder renders it.
     pub(super) fn project_history(&mut self, messages: &mut [Value]) -> anyhow::Result<()> {
         use crate::db::model_results::StoredContent;
-        let root = self.search_config_path.as_deref().and_then(Path::parent);
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(crate::data_layout::data_root_of);
         let session = self.conv_id.as_deref().unwrap_or_default();
         let history = self.session_search_storage();
         let cwd = std::path::PathBuf::from(self.get_workspace_cwd());
@@ -644,7 +649,7 @@ pub(super) fn metadata_path(root: &Path, id: &str) -> std::path::PathBuf {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    root.join("tool-output-metadata")
+    root.join("cache/tool-output-metadata")
         .join(format!("{key}.json"))
 }
 
@@ -655,7 +660,7 @@ pub(super) fn save_metadata(
 ) -> std::io::Result<()> {
     use std::io::Write;
     let path = metadata_path(root, id);
-    let dir = root.join("tool-output-metadata");
+    let dir = root.join("cache/tool-output-metadata");
     std::fs::create_dir_all(&dir)?;
     let mut file = tempfile::NamedTempFile::new_in(dir)?;
     file.write_all(&serde_json::to_vec(capture)?)?;
@@ -703,7 +708,7 @@ pub(crate) fn projected_command_notes(
     let cleaned = render(name, raw, None);
     if cleaned.len() > MODEL_TOOL_OUTPUT_BYTES {
         if let Ok(path) =
-            crate::performance::save_output_in(&root.join("tool-outputs"), cleaned.as_bytes())
+            crate::performance::save_output_in(&root.join("cache/tool-outputs"), cleaned.as_bytes())
         {
             notes = format!(
                 "\nSaved tool result ({} bytes, may already be truncated by the tool): {}",
@@ -1507,8 +1512,10 @@ mod tests {
         let mut provider = resolved.provider;
         provider.models = vec![resolved.model];
         provider.base_url = base;
-        let providers =
-            ProviderManager::in_memory(vec![provider], runtime.data_dir.join("providers.json"));
+        let providers = ProviderManager::in_memory(
+            vec![provider],
+            runtime.layout().config_file("providers.json"),
+        );
         // The Desktop Bridge builds its NativeEngine with this same data-root path.
         let engine = runtime::create_engine(
             &runtime,
@@ -1882,7 +1889,9 @@ mod tests {
             root.to_string_lossy().into(),
             ReasoningMode::Standard,
         )
-        .with_search_config_path(root.join("config.json"))
+        .with_search_config_path(
+            crate::data_layout::DataLayout::from_root(&root).config_file("config.json"),
+        )
     }
 
     #[test]
@@ -1980,12 +1989,12 @@ mod tests {
             }
         }
         assert_eq!(
-            std::fs::read_dir(paths.data_dir.join("tool-outputs"))
+            std::fs::read_dir(paths.data_dir.join("cache/tool-outputs"))
                 .unwrap()
                 .count(),
             1
         );
-        let spill = std::fs::read_dir(paths.data_dir.join("tool-outputs"))
+        let spill = std::fs::read_dir(paths.data_dir.join("cache/tool-outputs"))
             .unwrap()
             .next()
             .unwrap()

@@ -127,7 +127,7 @@ impl Fixture {
             self.store.db.clone(),
             Arc::new(tokio::sync::Mutex::new(ProviderManager::in_memory(
                 vec![self.provider.clone()],
-                self.paths.data_dir.join("providers.json"),
+                self.paths.data_dir.join("config/providers.json"),
             ))),
             runtime::default_permissions(),
             Arc::new(FileCache::new()),

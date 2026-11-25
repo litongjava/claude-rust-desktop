@@ -56,8 +56,8 @@ async fn fixture(
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let provider: Provider = serde_json::from_value(json!({"id":"p","name":"p","base_url":format!("http://{}",listener.local_addr().unwrap()),"api_key":"fixture","api_format":"openai","enabled":true,"models":[{"id":"m","name":"m","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
-    std::fs::write(
-        paths.data_dir.join("providers.json"),
+    deepseek_code_core::data_layout::write_config_file(
+        paths.data_dir.join("config/providers.json"),
         serde_json::to_vec(&vec![provider.clone()]).unwrap(),
     )
     .unwrap();

@@ -1649,7 +1649,7 @@ impl<D: TaskDatabase> TaskStore<D> {
         }
         let directory = self
             .data_dir
-            .join("super-agent")
+            .join("tasks/super-agent")
             .join(task_id)
             .join("artifacts");
         std::fs::create_dir_all(&directory)?;

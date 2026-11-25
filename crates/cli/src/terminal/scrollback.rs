@@ -1391,14 +1391,25 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let session = uuid::Uuid::new_v4().to_string();
         let task = uuid::Uuid::new_v4().to_string();
-        std::fs::create_dir_all(root.path().join("tasks")).unwrap();
-        let db = deepseek_code_core::db::DbManager::new(root.path().join("tasks").join(format!("{session}.sqlite3"))).unwrap();
+        std::fs::create_dir_all(root.path().join("data/session-tasks")).unwrap();
+        let db = deepseek_code_core::db::DbManager::new(
+            root.path()
+                .join("data/session-tasks")
+                .join(format!("{session}.sqlite3")),
+        )
+        .unwrap();
         let record = json!({"id":task,"status":"completed","metadata":{"managed_shell":true},"output":{"exit_code":0}});
         db.with_conn(|conn| {
-            conn.execute_batch("CREATE TABLE tasks(id TEXT PRIMARY KEY, body TEXT NOT NULL)").unwrap();
-            conn.execute("INSERT INTO tasks VALUES (?1,?2)", [&task, &record.to_string()]).unwrap();
-        }).unwrap();
-        let logs = root.path().join("shell-tasks").join(&session).join(&task);
+            conn.execute_batch("CREATE TABLE tasks(id TEXT PRIMARY KEY, body TEXT NOT NULL)")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO tasks VALUES (?1,?2)",
+                [&task, &record.to_string()],
+            )
+            .unwrap();
+        })
+        .unwrap();
+        let logs = root.path().join("tasks/shell").join(&session).join(&task);
         std::fs::create_dir_all(&logs).unwrap();
         std::fs::write(logs.join("stdout.log"), "FIRST\n").unwrap();
         std::fs::write(logs.join("stderr.log"), "\x1b[31mERROR\x1b[0m\n").unwrap();

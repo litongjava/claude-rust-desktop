@@ -32,9 +32,21 @@ async fn executor(
         Arc::new(EnvironmentCredentials),
     )
     .unwrap();
-    context.db.create(parent, crate::db::session_store::CreateOptions { model: Some("fixture".into()), provider: Some("fixture".into()), ..Default::default() }).unwrap();
-    let private_root = context.paths.data_dir.join("workspaces");
-    let cwd = context.db.engine_workspace(&private_root, parent, None)
+    context
+        .db
+        .create(
+            parent,
+            crate::db::session_store::CreateOptions {
+                model: Some("fixture".into()),
+                provider: Some("fixture".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let private_root = context.paths.data_dir.join("data/workspaces");
+    let cwd = context
+        .db
+        .engine_workspace(&private_root, parent, None)
         .unwrap()
         .0;
     std::fs::create_dir_all(&cwd).unwrap();
@@ -53,7 +65,7 @@ async fn executor(
         ReasoningMode::Standard,
     )
     .with_conv_id(parent.to_string())
-    .with_search_config_path(context.paths.data_dir.join("settings.json"));
+    .with_search_config_path(context.paths.layout().config_file("settings.json"));
     (executor, context)
 }
 
@@ -245,8 +257,8 @@ async fn teammate_idle_hook_receives_identity_and_blocking_feedback_resumes_the_
         )
     };
     std::fs::create_dir_all(temp.path().join("data")).unwrap();
-    std::fs::write(
-        temp.path().join("data").join("settings.json"),
+    crate::data_layout::write_config_file(
+        temp.path().join("data/config/settings.json"),
         json!({"hooks":{"TeammateIdle":[{"hooks":[{"type":"command","command":command,"shell":if cfg!(windows){"powershell"}else{"sh"}}]}]}})
             .to_string(),
     )

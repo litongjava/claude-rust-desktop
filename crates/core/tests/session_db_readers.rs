@@ -114,13 +114,18 @@ fn directory_listing_opens_zero_shards() -> Result<()> {
     for _ in 0..count {
         let id = uuid::Uuid::new_v4().to_string();
         stores.create(&id, Default::default())?;
-        paths.push(root.path().join("sessions").join(id).join("session.db"));
+        paths.push(
+            root.path()
+                .join("data/sessions")
+                .join(id)
+                .join("session.db"),
+        );
     }
     // This isolates the measured query from the independent repair thread.
     let namespace = std::fs::File::options()
         .read(true)
         .write(true)
-        .open(root.path().join("session-locks/.directory"))?;
+        .open(root.path().join("state/locks/session/.directory"))?;
     namespace.lock()?;
     for path in &paths {
         let c = CString::new(path.as_os_str().as_bytes())?;
@@ -162,7 +167,10 @@ fn usage_reports_exact_prices_and_retains_healthy_sessions_when_one_is_missing()
     let b = uuid::Uuid::new_v4().to_string();
     stores.create(&b, Default::default())?;
     std::fs::rename(
-        root.path().join("sessions").join(&b).join("session.db"),
+        root.path()
+            .join("data/sessions")
+            .join(&b)
+            .join("session.db"),
         root.path().join("damaged.db"),
     )?;
     let usage = stores.usage(|| false)?;
@@ -424,9 +432,10 @@ fn runtime_resolves_new_resume_clear_and_child_under_one_root() -> Result<()> {
     assert_eq!(store.history(&id)?[1]["content"], "question");
     assert_eq!(store.resume(&id)?.model.as_deref(), Some("model"));
     assert_eq!(store.latest(root.path())?.unwrap().id, id);
-    let child = store.derive_owned_child(&id, &paths.data_dir.join("workspaces"), root.path())?;
+    let child =
+        store.derive_owned_child(&id, &paths.data_dir.join("data/workspaces"), root.path())?;
     assert_eq!(
-        store.workspace(&child, &paths.data_dir.join("workspaces"))?,
+        store.workspace(&child, &paths.data_dir.join("data/workspaces"))?,
         root.path()
     );
     let cleared = store.clear(&id)?;
@@ -1040,25 +1049,41 @@ fn document_previews_and_import_backups_resolve_immutable_bodies() -> Result<()>
         runtime::RuntimePaths,
         services::{EnvironmentCredentials,ServiceContext,magic_docs::{self,Preview}},
     };
-    let root=tempfile::tempdir()?;
-    let paths=RuntimePaths::new(root.path().join("data"))?;
-    let ctx=ServiceContext::from_stores(paths,std::sync::Arc::new(EnvironmentCredentials))?;
-    let path=root.path().join("design.md");
-    let original="# MAGIC DOC: design\nOld body".to_owned();
-    let proposed="# MAGIC DOC: design\nNew body".to_owned();
-    std::fs::write(&path,&original)?;
-    let doc=magic_docs::check(&ctx,root.path(),&path)?;
-    ctx.db.save_preview(&Preview{id:"p".into(),document_id:doc.id.clone(),original:original.clone(),proposed:proposed.clone(),diff:String::new()})?;
-    ctx.db.record_input(&doc.id,"private source material")?;
-    assert!(!ctx.db.input_changed(&doc.id,"private source material")?);
-    assert_eq!(magic_docs::previews(&ctx,root.path())?[0].proposed,proposed);
-    let archive=root.path().join("archive.json");
-    std::fs::write(&archive,"[]")?;
-    let backup=magic_docs::import_legacy(&ctx,root.path(),&archive,false)?.backup.unwrap();
-    let manifest:serde_json::Value=serde_json::from_slice(&std::fs::read(&backup)?)?;
-    assert_eq!(manifest["blobs"].as_array().unwrap().len(),3);
-    for digest in manifest["blobs"].as_array().unwrap(){
-        assert!(std::path::Path::new(&backup).parent().unwrap().join("global-blobs").join(digest.as_str().unwrap()).is_file());
+    let root = tempfile::tempdir()?;
+    let paths = RuntimePaths::new(root.path().join("data"))?;
+    let ctx = ServiceContext::from_stores(paths, std::sync::Arc::new(EnvironmentCredentials))?;
+    let path = root.path().join("design.md");
+    let original = "# MAGIC DOC: design\nOld body".to_owned();
+    let proposed = "# MAGIC DOC: design\nNew body".to_owned();
+    std::fs::write(&path, &original)?;
+    let doc = magic_docs::check(&ctx, root.path(), &path)?;
+    ctx.db.save_preview(&Preview {
+        id: "p".into(),
+        document_id: doc.id.clone(),
+        original: original.clone(),
+        proposed: proposed.clone(),
+        diff: String::new(),
+    })?;
+    ctx.db.record_input(&doc.id, "private source material")?;
+    assert!(!ctx.db.input_changed(&doc.id, "private source material")?);
+    assert_eq!(
+        magic_docs::previews(&ctx, root.path())?[0].proposed,
+        proposed
+    );
+    let archive = root.path().join("archive.json");
+    std::fs::write(&archive, "[]")?;
+    let backup = magic_docs::import_legacy(&ctx, root.path(), &archive, false)?
+        .backup
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&backup)?)?;
+    assert_eq!(manifest["blobs"].as_array().unwrap().len(), 3);
+    for digest in manifest["blobs"].as_array().unwrap() {
+        assert!(std::path::Path::new(&backup)
+            .parent()
+            .unwrap()
+            .join("data/global-blobs")
+            .join(digest.as_str().unwrap())
+            .is_file());
     }
     let permissions=deepseek_code_core::runtime::default_permissions();
     permissions.set_mode(deepseek_code_core::permissions::PermissionMode::AcceptEdits);

@@ -78,7 +78,7 @@ pub async fn handle(
 fn ensure_workspace(paths: &RuntimePaths, session: &Session, checkpoint: &checkpoints::Checkpoint) -> Result<()> {
     let workspace = session
         .store
-        .workspace(&session.id, &paths.data_dir.join("workspaces"))?
+        .workspace(&session.id, &paths.data_dir.join("data/workspaces"))?
         .canonicalize()?;
     ensure!(
         workspace == checkpoint.workspace,

@@ -24,7 +24,7 @@ pub fn definition() -> super::ToolDefinition {
 }
 
 fn file(root: &Path, session: &str) -> PathBuf {
-    root.join("wakeups").join(format!("{session}.json"))
+    root.join("tasks/wakeups").join(format!("{session}.json"))
 }
 
 pub fn execute(input: &Value, root: &Path, session: &str, now: i64) -> Result<Value> {

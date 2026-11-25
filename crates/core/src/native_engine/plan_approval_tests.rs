@@ -39,7 +39,7 @@ pub(super) fn fixture() -> (
         ReasoningMode::Standard,
     )
     .with_conv_id(id)
-    .with_search_config_path(context.paths.data_dir.join("config.json"))
+    .with_search_config_path(context.paths.layout().config_file("config.json"))
     .with_permission_manager(manager.clone());
     (temp, context, sessions, executor, rx, manager)
 }
@@ -412,7 +412,7 @@ async fn teammate_plan_approval_routes_to_leader_and_never_self_approves() {
     let requests_file = context
         .paths
         .data_dir
-        .join("teams")
+        .join("data/teams")
         .join(&team.name)
         .join("requests.json");
     let request = teams::pending_plan_request(&context.paths.data_dir, &team.name, &member_session)

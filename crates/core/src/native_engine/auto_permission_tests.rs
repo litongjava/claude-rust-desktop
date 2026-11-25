@@ -51,7 +51,9 @@ fn executor(
         ReasoningMode::Standard,
     )
     .with_conv_id("auto-session".into())
-    .with_search_config_path(root.join("data/config.json"))
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(root.join("data")).config_file("config.json"),
+    )
     .with_permission_manager(manager.clone());
     (executor, rx, manager)
 }
@@ -161,8 +163,9 @@ async fn auto_discards_allow_after_rule_mode_or_config_changes_and_cancellation(
                 crate::services::session_messages::context(&root.path().join("data")).unwrap();
             let mut provider = executor.provider.provider.clone();
             provider.models = vec![executor.provider.model.clone()];
-            std::fs::write(
-                root.path().join("data/providers.json"),
+            crate::data_layout::write_config_file(
+                crate::data_layout::DataLayout::from_root(root.path().join("data"))
+                    .config_file("providers.json"),
                 serde_json::to_vec(&vec![provider]).unwrap(),
             )
             .unwrap();
@@ -192,7 +195,12 @@ async fn auto_discards_allow_after_rule_mode_or_config_changes_and_cancellation(
             ),
             "callback" => manager.set_always_allow_checker(Box::new(|_, _| false)),
             "provider" => {
-                std::fs::write(root.path().join("data/providers.json"), "[]").unwrap();
+                crate::data_layout::write_config_file(
+                    crate::data_layout::DataLayout::from_root(root.path().join("data"))
+                        .config_file("providers.json"),
+                    "[]",
+                )
+                .unwrap();
             }
             "mode" => {
                 manager.set_mode(PermissionMode::AskPermissions);

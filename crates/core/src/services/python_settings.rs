@@ -76,8 +76,8 @@ mod tests {
     #[test]
     fn invalid_settings_are_not_silently_ignored() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("settings.json"),
+        crate::data_layout::write_config_file(
+            crate::data_layout::DataLayout::from_root(&root.path()).config_file("settings.json"),
             r#"{"python":{"path":3}}"#,
         )
         .unwrap();

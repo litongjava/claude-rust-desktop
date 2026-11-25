@@ -620,8 +620,8 @@ fn write_responses_provider(root: &Path, url: &str) {
         }))
         .unwrap(),
     );
-    std::fs::write(
-        paths.data_dir.join("config.json"),
+    deepseek_code_core::data_layout::write_config_file(
+        paths.data_dir.join("config/config.json"),
         serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
@@ -1133,8 +1133,8 @@ async fn embedded_images_reach_both_providers_and_survive_history_and_fork() {
         let mut config = deepseek_code_core::config::AppConfig::default();
         std::fs::create_dir_all(&paths.data_dir).unwrap();
         config.providers.push(serde_json::from_value(json!({"id":"vision-fixture","name":"Vision fixture","provider_type":"openai","base_url":server.url,"enabled":true,"is_default":false,"settings":{},"supports_web_search":false,"models":[{"id":"fixture-model","name":"fixture-model","enabled":true,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true}]})).unwrap());
-        std::fs::write(
-            paths.data_dir.join("config.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.data_dir.join("config/config.json"),
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
@@ -1384,7 +1384,11 @@ fn write_stream_timeout_policy(root: &Path, idle_secs: u64, retries: u32, backof
             "retry_base_backoff_ms = 2000",
             &format!("retry_base_backoff_ms = {backoff_ms}"),
         );
-    std::fs::write(root.join("config/orchestration.toml"), config).unwrap();
+    deepseek_code_core::data_layout::write_config_file(
+        root.join("config/orchestration.toml"),
+        config,
+    )
+    .unwrap();
 }
 
 fn turn_rows(data: &Path, session: &str) -> Vec<(String, String)> {
@@ -1407,7 +1411,7 @@ fn turn_rows(data: &Path, session: &str) -> Vec<(String, String)> {
 
 fn turn_end_records(data: &Path, session: &str) -> Vec<Value> {
     let path = data
-        .join("logs/request-attempts")
+        .join("diagnostics/logs/request-attempts")
         .join(format!("{session}.jsonl"));
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -1896,8 +1900,8 @@ async fn sdk_initialize_applies_runtime_overrides_and_reports_real_resources() {
         other.name = "Other fixture provider".into();
         other.models.retain(|model| model.id == "fixture-second");
         config.providers.push(other);
-        std::fs::write(
-            paths.data_dir.join("config.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.data_dir.join("config/config.json"),
             serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
@@ -2302,8 +2306,8 @@ async fn sdk_initialize_agents_execute_with_bounded_tools_and_run_local_catalog(
             .unwrap();
             let mut config = deepseek_code_core::config::AppConfig::default();
             config.providers.push(serde_json::from_value(json!({"id":"sdk-fixture","name":"SDK fixture provider","provider_type":if anthropic {"anthropic"}else{"openai"},"base_url":server.url,"enabled":true,"is_default":false,"settings":{},"supports_web_search":false,"models":[{"id":"fixture-model","name":"Fixture primary","enabled":true,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true},{"id":"fixture-second","name":"Fixture secondary","enabled":true,"supports_vision":false,"supports_tools":true,"supports_text":true,"supports_streaming":true}]})).unwrap());
-            std::fs::write(
-                paths.data_dir.join("config.json"),
+            deepseek_code_core::data_layout::write_config_file(
+                paths.data_dir.join("config/config.json"),
                 serde_json::to_vec(&config).unwrap(),
             )
             .unwrap();

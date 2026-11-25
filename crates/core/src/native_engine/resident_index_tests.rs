@@ -169,12 +169,12 @@ async fn memory_resident_scopes_across_boundaries_and_resume() -> Result<()> {
             let project = FileMemory::session(&ctx, shard.id())?;
             let agent = project.directory.parent().unwrap().join("agents/reviewer");
             let team = root.path().join("team");
-            fs::write(
-                data.join("settings.json"),
+            crate::data_layout::write_config_file(
+                crate::data_layout::DataLayout::from_root(&data).config_file("settings.json"),
                 json!({"memory":{"team_dir":team}}).to_string(),
             )?;
             let dirs = [
-                ("global", data.join("memory/global")),
+                ("global", data.join("data/memory/global")),
                 ("team", team),
                 ("project", project.directory.clone()),
                 ("subagent", agent),

@@ -69,7 +69,7 @@ impl RuntimePaths {
 
     /// Read without silently discarding malformed configuration or creating defaults.
     pub fn read_config(&self) -> Result<AppConfig> {
-        let path = self.data_dir.join("config.json");
+        let path = self.layout().config_file("config.json");
         if !path.exists() {
             return Ok(AppConfig::default());
         }
@@ -78,7 +78,7 @@ impl RuntimePaths {
     }
 
     pub fn providers(&self) -> Result<Vec<Provider>> {
-        if self.data_dir.join("config.json").exists() {
+        if self.layout().config_file("config.json").exists() {
             return Ok(self
                 .read_config()?
                 .providers
@@ -86,12 +86,17 @@ impl RuntimePaths {
                 .map(provider_from_config)
                 .collect());
         }
-        let path = self.data_dir.join("providers.json");
+        let path = self.layout().config_file("providers.json");
         if !path.exists() {
             return Ok(Vec::new());
         }
         serde_json::from_str(&std::fs::read_to_string(&path)?)
             .with_context(|| format!("Invalid providers: {}", path.display()))
+    }
+
+    /// The single path contract for this data directory.
+    pub fn layout(&self) -> crate::data_layout::DataLayout {
+        crate::data_layout::DataLayout::new(self.data_dir.clone())
     }
 }
 
@@ -145,7 +150,7 @@ pub fn create_engine(
     let engine = NativeEngine::new(
         providers,
         db,
-        paths.data_dir.join("workspaces"),
+        paths.layout().workspaces(),
         permissions,
         cache,
     );

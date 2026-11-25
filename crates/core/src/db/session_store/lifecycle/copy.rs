@@ -98,11 +98,7 @@ impl SessionDb {
         self.check_directory()?;
         self.stores.global().read(|c| {
             let snapshot = c.unchecked_transaction()?;
-            workspace(
-                &snapshot,
-                &self.stores.root.path.join("workspaces"),
-                &self.id,
-            )
+            workspace(&snapshot, &self.stores.layout().workspaces(), &self.id)
         })
     }
     pub fn copy_preferences_to(&self, destination: &SessionDb) -> Result<()> {
@@ -231,7 +227,7 @@ impl SessionDb {
                 } else {
                     crate::native_engine::workspace::resolve_workspace(
                         c,
-                        &s.root.path.join("workspaces"),
+                        &s.layout().workspaces(),
                         &self.id,
                         None,
                     )?;

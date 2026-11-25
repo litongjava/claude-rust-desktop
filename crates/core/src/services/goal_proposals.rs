@@ -295,7 +295,8 @@ fn guard(
         permissions.get_mode() != PermissionMode::PlanMode && mode.as_deref() != Some("plan"),
         "ProposeGoal is unavailable in plan mode"
     );
-    let user = settings(&root.join("settings.json"))?;
+    let user =
+        settings(&crate::data_layout::DataLayout::from_root(&root).config_file("settings.json"))?;
     let preference = user["modelProposedGoals"].as_str().unwrap_or("auto");
     ensure!(
         matches!(preference, "auto" | "alwaysAsk"),
@@ -499,7 +500,7 @@ fn source_job_allows_activation(root: &Path, session: &str, proposal: &Proposal)
                 .is_ok_and(|target| target == session)
             && matches!(job.status.as_str(), "starting" | "running" | "completed")
             && !root
-                .join("background-tasks")
+                .join("tasks/background")
                 .join(id)
                 .join("cancel")
                 .exists()
@@ -754,7 +755,7 @@ mod tests {
             let proposal = frontend.poll().unwrap().unwrap();
             f.decide(&frontend, &proposal.id, true).unwrap();
             let id = uuid::Uuid::new_v4().to_string();
-            let directory = f.root.path().join("background-tasks").join(&id);
+            let directory = f.root.path().join("tasks/background").join(&id);
             std::fs::create_dir_all(&directory).unwrap();
             let job = super::super::background_sessions::Job {
                 id: id.clone(),
@@ -926,14 +927,18 @@ mod tests {
         f.propose("Tests pass", true).unwrap(); // Project consent settings do not govern this tool.
         let p = frontend.poll().unwrap().unwrap();
         f.decide(&frontend, &p.id, true).unwrap();
-        std::fs::write(
-            f.root.path().join("settings.json"),
+        crate::data_layout::write_config_file(
+            crate::data_layout::DataLayout::from_root(&f.root.path()).config_file("settings.json"),
             r#"{"modelProposedGoals":"disabled"}"#,
         )
         .unwrap();
         assert!(f.activate().unwrap().is_none());
         assert!(f.authority().is_empty());
-        std::fs::write(f.root.path().join("settings.json"), "{}").unwrap();
+        crate::data_layout::write_config_file(
+            crate::data_layout::DataLayout::from_root(&f.root.path()).config_file("settings.json"),
+            "{}",
+        )
+        .unwrap();
         f.propose("Tests pass", true).unwrap();
         let p = frontend.poll().unwrap().unwrap();
         f.permissions.set_mode(PermissionMode::PlanMode);
@@ -979,8 +984,8 @@ mod tests {
         let f = Fixture::new();
         let frontend = Frontend::acquire(f.db.clone(), &f.session).unwrap();
         session_goals::set(&f.db, &f.session, "Run the tests").unwrap();
-        std::fs::write(
-            f.root.path().join("settings.json"),
+        crate::data_layout::write_config_file(
+            crate::data_layout::DataLayout::from_root(&f.root.path()).config_file("settings.json"),
             r#"{"modelProposedGoals":"alwaysAsk"}"#,
         )
         .unwrap();

@@ -222,7 +222,7 @@ pub async fn handle(
             if argument.is_empty() {
                 let workspace = session
                     .store
-                    .workspace(&session.id, &paths.data_dir.join("workspaces"))?;
+                    .workspace(&session.id, &paths.data_dir.join("data/workspaces"))?;
                 command_eprintln!("Working directory: {}", workspace.display());
                 if command == "/add-dir" {
                     if let Some(project) = session.selected_session()?.repository().workspace_project()? {
@@ -361,7 +361,7 @@ pub fn is_goal_clear(argument: &str) -> bool {
 fn ensure_goal_allowed(session: &Session) -> Result<()> {
     session.selected_session()?.repository().workspace_project()?;
     for path in [
-        session.paths.data_dir.join("settings.json"),
+        session.paths.layout().config_file("settings.json"),
         session.workspace.join(".claude/settings.json"),
         session.workspace.join(".claude/settings.local.json"),
     ] {
@@ -937,7 +937,7 @@ mod tests {
         std::fs::create_dir_all(&paths.data_dir).unwrap();
         let script = dir.path().join("cwd.cjs");
         std::fs::write(&script, r#"const fs=require('fs');let s='';process.stdin.on('data',x=>s+=x);process.stdin.on('end',()=>fs.appendFileSync('cwd-events.jsonl',JSON.stringify(JSON.parse(s))+'\n'));"#).unwrap();
-        std::fs::write(paths.data_dir.join("settings.json"), serde_json::json!({"hooks":{"CwdChanged":[{"matcher":"never-matches-but-ignored","hooks":[{"type":"command","command":format!("node \"{}\"",script.display())}]}]}}).to_string()).unwrap();
+        deepseek_code_core::data_layout::write_config_file(paths.layout().config_file("settings.json"), serde_json::json!({"hooks":{"CwdChanged":[{"matcher":"never-matches-but-ignored","hooks":[{"type":"command","command":format!("node \"{}\"",script.display())}]}]}}).to_string()).unwrap();
         let provider = serde_json::from_value(serde_json::json!({"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1/v1","api_key":"fixture-only","api_format":"openai","enabled":true,"models":[{"id":"fixture-model","name":"Fixture","enabled":true,"supports_vision":false,"supports_web_search":false}]})).unwrap();
         let selection = crate::config::Selection {
             providers: vec![provider],

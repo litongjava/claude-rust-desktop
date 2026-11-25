@@ -339,7 +339,7 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("config")).unwrap();
-        std::fs::write(
+        crate::data_layout::write_config_file(
             temp.path().join("config/orchestration.toml"),
             "[tool_loop]\n[tools]\n[memory]\n[bridge]\n[http]\nrequest_timeout_secs = 0\n\
              [logging]\n[telemetry]\n",

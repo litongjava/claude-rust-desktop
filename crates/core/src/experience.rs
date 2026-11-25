@@ -530,7 +530,7 @@ mod tests {
     #[test]
     fn detects_internal_workspaces_through_symlinks() {
         let root = tempdir();
-        let workspaces = root.path().join("workspaces");
+        let workspaces = root.path().join("data/workspaces");
         let internal = workspaces.join("draft-id");
         let project = root.path().join("project");
         std::fs::create_dir_all(&internal).unwrap();

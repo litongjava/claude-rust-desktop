@@ -48,7 +48,7 @@ fn search_indexes_rollback_with_content_and_cursors_bind_to_the_incarnation() ->
         search(&a, json!({"query":"needle","range":"after"}))?["matches"][0]["message_id"],
         after
     );
-    let db = Connection::open(root.path().join("sessions").join(A).join("session.db"))?;
+    let db = Connection::open(root.path().join("data/sessions").join(A).join("session.db"))?;
     let chunks = || {
         db.query_row(
             "SELECT count(*) FROM context_search_chunks WHERE id=?1",
@@ -221,7 +221,7 @@ fn interrupted_compaction_resumes_checkpoint_and_commits_one_boundary() -> Resul
     let provider = deepseek_code_core::native_engine::provider_manager::ProviderManager::in_memory(
         vec![serde_json::from_value(json!({"id":"p","name":"p","base_url":"http://localhost","api_key":"checkpoint-fixture",
         "api_format":"openai","enabled":true,"models":[{"id":"m","name":"m","enabled":true,"max_tokens":8192,"supports_web_search":false}]}))?],
-        root.path().join("providers.json")).resolve_selected("p","m").unwrap();
+        root.path().join("config/providers.json")).resolve_selected("p","m").unwrap();
     let key = CheckpointKey::new(&provider, "configuration", "system", "fragment", 1024);
     let other = CheckpointKey::new(&provider, "configuration", "system", "changed", 1024);
     {
@@ -374,7 +374,7 @@ fn upgrading_a_populated_p2_root_backfills_chunks_and_usage() -> Result<()> {
         })?;
         a.incarnation().to_owned()
     };
-    let path = root.path().join("sessions").join(A).join("session.db");
+    let path = root.path().join("data/sessions").join(A).join("session.db");
     {
         let c = Connection::open(&path)?;
         c.execute_batch("BEGIN IMMEDIATE")?;
@@ -578,7 +578,7 @@ fn fix_search_checkout_obeys_the_filtered_read_budget() -> Result<()> {
     );
     // A valid external repair invalidates admission once. Further checkouts of
     // that same edited file must still obey the query budget.
-    let db = Connection::open(root.path().join("sessions").join(A).join("session.db"))?;
+    let db = Connection::open(root.path().join("data/sessions").join(A).join("session.db"))?;
     db.execute(
         "UPDATE message_user_content SET content_json=content_json",
         [],
@@ -671,7 +671,12 @@ fn fix_plan_origin_survives_reentry_and_resume() -> Result<()> {
         })?;
         s.open_session(id)?
             .write(|w| w.set_agent_mode(PermissionMode::PlanMode))?;
-        let c = Connection::open(root.path().join("sessions").join(id).join("session.db"))?;
+        let c = Connection::open(
+            root.path()
+                .join("data/sessions")
+                .join(id)
+                .join("session.db"),
+        )?;
         let value: String = c.query_row(
             "SELECT value FROM peripheral_settings WHERE key=?1",
             [format!("plan.return-bypass.{id}")],
@@ -943,10 +948,10 @@ fn shard_replacement_with_the_same_incarnation_requires_verification() -> Result
             ..Default::default()
         },
     )?;
-    let dir = root.path().join("sessions").join(A);
+    let dir = root.path().join("data/sessions").join(A);
     let path = dir.join("session.db");
     session.read(|r| r.initial_message())?;
-    let key = std::fs::File::open(root.path().join("session-locks").join(A))?;
+    let key = std::fs::File::open(root.path().join("state/locks/session").join(A))?;
     key.lock()?;
     let replacement = dir.join("replacement.db");
     {
@@ -987,7 +992,7 @@ fn upgrading_p3_stamps_requires_rereading_and_binds_pending_requests() -> Result
             Ok(target)
         })?
     };
-    let db = root.path().join("sessions").join(A).join("session.db");
+    let db = root.path().join("data/sessions").join(A).join("session.db");
     {
         let c = Connection::open(&db)?;
         c.execute_batch("BEGIN IMMEDIATE")?;

@@ -18,7 +18,7 @@ impl Stores {
     pub(super) fn put_payload(&self, value: &Value) -> Result<String> {
         let bytes = serde_json::to_vec(value)?;
         let hash = digest(&bytes);
-        let dir = self.root.path.join("global-blobs");
+        let dir = self.layout().global_blobs();
         fs::create_dir_all(&dir)?;
         layout::sync_dir(&self.root.path)?;
         let dest = dir.join(&hash);
@@ -40,7 +40,7 @@ impl Stores {
             hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
             "Invalid payload reference"
         );
-        let bytes = fs::read(self.root.path.join("global-blobs").join(hash))?;
+        let bytes = fs::read(self.layout().global_blobs().join(hash))?;
         ensure!(digest(&bytes) == hash, "Delivery payload digest mismatch");
         Ok(serde_json::from_slice(&bytes)?)
     }

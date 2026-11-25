@@ -168,10 +168,10 @@ fn admitted_mcp_result_is_durable_while_another_writer_remains_locked() -> Resul
             "{action}: {} ms before releasing writer; A={} B={} G={}",
             start.elapsed().as_millis(),
             root.path()
-                .join(format!("sessions/{A}/session.db"))
+                .join(format!("data/sessions/{A}/session.db"))
                 .display(),
             root.path()
-                .join(format!("sessions/{B}/session.db"))
+                .join(format!("data/sessions/{B}/session.db"))
                 .display(),
             root.path().join("global.db").display()
         );
@@ -491,7 +491,7 @@ fn import_preview_replay_dedup_and_atomic_visibility() -> Result<()> {
             s.import_json(src.path(), root.path(), true)?.imported.len(),
             2
         );
-        assert!(!root.path().join("backups").exists());
+        assert!(!root.path().join("data/backups").exists());
         let stopped = s.with_fault_hook(move |p| {
             ensure!(p != phase, "interrupted");
             Ok(())
@@ -724,12 +724,12 @@ fn accepted_p1_directory_and_shard_upgrade_without_changing_identity() -> Result
     let store = uuid::Uuid::new_v4().to_string();
     let inc = uuid::Uuid::new_v4().to_string();
     let seal = uuid::Uuid::new_v4().to_string();
-    let sessions = root.path().join("sessions");
+    let sessions = root.path().join("data/sessions");
     for dir in [".staging", ".trash", ".quarantine", A] {
         fs::create_dir_all(sessions.join(dir))?
     }
-    let locks = root.path().join("session-locks");
-    fs::create_dir(&locks)?;
+    let locks = root.path().join("state/locks/session");
+    fs::create_dir_all(&locks)?;
     for name in [".directory", ".orphan-sweep", A] {
         fs::write(locks.join(name), [])?
     }
@@ -1075,7 +1075,7 @@ fn review_partial_fork_excludes_later_parent_and_sidecars() -> Result<()> {
         assert!(r.origins(m)?.is_empty());
         Ok(())
     })?;
-    let db = Connection::open(root.path().join("sessions").join(B).join("session.db"))?;
+    let db = Connection::open(root.path().join("data/sessions").join(B).join("session.db"))?;
     for table in ["tool_call_timings", "tool_call_notes", "mcp_tool_outputs"] {
         assert_eq!(
             db.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r
@@ -1119,7 +1119,7 @@ fn review_recovery_quarantines_unreadable_later_message() -> Result<()> {
         Ok(())
     });
     assert!(stop.open_session(A)?.branch(B, Branch::Full).is_err());
-    let stage = fs::read_dir(root.path().join("sessions/.staging"))?
+    let stage = fs::read_dir(root.path().join("data/sessions/.staging"))?
         .next()
         .unwrap()?
         .path();
@@ -1131,7 +1131,7 @@ fn review_recovery_quarantines_unreadable_later_message() -> Result<()> {
     let again = Stores::open(root.path())?;
     assert!(again.open_session(B).is_err());
     assert!(again.global().conversation(B)?.is_none());
-    assert!(fs::read_dir(root.path().join("sessions/.quarantine"))?
+    assert!(fs::read_dir(root.path().join("data/sessions/.quarantine"))?
         .next()
         .is_some());
     assert_eq!(again.open_session(A)?.read(|r| r.messages())?.len(), 2);
@@ -1162,7 +1162,7 @@ fn review_import_keeps_selected_workspace_across_backup() -> Result<()> {
     thread::scope(|scope| -> Result<()> {
         let job = scope.spawn(|| s.import_json_into_project(&input, old.path(), false, Some(&id)));
         let start = Instant::now();
-        while !fs::read_dir(root.path().join("backups"))
+        while !fs::read_dir(root.path().join("data/backups"))
             .into_iter()
             .flatten()
             .flatten()
@@ -1250,7 +1250,7 @@ fn review_rewind_removes_whole_tied_group() -> Result<()> {
         w.append("user", "last")?;
         Ok(m)
     })?;
-    Connection::open(root.path().join("sessions").join(A).join("session.db"))?.execute(
+    Connection::open(root.path().join("data/sessions").join(A).join("session.db"))?.execute(
         "UPDATE messages SET sort_order=CASE WHEN sort_order<2 THEN 8 ELSE 20 END",
         [],
     )?;
@@ -1380,8 +1380,14 @@ fn round2_partial_and_full_forks_preserve_snapshot_shapes() -> Result<()> {
         assert_eq!(r.requests(&rows[4].id)?[0]["replacesRequestId"], new_id);
         Ok(())
     })?;
-    let shard =
-        |id: &str| Connection::open(root.path().join("sessions").join(id).join("session.db"));
+    let shard = |id: &str| {
+        Connection::open(
+            root.path()
+                .join("data/sessions")
+                .join(id)
+                .join("session.db"),
+        )
+    };
     for id in [A, B] {
         let anonymous: usize = shard(id)?.query_row(
             "SELECT count(*) FROM model_requests WHERE id IS NULL",
@@ -1449,16 +1455,24 @@ async fn task_get_parent_admission_uses_the_wait_budget() -> Result<()> {
     let child = stores.create(&child_id, Default::default())?;
     child.write(|w| w.append("assistant", "committed report"))?;
     let job = uuid::Uuid::new_v4().to_string();
-    let directory = root.path().join("background-tasks").join(&job);
+    let directory = root.path().join("tasks/background").join(&job);
     std::fs::create_dir_all(&directory)?;
-    std::fs::write(directory.join("state.json"), json!({
-        "id":job,"parent_session_id":parent_id,"session_id":child_id,
-        "status":"completed","title":"fixture","started_ms":1,"heartbeat_ms":1
-    }).to_string())?;
-    std::fs::write(directory.join("session-owners.json"), json!({
-        "parent":parent.incarnation(),"execution":child.incarnation()
-    }).to_string())?;
-    let key = std::fs::File::open(root.path().join("session-locks").join(&parent_id))?;
+    std::fs::write(
+        directory.join("state.json"),
+        json!({
+            "id":job,"parent_session_id":parent_id,"session_id":child_id,
+            "status":"completed","title":"fixture","started_ms":1,"heartbeat_ms":1
+        })
+        .to_string(),
+    )?;
+    std::fs::write(
+        directory.join("session-owners.json"),
+        json!({
+            "parent":parent.incarnation(),"execution":child.incarnation()
+        })
+        .to_string(),
+    )?;
+    let key = std::fs::File::open(root.path().join("state/locks/session").join(&parent_id))?;
     key.lock()?;
     let (release, rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {

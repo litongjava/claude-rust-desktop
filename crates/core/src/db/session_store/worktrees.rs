@@ -253,9 +253,12 @@ mod tests {
 }
 
 impl super::Stores {
-    pub fn workspace_roots(&self,scope:&crate::services::workspace_files::Scope) -> Result<Vec<crate::services::workspace_files::Root>> {
-        let root=self.data_dir().join("workspaces");
-        if let Some(id)=scope.conversation_id.as_deref() {
+    pub fn workspace_roots(
+        &self,
+        scope: &crate::services::workspace_files::Scope,
+    ) -> Result<Vec<crate::services::workspace_files::Root>> {
+        let root = self.layout().workspaces();
+        if let Some(id) = scope.conversation_id.as_deref() {
             use super::SessionAccess;
             return self.select_session(id)?.directory_snapshot(|c,_| crate::services::workspace_files::roots(c,&root,scope));
         }

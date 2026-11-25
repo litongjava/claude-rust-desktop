@@ -180,6 +180,10 @@ fn main() {
                 tracing::warn!("Failed to load orchestration.toml, using defaults: {}", e);
             }
             let paths = deepseek_code_core::runtime::RuntimePaths::new(std::path::absolute(&data_dir)?)?;
+            if let Err(error) = paths.layout().migrate_if_needed() {
+                tracing::error!(module = "DataLayout", error = %error);
+                return Err(error.into());
+            }
             let db_manager = paths.open_database()?;
             app.manage(db_manager.clone());
             tracing::info!(module = "SQLite", "Database initialized in {:?}", data_dir);
@@ -196,7 +200,7 @@ fn main() {
             tracing::info!(module = "IM", "IM Integration Manager initialized");
 
             // Initialize Knowledge Base
-            let kb_dir = data_dir.join("knowledge");
+            let kb_dir = deepseek_code_core::data_layout::DataLayout::from_root(&data_dir).knowledge();
             let kb = Arc::new(crate::knowledge::KnowledgeBase::new(kb_dir));
             tauri::async_runtime::block_on(async { kb.load().await; });
             app.manage(kb.clone());

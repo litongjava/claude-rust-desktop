@@ -20,7 +20,7 @@ fn restore_executor(paths: &RuntimePaths, messages: Vec<Value>) -> ToolLoopExecu
         paths.data_dir.to_string_lossy().into_owned(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(paths.data_dir.join("config.json"))
+    .with_search_config_path(paths.layout().config_file("config.json"))
 }
 
 /// Stores one assistant tool call and its result the way the host does.
@@ -276,6 +276,6 @@ fn failed_read_cannot_authorize_an_edit_and_the_successful_read_survives_resume(
         .unread_file_error("Edit", &read)
         .unwrap()
         .contains("modified"));
-    assert!(!paths.data_dir.join("file-state").exists());
+    assert!(!paths.data_dir.join("cache/file-state").exists());
     Ok(())
 }

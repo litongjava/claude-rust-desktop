@@ -28,7 +28,7 @@ async fn pressure_request(messages: Vec<Value>, window: usize) -> Vec<Value> {
         root.path().to_str().unwrap().into(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(root.path().join("config.json"))
+    .with_search_config_path(root.path().join("config/config.json"))
     .with_conv_id("review".into());
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), runner.execute())
         .await

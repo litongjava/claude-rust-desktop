@@ -148,7 +148,7 @@ impl ToolLoopExecutor {
             self.conv_id.as_deref(),
             self.search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent),
+                .and_then(crate::data_layout::data_root_of),
         )
         .await?;
         let boundary = shard.commit_compaction_window(cut, &compacted)?;
@@ -184,7 +184,7 @@ impl ToolLoopExecutor {
             self.conv_id.as_deref(),
             self.search_config_path
                 .as_deref()
-                .and_then(std::path::Path::parent),
+                .and_then(crate::data_layout::data_root_of),
         )
         .await?;
         if let Some(record) = &mut record {
@@ -196,7 +196,7 @@ impl ToolLoopExecutor {
                 window,
                 self.search_config_path
                     .as_deref()
-                    .and_then(std::path::Path::parent),
+                    .and_then(crate::data_layout::data_root_of),
                 self.conv_id.as_deref().unwrap_or_default(),
             );
         }

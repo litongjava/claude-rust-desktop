@@ -19,7 +19,7 @@ fn store(root: &Path) -> FileMemoryStore {
 }
 
 fn state(root: &Path) -> std::path::PathBuf {
-    root.join("memory/state")
+    root.join("data/memory/state")
         .join(MemoryScope::private("fixture-owner").unwrap().key())
 }
 
@@ -437,7 +437,7 @@ fn store_crud_persists_ids_extensions_generation_and_index() {
     assert!(memory.read("one.md").unwrap().is_none());
     assert!(!fs::read_dir(
         root.path()
-            .join("memory/trash")
+            .join("data/memory/trash")
             .join(MemoryScope::private("fixture-owner").unwrap().key())
     )
     .unwrap()
@@ -741,8 +741,12 @@ fn symlink_in_state_or_project_parent_is_rejected_before_creation() {
     for component in ["state", "projects", "trash"] {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("memory")).unwrap();
-        symlink(outside.path(), root.path().join("memory").join(component)).unwrap();
+        fs::create_dir_all(root.path().join("data/memory")).unwrap();
+        symlink(
+            outside.path(),
+            root.path().join("data/memory").join(component),
+        )
+        .unwrap();
         assert!(FileMemoryStore::open(
             root.path(),
             &MemoryScope::private("fixture-owner").unwrap()
@@ -788,8 +792,8 @@ fn windows_directory_reparse_point_is_not_a_managed_project_root() {
     use std::os::windows::fs::symlink_dir;
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("memory")).unwrap();
-    if symlink_dir(outside.path(), root.path().join("memory/projects")).is_err() {
+    fs::create_dir_all(root.path().join("data/memory")).unwrap();
+    if symlink_dir(outside.path(), root.path().join("data/memory/projects")).is_err() {
         eprintln!("skipping: directory symlink privilege unavailable");
         return;
     }
@@ -805,10 +809,10 @@ fn windows_directory_reparse_point_is_not_a_managed_project_root() {
 fn windows_junction_is_rejected_before_any_external_file_is_created() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    fs::create_dir(root.path().join("memory")).unwrap();
+    fs::create_dir_all(root.path().join("data/memory")).unwrap();
     let status = Command::new("cmd")
         .args(["/d", "/c", "mklink", "/J"])
-        .arg(root.path().join("memory/projects"))
+        .arg(root.path().join("data/memory/projects"))
         .arg(outside.path())
         .status()
         .unwrap();

@@ -492,7 +492,7 @@ fn export_summary(
         uuid::Uuid::parse_str(session).is_ok(),
         "Invalid compaction session ID"
     );
-    let dir = data_dir.join("compactions").join(session);
+    let dir = data_dir.join("cache/compactions").join(session);
     std::fs::create_dir_all(&dir)?;
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
     let body = summary.trim();
@@ -962,7 +962,7 @@ mod hook_tests {
         (dir, service, store, id)
     }
     fn configure(service: &ServiceContext, pre: &str, start: &str, post: &str) {
-        std::fs::write(service.paths.data_dir.join("settings.json"), json!({"hooks":{
+        crate::data_layout::write_config_file(service.paths.layout().config_file("settings.json"), json!({"hooks":{
             "PreCompact":[{"matcher":"^(manual|auto)$","hooks":[{"type":"command","command":format!("node hook.cjs {pre}")}]},{"matcher":"^never$","hooks":[{"type":"command","command":"node hook.cjs fail"}]}],
             "SessionStart":[{"matcher":"^compact$","hooks":[{"type":"command","command":format!("node hook.cjs {start}")}]}],
             "PostCompact":[{"matcher":"^(manual|auto)$","hooks":[{"type":"command","command":format!("node hook.cjs {post}")}]}]
@@ -1234,8 +1234,9 @@ mod hook_tests {
     async fn a_failed_export_keeps_the_committed_compaction_and_its_commit_marker() {
         let (dir, service, store, id) = fixture();
         // Block the export directory with a file; the compaction must still commit.
+        std::fs::create_dir_all(service.paths.data_dir.join("cache")).unwrap();
         std::fs::write(
-            service.paths.data_dir.join("compactions"),
+            service.paths.data_dir.join("cache/compactions"),
             "not a directory",
         )
         .unwrap();
@@ -1307,17 +1308,18 @@ mod export_tests {
     fn invalid_session_ids_are_not_written_outside_the_data_directory() {
         let dir = tempfile::tempdir().unwrap();
         assert!(export_summary(dir.path(), "../escape", 1, "summary").is_err());
-        assert!(!dir.path().join("compactions").exists());
+        assert!(!dir.path().join("cache/compactions").exists());
     }
 
     #[test]
     fn an_unwritable_destination_reports_an_error_without_a_partial_file() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("compactions"), "not a directory").unwrap();
+        std::fs::create_dir_all(dir.path().join("cache")).unwrap();
+        std::fs::write(dir.path().join("cache/compactions"), "not a directory").unwrap();
         let session = uuid::Uuid::new_v4().to_string();
         assert!(export_summary(dir.path(), &session, 1, "summary").is_err());
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("compactions")).unwrap(),
+            std::fs::read_to_string(dir.path().join("cache/compactions")).unwrap(),
             "not a directory"
         );
     }

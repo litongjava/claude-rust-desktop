@@ -849,7 +849,7 @@ async fn refresh_provider(
     // Read both files again right before writing so a concurrent edit is never
     // overwritten; the selection above waits for the user, so this is late.
     ensure!(
-        paths.data_dir.join("config.json").exists(),
+        paths.layout().config_file("config.json").exists(),
         "The configuration file was removed while refreshing; nothing was changed"
     );
     let mut manager = ConfigManager::new(paths.data_dir.clone());
@@ -1055,7 +1055,7 @@ async fn verify(paths: &RuntimePaths, provider: &str, model: &str) -> Result<()>
     let selection = select(paths, provider, model)?;
     let manager = deepseek_code_core::native_engine::provider_manager::ProviderManager::in_memory(
         selection.providers,
-        paths.data_dir.join("providers.json"),
+        paths.layout().config_file("providers.json"),
     );
     let resolved = manager
         .resolve_selected(&selection.provider_id, &selection.model)
@@ -1693,14 +1693,14 @@ mod tests {
             Some("google-generative-ai")
         );
         assert!(select(&paths, "three", "model-a").is_err());
-        let before = std::fs::read(paths.data_dir.join("config.json")).unwrap();
+        let before = std::fs::read(paths.layout().config_file("config.json")).unwrap();
         assert!(wizard(&paths, &mut answers(&["one"]), None).await.is_err());
         assert!(wizard(&paths, &mut answers(&["/cancel"]), Some("one"))
             .await
             .is_err());
         assert_eq!(
             before,
-            std::fs::read(paths.data_dir.join("config.json")).unwrap()
+            std::fs::read(paths.layout().config_file("config.json")).unwrap()
         );
         wizard(
             &paths,
@@ -2069,13 +2069,16 @@ mod tests {
         let mut manager = ConfigManager::new(paths.data_dir.clone());
         manager.add_provider(provider).unwrap();
         let mut session = open_refresh_session(&paths, "one", "gone").await;
-        let before = std::fs::read(paths.data_dir.join("config.json")).unwrap();
+        let before = std::fs::read(paths.layout().config_file("config.json")).unwrap();
 
         let error = handle("/model refresh", &paths, &mut session, &mut answers(&[""]))
             .await
             .unwrap_err();
         assert!(error.to_string().contains("cancelled"), "{error:#}");
-        assert_eq!(std::fs::read(paths.data_dir.join("config.json")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(paths.layout().config_file("config.json")).unwrap(),
+            before
+        );
         assert_eq!(session.binding_state().provider_id, "one");
         assert_eq!(session.binding_state().model, "gone");
         session.close().await.unwrap();
@@ -2559,12 +2562,8 @@ mod tests {
         // The preference file already holds an unrelated setting and a default
         // this provider no longer offers. A failure between the temporary file
         // and the rename must leave every byte of it in place.
-        let cli_path = paths.data_dir.join("cli.json");
-        std::fs::write(
-            &cli_path,
-            r#"{"model":"one::already-gone","theme":"dark"}"#,
-        )
-        .unwrap();
+        let cli_path = paths.layout().config_file("cli.json");
+        std::fs::write(&cli_path, r#"{"model":"one::already-gone","theme":"dark"}"#).unwrap();
         let before = std::fs::read(&cli_path).unwrap();
         config::FAIL_PREFERENCE_COMMIT.with(|flag| flag.set(true));
 

@@ -307,7 +307,7 @@ pub async fn prepare_invocation(
         }
         deepseek_code_core::services::agents::bind(&session.store.db, &child_id, &definition)?;
     }
-    let directory = session.paths.data_dir.join("skill-runs");
+    let directory = session.paths.layout().skill_runs();
     std::fs::create_dir_all(&directory)?;
     let mut file = tempfile::NamedTempFile::new_in(&directory)?;
     std::io::Write::write_all(&mut file, expanded.as_bytes())?;

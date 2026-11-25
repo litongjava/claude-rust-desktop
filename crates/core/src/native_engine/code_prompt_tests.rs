@@ -17,7 +17,9 @@ async fn fresh_read_retains_requested_source_range_beyond_spill_limit() {
         dir.path().to_string_lossy().into(),
         ReasoningMode::Standard,
     )
-    .with_search_config_path(dir.path().join("settings.json"));
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&dir.path()).config_file("settings.json"),
+    );
     let (_, output, failed) = executor
         .execute_tool_call("Read", &json!({"file_path":"source.ts"}), "read-source")
         .await;
@@ -29,7 +31,7 @@ async fn fresh_read_retains_requested_source_range_beyond_spill_limit() {
         serde_json::from_str::<Value>(&output).unwrap()["content"]
     );
     assert!(retained.contains("line_400"));
-    assert!(!dir.path().join("tool-outputs").exists());
+    assert!(!dir.path().join("cache/tool-outputs").exists());
 
     let (_, range, failed) = executor
         .execute_tool_call(
@@ -883,7 +885,7 @@ async fn stored_recall_blocks_are_not_replayed_on_later_turns() {
         axum::serve(listener, app).await.unwrap();
     });
     let temp = tempfile::tempdir().unwrap();
-    let client = crate::memory::MemExClient::with_path(temp.path().join("memory.sqlite3"));
+    let client = crate::memory::MemExClient::with_path(temp.path().join("data/memory.sqlite3"));
     client
         .ingest("alphamark uses port 7001", Some(0.9), None)
         .await

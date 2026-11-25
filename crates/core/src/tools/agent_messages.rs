@@ -463,7 +463,7 @@ mod tests {
         let child = sessions.fork(&parent).unwrap();
         let stranger = sessions.fork(&parent).unwrap();
         let task = uuid::Uuid::new_v4().to_string();
-        let directory = temp.path().join("background-tasks").join(&task);
+        let directory = temp.path().join("tasks/background").join(&task);
         std::fs::create_dir_all(&directory).unwrap();
         let job = crate::services::background_sessions::Job {
             id: task.clone(),

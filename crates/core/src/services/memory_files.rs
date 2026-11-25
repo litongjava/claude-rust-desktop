@@ -37,7 +37,7 @@ pub fn config(context: &ServiceContext) -> Result<crate::memory::MemoryConfig> {
 }
 
 fn archive_config(data_dir: &Path) -> Result<Option<crate::memory::MemoryConfig>> {
-    let archive = data_dir.join("memory.sqlite3");
+    let archive = data_dir.join("data/memory.sqlite3");
     if archive.is_file() {
         use rusqlite::{Connection, OpenFlags, OptionalExtension};
         let conn = Connection::open_with_flags(archive, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -61,7 +61,9 @@ pub fn save_config(context: &ServiceContext, config: &crate::memory::MemoryConfi
 
 /// Only the user-level settings file can grant access to a shared memory directory.
 fn team_directory(data: &Path) -> Result<Option<PathBuf>> {
-    let raw = match std::fs::read(data.join("settings.json")) {
+    let raw = match std::fs::read(
+        crate::data_layout::DataLayout::from_root(&data).config_file("settings.json"),
+    ) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         other => other?,
     };
@@ -122,7 +124,7 @@ impl FileMemory {
         inherited: Option<&str>,
     ) -> Result<Self> {
         let (workspace, project, _) = shard.scoped_stores().engine_workspace(
-            &context.paths.data_dir.join("workspaces"),
+            &context.paths.data_dir.join("data/workspaces"),
             shard.id(),
             None,
         )?;
@@ -209,7 +211,7 @@ impl FileMemory {
     ) -> Result<Self> {
         let root = context.paths.data_dir.canonicalize()?;
         let directory = root
-            .join("memory/projects")
+            .join("data/memory/projects")
             .join(scope.key())
             .join("memory");
         // This changes service state only; old data and dream configuration stay.
@@ -238,7 +240,12 @@ impl FileMemory {
         session: &Path,
     ) -> Result<Vec<(&'static str, PathBuf)>> {
         let root = self.context.paths.data_dir.canonicalize()?;
-        let mut dirs = vec![("global", root.join("memory/global"))];
+        let mut dirs = vec![(
+            "global",
+            crate::data_layout::DataLayout::from_root(&root)
+                .memory_files()
+                .join("global"),
+        )];
         if let Some(team) = team {
             ensure!(team.is_absolute(), "Team memory directory must be absolute");
             dirs.push(("team", team.to_owned()));
@@ -397,7 +404,7 @@ impl FileMemory {
             .parent()
             .unwrap();
         let directories = self.session_directories()?;
-        let sessions = self.context.paths.data_dir.join("sessions");
+        let sessions = self.context.paths.data_dir.join("data/sessions");
         let protected = |path: &Path| {
             path.starts_with(base)
                 || directories.iter().any(|(_, dir)| path.starts_with(dir))
@@ -715,7 +722,7 @@ mod tests {
         let paths = crate::runtime::RuntimePaths::new(root.path().join("data")).unwrap();
         let context =
             ServiceContext::open(paths, Arc::new(super::super::EnvironmentCredentials)).unwrap();
-        let archive = context.paths.data_dir.join("memory.sqlite3");
+        let archive = context.paths.data_dir.join("data/memory.sqlite3");
         let conn = rusqlite::Connection::open(&archive).unwrap();
         conn.execute_batch(
             r#"CREATE TABLE memory_settings(id INTEGER, config TEXT);
@@ -1048,7 +1055,7 @@ mod tests {
                 .context
                 .paths
                 .data_dir
-                .join("memory/state/catalog.json"),
+                .join("data/memory/state/catalog.json"),
         ] {
             assert!(
                 memory

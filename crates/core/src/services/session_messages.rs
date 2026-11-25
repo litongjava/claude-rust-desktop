@@ -58,7 +58,12 @@ pub(crate) fn project(conn: &Connection, root: &Path, id: &str) -> Result<String
         .context("Message session has no source project")?;
     // Resolve validates trust and the managed-worktree mapping, but returns an
     // adapted worktree project. Identity must come from the original project.
-    crate::native_engine::workspace::resolve_workspace(conn, &root.join("workspaces"), id, None)?;
+    crate::native_engine::workspace::resolve_workspace(
+        conn,
+        &root.join("data/workspaces"),
+        id,
+        None,
+    )?;
     let project = crate::db::project_repo::get_project(conn, project_id)?
         .context("Message project not found")?;
     ensure!(!project.is_archived, "Message project is archived");
@@ -376,7 +381,7 @@ impl PeerMailbox for ServiceContext<crate::db::DbManager> {
 fn lock_path(root: &Path, session: &str) -> Result<PathBuf> {
     valid_id(session)?;
     Ok(root
-        .join("session-message-locks")
+        .join("state/locks/session-message")
         .join(format!("{session}.lock")))
 }
 pub fn receiver_active(root:&Path,session:&str)->Result<bool>{
@@ -454,7 +459,7 @@ pub struct PresenceLease {
 impl PresenceLease {
     pub fn acquire(root: &Path, session: &str) -> Result<Self> {
         valid_id(session)?;
-        let directory = root.join("session-presence");
+        let directory = root.join("state/presence");
         std::fs::create_dir_all(&directory)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -483,9 +488,7 @@ impl Drop for PresenceLease {
 /// Whether a frontend currently holds the session open.
 pub fn session_open(root: &Path, session: &str) -> Result<bool> {
     valid_id(session)?;
-    let path = root
-        .join("session-presence")
-        .join(format!("{session}.lock"));
+    let path = root.join("state/presence").join(format!("{session}.lock"));
     let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -519,7 +522,7 @@ pub fn execution_active(root: &Path, session: &str) -> Result<bool> {
         return Ok(false);
     }
     let path = root
-        .join("session-execution-locks")
+        .join("state/locks/session-execution")
         .join(format!("{session}.lock"));
     let file = match std::fs::OpenOptions::new()
         .read(true)
@@ -596,7 +599,7 @@ impl ExecutionLease {
         }
         // Lock ownership does not require opening/migrating a second database pool.
         // UUID validation bounds the filename; workspace/trust validation stays with the executor.
-        let directory = root.join("session-execution-locks");
+        let directory = root.join("state/locks/session-execution");
         std::fs::create_dir_all(&directory)?;
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -777,10 +780,10 @@ mod tests {
     #[test]
     fn family_excludes_unrelated_saved_sessions_and_notices_include_body_once() {
         let (_temp, context, store, parent, other) = fixture();
-        let root = context.paths.data_dir.join("workspaces");
-        let cwd = store.workspace(&parent,&root).unwrap();
-        let child = store.derive_owned_child(&parent,&root,&cwd).unwrap();
-        let grandchild = store.derive_owned_child(&child,&root,&cwd).unwrap();
+        let root = context.paths.data_dir.join("data/workspaces");
+        let cwd = store.workspace(&parent, &root).unwrap();
+        let child = store.derive_owned_child(&parent, &root, &cwd).unwrap();
+        let grandchild = store.derive_owned_child(&child, &root, &cwd).unwrap();
         for current in [&parent, &child, &grandchild] {
             let peers = session_peers(&context, current).unwrap();
             assert_eq!(peers.len(), 3);
@@ -1068,7 +1071,7 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let path = dir
             .path()
-            .join("session-execution-locks")
+            .join("state/locks/session-execution")
             .join(format!("{id}.lock"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Open and lock exactly as `execution_active` does during its probe.
@@ -1171,7 +1174,7 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let path = dir
             .path()
-            .join("session-execution-locks")
+            .join("state/locks/session-execution")
             .join(format!("{id}.lock"));
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         // Emulate the probe's own acquisition, then inherit it into a child.
@@ -1743,7 +1746,7 @@ mod tests {
     fn managed_worktree_peers_share_source_identity_and_inbox() {
         let (_temp, context, store, sender, recipient) = fixture();
         let source = store
-            .workspace(&sender, &context.paths.data_dir.join("workspaces"))
+            .workspace(&sender, &context.paths.data_dir.join("data/workspaces"))
             .unwrap();
         for args in [
             vec!["init", "-q"],
@@ -1770,7 +1773,7 @@ mod tests {
             .unwrap();
         assert_ne!(
             store
-                .workspace(&recipient, &context.paths.data_dir.join("workspaces"))
+                .workspace(&recipient, &context.paths.data_dir.join("data/workspaces"))
                 .unwrap(),
             source
         );

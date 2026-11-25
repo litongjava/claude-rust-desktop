@@ -840,14 +840,10 @@ impl QueryEngine {
             skill.content.context("Skill has no content")?
         };
         // Kept after the user's message for the rest of the session.
-        let root = self
-            .provider_manager
-            .lock()
-            .await
-            .config_path()
-            .parent()
-            .context("Missing runtime directory")?
-            .to_path_buf();
+        let root =
+            crate::data_layout::data_root_of(self.provider_manager.lock().await.config_path())
+                .context("Missing runtime directory")?
+                .to_path_buf();
         let (session, messages) = (request.conversation_id.clone(), request.messages.clone());
         tokio::task::spawn_blocking(move || {
             crate::services::turn_context::attach_to_last(&root, &session, &messages, vec![content])
@@ -1032,14 +1028,10 @@ impl QueryEngine {
                 )
             });
         let conv_id = request.conversation_id.clone();
-        let plugin_root = self
-            .provider_manager
-            .lock()
-            .await
-            .config_path()
-            .parent()
-            .context("Missing runtime directory")?
-            .to_path_buf();
+        let plugin_root =
+            crate::data_layout::data_root_of(self.provider_manager.lock().await.config_path())
+                .context("Missing runtime directory")?
+                .to_path_buf();
         let plugin_context = crate::services::ServiceContext {
             paths: crate::runtime::RuntimePaths::new(plugin_root)?,
             db: Arc::new(selected.scoped_stores()),
@@ -1727,23 +1719,17 @@ impl QueryEngine {
             }
         }
 
-        let search_config_path = self
-            .provider_manager
-            .lock()
-            .await
-            .config_path()
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("config.json");
+        let search_config_path = {
+            let manager = self.provider_manager.lock().await;
+            let root = crate::data_layout::data_root_of(manager.config_path())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            crate::data_layout::DataLayout::from_root(root).config_file("config.json")
+        };
         // Super Agent identity is durable, so a resumed session keeps its role
         // and a task member keeps its member tools. A stale call is rejected at
         // execution even when the schema no longer offers it.
         let super_agent_role = crate::super_agent::role::load(&selected, &conv_id)?;
-        let data_dir = self
-            .workspaces_dir
-            .parent()
-            .unwrap_or(&self.workspaces_dir)
-            .to_path_buf();
+        let data_dir = plugin_context.paths.data_dir.clone();
         let system_prompt = if super_agent_role.is_router() {
             Some(crate::super_agent::prompt::append_router(
                 request.system_prompt.as_deref().unwrap_or_default(),

@@ -82,11 +82,11 @@ impl ToolLoopExecutor {
             let root = self
                 .search_config_path
                 .as_deref()
-                .and_then(Path::parent)
+                .and_then(crate::data_layout::data_root_of)
                 .map(Path::to_path_buf);
             let candidates = [
                 Some(PathBuf::from(&self.workspace_cwd).join(".claude/workflows")),
-                root.map(|root| root.join("workflows")),
+                root.map(|root| root.join("tasks/workflows")),
             ];
             candidates
                 .into_iter()
@@ -114,12 +114,12 @@ impl ToolLoopExecutor {
         let root = self
             .search_config_path
             .as_deref()
-            .and_then(Path::parent)
+            .and_then(crate::data_layout::data_root_of)
             .context("Runtime directory is unavailable")?
             .to_path_buf();
         let session = self.conv_id.clone().context("Workflows need a session")?;
         let script = self.workflow_script(input)?;
-        let sessions = root.join("workflows").join(&session);
+        let sessions = root.join("tasks/workflows").join(&session);
         let resume_dir = match input["resumeFromRunId"].as_str() {
             Some(id) => {
                 ensure!(

@@ -412,8 +412,8 @@ async fn plan_mode_denies_the_patch_without_touching_files() {
 }
 
 fn settings_with_hook(data: &Path, matcher: &str, command: &str) {
-    std::fs::write(
-        data.join("settings.json"),
+    deepseek_code_core::data_layout::write_config_file(
+        data.join("config/settings.json"),
         json!({"hooks":{"PreToolUse":[{"matcher":matcher,"hooks":[{"type":"command","command":command}]}]}})
             .to_string(),
     )

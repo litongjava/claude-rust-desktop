@@ -743,7 +743,7 @@ mod windows_tests {
     #[tokio::test]
     async fn model_conpty_initialization_failure_is_terminal_without_starting_command() {
         let mut h = Harness::new().await;
-        let parent = h.data.join("shell-tasks").join(&h.host.session_id);
+        let parent = h.data.join("tasks/shell").join(&h.host.session_id);
         std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
         std::fs::write(&parent, b"block directory creation").unwrap();
         h.turn(

@@ -121,7 +121,10 @@ fn upgrade_discards_all_legacy_first_message_receipts() -> Result<()> {
         }
         drop(stores);
         let shard = rusqlite::Connection::open(
-            root.path().join("sessions").join(RETRY).join("session.db"),
+            root.path()
+                .join("data/sessions")
+                .join(RETRY)
+                .join("session.db"),
         )?;
         shard.execute_batch("INSERT INTO peripheral_settings SELECT 'first-chat-receipt.' || incarnation,digest FROM manifest,first_chat_receipts;
             DROP TRIGGER first_chat_text_edit; DROP TRIGGER first_chat_typed_insert;

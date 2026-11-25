@@ -222,8 +222,9 @@ impl BridgeServer {
 
     pub fn new(data_dir: PathBuf, db_manager: Arc<Stores>) -> Self {
         let skills_dir = data_dir.join("skills");
-        let log_dir = data_dir.join("logs");
-        let analytics_dir = data_dir.join("analytics");
+        let log_dir = data_dir.join("diagnostics/logs");
+        let analytics_dir =
+            deepseek_code_core::data_layout::DataLayout::from_root(&data_dir).analytics();
 
         let skill_manager = SkillsManager::with_path(skills_dir);
         if let Err(e) = skill_manager.ensure_installed() {
@@ -239,7 +240,7 @@ impl BridgeServer {
         let config_manager = Arc::new(Mutex::new(Some(config_manager)));
 
         let provider_manager = Arc::new(Mutex::new(ProviderManager::new(
-            data_dir.join("providers.json")
+            crate::data_layout::DataLayout::from_root(&data_dir).config_file("providers.json"),
         )));
         let task_executor = TaskExecutor::new_with_provider_manager(
             provider_manager.clone(),
@@ -281,18 +282,34 @@ impl BridgeServer {
         let orchestrator = Arc::new(Mutex::new(Some(orchestrator)));
         tracing::info!(module = "Bridge", "MultiAgentOrchestrator initialized");
 
-        let memex_client = Arc::new(MemExClient::with_path(data_dir.join("memory.sqlite3")));
-        tracing::info!(module = "Bridge", "MemExClient initialized for the legacy local store");
+        let memex_client = Arc::new(MemExClient::with_path(data_dir.join("data/memory.sqlite3")));
+        tracing::info!(
+            module = "Bridge",
+            "MemExClient initialized for the legacy local store"
+        );
 
         let api_key = uuid::Uuid::new_v4().to_string();
         // Only the loopback development server reads this file; never expose it to the browser.
         #[cfg(debug_assertions)]
-        if let Err(error) = std::fs::write(data_dir.join("dev-bridge-key"), &api_key) {
-            tracing::warn!(module = "Bridge", "Cannot initialize browser development proxy: {}", error);
+        {
+            let path =
+                deepseek_code_core::data_layout::DataLayout::from_root(&data_dir).dev_bridge_key();
+            if let Some(directory) = path.parent() {
+                let _ = std::fs::create_dir_all(directory);
+            }
+            if let Err(error) = std::fs::write(path, &api_key) {
+                tracing::warn!(
+                    module = "Bridge",
+                    "Cannot initialize browser development proxy: {}",
+                    error
+                );
+            }
         }
         tracing::info!(module = "Bridge", "API Key generated for bridge authentication");
 
-        let cost_tracker = Arc::new(CostTracker::new(data_dir.join("costs")));
+        let cost_tracker = Arc::new(CostTracker::new(
+            deepseek_code_core::data_layout::DataLayout::from_root(&data_dir).costs(),
+        ));
         tracing::info!(module = "Bridge", "CostTracker initialized");
 
         let preview_engine = Arc::new(PreviewEngine::new(None));
@@ -886,8 +903,9 @@ fn get_upload_dir() -> PathBuf {
     drop(guard);
     let default_dir = crate::commands::app_data_dir()
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("deepseek-code"))
-        .join("uploads");
+        .unwrap_or_else(|_| std::env::temp_dir().join("deepseek-code"));
+    let default_dir =
+        deepseek_code_core::data_layout::DataLayout::from_root(&default_dir).uploads();
     let mut guard = UPLOAD_DIR.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(default_dir.clone());
     default_dir

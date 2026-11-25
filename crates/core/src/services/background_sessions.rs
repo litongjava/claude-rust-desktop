@@ -523,7 +523,7 @@ pub(crate) fn directory(root: &Path, id: &str) -> Result<PathBuf> {
         uuid::Uuid::parse_str(id).is_ok(),
         "Invalid background task ID"
     );
-    Ok(root.join("background-tasks").join(id))
+    Ok(root.join("tasks/background").join(id))
 }
 pub(crate) fn read_job(dir: &Path) -> Result<Job> {
     let path = dir.join("state.json");
@@ -600,7 +600,7 @@ impl SessionClaim {
             "Invalid foreground session ID"
         );
         Ok(root
-            .join("background-tasks")
+            .join("tasks/background")
             .join(format!("session-{session}.claim")))
     }
     pub(crate) fn acquire(root: &Path, session: &str, id: &str) -> Result<Self> {
@@ -761,13 +761,16 @@ impl Drop for PublicationFence {
 }
 
 pub(crate) fn job_publication_fence(root: &Path, cleanup: bool) -> Result<PublicationFence> {
-    fs::create_dir_all(root)?;
+    let path = crate::data_layout::DataLayout::from_root(root).publication_lock();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let file = fs::File::options()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join("background-task-publication.lock"))?;
+        .open(path)?;
     if cleanup {
         crate::fs::try_lock_file(&file).context("Background job publication in progress")?;
     } else {
@@ -1192,7 +1195,7 @@ pub fn list(root: &Path, parent: Option<&str>) -> Result<Vec<Job>> {
 }
 
 fn list_matching(root: &Path, include: impl Fn(&Job) -> bool) -> Result<Vec<Job>> {
-    let directory = root.join("background-tasks");
+    let directory = root.join("tasks/background");
     if !directory.exists() {
         return Ok(Vec::new());
     }
@@ -2398,7 +2401,7 @@ mod tests {
     #[test]
     fn discovery_preserves_crash_damaged_records_and_ownership() {
         let (root, dir, id) = fixture("");
-        let claim = root.path().join("background-tasks/session-test.claim");
+        let claim = root.path().join("tasks/background/session-test.claim");
         fs::write(&claim, &id).unwrap();
         for bytes in [
             Vec::new(),
@@ -2448,7 +2451,7 @@ mod tests {
     #[test]
     fn foreground_claim_is_exclusive_and_released_only_by_owner() {
         let root = tempfile::tempdir().unwrap();
-        fs::create_dir(root.path().join("background-tasks")).unwrap();
+        fs::create_dir_all(root.path().join("tasks/background")).unwrap();
         let session = uuid::Uuid::new_v4().to_string();
         let mut claim = SessionClaim::acquire(root.path(), &session, "owner").unwrap();
         assert!(SessionClaim::acquire(root.path(), &session, "other").is_err());

@@ -179,7 +179,7 @@ fn run(program: &str, args: &[&str]) -> Option<Vec<u8>> {
 /// Saves a clipboard image as PNG under `<data dir>/pasted-images`, or returns
 /// the image file copied in a file manager.
 pub fn paste_clipboard() -> Result<Option<PathBuf>> {
-    let dir = deepseek_code_core::runtime::resolve_default_data_dir()?.join("pasted-images");
+    let dir = deepseek_code_core::runtime::resolve_default_data_dir()?.join("data/pasted-images");
     let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
     #[cfg(windows)]
     let bytes = match native_clipboard::image() {

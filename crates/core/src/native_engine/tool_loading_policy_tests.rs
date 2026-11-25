@@ -28,7 +28,9 @@ fn executor(root: &std::path::Path) -> ToolLoopExecutor {
     )
     .with_conv_id("tool-loading-fixture".into())
     .with_permission_manager(manager)
-    .with_search_config_path(root.join("config.json"))
+    .with_search_config_path(
+        crate::data_layout::DataLayout::from_root(&root).config_file("config.json"),
+    )
 }
 
 /// Drive the public executor through real HTTP, never rebuilding its tools in
@@ -91,7 +93,12 @@ async fn provider_loop_case(format: &'static str, scenario: &'static str) {
                     }
                     ("hot", 2) => Some(("ListDir", json!({"path":"."}))),
                     ("corrupt", 0) => {
-                        std::fs::write(root.join("customization.json"), "{broken").unwrap();
+                        crate::data_layout::write_config_file(
+                            crate::data_layout::DataLayout::from_root(&root)
+                                .config_file("customization.json"),
+                            "{broken",
+                        )
+                        .unwrap();
                         Some(("Read", json!({"file_path":"execution-marker.txt"})))
                     }
                     _ => None,
@@ -523,7 +530,11 @@ fn write_switches(root: &std::path::Path, tools: &[(&str, bool, bool)]) {
     for (name, enabled, on_demand) in tools {
         value["tool_loading"][name] = json!({"enabled": enabled, "on_demand": on_demand});
     }
-    std::fs::write(root.join("customization.json"), value.to_string()).unwrap();
+    crate::data_layout::write_config_file(
+        crate::data_layout::DataLayout::from_root(&root).config_file("customization.json"),
+        value.to_string(),
+    )
+    .unwrap();
 }
 
 fn request_names(executor: &ToolLoopExecutor) -> Vec<String> {
@@ -699,8 +710,8 @@ fn a_resident_tool_enabled_after_the_request_waits_for_the_next_one() {
 #[test]
 fn names_outside_the_catalog_keep_their_legacy_meaning() {
     let (root, mut executor) = setup();
-    std::fs::write(
-        root.path().join("customization.json"),
+    crate::data_layout::write_config_file(
+        crate::data_layout::DataLayout::from_root(&root.path()).config_file("customization.json"),
         json!({
             "system_prompt": {"mode": "default", "text": ""},
             "disabled_tools": ["mcp__fixture__tool"],
@@ -734,7 +745,11 @@ fn names_outside_the_catalog_keep_their_legacy_meaning() {
 #[test]
 fn a_damaged_settings_file_fails_instead_of_reopening_every_tool() {
     let (root, mut executor) = setup();
-    std::fs::write(root.path().join("customization.json"), "{not json").unwrap();
+    crate::data_layout::write_config_file(
+        crate::data_layout::DataLayout::from_root(&root.path()).config_file("customization.json"),
+        "{not json",
+    )
+    .unwrap();
     assert!(
         executor.tool_definitions().is_err(),
         "a damaged file must not fall back to everything"

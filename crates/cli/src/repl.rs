@@ -93,7 +93,7 @@ pub fn save_completion(session: &Session) -> Result<()> {
     };
     let messages = session.selected_session()?.repository().messages()?;
     if let Some(message) = messages.last().filter(|m| m.role == "assistant") {
-        let directory = session.paths.data_dir.join("turn-completions");
+        let directory = session.paths.data_dir.join("state/turn-completions");
         std::fs::create_dir_all(&directory)?;
         let key = hex_message_id(&message.id);
         std::fs::write(directory.join(key), status)?;
@@ -117,7 +117,7 @@ fn completion_for_message(
         return None;
     }
     let path = data_dir
-        .join("turn-completions")
+        .join("state/turn-completions")
         .join(hex_message_id(&message.id));
     if let Ok(status) = std::fs::read_to_string(path) {
         return Some(status);
@@ -382,7 +382,7 @@ fn conversation(
             let saved = session
                 .paths
                 .data_dir
-                .join("turn-completions")
+                .join("state/turn-completions")
                 .join(hex_message_id(&message.id));
             // Only the final legacy message has a fallback; intermediate tool
             // messages must not be presented as completed turns.
@@ -511,7 +511,7 @@ async fn all_tools_keep_numbers_in_resume_and_detailed_transcript() {
     let mut display = crate::terminal::live::TurnDisplay::new(
         false,
         "ask",
-        &paths.data_dir.join("keybindings.json"),
+        &paths.layout().config_file("keybindings.json"),
         vec![],
     )
     .unwrap();
@@ -925,7 +925,7 @@ mod tests {
         assert!(completion_for_message(&paths.data_dir, &messages[0], None)
             .unwrap()
             .contains("duration unavailable"));
-        let directory = paths.data_dir.join("turn-completions");
+        let directory = paths.data_dir.join("state/turn-completions");
         std::fs::create_dir_all(&directory).unwrap();
         let status = "✻ Worked for 1m 30s · done 5:45 PM";
         std::fs::write(directory.join(hex_message_id(&messages[0].id)), status).unwrap();

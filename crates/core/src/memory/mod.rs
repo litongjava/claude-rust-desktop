@@ -106,7 +106,7 @@ impl MemExClient {
         // The shared data directory, where the CLI and Desktop keep memory.
         let directory = crate::runtime::resolve_default_data_dir()
             .unwrap_or_else(|_| std::env::temp_dir().join("deepseek-code"));
-        Self::with_path(directory.join("memory.sqlite3"))
+        Self::with_path(directory.join("data/memory.sqlite3"))
     }
 
     pub fn with_path(path: std::path::PathBuf) -> Self {
@@ -770,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn local_memory_survives_restart_and_retrieves_chinese() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("memory.sqlite3");
+        let path = directory.path().join("data/memory.sqlite3");
         let client = MemExClient::with_path(path.clone());
         client.ingest("用户偏好中文回复，项目使用 Rust", Some(0.8), None).await.unwrap();
         client.ingest("用户偏好中文回复，项目使用 Rust", Some(0.8), None).await.unwrap();
@@ -786,7 +786,7 @@ mod tests {
     #[tokio::test]
     async fn settings_persist_and_apply_to_other_clients() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("memory.sqlite3");
+        let path = directory.path().join("data/memory.sqlite3");
         let client = MemExClient::with_path(path.clone());
         let runtime = MemExClient::with_path(path);
         let mut config = client.get_config().await;
@@ -799,7 +799,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_content_and_config_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
-        let client = MemExClient::with_path(directory.path().join("memory.sqlite3"));
+        let client = MemExClient::with_path(directory.path().join("data/memory.sqlite3"));
         assert!(client.ingest("  ", None, None).await.is_err());
         assert!(client.ingest("test", Some(2.0), None).await.is_err());
         let mut config = client.get_config().await;

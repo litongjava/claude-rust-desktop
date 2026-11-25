@@ -153,7 +153,7 @@ impl Reply {
 pub fn directory(worker: &Worker) -> PathBuf {
     worker
         .root
-        .join("session-workers")
+        .join("state/workers")
         .join(&worker.session_id)
         .join(&worker.id)
 }
@@ -162,7 +162,7 @@ fn worker_path(root: &Path, session: &str) -> Result<PathBuf> {
         uuid::Uuid::parse_str(session).is_ok(),
         "Invalid session worker ID"
     );
-    Ok(root.join("session-workers").join(session))
+    Ok(root.join("state/workers").join(session))
 }
 pub fn read_worker(dir: &Path) -> Result<Worker> {
     let path = dir.join("worker.json");
@@ -539,7 +539,7 @@ pub async fn ensure_worker(
         }
     }
     let id = uuid::Uuid::new_v4().to_string();
-    fs::create_dir_all(root.join("background-tasks"))?;
+    fs::create_dir_all(root.join("tasks/background"))?;
     let mut claim = SessionClaim::acquire(root, session, &id)?;
     let dir = worker_path(root, session)?.join(&id);
     fs::create_dir_all(&dir)?;
@@ -1393,7 +1393,7 @@ mod runtime_status_tests {
             runtime_status(dir.path(), &session).await.state,
             "not_started"
         );
-        assert!(!dir.path().join("session-workers").exists());
+        assert!(!dir.path().join("state/workers").exists());
         for behavior in ["old", "unresponsive"] {
             let id = uuid::Uuid::new_v4().to_string();
             let endpoint = if cfg!(windows) {

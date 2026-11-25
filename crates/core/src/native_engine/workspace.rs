@@ -324,14 +324,14 @@ mod tests {
         let releaser =
             test_support::release_after(release, holder, std::time::Duration::from_secs(6));
         let private = store
-            .workspace(&id, &paths.data_dir.join("workspaces"))
+            .workspace(&id, &paths.data_dir.join("data/workspaces"))
             .unwrap();
         releaser.join().unwrap();
         assert_eq!(
             private,
             paths
                 .data_dir
-                .join("workspaces")
+                .join("data/workspaces")
                 .join(store.db.open_session(&id).unwrap().incarnation())
                 .canonicalize()
                 .unwrap()
@@ -414,7 +414,7 @@ mod tests {
             holder.join().unwrap();
         });
 
-        let workspaces = paths.data_dir.join("workspaces");
+        let workspaces = paths.data_dir.join("data/workspaces");
         let private = store.workspace(&id, &workspaces).unwrap();
         assert!(private
             .canonicalize()
@@ -535,7 +535,7 @@ mod tests {
             let member = store.create(&first, "model", "provider").unwrap();
             let sibling = store.create(&first, "model", "provider").unwrap();
             Self {
-                workspaces: root.path().join("workspaces"),
+                workspaces: root.path().join("data/workspaces"),
                 _root: root,
                 first: first.canonicalize().unwrap(),
                 second: second.canonicalize().unwrap(),
@@ -678,7 +678,7 @@ mod tests {
     #[test]
     fn authorized_move_drops_the_saved_shell_cwd_after_commit() {
         let fixture = RebindFixture::new();
-        let shell = fixture._root.path().join("shell-cwd");
+        let shell = fixture._root.path().join("state/shell-cwd");
         std::fs::create_dir_all(&shell).unwrap();
         std::fs::write(
             shell.join(&fixture.member),
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn a_failed_authorized_move_restores_the_saved_shell_cwd() {
         let fixture = RebindFixture::new();
-        let shell = fixture._root.path().join("shell-cwd");
+        let shell = fixture._root.path().join("state/shell-cwd");
         std::fs::create_dir_all(&shell).unwrap();
         let original = fixture.first.to_string_lossy().into_owned();
         std::fs::write(shell.join(&fixture.member), &original).unwrap();
@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn a_shell_listing_failure_leaves_the_database_untouched() {
         let fixture = RebindFixture::new();
-        let shell = fixture._root.path().join("shell-cwd");
+        let shell = fixture._root.path().join("state/shell-cwd");
         // A non-directory makes the real listing fail before any mutation.
         std::fs::write(&shell, "not a directory").unwrap();
         let before = fixture.conversation(&fixture.member);
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn a_commit_cleanup_failure_keeps_the_database_move() {
         let fixture = RebindFixture::new();
-        let shell = fixture._root.path().join("shell-cwd");
+        let shell = fixture._root.path().join("state/shell-cwd");
         std::fs::create_dir_all(&shell).unwrap();
         std::fs::write(shell.join(&fixture.member), "/old/review-1").unwrap();
         std::fs::write(shell.join(&fixture.sibling), "/other/workspace").unwrap();

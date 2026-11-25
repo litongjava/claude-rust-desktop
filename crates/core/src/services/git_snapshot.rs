@@ -118,7 +118,7 @@ pub fn reminder(snapshot: &str) -> String {
 
 /// The session's snapshot: taken on its first request, then reused.
 pub fn for_session(root: &Path, session: &str, cwd: &Path) -> Option<String> {
-    let path = root.join("git-status").join(format!("{session}.txt"));
+    let path = root.join("cache/git-status").join(format!("{session}.txt"));
     if let Ok(saved) = std::fs::read_to_string(&path) {
         return Some(saved).filter(|text| !text.is_empty());
     }

@@ -815,7 +815,7 @@ impl Session {
             deepseek_code_core::super_agent::role::set(&store.db, &id, role.into())?;
         }
         let workspace = store
-            .workspace(&id, &paths.data_dir.join("workspaces"))
+            .workspace(&id, &paths.data_dir.join("data/workspaces"))
             .map_err(|error| crate::session_trust::diagnose(&store.db, paths, &id, error))?;
         let permissions = runtime::default_permissions();
         permissions
@@ -1000,7 +1000,8 @@ impl Session {
         let selected = store.db.open_session(&id)?;
         let store = SessionStore::new(Arc::new(selected.scoped_stores()));
         binding.track_session(selected);
-        let mut manager = ProviderManager::in_memory(Vec::new(), paths.data_dir.join("providers.json"));
+        let mut manager =
+            ProviderManager::in_memory(Vec::new(), paths.layout().config_file("providers.json"));
         manager.binding = binding.clone();
 
         let providers = Arc::new(Mutex::new(manager));
@@ -1045,7 +1046,8 @@ impl Session {
             mcp,
             mcp_ready: Arc::new(tokio::sync::OnceCell::new()),
             startup_provider,
-            has_saved_providers: paths.data_dir.join("config.json").is_file() || paths.data_dir.join("providers.json").is_file(),
+            has_saved_providers: paths.layout().config_file("config.json").is_file()
+                || paths.layout().config_file("providers.json").is_file(),
             providers,
             workspace,
             auto_route,
@@ -1084,7 +1086,8 @@ impl Session {
             state.generation = self.binding.read().map_or(0, |s| s.generation);
             self.binding.install(state)?;
         }
-        self.has_saved_providers |= paths.data_dir.join("config.json").is_file() || paths.data_dir.join("providers.json").is_file();
+        self.has_saved_providers |= paths.layout().config_file("config.json").is_file()
+            || paths.layout().config_file("providers.json").is_file();
         self.startup_provider = None;
         self.auto_route = false;
         Ok(())
@@ -2390,7 +2393,7 @@ impl Session {
         let mut progress = crate::terminal::live::TurnDisplay::new(
             interactive_display,
             self.permission_mode(),
-            &self.paths.data_dir.join("keybindings.json"),
+            &self.paths.layout().config_file("keybindings.json"),
             self.store
                 .history(&self.id)?
                 .iter()
@@ -4241,8 +4244,8 @@ mod event_tests {
         let agent = session.sdk_agent_model("b::m[1m]").await.unwrap();
         let target = session.store.create(dir.path(), "m", "b").unwrap();
         let rotated = provider("b", 3, "rotated-key");
-        std::fs::write(
-            paths.data_dir.join("providers.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("providers.json"),
             serde_json::to_vec(&[a.clone(), rotated.clone()]).unwrap(),
         )
         .unwrap();
@@ -4258,8 +4261,8 @@ mod event_tests {
         assert_eq!(bound.model.context_window, Some(1_000_000));
         let another = session.store.create(dir.path(), "m", "b").unwrap();
         let rotated_again = provider("b", 4, "new-saved-key");
-        std::fs::write(
-            paths.data_dir.join("providers.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("providers.json"),
             serde_json::to_vec(&[&a, &rotated_again]).unwrap(),
         )
         .unwrap();
@@ -4714,8 +4717,8 @@ mod event_tests {
         );
         let paths = RuntimePaths::new(dir.join("data")).unwrap();
         std::fs::create_dir_all(&paths.data_dir).unwrap();
-        std::fs::write(
-            paths.data_dir.join("settings.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("settings.json"),
             r#"{"localCoordination":{"enabled":true,"registry":true}}"#,
         )
         .unwrap();
@@ -4895,8 +4898,8 @@ mod event_tests {
 
     #[cfg(target_os = "linux")]
     fn lc_set_enabled(paths: &RuntimePaths, enabled: bool) {
-        std::fs::write(
-            paths.data_dir.join("settings.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("settings.json"),
             format!(r#"{{"localCoordination":{{"enabled":{enabled},"registry":true}}}}"#),
         )
         .unwrap();
@@ -4967,7 +4970,7 @@ mod event_tests {
         session.lifecycle_owned = true;
         let entered = dir.path().join("hook-entered");
         let release = dir.path().join("hook-release");
-        std::fs::write(paths.data_dir.join("settings.json"), json!({
+        deepseek_code_core::data_layout::write_config_file(paths.layout().config_file("settings.json"), json!({
             "localCoordination":{"enabled":true,"registry":true},
             "hooks":{"SessionEnd":[{"hooks":[{"type":"command","command":format!(
                 "touch '{}' && while [ ! -e '{}' ]; do sleep 0.02; done",entered.display(),release.display())}]}]}
@@ -5128,8 +5131,8 @@ mod event_tests {
             std::fs::create_dir_all(workspace).unwrap();
         }
         let marker = dir.path().join("hook-runs");
-        std::fs::write(
-            paths.data_dir.join("settings.json"),
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("settings.json"),
             serde_json::json!({
                 "localCoordination": {"enabled": true, "registry": true},
                 "hooks": {"SessionStart": [{"hooks": [{

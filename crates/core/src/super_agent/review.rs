@@ -371,7 +371,7 @@ fn artifact_read(store: &TaskStore, task: &TaskRecord, input: &Value) -> Result<
     let name = artifact_name(artifact_id)?;
     let directory = store
         .data_dir()
-        .join("super-agent")
+        .join("tasks/super-agent")
         .join(&task.task_id)
         .join("artifacts");
     let path = directory.join(name);
@@ -675,7 +675,7 @@ fn same_submission_content(left: &SnapshotManifest, right: &SnapshotManifest) ->
 
 fn submission_scope(data_dir: &Path, task_id: &str) -> PathBuf {
     data_dir
-        .join("super-agent")
+        .join("tasks/super-agent")
         .join(task_id)
         .join("submissions")
 }

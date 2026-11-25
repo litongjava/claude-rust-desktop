@@ -583,7 +583,7 @@ fn artifacts_are_written_atomically_and_names_cannot_escape_the_task_directory()
         .write_artifact(&task.task_id, "tests.log", b"passed\n")
         .unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "passed\n");
-    assert!(path.starts_with(data.join("super-agent").join(&task.task_id)));
+    assert!(path.starts_with(data.join("tasks/super-agent").join(&task.task_id)));
     assert!(store
         .write_artifact(&task.task_id, "../escape", b"x")
         .is_err());
@@ -1410,7 +1410,7 @@ fn completion_rejects_an_unverified_non_git_snapshot() {
         .save_non_git_target(&NonGitTarget {
             task_id: record.task_id.clone(),
             path: data.join("scripts"),
-            snapshot_dir: data.join("super-agent").join("missing-snapshot"),
+            snapshot_dir: data.join("tasks/super-agent").join("missing-snapshot"),
             snapshot_manifest_json: "{}".into(),
             diff_ref: Some("diff-1".into()),
             status: NonGitStatus::Completed,
@@ -1479,7 +1479,7 @@ fn completion_with_a_real_pinned_non_git_target_requires_the_reviewed_bytes() {
         .create_task("router", non_git_spec(&target_dir), "create")
         .unwrap();
     let baseline = data
-        .join("super-agent")
+        .join("tasks/super-agent")
         .join(&task.task_id)
         .join("snapshots")
         .join("1");

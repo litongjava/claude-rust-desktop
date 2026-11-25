@@ -25,7 +25,7 @@ fn shared_lock(file: &File) -> Result<()> {
 
 impl Stores {
     fn workspace_lock_file(&self, key: &str) -> Result<File> {
-        let locks = self.data_dir().join("workspace-locks");
+        let locks = self.layout().lock_path("workspace");
         fs::create_dir_all(&locks)?;
         Ok(File::options()
             .create(true)
@@ -43,8 +43,8 @@ impl Stores {
             "Invalid workspace lease identity"
         );
         Ok(self
-            .data_dir()
-            .join("workspace-locks")
+            .layout()
+            .lock_path("workspace")
             .join(format!("lease-{incarnation}")))
     }
 

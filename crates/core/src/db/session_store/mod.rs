@@ -114,6 +114,12 @@ struct Root {
 type RootSlot = Arc<Mutex<Weak<Root>>>;
 static ROOTS: LazyLock<Mutex<HashMap<PathBuf, RootSlot>>> = LazyLock::new(Default::default);
 
+impl Root {
+    fn layout(&self) -> crate::data_layout::DataLayout {
+        crate::data_layout::DataLayout::new(self.path.clone())
+    }
+}
+
 #[derive(Clone)]
 pub struct Stores {
     root: Arc<Root>,
@@ -146,6 +152,15 @@ impl Stores {
 
     fn open_existing(path: &Path, mode: OpenMode) -> Result<Self> {
         layout::allow_entry()?;
+        let outcome = crate::data_layout::DataLayout::from_root(&path).migrate_if_needed()?;
+        if !outcome.warnings.is_empty() {
+            tracing::warn!(
+                module = "SessionStore",
+                root = %path.display(),
+                entries = %outcome.warnings.join(", "),
+                "Legacy or unknown entries remain in the data directory root"
+            );
+        }
         ensure!(
             path.is_dir(),
             "Session store requires an existing data root"
@@ -225,6 +240,9 @@ impl Stores {
     pub fn data_dir(&self) -> &Path {
         &self.root.path
     }
+    pub fn layout(&self) -> crate::data_layout::DataLayout {
+        self.root.layout()
+    }
     #[doc(hidden)]
     pub fn with_fault_hook(
         &self,
@@ -247,10 +265,10 @@ impl Stores {
         &self.root.global
     }
     fn sessions(&self) -> PathBuf {
-        self.root.path.join("sessions")
+        self.root.layout().sessions()
     }
     fn namespace(&self) -> Result<std::fs::File> {
-        let dir = self.root.path.join("session-locks");
+        let dir = self.root.layout().lock_path("session");
         let guard = layout::lock_existing(&dir.join(".directory"), false)?;
         ensure!(
             std::fs::read_to_string(dir.join(".initialized"))? == self.global().uuid,
@@ -281,7 +299,7 @@ impl Stores {
         exclusive: bool,
         allocate: bool,
     ) -> Result<Option<Vec<std::fs::File>>> {
-        let dir = self.root.path.join("session-locks");
+        let dir = self.root.layout().lock_path("session");
         let path = dir.join(key);
         let namespace = self.namespace()?;
         if !path.try_exists()? {
@@ -816,8 +834,8 @@ mod tests {
     fn multi_key_locks_are_unique_and_in_storage_key_order() -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir()?;
-        let path = tmp.path().join("session-locks");
-        std::fs::create_dir(&path)?;
+        let path = tmp.path().join("state/locks/session");
+        std::fs::create_dir_all(&path)?;
         for name in ["a", "b"] {
             std::fs::File::create_new(path.join(name))?;
         }

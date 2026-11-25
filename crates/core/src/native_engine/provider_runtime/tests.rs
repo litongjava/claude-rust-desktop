@@ -1062,7 +1062,7 @@ async fn builtin_chat_retries_pre_content_timeout_under_one_budget() {
         }
         drop(captured);
 
-        let records = temp.path().join("request-records/builtin-chat-fixture");
+        let records = temp.path().join("diagnostics/request-records/builtin-chat-fixture");
         let mut metas: Vec<std::path::PathBuf> = std::fs::read_dir(&records)
             .unwrap()
             .filter_map(Result::ok)
@@ -1426,7 +1426,7 @@ async fn builtin_chat_invalid_orchestration_fails_before_open() {
     }
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("config")).unwrap();
-    std::fs::write(
+    crate::data_layout::write_config_file(
         temp.path().join("config/orchestration.toml"),
         "this is not toml [[[",
     )
@@ -1478,7 +1478,7 @@ async fn builtin_chat_mixed_exhaustion_ends_at_the_shared_cap() {
     if std::env::var_os(CHILD).is_none() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("config")).unwrap();
-        std::fs::write(
+        crate::data_layout::write_config_file(
             temp.path().join("config/orchestration.toml"),
             "[tool_loop]\n[tools]\n[memory]\nenabled = false\n[bridge]\n[http]\n\
              request_timeout_secs = 30\nmax_retries = 1\nretry_base_backoff_ms = 20\n\
@@ -1725,7 +1725,7 @@ async fn single_attempt_chat_stream_never_spends_a_second_post() {
     if std::env::var_os(CHILD).is_none() {
         let temp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(temp.path().join("config")).unwrap();
-        std::fs::write(
+        crate::data_layout::write_config_file(
             temp.path().join("config/orchestration.toml"),
             "[tool_loop]\n[tools]\n[memory]\nenabled = false\n[bridge]\n[http]\n\
              request_timeout_secs = 1\nmax_retries = 2\nretry_base_backoff_ms = 5\n\
@@ -1886,7 +1886,10 @@ async fn single_attempt_chat_stream_never_spends_a_second_post() {
             "{transport:?}"
         );
         drop(captured);
-        let records = temp.path().join("request-records").join(&session);
+        let records = temp
+            .path()
+            .join("diagnostics/request-records")
+            .join(&session);
         let metas = std::fs::read_dir(records)
             .map(|dir| {
                 dir.filter_map(Result::ok)
@@ -1927,7 +1930,7 @@ async fn openai_counted_stream_invalid_orchestration_fails_before_open() {
     }
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(temp.path().join("config")).unwrap();
-    std::fs::write(
+    crate::data_layout::write_config_file(
         temp.path().join("config/orchestration.toml"),
         "this is not toml [[[",
     )
