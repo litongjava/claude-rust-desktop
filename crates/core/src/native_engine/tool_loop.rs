@@ -1353,6 +1353,7 @@ pub(crate) async fn discover_mcp_tools(
                 tool.name
             );
             Ok(crate::tools::ToolDefinition {
+                summary: None,
                 name: tool.name,
                 description: tool.description,
                 input_schema: tool.input_schema,
@@ -1387,7 +1388,7 @@ pub(crate) fn loadable_tool_lists(
             let loading = customization.loading(&tool.name);
             loading.on_demand && !loading.enabled
         })
-        .map(|tool| (tool.name.clone(), tool.description.clone()))
+        .map(|tool| (tool.name.clone(), customization.listing_text(tool).to_owned()))
         .collect();
     let mut mcp: Vec<(String, String)> = mcp_tools
         .iter()
@@ -1398,7 +1399,7 @@ pub(crate) fn loadable_tool_lists(
                     crate::mcp::states::effective(mcp_states, server) == McpState::OnDemand
                 })
         })
-        .map(|tool| (tool.name.clone(), tool.description.clone()))
+        .map(|tool| (tool.name.clone(), customization.listing_text(tool).to_owned()))
         .collect();
     let by_name = |a: &(String, String), b: &(String, String)| {
         a.0.to_ascii_lowercase()
@@ -3488,6 +3489,7 @@ impl ToolLoopExecutor {
                 .iter()
                 .filter(|tool| tool.enabled)
                 .map(|tool| crate::tools::ToolDefinition {
+                    summary: None,
                     name: tool.name.clone(),
                     description: tool.description.clone(),
                     input_schema: tool.input_schema.clone(),

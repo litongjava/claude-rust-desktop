@@ -97,6 +97,10 @@ pub struct Customization {
     pub system_prompt: SystemPrompt,
     pub disabled_tools: Vec<String>,
     pub tool_descriptions: BTreeMap<String, String>,
+    /// Text for the loadable-tool listing, per tool. Shown as written (only
+    /// whitespace collapsed) and never cut; it wins over the tool's own
+    /// `summary` and over the complete description.
+    pub tool_summaries: BTreeMap<String, String>,
     pub custom_tools: Vec<CustomTool>,
     /// Explicit switches per built-in tool. A missing entry follows the default.
     pub tool_loading: BTreeMap<String, ToolLoading>,
@@ -151,6 +155,7 @@ pub fn save_tools(data_dir: &Path, submitted: &Customization, builtin: &[String]
         }
     }
     next.tool_descriptions = submitted.tool_descriptions.clone();
+    next.tool_summaries = submitted.tool_summaries.clone();
     next.custom_tools = submitted.custom_tools.clone();
     // Both lists are folded, so a legacy name neither the page nor the file
     // mentions is never turned back on by accident. Names outside the catalog
@@ -248,10 +253,28 @@ impl Customization {
             .collect()
     }
 
+    /// The text the loadable-tool reminder shows for this tool. The user's
+    /// `tool_summaries` entry wins, then the user's `tool_descriptions` override,
+    /// then the tool's own `summary`, and finally its complete description. The
+    /// reminder collapses the result to one line without cutting it.
+    pub fn listing_text<'a>(&'a self, tool: &'a ToolDefinition) -> &'a str {
+        [
+            self.tool_summaries.get(&tool.name).map(String::as_str),
+            self.tool_descriptions.get(&tool.name).map(String::as_str),
+            tool.summary.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|text| !text.is_empty())
+        .unwrap_or(&tool.description)
+    }
+
     /// The advertised tools, then the user's own enabled ones.
     pub fn apply(&self, tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
         let mut tools = self.described(tools);
         tools.extend(self.custom_tools.iter().filter(|tool| tool.enabled).map(|tool| ToolDefinition {
+            summary: None,
             name: tool.name.clone(),
             description: tool.description.clone(),
             input_schema: tool.input_schema.clone(),
@@ -319,7 +342,7 @@ mod tests {
     }
 
     fn definition(name: &str) -> ToolDefinition {
-        ToolDefinition { name: name.into(), description: "original".into(), input_schema: json!({"type":"object"}) }
+        ToolDefinition { summary: None, name: name.into(), description: "original".into(), input_schema: json!({"type":"object"}) }
     }
 
     #[test]
@@ -336,6 +359,25 @@ mod tests {
         assert_eq!(summary, [("Read", "edited"), ("Grep", "original"), ("shout", "Test tool")]);
         assert!(customization.custom_tool("shout").is_some());
         assert!(customization.custom_tool("quiet").is_none());
+    }
+
+    #[test]
+    fn listing_text_prefers_the_user_summary_then_the_tool_summary_then_the_description() {
+        let mut customization = Customization::default();
+        let mut written = definition("Read");
+        written.summary = Some("Read one file".into());
+        assert_eq!(customization.listing_text(&written), "Read one file");
+        // A description override stays visible in the listing, as before.
+        customization.tool_descriptions.insert("Read".into(), "Read the whole file".into());
+        assert_eq!(customization.listing_text(&written), "Read the whole file");
+        // The dedicated listing text wins over both.
+        customization.tool_summaries.insert("Read".into(), "Read a file for me".into());
+        assert_eq!(customization.listing_text(&written), "Read a file for me");
+        // A blank override never hides the fallback.
+        customization.tool_summaries.insert("Read".into(), "  ".into());
+        assert_eq!(customization.listing_text(&written), "Read the whole file");
+        // Without either, the complete description is the listing text.
+        assert_eq!(customization.listing_text(&definition("Grep")), "original");
     }
 
     #[test]

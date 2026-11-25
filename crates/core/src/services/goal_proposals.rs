@@ -601,6 +601,7 @@ pub fn discard(db: &impl SessionAccess, session: &str) -> Result<()> {
 }
 pub fn definition() -> crate::tools::ToolDefinition {
     crate::tools::ToolDefinition {
+        summary: Some("Propose a measurable completion condition for a multi-turn task".into()),
         name: "ProposeGoal".into(),
         description: "Propose a measurable completion condition (up to 500 UTF-16 code units) for a multi-turn task already requested by the user. Nonblocking: continue working while the user decides. Do not widen scope or repeat declined/reworded goals. ask_user defaults true. Setting false only reuses an exactly matching currently active goal; otherwise user approval remains required. No new goal or authority exists until a kickoff message confirms activation.".into(),
         input_schema: json!({"type":"object","properties":{"condition":{"type":"string","minLength":1,"maxLength":500},"ask_user":{"type":"boolean"}},"required":["condition"],"additionalProperties":false}),

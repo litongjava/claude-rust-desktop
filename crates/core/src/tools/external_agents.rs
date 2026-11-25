@@ -67,6 +67,7 @@ pub(super) fn definitions() -> Vec<super::ToolDefinition> {
         .filter(|agent| !(agent.command == "dcl" && std::env::var_os(NESTED_ENV).is_some()))
         .filter(|agent| super::lsp_servers::find_on_path(agent.command).is_some())
         .map(|agent| super::ToolDefinition {
+            summary: Some(format!("Delegate a self-contained task to {}", agent.name)),
             name: agent.tool.into(),
             description: format!(
                 "Delegate a self-contained task to {} (the `{}` CLI installed on this machine) and return its final answer. Use it for a second opinion, a review, or work the user explicitly wants {} to do. It runs non-interactively in the project directory: read-only by default, mode=edit lets it change files. It cannot ask questions, so give it the full context. Each call starts a new {} session unless session_id continues an earlier one from a previous result. Requires approval.",

@@ -67,6 +67,7 @@ impl OwnedChild {
 
 pub(super) fn definitions() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
+        summary: Some("Start a child agent on one task and return its result".into()),
         name: "Agent".into(),
         description: "Start a child agent on one task. Pick a subagent_type from the runtime list; leaving it out starts a general-purpose agent, whose prompt and tools come from its definition.\n\nA fork branches this session instead: it keeps the full history, runs in the background on this session's model and takes prompt as its directive, and it cannot start another fork.\n\nMain-session children run in the background by default and send a completion notification, so keep working rather than polling; pass run_in_background: false to get the result before you continue. isolation: \"worktree\" puts the child in its own git worktree. The user does not see a child's report, so relay what matters; SendMessage continues the same child with its context, while a new Agent call starts fresh.".into(),
         input_schema: json!({"type":"object","properties":{

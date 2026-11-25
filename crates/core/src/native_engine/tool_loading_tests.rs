@@ -74,6 +74,7 @@ fn loadable_reminder(executor: &ToolLoopExecutor) -> Option<String> {
 /// server, which these tests do not start.
 fn mcp_tool(name: &str, description: &str) -> crate::tools::ToolDefinition {
     crate::tools::ToolDefinition {
+        summary: None,
         name: name.into(),
         description: description.into(),
         input_schema: json!({"type":"object"}),
@@ -947,6 +948,45 @@ async fn tool_load_returns_the_description_override() {
 }
 
 #[test]
+fn the_loadable_reminder_shows_custom_text_uncut_and_the_whole_description_otherwise() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut customization = crate::services::customization::Customization::default();
+    let custom = format!(
+        "Run directory listings for the project and {}.\nSecond line.",
+        "keep every word ".repeat(10)
+    );
+    customization
+        .tool_summaries
+        .insert("ListDir".to_owned(), custom.clone());
+    crate::services::customization::save(temp.path(), &customization, &[]).unwrap();
+    let mut executor = executor(temp.path());
+    let reminder = loadable_reminder(&executor).unwrap();
+    let line = reminder.lines().find(|line| line.starts_with("- ListDir:")).unwrap();
+    let one_line = custom.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(line, format!("- ListDir: {one_line}"));
+    // A tool without any custom text keeps its complete description.
+    let full = format!("First sentence. {}\nSecond line.", "keep every word ".repeat(10));
+    executor.mcp_states = std::collections::BTreeMap::from([("fixture".to_owned(), McpState::OnDemand)]);
+    executor.mcp_tools = vec![crate::tools::ToolDefinition {
+        summary: None,
+        name: "mcp__fixture__long".into(),
+        description: full.clone(),
+        input_schema: json!({"type":"object"}),
+    }];
+    let reminder = loadable_reminder(&executor).unwrap();
+    let line = reminder
+        .lines()
+        .find(|line| line.starts_with("- mcp__fixture__long:"))
+        .unwrap();
+    assert_eq!(
+        line,
+        format!("- mcp__fixture__long: {}", crate::prompt::one_line(&full))
+    );
+    assert!(line.ends_with("Second line."), "{line}");
+    assert!(line.len() > 200, "the description is not cut: {line}");
+}
+
+#[test]
 fn a_legacy_entry_outside_the_catalog_still_turns_that_tool_off() {
     let temp = tempfile::tempdir().unwrap();
     let customization = crate::services::customization::Customization {
@@ -956,6 +996,7 @@ fn a_legacy_entry_outside_the_catalog_still_turns_that_tool_off() {
     crate::services::customization::save(temp.path(), &customization, &[]).unwrap();
     let mut executor = executor(temp.path());
     executor.mcp_tools = vec![crate::tools::ToolDefinition {
+        summary: None,
         name: "mcp__old__echo".into(),
         description: "old".into(),
         input_schema: json!({"type":"object"}),
@@ -967,6 +1008,7 @@ fn a_legacy_entry_outside_the_catalog_still_turns_that_tool_off() {
     assert!(violation.contains("turned off"), "{violation}");
     // An MCP tool the user did not disable keeps its existing path.
     executor.mcp_tools.push(crate::tools::ToolDefinition {
+        summary: None,
         name: "mcp__live__echo".into(),
         description: "live".into(),
         input_schema: json!({"type":"object"}),
@@ -1127,7 +1169,7 @@ fn mcp_descriptions_are_snapshotted_per_session() {
 fn on_demand_mcp_tools_are_listed_with_builtins_first() {
     let temp = tempfile::tempdir().unwrap();
     let mut executor = executor(temp.path());
-    let noisy = format!("{}\nA second line is never shown", "x".repeat(200));
+    let noisy = format!("{}\nA second line stays on the same line", "x".repeat(200));
     executor.mcp_tools = vec![
         mcp_tool(
             "mcp__gh__create_issue",
@@ -1158,18 +1200,16 @@ fn on_demand_mcp_tools_are_listed_with_builtins_first() {
         "{prompt}"
     );
     assert!(!prompt.contains("mcp__fs__read_file"), "{prompt}");
-    assert!(!prompt.contains("A second line"), "{prompt}");
-    // Built-ins come before the MCP block.
-    let builtin = prompt.find("- ListDir:").unwrap();
-    let mcp = prompt.find("- mcp__gh__create_issue:").unwrap();
-    assert!(builtin < mcp, "{prompt}");
+    // An MCP tool has no summary, so its whole description is listed on one line.
     let line = prompt
         .lines()
         .find(|line| line.starts_with("- mcp__gh__noisy:"))
         .expect("the second on-demand tool is listed");
-    let summary = line.trim_start_matches("- mcp__gh__noisy: ");
-    assert_eq!(summary.chars().count(), 100, "{line}");
-    assert!(summary.ends_with('…'), "{line}");
+    assert_eq!(line, format!("- mcp__gh__noisy: {} A second line stays on the same line", "x".repeat(200)), "{prompt}");
+    // Built-ins come before the MCP block.
+    let builtin = prompt.find("- ListDir:").unwrap();
+    let mcp = prompt.find("- mcp__gh__create_issue:").unwrap();
+    assert!(builtin < mcp, "{prompt}");
 
     executor.loaded_tools.insert("mcp__gh__create_issue".into());
     let request = executor.prepare_request().unwrap();

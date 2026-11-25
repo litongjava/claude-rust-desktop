@@ -354,6 +354,7 @@ pub fn definitions() -> Vec<crate::tools::ToolDefinition> {
     use serde_json::json;
     vec![
         crate::tools::ToolDefinition {
+            summary: Some("Enter plan mode and research before changing code".into()),
             name: "EnterPlanMode".into(),
             description: "Enter plan mode when the approach deserves the user's approval before code changes: several designs are viable, the user asked to review a plan, or the change is large or risky. In plan mode you can explore with read-only tools; Write and Edit accept only the session plan file, and shell commands follow the plan policy. The result names that file. Record your proposed approach there, then call ExitPlanMode to request approval. If the change is simple or already well specified, implement it directly instead.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
@@ -361,6 +362,7 @@ pub fn definitions() -> Vec<crate::tools::ToolDefinition> {
         // `plan` is still accepted from older transcripts but no longer advertised:
         // like the reference CLI, the plan is read from the session plan file.
         crate::tools::ToolDefinition {
+            summary: Some("Leave plan mode and present the plan for approval".into()),
             name: "ExitPlanMode".into(),
             description: "Call this in plan mode once the approach is written to the session plan file. The plan in that file (or plan text supplied with the call) is shown to the user, who approves or rejects it; the result reports which. Use it only to hand over an implementation plan for approval, not to finish a research or exploration task.".into(),
             input_schema: json!({"type":"object","properties":{"allowedPrompts":{"description":"Bash actions the plan expects; recorded for the user's review, not granted as permissions.","type":"array","maxItems":32,"items":{"type":"object","properties":{"tool":{"description":"The tool a prompt applies to; only Bash is accepted.","type":"string","enum":["Bash"]},"prompt":{"description":"Short description of a Bash action the plan needs.","type":"string"}},"required":["tool","prompt"],"additionalProperties":false}}},"additionalProperties":{}}),

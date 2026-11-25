@@ -10,6 +10,7 @@ const MAX_DELAY_SECS: f64 = 3600.0;
 
 pub fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
+        summary: Some("Ask the runtime to wake this /loop session again later".into()),
         name: "ScheduleWakeup".into(),
         description: "Ask the runtime to wake this /loop session again later. Save the loop input in prompt each time: when the delay expires and the session is idle, that input fires once, so pass the same text to keep the loop going. delaySeconds is clamped to 60-3600 seconds; choose it from how fast the thing you watch changes. reason is a short note shown to the user. Set noop to true when the check found nothing new and false when it did. To end the loop, send stop: true alone; the saved wakeup is removed and no other field is used.".into(),
         input_schema: json!({"type":"object","properties":{

@@ -27,13 +27,14 @@ const DEFAULT_DESCRIPTION: &str = "Run Python";
 
 pub(crate) fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
+        summary: Some("Run Python code as __main__ with the workspace interpreter, without a shell. Prefer this tool over a Bash heredoc or `python -c` for pure Python snippets".into()),
         name: "Python".into(),
-        description: "Run Python code as `__main__` with the workspace interpreter; prefer this tool over a Bash heredoc or `python -c` for pure Python snippets and numeric experiments, and use Bash when the task needs shell syntax, script arguments, or `python -m`. This is Python, not a shell: pipes, redirection, `$VAR`, `&&` and globs are not interpreted. The code runs from a file, so `__file__` is set and `input()` returns EOF. Set `save_name` to keep the script under the workspace `temp/` directory and return its path as `script_path`; without it the script is temporary and deleted after the call. `env` is merged over the inherited environment before the interpreter starts; `PYTHONPATH` is merged rather than replaced, and the working directory stays importable. Long jobs can use `run_in_background` and are read with `TaskGet`.".into(),
+        description: "Run Python code, prefer this tool over a Bash heredoc or `python -c` for pure Python snippets and numeric experiments, and use Bash when the task needs shell syntax, script arguments, or `python -m`. This is Python, not a shell: pipes, redirection, `$VAR`, `&&` and globs are not interpreted. The code runs from a file, so `__file__` is set and `input()` returns EOF. Set `save_name` to keep the script under the workspace `temp/` directory and return its path as `script_path`; without it the script is temporary and deleted after the call. `env` is merged over the inherited environment before the interpreter starts; `PYTHONPATH` is merged rather than replaced, and the working directory stays importable. Long jobs can use `run_in_background` and are read with `TaskGet`.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {
                 "code": {
-                    "description": "Python source to run as __main__. Prefer this tool over a Bash heredoc or `python -c` for pure Python snippets and numeric experiments. Python only: shell syntax such as pipes, redirection, $VAR and && is not interpreted. Use Bash for `python -m ...`, scripts with arguments, or untrusted code. The code runs from a file, so __file__ is set; stdin is empty, so input() returns EOF.",
+                    "description": "Python source to run as __main__.  Python only: shell syntax such as pipes, redirection, $VAR and && is not interpreted. Use Bash for `python -m ...`, scripts with arguments, or untrusted code. The code runs from a file, so __file__ is set; stdin is empty, so input() returns EOF.",
                     "type": "string"
                 },
                 "save_name": {

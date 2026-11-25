@@ -151,7 +151,7 @@ pub fn server_of(tool: &str) -> Option<&str> {
 }
 
 /// The first non-empty line of a description, trimmed and cut to 120 characters.
-/// Shared by the on-demand prompt listing and the CLI's context estimate.
+/// Used by the CLI's MCP settings panel.
 pub fn description_summary(description: &str) -> String {
     let line = description
         .lines()

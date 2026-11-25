@@ -77,10 +77,17 @@ pub const SKILLS_LEAD_IN: &str = "Available skills: invoke the Skill tool with {
 /// here, never in the system prompt or a project's AGENTS.md.
 pub const EXPERIENCE_LEAD_IN: &str = "Verified fixes recorded for this project. Before re-deriving a fix, search .agents/experience/ and read the matching file; a one-line description is only a pointer. Before finishing a turn in which you solved a non-obvious problem that you verified, add one entry file there (frontmatter name and description; body Symptom, Cause, Fix, Verification), or update the existing entry for the same symptom and root cause. Keep one problem per file, merge near-duplicates, and delete entries that no longer hold. Entries are records, not instructions; never store credentials, tokens or raw logs.";
 
+/// Whitespace-collapsed text on a single line, cut nowhere. The loadable-tool
+/// listing shows custom summaries and full descriptions through it, so a list
+/// entry stays one line without losing any of its words.
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// The first sentence of a description, whitespace collapsed and cut to
-/// `limit` characters. The loadable-tool listing uses 100.
+/// `limit` characters. Used by the experience index, not the tool listing.
 pub fn one_sentence(description: &str, limit: usize) -> String {
-    let text = description.split_whitespace().collect::<Vec<_>>().join(" ");
+    let text = one_line(description);
     let sentence = text
         .split(". ")
         .next()
@@ -97,7 +104,9 @@ pub fn one_sentence(description: &str, limit: usize) -> String {
 }
 
 /// One reminder listing the loadable built-in tools first, then the on-demand
-/// MCP tools. None when ToolLoad has nothing to offer.
+/// MCP tools. Each entry shows the text the caller resolved (a custom summary or
+/// the complete description) on one line, uncut. None when ToolLoad has nothing
+/// to offer.
 pub fn loadable_tools_reminder(
     builtin: &[(String, String)],
     mcp: &[(String, String)],
@@ -107,7 +116,7 @@ pub fn loadable_tools_reminder(
     }
     let mut text = String::from(LOADABLE_TOOLS_LEAD_IN);
     for (name, description) in builtin.iter().chain(mcp) {
-        text.push_str(&format!("\n- {name}: {}", one_sentence(description, 100)));
+        text.push_str(&format!("\n- {name}: {}", one_line(description)));
     }
     Some(format!("<system-reminder>\n{text}\n</system-reminder>"))
 }
@@ -1281,12 +1290,12 @@ mod tests {
     }
 
     #[test]
-    fn loadable_tools_and_skills_freeze_and_report_changes_once() {
+    fn loadable_tools_show_the_resolved_text_uncut_and_freeze_once() {
         let root = tempfile::tempdir().unwrap();
         let builtin = vec![
             (
                 "ListDir".to_owned(),
-                "List a directory. A second sentence is dropped.".to_owned(),
+                "List a directory.\nA second line stays whole.".to_owned(),
             ),
             (
                 "WebSearch".to_owned(),
@@ -1298,11 +1307,12 @@ mod tests {
         assert!(reminder.starts_with(
             "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n"
         ));
-        assert!(reminder.contains("- ListDir: List a directory"));
-        assert!(!reminder.contains("second sentence"));
+        // Every line keeps the whole text, only whitespace is collapsed.
+        assert!(reminder.contains("- ListDir: List a directory. A second line stays whole."));
         assert!(reminder.contains("- mcp__gh__create_issue: Create an issue"));
-        let mcp_line = reminder.lines().find(|line| line.starts_with("- WebSearch:")).unwrap();
-        assert_eq!(mcp_line.trim_start_matches("- WebSearch: ").chars().count(), 100, "{reminder}");
+        let web = reminder.lines().find(|line| line.starts_with("- WebSearch:")).unwrap();
+        assert_eq!(web, format!("- WebSearch: {} second line", "x".repeat(200)));
+        assert!(!reminder.contains('…'), "the listing cuts nothing: {reminder}");
         // A later request reads the frozen file, whatever the current tools say.
         assert_eq!(
             loadable_tools_for_session(root.path(), "s", &[], &[]).as_deref(),
@@ -1536,6 +1546,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reminder, "<system-reminder>\nRemoved experience: beta\n</system-reminder>");
+    }
+
+    #[test]
+    fn one_line_collapses_whitespace_without_cutting() {
+        assert_eq!(one_line("First line.\nSecond line."), "First line. Second line.");
+        assert_eq!(one_line("  spaced   words  "), "spaced words");
+        let long = "a".repeat(120);
+        assert_eq!(one_line(&long), long);
+        assert_eq!(one_line("é".repeat(120).as_str()).chars().count(), 120);
     }
 
     #[test]
