@@ -187,18 +187,22 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 
 ### C3. 拖动选择与右击复制（SSH/tmux）
 
-1. 在提示符、模型输出和 `Ctrl+O` 记录里按住左键拖动：出现反色选择，松开后高亮保留；在保留的选择上右击，所选文本进入剪贴板，高亮仍在，可以再次右击复制。
-2. 没有选择时右击不复制、不报错；滚轮、左键点击展开、单双击状态行复制保持原行为。
+1. 在提示符、模型输出和 `Ctrl+O` 记录里按住左键拖动：出现反色选择，松开后高亮保留；在保留的选择上右击，所选文本进入剪贴板，高亮消失，底部显示 `Copied N characters to clipboard`。没有选区时再次右击不复制、不报错。
+2. 复制失败的路径显示 `Copy failed; the clipboard is unavailable`，选择同样取消；滚轮、左键点击展开、单双击状态行复制保持原行为。
 3. 本地桌面终端：右击后粘贴应得到原文，包含中文和换行；本地会话仍优先使用系统剪贴板。
-4. 在 tmux 中运行（含 SSH 远程主机）：tmux 需已开启 `set -g mouse on`，应用才能收到鼠标事件；拖动选择后右击，`tmux show-buffer` 应为所选文本。外层终端支持 OSC 52 时，`load-buffer -w` 也应把同一文本送到本地剪贴板。即使远端存在 `pbcopy`/`xclip`，也不能只写远端剪贴板。
-5. 自动回归（两条命令分别执行）：
+4. 在 tmux 中运行（含 SSH 远程主机）：tmux 需已开启 `set -g mouse on`，应用才能收到鼠标事件；拖动选择后右击，`tmux show-buffer` 应为所选文本，屏幕上不再保留反色高亮并显示复制提示。外层终端支持 OSC 52 时，`load-buffer -w` 也应把同一文本送到本地剪贴板。即使远端存在 `pbcopy`/`xclip`，也不能只写远端剪贴板。
+5. 运行中的反馈还要单独验证：模型流式输出时拖动选择并右击，底部提示出现且流式输出继续；`Ctrl+O` 全页记录和文件差异页的右击复制使用各自页脚显示提示。
+6. 自动回归（分别执行）：
 
    ```bash
    cargo test --locked -p deepseek-code-cli --bin dcl terminal::mouse_selection::tests::
+   cargo test --locked -p deepseek-code-cli --bin dcl terminal::file_review
+   cargo test --locked -p deepseek-code-cli --bin dcl terminal::transcript_pager
+   cargo test --locked -p deepseek-code-cli --bin dcl editor_keeps_right_click_events_for_selection_copy
    cargo test --locked -p deepseek-code-cli --bin dcl extended_commands::tests::clipboard
    ```
 
-6. 平台说明：Windows ConPTY 的右击由 crossterm 鼠标事件驱动；macOS/Linux 的 SSH+tmux 需要真实终端复验，不能用本机单测替代。
+7. 平台说明：Windows ConPTY 的右击由 crossterm 鼠标事件驱动；macOS/Linux 的 SSH+tmux 需要真实终端复验，不能用本机单测替代。
 
 ### D. 中途关闭后恢复
 
@@ -935,7 +939,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `native_engine/tool_loop.rs` 的错误与请求快照路径：K、H
 - `native_engine/generation.rs`、`services/compaction.rs`、`services/compaction/`：L，以及 E5
 - `native_engine/tool_call_ids.rs`（发给模型的请求体）：E1、E6；确认只改写超长调用 ID，未提供 `tool_calls`、`content` 等字段的消息不会被补成 `null`
-- `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择；拖动松开或右击保留的选择都会复制）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
+- `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择；右击复制后会取消选中并提示结果）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
 - `skills/discovery.rs`、`native_engine/skill_tool.rs`、`native_engine/engine_core.rs` 的技能发现与模型列表、`cli/skill_commands.rs`：N
 - 其他范围：至少跑 E
 

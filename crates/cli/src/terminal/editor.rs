@@ -1979,6 +1979,12 @@ impl PromptEditor {
                         } else {
                             selection.screen_event(mouse, snapshot.clone())?
                         };
+                        if let Some((characters, copied)) = selection.take_copy_feedback() {
+                            copy_feedback = Some(
+                                crate::terminal::mouse_selection::copy_message(characters, copied),
+                            );
+                            continue;
+                        }
                         if let Some(click) = selected {
                             if click.kind == MouseEventKind::Down(MouseButton::Left) {
                                 if (click.row as usize) < history_view.header_rows(page) {
@@ -2015,7 +2021,14 @@ impl PromptEditor {
                             *row = text.clone();
                         }
                     }
-                    let Some(mouse) = selection.screen_event(mouse, snapshot.clone())? else {
+                    let event = selection.screen_event(mouse, snapshot.clone())?;
+                    if let Some((characters, copied)) = selection.take_copy_feedback() {
+                        copy_feedback = Some(
+                            crate::terminal::mouse_selection::copy_message(characters, copied),
+                        );
+                        continue;
+                    }
+                    let Some(mouse) = event else {
                         continue;
                     };
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left)

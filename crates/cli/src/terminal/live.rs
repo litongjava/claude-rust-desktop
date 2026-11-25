@@ -2994,6 +2994,12 @@ fn run(
                         } else {
                             selection.screen_event(mouse, snapshot.clone())?
                         };
+                        if let Some((characters, copied)) = selection.take_copy_feedback() {
+                            state.copy_feedback =
+                                Some(super::mouse_selection::copy_message(characters, copied));
+                            screen.draw(state)?;
+                            continue;
+                        }
                         if let Some(click) = event {
                             if click.kind == MouseEventKind::Down(MouseButton::Left) {
                                 if (click.row as usize) < screen.history_view.header_rows(page) {
@@ -3037,7 +3043,14 @@ fn run(
                             *row = text.clone();
                         }
                     }
-                    let Some(mouse) = selection.screen_event(mouse, snapshot.clone())? else {
+                    let event = selection.screen_event(mouse, snapshot.clone())?;
+                    if let Some((characters, copied)) = selection.take_copy_feedback() {
+                        state.copy_feedback =
+                            Some(super::mouse_selection::copy_message(characters, copied));
+                        screen.draw(state)?;
+                        continue;
+                    }
+                    let Some(mouse) = event else {
                         continue;
                     };
                     if mouse.kind == MouseEventKind::Down(MouseButton::Left)
