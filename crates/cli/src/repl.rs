@@ -48,17 +48,11 @@ pub fn show_resumed(session: &Session, clear: bool) -> Result<()> {
         let active = crate::worker_frontend::settle_session(session)
             .ok()
             .flatten();
-        if let Some(job) = &active {
-            command_eprintln!("{}", resumed_notice(Some(job)));
-        } else if crate::observe::execution_lease_active(session).unwrap_or(false) {
-            // A direct print/json owner keeps the execution lease. Show that the
-            // turn runs elsewhere so /continue cannot start a second one.
-            command_eprintln!(
-                "{}",
-                crate::observe::running_notice(session).unwrap_or_else(|_| {
-                    "✻ A turn is still running in another process; observing its published progress. Esc returns without stopping it.".into()
-                })
-            );
+        let leased = active.is_none()
+            && crate::observe::execution_lease_active(session).unwrap_or(false);
+        if active.is_some() || leased {
+            // The REPL prints a read-only observation banner and blocks
+            // ordinary prompts; do not claim the session is waiting for input.
         } else if crate::observe::latest_interrupted(session).unwrap_or(false) {
             command_eprintln!("Session restored; the previous turn was interrupted before it completed and its request was not replayed. Send a new message or /continue to continue explicitly.");
         } else {

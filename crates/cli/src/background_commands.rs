@@ -1209,6 +1209,11 @@ pub(crate) async fn wake_for_notifications(cli: &crate::args::Cli, session: &mut
         return Ok(false);
     }
     let Some(item)=session.store.db.next_desktop_input(&session.id)? else { return Ok(false); };
+    // Another process may own the session even when this terminal was not
+    // resumed. Leave the notification queued instead of racing its lease.
+    if crate::worker_frontend::occupancy(session)?.is_some() {
+        return Ok(false);
+    }
     session.dispatch_input(cli,item,input).await?;
     Ok(true)
 }
@@ -1714,6 +1719,84 @@ mod worker_config_tests {
         assert_eq!(snapshot.context_window, Some(12345));
         assert_eq!(snapshot.max_tokens, Some(321));
         assert!(!values["DEEPSEEK_CODE_WORKER_MODEL"].contains("test-secret"));
+    }
+
+    #[tokio::test]
+    async fn notifications_and_direct_input_wait_while_another_owner_holds_the_lease() {
+        use clap::Parser;
+        use deepseek_code_core::runtime::SessionStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().join("data")).unwrap();
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        deepseek_code_core::data_layout::write_config_file(
+            paths.layout().config_file("settings.json"),
+            r#"{"disableAllHooks":true}"#,
+        )
+        .unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(dir.path(), "fixture-model", "fixture").unwrap();
+        let notification = "<task-notification>LEASE_BUSY</task-notification>";
+        store
+            .db
+            .open_session(&id)
+            .unwrap()
+            .enqueue_cli_input(
+                deepseek_code_core::services::input_queue::QueueOrigin::TaskNotification,
+                notification,
+            )
+            .unwrap();
+        let mut provider = deepseek_code_core::runtime::provider_from_config(
+            &crate::config::provider_template("fixture-model"),
+        );
+        provider.id = "fixture".into();
+        provider.api_key = "fixture".into();
+        provider.base_url = "http://127.0.0.1:1".into();
+        let cli = Cli::parse_from(["dcl", "--print", "--permission-mode", "dont-ask"]);
+        let mut session = Session::open(
+            &cli,
+            &paths,
+            crate::config::Selection {
+                providers: vec![provider],
+                provider_id: "fixture".into(),
+                model: "fixture-model".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        session.allow_automatic_wake();
+        let incarnation = session
+            .selected_session()
+            .unwrap()
+            .incarnation()
+            .to_owned();
+        let lease = deepseek_code_core::services::session_messages::ExecutionLease::acquire(
+            &paths.data_dir,
+            &incarnation,
+        )
+        .unwrap()
+        .expect("session incarnation is a UUID");
+        assert!(crate::observe::execution_lease_active(&session).unwrap());
+        assert!(!wake_for_notifications(&cli, &mut session, &mut None)
+            .await
+            .unwrap());
+        assert!(store.db.pending_input(&id, is_notification).unwrap());
+        let item = store.db.next_desktop_input(&id).unwrap().unwrap();
+        let error = session
+            .dispatch_input(&cli, item, &mut None)
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("executing in another process") || text.contains("still running"),
+            "{text}"
+        );
+        assert!(!text.contains("lock acquisition failed"), "{text}");
+        assert!(store.db.pending_input(&id, is_notification).unwrap());
+        drop(lease);
+        assert!(store.db.next_desktop_input(&id).unwrap().is_some());
+        session.close().await.unwrap();
     }
 }
 

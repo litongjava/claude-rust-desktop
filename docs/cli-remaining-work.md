@@ -283,3 +283,16 @@ Acceptance evidence: development record `acceptance-20261102.md` and `ux-2026110
 - [x] 截断恢复不再提高预算：首次请求已用满配置上限，直接按同一预算按 token 二分、分别摘要并合并；空正文同预算重试一次、超长正文直接拆分、深度/额度上限、取消、检查点复用和原子提交保持不变。缓存键仍区分提示词与预算。
 - [x] 测试：`compaction_truncation` 41 项、`compaction_overflow` 7 项（1 项按设计忽略）；`compaction_overflow` 新增缺失与 0 上限时首个真实 HTTP 请求为 32768、以及 2000 窗口下 0 请求且历史/缓存不变；`native_engine::generation::tests` 13 项。最终验收包记录完整回归为 core 1172 通过/0 失败/10 忽略（46 个外层目标，含 0 项 Doc-tests）、CLI 601 通过/0 失败/13 忽略（33 个目标），见 `repaired-24b0641/复验申请.md`（`round10-core-full.log`、`round11-cli-full.log`）；这些是被接受的 `24b0641` 的历史验收结果，截至本记录本次集成尚未执行完整 core/CLI/Desktop 回归。
 - 未验证：OpenCode 平台真实最大输出、真实 reasoning 用量与真实耗时未测量；Windows/macOS/ConPTY 未运行。候选 CLI 的本地 mock 压缩已确认 32000 配置在首个分段请求生效，并提交一条边界。
+
+## 2026-11-26 会话占用只读观察与切换清理
+
+背景：用户在 Windows 上同时运行两个前台任务时，view 因 goal proposal frontend 易主而 detach；随后普通 prompt 被单任务保护拒绝，另一会话在 worker 取消窗口出现原始 `lock acquisition failed because the operation would block`。
+
+- [x] goal proposal frontend 失主不再结束 task view：记录到 job stderr，重新 acquire 一次；失败后禁用提案 UI 并提示 `Goal proposal status unavailable; task output continues.`，文本/工具/结束观测继续。
+- [x] 新增统一占用检测（先 managed job，后执行租约），`wake_for_notifications` 和 `dispatch_input` 在取走/消费队列项前检查；通知保留到 owner 释放。
+- [x] `single_turn` 与 `run_and_finalize_turn` 的租约失败改为可操作提示；原始 OS 锁错误只进 tracing，不再上屏。
+- [x] REPL 在恢复或发现占用时进入只读观察：banner 显示任务 ID/开始时间，普通 prompt 和 `/plan`、`/goal`、`/loop`、`/btw`、`/compact`、MCP、技能不提交；`/continue`、`/tasks`、`/clear` 可用；owner 结束后恢复输入，不自动提交。
+- [x] `/resume`、`/branch`、`/clear` 切换会话时断开 Remote Control，清空 published/deferred/remote_prompts、session relay、`/loop`、草稿、`NEXT_DRAFT` 和 TerminalInput 队列。
+- [x] `session_worker::current` 校验 worker 记录属于目标会话。
+- 测试：CLI 全量单测（589 passed / 1 existing plugins failure / 13 ignored）、core `services::session_worker` 24 项、Desktop `--all-targets` 检查通过；macOS tmux 真实 pty 场景通过。详见 `docs/cli-regression-tests.md` D9 与 `dev-support/deepseek-code/session-occupancy-20261126/`。
+- 未验证：Windows ConPTY；goal proposal 两个本地 frontend 的真实竞态未构造自动化用例；core 全量在并发基线编译期间出现进程/超时类失败，环境相关用例（workspace lock、durability）单独仍失败。

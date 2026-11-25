@@ -450,6 +450,13 @@ impl TerminalInput {
         });
         taken
     }
+    /// Drops prompts queued for the previous session. Returns whether anything
+    /// was discarded so the caller can explain the change.
+    pub fn discard_queued(&mut self) -> bool {
+        let had = !self.queued.is_empty();
+        self.queued.clear();
+        had
+    }
     pub fn restore_draft(&self, draft: String) {
         let _ = self.requests.send(Message::Draft(draft));
     }
@@ -632,6 +639,16 @@ mod recall_tests {
         assert!(
             matches!(input.queued.front(), Some(PromptEvent::Line(text)) if text == "/compact")
         );
+    }
+
+    #[test]
+    fn discarding_queued_prompts_reports_only_when_something_was_dropped() {
+        let mut input = TerminalInput::from(mpsc::unbounded_channel().1);
+        assert!(!input.discard_queued());
+        input.queue_prompt("old".into());
+        input.queue_scheduled("/loop".into());
+        assert!(input.discard_queued());
+        assert!(input.queued.is_empty());
     }
 }
 

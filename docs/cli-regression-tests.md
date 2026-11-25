@@ -279,6 +279,28 @@ python3 dev-support/deepseek-code/super-agent-20261110/harness-fix/h1_pty_accept
 
 脚本写入独立的 `results.json`，覆盖上述 1–5 条与正常结束、被杀两类结束方式：观察在附件之后才产生的文本标记、同一观察端跨过完成和被杀的显示、无重复行、排队通知保持不变、退出终端不影响 owner、无换行长文本可见。计数的前提是只统计该回合的请求；仅为会话标题或输入建议发出的请求不属于回合，脚本按请求体把标题请求单独分类，并关闭输入建议。
 
+#### D9. 占用时的只读观察与自动唤醒门禁
+
+另一个进程持有执行租约时，恢复的 REPL 必须保持只读，并且所有会自动开回合的入口都必须先检查占用。
+
+1. **后台任务占用**：`/resume` 显示 `✻ Task … is executing this session since …`，普通消息提示未提交；`/continue` 接回任务，`/tasks attach ID` 打开完整视图，`Esc` 退出。
+2. **直接执行占用**：显示 `A turn is still running in another process since …`，继续显示已发布的文本和工具行；不得出现原始的 `lock acquisition failed`。
+3. **自动入口**：占用期间 task notification、`/loop`、cron、hook wake、remote deferred prompt 都不得创建新 turn；通知留在队列中，占用结束后也不自动提交，直到用户显式输入或 `/continue`。`dispatch_input` 自身也必须再次检查，不能消费队列项。
+4. **恢复输入**：owner 结束后显示 `The other turn finished; input is enabled`，只读 banner 不再出现；之后输入的消息可以提交。
+5. **goal proposal 失主**：另一个 frontend 接管 goal proposal 时，任务 view 不退出、不 detach；日志记录一次，重新 acquire 一次，失败则提示 `Goal proposal status unavailable; task output continues.`，文本和工具行继续。
+6. **切换会话清理**：`/resume`、`/branch`、`/clear` 后，Remote Control 断开并提示，旧 `/loop`、草稿、`NEXT_DRAFT` 和排队提示被丢弃；新会话不会收到旧 remote 注册的消息或权限。
+
+自动回归：
+
+```bash
+cargo test --locked -p deepseek-code-cli --bin dcl notifications_and_direct_input_wait
+cargo test --locked -p deepseek-code-cli --bin dcl reset_for_session_change
+cargo test --locked -p deepseek-code-cli --bin dcl a_second_top_level_turn_is_rejected
+cargo test --locked -p deepseek-code-core --lib current_rejects_a_worker_record
+```
+
+第 1、2、4 条及 banner 的终端渲染需要真实 pty。2026-11-26 已在 macOS 用 tmux + 本地 mock SSE 跑通：owner 为 `dcl --resume ID --print`，observer 在 40×140 tmux 面板中 `dcl --resume ID`；banner、已发布文本、未提交提示、owner 结束后的输入恢复均通过，且观察期间没有模型请求。脚本和日志见 `dev-support/deepseek-code/session-occupancy-20261126/`（`dcl_occupancy_tmux.py`、`pty-run.log`）。Windows ConPTY 尚未运行。第 5 条可用两个本地 frontend 的 presence 竞争复现，当前只在代码路径上处理，尚无用例直接构造该竞态。
+
 ### F. /tasks
 
 有两个后台命令时输入 `/tasks`：

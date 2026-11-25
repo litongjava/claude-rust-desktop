@@ -228,7 +228,12 @@ pub fn current(root: &Path, session: &str) -> Result<Option<Worker>> {
     };
     let id: String = serde_json::from_slice(&pointer)?;
     ensure!(uuid::Uuid::parse_str(&id).is_ok(), "Invalid worker pointer");
-    Ok(Some(read_worker(&base.join(id))?))
+    let worker = read_worker(&base.join(id))?;
+    ensure!(
+        worker.session_id == session,
+        "Worker record belongs to another session"
+    );
+    Ok(Some(worker))
 }
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -1552,5 +1557,43 @@ mod active_marker_tests {
         assert_eq!(active(&worker), second);
         release_active(&worker, &second).unwrap();
         assert!(!directory(&worker).join("active.json").exists());
+    }
+}
+
+#[cfg(test)]
+mod current_session_tests {
+    use super::*;
+
+    #[test]
+    fn current_rejects_a_worker_record_for_another_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = "11111111-1111-4111-8111-111111111111";
+        let other = "22222222-2222-4222-8222-222222222222";
+        let id = "33333333-3333-4333-8333-333333333333";
+        let base = worker_path(dir.path(), session).unwrap();
+        let worker_dir = base.join(id);
+        std::fs::create_dir_all(&worker_dir).unwrap();
+        std::fs::write(base.join("current.json"), serde_json::to_vec(&id).unwrap()).unwrap();
+        let worker = Worker {
+            id: id.into(),
+            session_id: other.into(),
+            root: dir.path().to_owned(),
+            workspace: dir.path().to_owned(),
+            executable: dir.path().join("dcl"),
+            endpoint: "test".into(),
+            status: "running".into(),
+            supervisor_pid: None,
+            child_pid: None,
+            heartbeat_ms: 0,
+            active_job: None,
+            error: None,
+        };
+        std::fs::write(
+            worker_dir.join("worker.json"),
+            serde_json::to_vec(&worker).unwrap(),
+        )
+        .unwrap();
+        let error = current(dir.path(), session).unwrap_err();
+        assert!(format!("{error:#}").contains("another session"));
     }
 }

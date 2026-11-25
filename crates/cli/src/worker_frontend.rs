@@ -180,6 +180,62 @@ pub(crate) fn active_worker_message(job: &jobs::Job) -> String {
     }
 }
 
+/// What keeps this session from admitting a new turn. A managed task and a
+/// direct print/json owner are different kinds of occupancy: only the former
+/// can be attached interactively.
+pub(crate) enum Occupancy {
+    Job(jobs::Job),
+    Lease,
+}
+
+/// Reports the owner of the session, checking the managed task first because
+/// it has the actionable attach/cancel commands. This only observes; it never
+/// takes the execution lease.
+pub(crate) fn occupancy(session: &Session) -> Result<Option<Occupancy>> {
+    if let Some(job) = settle_session(session)? {
+        return Ok(Some(Occupancy::Job(job)));
+    }
+    if crate::observe::execution_lease_active(session)? {
+        return Ok(Some(Occupancy::Lease));
+    }
+    Ok(None)
+}
+
+/// How to get past an occupied session, without the read-only guidance.
+pub(crate) fn occupancy_message(session: &Session, occupancy: &Occupancy) -> String {
+    match occupancy {
+        Occupancy::Job(job) => active_worker_message(job),
+        Occupancy::Lease => crate::observe::running_notice(session).unwrap_or_else(|_| {
+            "A turn is still running in another process; observe it or wait for it to finish."
+                .into()
+        }),
+    }
+}
+
+/// The banner shown once when the REPL enters read-only observation.
+pub(crate) fn observation_banner(session: &Session, occupancy: &Occupancy) -> String {
+    match occupancy {
+        Occupancy::Job(job) => {
+            let since =
+                chrono::DateTime::<chrono::Utc>::from_timestamp_millis(job.started_ms as i64)
+                    .map(|time| {
+                        time.with_timezone(&chrono::Local)
+                            .format("%-I:%M %p")
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "an earlier time".into());
+            format!(
+                "✻ Task {} is executing this session since {since}. Read-only observation: ordinary prompts are not submitted. /continue returns to it, /tasks attach {} opens the full view, Esc exits.",
+                job.id, job.id
+            )
+        }
+        Occupancy::Lease => format!(
+            "{} Ordinary prompts are not submitted; /continue shows the running turn. Esc exits.",
+            occupancy_message(session, occupancy)
+        ),
+    }
+}
+
 async fn single_turn(
     cli: &Cli,
     session: &Session,
@@ -190,6 +246,12 @@ async fn single_turn(
     let root = &session.paths.data_dir;
     if let Some(job) = settle_session(session)? {
         anyhow::bail!("{} The current prompt was not submitted.", active_worker_message(&job));
+    }
+    if crate::observe::execution_lease_active(session)? {
+        anyhow::bail!(
+            "{} The current prompt was not submitted.",
+            crate::observe::running_notice(session)?
+        );
     }
     let provider = session.launch_provider().await?;
     let executable = std::env::current_exe()?;
@@ -307,7 +369,7 @@ async fn single_turn(
         }
     };
     drop(_admission);
-    present(session, &job, input, &mut display, true, proposal_frontend.as_ref()).await?;
+    present(session, &job, input, &mut display, true, proposal_frontend).await?;
     if jobs::get(root, &job.id)?.status == "completed" { activate_goal_proposal(session, &job.id) } else { Ok(None) }
 }
 
@@ -349,9 +411,8 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
     let proposal_frontend = if display.live.is_some() && main_execution {
         Some(acquire_proposal_frontend(session).await?)
     } else { None };
-    present(session, &job, input, &mut display, false, proposal_frontend.as_ref()).await?;
+    present(session, &job, input, &mut display, false, proposal_frontend).await?;
     let kickoff = if main_execution && jobs::get(&session.paths.data_dir, &job.id)?.status == "completed" { activate_goal_proposal(session, &job.id)? } else { None };
-    drop(proposal_frontend);
     if let Some(kickoff) = kickoff {
         Box::pin(turn(
             cli,
@@ -393,7 +454,7 @@ async fn present(
     input: &mut Option<TerminalInput>,
     display: &mut TurnDisplay,
     sync_plan_mode: bool,
-    proposal_frontend: Option<&deepseek_code_core::services::goal_proposals::Frontend>,
+    proposal_frontend: Option<deepseek_code_core::services::goal_proposals::Frontend>,
 ) -> Result<()> {
     let _participants =
         jobs::hold_attachment(&session.paths.data_dir, job, &session.selected_session()?)?;
@@ -478,7 +539,7 @@ async fn observe(
     input: &mut Option<TerminalInput>,
     display: &mut TurnDisplay,
     sync_plan_mode: bool,
-    proposal_frontend: Option<&deepseek_code_core::services::goal_proposals::Frontend>,
+    proposal_frontend: Option<deepseek_code_core::services::goal_proposals::Frontend>,
 ) -> Result<bool> {
     let root = &session.paths.data_dir;
     let initial_job = jobs::get(root, id)?;
@@ -514,6 +575,10 @@ async fn observe(
     let mut proposal_retry = ProposalRetry::default();
     let mut state_retry = StateRetry::default();
     let mut current_proposal = None;
+    // Goal proposals are auxiliary UI. This frontend may be replaced while a
+    // turn runs; that must never end the task view.
+    let mut proposal_frontend = proposal_frontend;
+    let mut proposal_reacquired = false;
     let relay = session.remote_relay();
     let mut remote_request: Option<deepseek_code_core::services::remote_control::PermissionRequest> = None;
     let mut remote_interrupts = session.remote_interrupts();
@@ -540,14 +605,15 @@ async fn observe(
             },
             _ = tick.tick() => {
                 if proposal_retry.due(std::time::Instant::now()) {
-                  match proposal_frontend.map(|frontend| frontend.poll()).transpose() {
-                    Ok(proposal) => {
+                  let polled = proposal_frontend.as_ref().map(|frontend| frontend.poll());
+                  match polled {
+                    Some(Ok(proposal)) => {
                         if let Some(elapsed) = proposal_retry.recovered(std::time::Instant::now()) {
                             log_job_observation(root, id, &format!("Goal proposal observation recovered after {} ms", elapsed.as_millis()));
                         }
-                        current_proposal = proposal.flatten();
+                        current_proposal = proposal;
                     },
-                    Err(error) if deepseek_code_core::db::is_contention(&error) => {
+                    Some(Err(error)) if deepseek_code_core::db::is_contention(&error) => {
                         if proposal_retry.since.is_none() {
                             log_job_observation(root, id, &format!("Goal proposal observation deferred: {error:#}"));
                         }
@@ -556,7 +622,33 @@ async fn observe(
                             log_job_observation(root, id, "Goal proposal observation still deferred after 5000 ms");
                         }
                     },
-                    Err(error) => return Err(error.context("Reading goal proposal status")),
+                    Some(Err(error)) => {
+                        log_job_observation(root, id, &format!("Goal proposal observation failed: {error:#}"));
+                        current_proposal = None;
+                        shown_proposal = None;
+                        if let Some(live) = &display.live { live.goal_proposal(None); }
+                        proposal_frontend = if proposal_reacquired {
+                            None
+                        } else {
+                            proposal_reacquired = true;
+                            use deepseek_code_core::services::goal_proposals::Frontend;
+                            match Frontend::acquire(session.store.db.clone(), &session.id) {
+                                Ok(frontend) => {
+                                    log_job_observation(root, id, "Goal proposal frontend reacquired");
+                                    Some(frontend)
+                                }
+                                Err(retry) => {
+                                    log_job_observation(root, id, &format!("Goal proposal frontend could not be reacquired: {retry:#}"));
+                                    None
+                                }
+                            }
+                        };
+                        if proposal_frontend.is_none() {
+                            display.notice("Goal proposal status unavailable; task output continues.");
+                            log_job_observation(root, id, "Goal proposal observation disabled for this view");
+                        }
+                    },
+                    None => {}
                   }
                 }
                 let proposal = current_proposal.clone();
@@ -771,7 +863,7 @@ async fn observe(
                 terminal_actions_open = action.is_some();
                 match action {
                     Some(Action::GoalDecision { id, approved }) => {
-                        if let Some(frontend) = proposal_frontend {
+                        if let Some(frontend) = proposal_frontend.as_ref() {
                             match frontend.decide(&id, approved, root, &session.workspace, &session.permissions) {
                                 Ok(true) => display.notice(if approved { "Goal approved. It will start after the current turn finishes." } else { "Goal proposal declined. Current work continues." }),
                                 Ok(false) => display.notice("That goal proposal is no longer current."),
@@ -780,6 +872,8 @@ async fn observe(
                             shown_proposal = None;
                             current_proposal = None;
                             if let Some(live) = &display.live { live.goal_proposal(None); }
+                        } else {
+                            display.notice("Goal proposal controls are unavailable; task output continues.");
                         }
                     },
                     Some(Action::CyclePermission) => {

@@ -330,6 +330,33 @@ async fn prompt_turn(
     result
 }
 
+/// Commands that submit a model turn or a side model request must wait while
+/// another process owns the session.
+fn starts_turn_command(command: &str, argument: &str) -> bool {
+    match command {
+        "/plan" | "/btw" | "/compact" => true,
+        "/loop" => {
+            let argument = argument.trim();
+            !argument.is_empty()
+                && argument != "list"
+                && !argument.starts_with("stop")
+        }
+        "/goal" => !argument.trim().is_empty() && !session_commands::is_goal_clear(argument),
+        _ => command.starts_with("/mcp__"),
+    }
+}
+
+/// Whether this REPL must stay read-only: another owner exists now, or the
+/// observer watched a turn that is still finalizing.
+fn observing_session(
+    session: &session::Session,
+    announced: bool,
+    state: observe::State,
+) -> Result<bool> {
+    Ok((announced && state == observe::State::Running)
+        || worker_frontend::occupancy(session)?.is_some())
+}
+
 async fn run(cli: &mut Cli) -> Result<()> {
     if let Some(Commands::Help { topic, command }) = &cli.command {
         return help::show(topic.as_deref(), command);
@@ -1156,6 +1183,12 @@ async fn run(cli: &mut Cli) -> Result<()> {
         let mut reported_binding_failures = std::collections::HashMap::new();
         // Read-only view of a turn a direct print/json owner still executes.
         let mut execution_observer = observe::Observer::default();
+        // Cross-session state is reset when /resume, /branch or /clear changes
+        // session.id; observation state follows the same boundary.
+        let mut active_session = session.id.clone();
+        let mut observe_announced = false;
+        let mut observe_state = observe::State::Idle;
+        let mut last_occupancy_error = String::new();
         terminal::tips::start_session(&paths.data_dir);
         // Lets other sessions see this one is open while it is idle.
         let mut presence: Option<(String, deepseek_code_core::services::session_messages::PresenceLease)> = None;
@@ -1167,6 +1200,70 @@ async fn run(cli: &mut Cli) -> Result<()> {
         'repl: loop {
             if crate::signals::terminating() {
                 break 'repl;
+            }
+            if active_session != session.id {
+                active_session = session.id.clone();
+                // Remote state, loops and drafts belong to the session that was
+                // active when they were created. Never carry them across a
+                // /resume, /branch or /clear.
+                let was_connected = remote.reset_for_session_change().await;
+                session.set_remote_relay(None);
+                if was_connected {
+                    command_eprintln!("Remote Control disconnected because the session changed; reconnect with /remote-control.");
+                }
+                if !loops.is_empty() {
+                    loops.clear();
+                    command_eprintln!("/loop prompts from the previous session were cleared.");
+                }
+                let had_draft = composer.is_pending();
+                composer.cancel();
+                let had_queued = input.as_mut().is_some_and(|input| input.discard_queued());
+                let restored = terminal::NEXT_DRAFT
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                    .is_some();
+                if had_draft || had_queued || restored {
+                    command_eprintln!("Draft or queued prompts from the previous session were discarded.");
+                }
+                execution_observer = observe::Observer::default();
+                observe_announced = false;
+                observe_state = observe::State::Idle;
+            }
+            let occupancy = match worker_frontend::occupancy(&session) {
+                Ok(occupancy) => {
+                    last_occupancy_error.clear();
+                    occupancy
+                }
+                Err(error) => {
+                    let text = format!("{error:#}");
+                    if text != last_occupancy_error {
+                        command_eprintln!("Session occupancy: {text}");
+                        last_occupancy_error = text;
+                    }
+                    None
+                }
+            };
+            let occupied = occupancy.is_some();
+            let observing =
+                occupied || (observe_announced && observe_state == observe::State::Running);
+            if observing {
+                // Keep automatic notifications and remote prompts from opening
+                // a turn while another process owns the session.
+                session.hold_automatic_wake();
+            }
+            if observing && !observe_announced {
+                observe_announced = true;
+                if let Some(occupancy) = occupancy.as_ref() {
+                    command_eprintln!(
+                        "{}",
+                        worker_frontend::observation_banner(&session, occupancy)
+                    );
+                }
+            }
+            if !observing && observe_announced {
+                observe_announced = false;
+                command_eprintln!("✻ The other turn finished; input is enabled. Nothing queued while observing was submitted.");
             }
             // A committed transition may have resolved a root this launch deferred,
             // so children of this iteration inherit the current native value.
@@ -1183,14 +1280,14 @@ async fn run(cli: &mut Cli) -> Result<()> {
             for notice in background_commands::collect_completed(&session)? { command_eprintln!("{notice}"); }
             // A background command that finished meanwhile starts a turn, as in
             // the reference CLI.
-            if !composer.is_pending() {
+            if last_occupancy_error.is_empty() && !composer.is_pending() && !observing {
                 match background_commands::wake_for_notifications(cli, &mut session, &mut input).await {
                     Ok(true) => continue 'repl,
                     Ok(false) => {},
                     Err(error) => report_error(error)?,
                 }
             }
-            if !session.waiting_for_continue() {
+            if last_occupancy_error.is_empty() && !session.waiting_for_continue() && !observing {
                 if let Some(prompt) = remote.take_deferred() {
                     if let Err(error) = session.turn(cli, &prompt, &mut input, TurnOrigin::User(&prompt)).await { report_error(error)?; }
                 }
@@ -1264,7 +1361,13 @@ async fn run(cli: &mut Cli) -> Result<()> {
             }
             input.as_ref().expect("interactive reader").set_permission_mode(session.permission_mode());
             let idle_prompt = format!("\n{} ", terminal::prompt_glyph());
-            let prompt = if composer.is_pending() { "... " } else { idle_prompt.as_str() };
+            let prompt = if composer.is_pending() {
+                "... "
+            } else if observing {
+                "\n… "
+            } else {
+                idle_prompt.as_str()
+            };
             let (line, scheduled) = 'read: loop { tokio::select! {
                 line = input.as_mut().expect("interactive reader").read_prompt(prompt) => break 'read match line {
                     Ok(Some(terminal::input::PromptEvent::Line(line))) => (line, false),
@@ -1328,9 +1431,20 @@ async fn run(cli: &mut Cli) -> Result<()> {
                         match execution_observer.poll(&session) {
                             // Observing never opens the automatic-wake path: a
                             // queued notification waits for explicit input.
-                            Ok((_, lines)) => {
+                            Ok((state, lines)) => {
+                                observe_state = state;
                                 if let Some(reader) = input.as_ref() {
                                     for line in lines { reader.notice(line); }
+                                }
+                                if observe_announced && state != observe::State::Running {
+                                    let occupied = worker_frontend::occupancy(&session).ok().flatten().is_some();
+                                    if state == observe::State::Finished || !occupied {
+                                        observe_announced = false;
+                                        observe_state = observe::State::Idle;
+                                        if let Some(reader) = input.as_ref() {
+                                            reader.notice("✻ The other turn finished; input is enabled. Nothing queued while observing was submitted.".into());
+                                        }
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -1422,17 +1536,25 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     let reader = input.as_ref().expect("interactive reader");
                     match remote.handle(update, &mut session, |line| reader.notice(line)).await {
                         Ok(remote_commands::Action::Prompt(prompt)) => {
-                            session.allow_automatic_wake();
-                            if !input.as_mut().expect("interactive reader").yield_prompt().await? {
-                                command_eprintln!("Remote prompt queued until the current input is submitted.");
-                                remote.defer(prompt);
-                            } else if composer.is_pending() {
-                                command_eprintln!("Remote prompt queued until the multiline prompt is finished.");
-                                remote.defer(prompt);
-                            } else {
-                                command_eprintln!("Remote prompt: {}", prompt.lines().next().unwrap_or_default());
-                                remote.defer(prompt);
-                                continue 'repl;
+                            match observing_session(&session, observe_announced, observe_state) {
+                                Ok(true) => {
+                                    command_eprintln!("Remote prompt not submitted: this session is executing in another process. It was not queued.");
+                                }
+                                Ok(false) => {
+                                    session.allow_automatic_wake();
+                                    if !input.as_mut().expect("interactive reader").yield_prompt().await? {
+                                        command_eprintln!("Remote prompt queued until the current input is submitted.");
+                                        remote.defer(prompt);
+                                    } else if composer.is_pending() {
+                                        command_eprintln!("Remote prompt queued until the multiline prompt is finished.");
+                                        remote.defer(prompt);
+                                    } else {
+                                        command_eprintln!("Remote prompt: {}", prompt.lines().next().unwrap_or_default());
+                                        remote.defer(prompt);
+                                        continue 'repl;
+                                    }
+                                }
+                                Err(error) => command_eprintln!("Remote prompt not submitted: {error:#}"),
                             }
                         },
                         Ok(remote_commands::Action::Refresh) => {
@@ -1464,7 +1586,18 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 terminal::prompt::Input::Cancelled => { command_eprintln!("Prompt discarded."); continue; },
                 terminal::prompt::Input::Prompt(prompt) => {
                     if !prompt.trim().is_empty() {
-                        if let Err(error) = prompt_turn(cli, &mut session, &prompt, &mut input, input_origin(scheduled, &prompt)).await { report_error(error)?; }
+                        match observing_session(&session, observe_announced, observe_state) {
+                            Ok(true) => {
+                                command_eprintln!("The session is executing in another process; the prompt was not submitted. Use /continue to return to it, /tasks to inspect it, or wait for it to finish.");
+                                if !scheduled {
+                                    if let Some(input) = input.as_ref() { input.restore_draft(prompt); }
+                                }
+                            }
+                            Ok(false) => {
+                                if let Err(error) = prompt_turn(cli, &mut session, &prompt, &mut input, input_origin(scheduled, &prompt)).await { report_error(error)?; }
+                            }
+                            Err(error) => command_eprintln!("Session occupancy: {error:#}"),
+                        }
                     }
                     continue;
                 },
@@ -1575,6 +1708,19 @@ async fn run(cli: &mut Cli) -> Result<()> {
             }
             let (command, argument) = line.trim().split_once(char::is_whitespace).unwrap_or((line.trim(), ""));
             let command = command_catalog::canonical(command);
+            if starts_turn_command(command, argument) {
+                match observing_session(&session, observe_announced, observe_state) {
+                    Ok(true) => {
+                        command_eprintln!("The session is executing in another process; `{command}` was not submitted. Use /continue to return to it, /tasks to inspect it, or wait for it to finish.");
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        command_eprintln!("Session occupancy: {error:#}");
+                        continue;
+                    }
+                }
+            }
             if command == "/powerup" && powerup::interactive_topic(argument).is_some() && powerup::available() {
                 if let Err(error) = input.as_mut().unwrap().powerup(paths.clone(), argument.to_owned()).await {
                     command_eprintln!("Power-ups: {error:#}");
@@ -1744,10 +1890,18 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     if let Err(error) = result { command_eprintln!("Tools: {error:#}"); }
                 },
                 command if skills.contains_key(command.split_whitespace().next().unwrap_or(command)) => {
-                    if let Err(error) = session.turn(cli, &line, &mut input, input_origin(scheduled, &line)).await { report_error(error)?; }
+                    match observing_session(&session, observe_announced, observe_state) {
+                        Ok(true) => command_eprintln!("The session is executing in another process; the skill prompt was not submitted. Use /continue to return to it, /tasks to inspect it, or wait for it to finish."),
+                        Ok(false) => if let Err(error) = session.turn(cli, &line, &mut input, input_origin(scheduled, &line)).await { report_error(error)?; },
+                        Err(error) => command_eprintln!("Session occupancy: {error:#}"),
+                    }
                 },
                 command if command.starts_with('/') => command_eprintln!("Unknown command: {}. Use /help; use /multiline to send text starting with /.", command.split_whitespace().next().unwrap_or(command)),
-                _ => if let Err(error) = prompt_turn(cli, &mut session, &line, &mut input, input_origin(scheduled, &line)).await { report_error(error)?; },
+                _ => match observing_session(&session, observe_announced, observe_state) {
+                    Ok(true) => command_eprintln!("The session is executing in another process; the prompt was not submitted. Use /continue to return to it, /tasks to inspect it, or wait for it to finish."),
+                    Ok(false) => if let Err(error) = prompt_turn(cli, &mut session, &line, &mut input, input_origin(scheduled, &line)).await { report_error(error)?; },
+                    Err(error) => command_eprintln!("Session occupancy: {error:#}"),
+                },
             }
         }
         if remote.is_connected() {

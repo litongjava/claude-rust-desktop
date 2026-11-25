@@ -1680,6 +1680,14 @@ impl Session {
             .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Keeps idle notifications and remote prompts from starting a turn until
+    /// the user submits explicit input. Used while another process owns the
+    /// session, so observation never auto-submits queued work.
+    pub(crate) fn hold_automatic_wake(&self) {
+        self.waiting_for_continue
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) async fn turn(
         &self,
         cli: &Cli,
@@ -1935,6 +1943,15 @@ impl Session {
 
     pub(crate) async fn dispatch_input(&self,cli:&Cli,item:deepseek_code_core::services::input_queue::QueueItem,input:&mut Option<TerminalInput>)->Result<()> {
         self.apply_settings_permissions(cli)?;
+        // Defensive re-check: the caller normally waits for an idle session,
+        // but a race with another owner must not disappear into a raw lock
+        // error or consume the queued item.
+        if let Some(occupancy) = crate::worker_frontend::occupancy(self)? {
+            anyhow::bail!(
+                "{} The queued input was not submitted.",
+                crate::worker_frontend::occupancy_message(self, &occupancy)
+            );
+        }
         let (prompt, _) =
             deepseek_code_core::db::message_repo::prepare_user_message(&item.content)?;
         let origin = TurnOrigin::Queue(&item.prompt_origin, &item.content);
@@ -1988,7 +2005,21 @@ impl Session {
         // before any turn record, queued input or model request.
         let turn_lease = match self.store.db.executor_history(&self.id)?.execution_lease() {
             Ok(lease) => lease.map(std::sync::Arc::new),
-            Err(error) => return Err(error).context("This session is already executing in another process; observe or stop that turn first"),
+            Err(error) => {
+                // The raw OS lock error is diagnostic only. Report the owner in
+                // the same actionable terms the REPL uses for an occupied
+                // session, and never echo `lock acquisition failed` to the user.
+                tracing::warn!("Session execution lease not acquired for {}: {error:#}", self.id);
+                let message = match crate::worker_frontend::occupancy(self) {
+                    Ok(Some(occupancy)) => {
+                        crate::worker_frontend::occupancy_message(self, &occupancy)
+                    }
+                    _ => "A turn is still running in another process; observe it or wait for it to finish.".to_string(),
+                };
+                return Err(anyhow::anyhow!(
+                    "{message} The current prompt was not submitted."
+                ));
+            }
         };
         let mut turn = match &completion.queued {
             Some(item) => self.store.db.start_desktop_input(&self.id,turn_lease.clone().context("Missing queue execution lease")?,item)?,
@@ -4585,6 +4616,10 @@ mod event_tests {
                 .unwrap()
         };
         let turns_before = turn_count();
+        assert!(
+            crate::observe::execution_lease_active(&second).unwrap(),
+            "the observer must see the lease held by the running turn"
+        );
         let error = second
             .run_turn(
                 &cli,
@@ -4594,10 +4629,12 @@ mod event_tests {
             )
             .await
             .expect_err("a concurrent top-level turn must be rejected");
+        let text = format!("{error:#}");
         assert!(
-            format!("{error:#}").contains("already executing"),
-            "unexpected rejection: {error:#}"
+            text.contains("already executing") || text.contains("still running in another process"),
+            "unexpected rejection: {text}"
         );
+        assert!(!text.contains("lock acquisition failed"), "{text}");
         assert_eq!(
             gate.streams.load(Ordering::SeqCst),
             1,
