@@ -98,11 +98,7 @@ impl Selection {
             // Right-clicking a drag selection copies it, clears the highlight
             // and reports the result to the footer.
             MouseEventKind::Down(MouseButton::Right) => {
-                if let Some(text) = self.selected_text() {
-                    let characters = text.chars().count();
-                    let copied = copy(&text);
-                    self.clear()?;
-                    self.copy_feedback = Some((characters, copied));
+                if self.copy_selected(|text| copy(text))? {
                     Ok(None)
                 } else {
                     Ok(Some(mouse))
@@ -158,7 +154,21 @@ impl Selection {
         let text = self.text();
         (!text.is_empty()).then_some(text)
     }
-    /// The latest right-click copy result, consumed by the view footer.
+    fn copy_selected(&mut self, copy: impl FnOnce(&str) -> bool) -> io::Result<bool> {
+        let Some(text) = self.selected_text() else {
+            return Ok(false);
+        };
+        let characters = text.chars().count();
+        let copied = copy(&text);
+        self.clear()?;
+        self.copy_feedback = Some((characters, copied));
+        Ok(true)
+    }
+    /// Copies the retained selection for a keyboard shortcut.
+    pub fn copy_retained(&mut self) -> io::Result<bool> {
+        self.copy_selected(|text| crate::extended_commands::copy_text(text).is_ok())
+    }
+    /// The latest right-click or keyboard copy result, consumed by the view footer.
     pub fn take_copy_feedback(&mut self) -> Option<(usize, bool)> {
         self.copy_feedback.take()
     }

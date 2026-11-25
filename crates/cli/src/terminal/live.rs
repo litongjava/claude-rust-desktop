@@ -2642,6 +2642,21 @@ fn run(
             }
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if selection.retained()
+                        && key.modifiers.is_empty()
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if selection.copy_retained()? {
+                            if let Some((characters, copied)) = selection.take_copy_feedback() {
+                                state.copy_feedback = Some(super::mouse_selection::copy_message(
+                                    characters, copied,
+                                ));
+                                copy_feedback_at = Some(Instant::now());
+                            }
+                            screen.draw(state)?;
+                            continue;
+                        }
+                    }
                     selection.clear()?;
                     state.copy_feedback = None;
                     copy_feedback_at = None;

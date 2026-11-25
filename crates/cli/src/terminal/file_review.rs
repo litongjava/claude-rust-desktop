@@ -251,6 +251,18 @@ pub(super) fn show(
                     }
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if selection.retained()
+                        && key.modifiers.is_empty()
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if selection.copy_retained()? {
+                            copy_feedback = selection.take_copy_feedback().map(|(characters, copied)| {
+                                super::mouse_selection::copy_message(characters, copied)
+                            });
+                            redraw = true;
+                            continue;
+                        }
+                    }
                     copy_feedback = None;
                     selection.clear()?;
                     let page = height.saturating_sub(3).max(1);

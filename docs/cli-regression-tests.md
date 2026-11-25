@@ -187,7 +187,7 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 
 ### C3. 拖动选择与右击复制（SSH/tmux）
 
-1. 在提示符、模型输出和 `Ctrl+O` 记录里按住左键拖动：出现反色选择，松开后高亮保留；在保留的选择上右击，所选文本进入剪贴板，高亮消失，底部显示 `Copied N characters to clipboard`。提示约 2 秒后自动恢复普通页脚，按任意键也会立即恢复。没有选区时再次右击不复制、不报错。
+1. 在提示符、模型输出和 `Ctrl+O` 记录里按住左键拖动：出现反色选择，松开后高亮保留；在保留的选择上右击或按 `c`，所选文本进入剪贴板，高亮消失，底部显示 `Copied N characters to clipboard`，且 `c` 不会插入草稿。提示约 2 秒后自动恢复普通页脚，按任意键也会立即恢复。没有选区时再次右击不复制、不报错，按 `c` 正常输入。
 2. 复制失败的路径显示 `Copy failed; the clipboard is unavailable`，选择同样取消；滚轮、左键点击展开、单双击状态行复制保持原行为。
 3. 本地桌面终端：右击后粘贴应得到原文，包含中文和换行；本地会话仍优先使用系统剪贴板。
 4. 在 tmux 中运行（含 SSH 远程主机）：tmux 需已开启 `set -g mouse on`，应用才能收到鼠标事件；拖动选择后右击，`tmux show-buffer` 应为所选文本，屏幕上不再保留反色高亮并显示复制提示。外层终端支持 OSC 52 时，`load-buffer -w` 也应把同一文本送到本地剪贴板。即使远端存在 `pbcopy`/`xclip`，也不能只写远端剪贴板。

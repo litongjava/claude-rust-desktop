@@ -2124,6 +2124,20 @@ impl PromptEditor {
                     menu_hidden = false;
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if selection.retained()
+                        && key.modifiers.is_empty()
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if selection.copy_retained()? {
+                            if let Some((characters, copied)) = selection.take_copy_feedback() {
+                                copy_feedback = Some(
+                                    crate::terminal::mouse_selection::copy_message(characters, copied),
+                                );
+                                copy_feedback_at = Some(std::time::Instant::now());
+                            }
+                            continue;
+                        }
+                    }
                     selection.clear()?;
                     if buffer.cursor < buffer.paste_end
                         || matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Home)
