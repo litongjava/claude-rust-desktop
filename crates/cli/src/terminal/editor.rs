@@ -1202,7 +1202,9 @@ impl PromptEditor {
         let mut last_state = (buffer.chars.clone(), buffer.cursor);
         let mut kill_hint = false;
         let mut copy_feedback: Option<String> = None;
-        let mut copy_feedback_at: Option<std::time::Instant> = None;
+        let mut selection_copy: Option<(usize, bool)> = None;
+        let mut selection_copy_at: Option<std::time::Instant> = None;
+        let mut badge = crate::terminal::corner_badge::CornerBadge::default();
         let mut clear_esc: Option<std::time::Instant> = None;
         // Read once per prompt; ctrl+t toggles whether they show.
         let todo_list = self.todos.as_ref().map(|todos| todos()).unwrap_or_default();
@@ -1258,12 +1260,12 @@ impl PromptEditor {
         // Files may have changed since the last prompt; list them again on `@`.
         self.files = None;
         loop {
-            if copy_feedback.is_some()
-                && copy_feedback_at
+            if selection_copy.is_some()
+                && selection_copy_at
                     .is_some_and(|at| at.elapsed() >= std::time::Duration::from_secs(2))
             {
-                copy_feedback = None;
-                copy_feedback_at = None;
+                selection_copy = None;
+                selection_copy_at = None;
             }
             if yielded.load(std::sync::atomic::Ordering::Acquire) {
                 self.pending_draft = buffer.text();
@@ -1731,6 +1733,26 @@ impl PromptEditor {
                     agent_scroll,
                 )?;
             }
+            let badge_text = if selection.retained() {
+                Some("按 c 复制".to_owned())
+            } else {
+                selection_copy.map(|(characters, copied)| {
+                    if copied {
+                        format!("已复制 {characters} 个字符")
+                    } else {
+                        "复制失败".to_owned()
+                    }
+                })
+            };
+            let badge_row = if history_view.active() {
+                rows.checked_sub(lines.len() as u16 + 1)
+            } else {
+                screen.top.and_then(|top| top.checked_sub(1))
+            };
+            match badge_text.zip(badge_row) {
+                Some((text, row)) => badge.show(row, &text)?,
+                None => badge.clear()?,
+            }
             let Some(event) = read_editor_event(&mut input_reader)? else {
                 continue;
             };
@@ -1988,10 +2010,8 @@ impl PromptEditor {
                             selection.screen_event(mouse, snapshot.clone())?
                         };
                         if let Some((characters, copied)) = selection.take_copy_feedback() {
-                            copy_feedback = Some(
-                                crate::terminal::mouse_selection::copy_message(characters, copied),
-                            );
-                            copy_feedback_at = Some(std::time::Instant::now());
+                            selection_copy = Some((characters, copied));
+                            selection_copy_at = Some(std::time::Instant::now());
                             continue;
                         }
                         if let Some(click) = selected {
@@ -2032,10 +2052,8 @@ impl PromptEditor {
                     }
                     let event = selection.screen_event(mouse, snapshot.clone())?;
                     if let Some((characters, copied)) = selection.take_copy_feedback() {
-                        copy_feedback = Some(
-                            crate::terminal::mouse_selection::copy_message(characters, copied),
-                        );
-                        copy_feedback_at = Some(std::time::Instant::now());
+                        selection_copy = Some((characters, copied));
+                        selection_copy_at = Some(std::time::Instant::now());
                         continue;
                     }
                     let Some(mouse) = event else {
@@ -2130,10 +2148,8 @@ impl PromptEditor {
                     {
                         if selection.copy_retained()? {
                             if let Some((characters, copied)) = selection.take_copy_feedback() {
-                                copy_feedback = Some(
-                                    crate::terminal::mouse_selection::copy_message(characters, copied),
-                                );
-                                copy_feedback_at = Some(std::time::Instant::now());
+                                selection_copy = Some((characters, copied));
+                                selection_copy_at = Some(std::time::Instant::now());
                             }
                             continue;
                         }
@@ -2180,7 +2196,8 @@ impl PromptEditor {
                     }
                     restored = false;
                     copy_feedback = None;
-                    copy_feedback_at = None;
+                    selection_copy = None;
+                    selection_copy_at = None;
                     let killing = control && matches!(key.code, KeyCode::Char('u' | 'k'));
                     if killing {
                         let cut: String = if key.code == KeyCode::Char('u') {
@@ -2481,7 +2498,6 @@ impl PromptEditor {
                                         crate::extended_commands::copy_session_id(session)
                                             .unwrap_or_else(|error| format!("{error:#}")),
                                     );
-                                    copy_feedback_at = None;
                                     buffer.set("");
                                     menu_hidden = true;
                                     continue;
