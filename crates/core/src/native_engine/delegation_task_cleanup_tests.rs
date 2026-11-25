@@ -284,6 +284,7 @@ fn process_finished(pid: u32) -> bool {
     crate::services::session_worker::process_exited(pid)
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_subagent_background_task_is_stopped_when_the_subagent_ends() {
     let temp = tempfile::tempdir().unwrap();
@@ -338,6 +339,7 @@ async fn a_finished_subagent_task_is_left_alone() {
 }
 
 /// The cleanup summary must reach the parent on the error path as well.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failed_subagent_still_reports_the_stopped_tasks() {
     let temp = tempfile::tempdir().unwrap();
@@ -402,6 +404,7 @@ async fn a_scan_error_is_reported_to_the_parent() {
 /// Dropping the owner while the child still runs must not leave its shell
 /// behind: the guard inside the child's own task requests the stop when the
 /// child future is dropped, and the shell owner confirms it.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn aborting_the_owner_stops_a_task_created_late() {
     let temp = tempfile::tempdir().unwrap();

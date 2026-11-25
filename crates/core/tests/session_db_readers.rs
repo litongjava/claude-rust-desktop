@@ -696,7 +696,10 @@ fn project_chat_rechecks_trust_and_recovers_the_prepared_workspace() -> Result<(
     assert_eq!(chats[0].project_id.as_deref(), Some(project.id.as_str()));
     assert_eq!(chats[0].title.as_deref(), Some("Desktop chat"));
     assert_eq!(
-        reopened.open_session(&chats[0].id)?.workspace()?,
+        reopened
+            .open_session(&chats[0].id)?
+            .workspace()?
+            .canonicalize()?,
         workspace.path().canonicalize()?
     );
     Ok(())
@@ -813,8 +816,8 @@ fn synced_project_chat_uses_the_locally_trusted_workspace() -> Result<()> {
     let (catalog, _) = stores.sync_contents()?;
     let selected = catalog.iter().find(|row| row.id == header.id).unwrap();
     assert_eq!(
-        selected.workspace_path.as_deref(),
-        project.path().canonicalize()?.to_str()
+        std::path::Path::new(selected.workspace_path.as_deref().unwrap()).canonicalize()?,
+        project.path().canonicalize()?
     );
     Ok(())
 }

@@ -1182,8 +1182,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            row.workspace_path.as_deref(),
-            Some(canonical.to_string_lossy().as_ref())
+            std::path::Path::new(row.workspace_path.as_deref().unwrap())
+                .canonicalize()
+                .unwrap(),
+            canonical.canonicalize().unwrap()
         );
         let launch = std::fs::read_to_string(
             data.join("background-tasks")

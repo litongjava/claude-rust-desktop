@@ -416,7 +416,10 @@ mod tests {
 
         let workspaces = paths.data_dir.join("workspaces");
         let private = store.workspace(&id, &workspaces).unwrap();
-        assert!(private.starts_with(&workspaces));
+        assert!(private
+            .canonicalize()
+            .unwrap()
+            .starts_with(workspaces.canonicalize().unwrap()));
         releaser.join().unwrap();
         let resolved = store.workspace(&id, &workspaces).unwrap();
 
@@ -610,9 +613,18 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(fixture.resolve(&fixture.parent), fixture.first);
-        assert_eq!(fixture.resolve(&fixture.member), fixture.first);
-        assert_eq!(fixture.resolve(&fixture.sibling), fixture.first);
+        assert_eq!(
+            fixture.resolve(&fixture.parent).canonicalize().unwrap(),
+            fixture.first.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fixture.resolve(&fixture.member).canonicalize().unwrap(),
+            fixture.first.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fixture.resolve(&fixture.sibling).canonicalize().unwrap(),
+            fixture.first.canonicalize().unwrap()
+        );
 
         fixture
             .store
@@ -622,9 +634,18 @@ mod tests {
             .unwrap();
 
         // The real resolver is authoritative: only the member moved.
-        assert_eq!(fixture.resolve(&fixture.member), fixture.second);
-        assert_eq!(fixture.resolve(&fixture.parent), fixture.first);
-        assert_eq!(fixture.resolve(&fixture.sibling), fixture.first);
+        assert_eq!(
+            fixture.resolve(&fixture.member).canonicalize().unwrap(),
+            fixture.second.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fixture.resolve(&fixture.parent).canonicalize().unwrap(),
+            fixture.first.canonicalize().unwrap()
+        );
+        assert_eq!(
+            fixture.resolve(&fixture.sibling).canonicalize().unwrap(),
+            fixture.first.canonicalize().unwrap()
+        );
         assert_eq!(fixture.project_id(&fixture.sibling), shared);
         assert_eq!(fixture.project_id(&fixture.parent), shared);
 
@@ -689,7 +710,10 @@ mod tests {
             "/other/workspace",
             "another session's saved cwd must not be cleared"
         );
-        assert_eq!(fixture.resolve(&fixture.member), fixture.second);
+        assert_eq!(
+            fixture.resolve(&fixture.member).canonicalize().unwrap(),
+            fixture.second.canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -753,8 +777,10 @@ mod tests {
         // reject the deliberately fake managed-worktree row.
         assert_eq!(fixture.project_id(&fixture.member), project);
         assert_eq!(
-            fixture.conversation(&fixture.member).1.as_deref(),
-            Some(original.as_str())
+            std::path::Path::new(fixture.conversation(&fixture.member).1.as_deref().unwrap())
+                .canonicalize()
+                .unwrap(),
+            std::path::Path::new(&original).canonicalize().unwrap()
         );
     }
 
@@ -788,7 +814,10 @@ mod tests {
         );
         assert_eq!(fixture.conversation(&fixture.member), before);
         assert_eq!(std::fs::read_to_string(&shell).unwrap(), "not a directory");
-        assert_eq!(fixture.resolve(&fixture.member), fixture.first);
+        assert_eq!(
+            fixture.resolve(&fixture.member).canonicalize().unwrap(),
+            fixture.first.canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -822,7 +851,10 @@ mod tests {
 
         // The database move stands, the active cache is not restored, and the
         // exact previous bytes remain in the reported backup.
-        assert_eq!(fixture.resolve(&fixture.member), fixture.second);
+        assert_eq!(
+            fixture.resolve(&fixture.member).canonicalize().unwrap(),
+            fixture.second.canonicalize().unwrap()
+        );
         assert!(!shell.join(&fixture.member).exists());
         let leftovers: Vec<String> = std::fs::read_dir(&shell)
             .unwrap()
@@ -938,6 +970,9 @@ mod tests {
             fixture.conversation(&fixture.member),
             (project_before, workspace_before)
         );
-        assert_eq!(fixture.resolve(&fixture.member), fixture.first);
+        assert_eq!(
+            fixture.resolve(&fixture.member).canonicalize().unwrap(),
+            fixture.first.canonicalize().unwrap()
+        );
     }
 }

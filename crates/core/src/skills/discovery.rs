@@ -1025,12 +1025,14 @@ mod tests {
         assert_eq!(skill.path, data.join("skills/data-dir-check/SKILL.md"));
         let rendered = skill.render_template("the target", "session-id").unwrap();
         assert!(rendered.contains("the target"));
-        assert!(rendered.contains(
-            &data
-                .join("skills/data-dir-check")
-                .to_string_lossy()
-                .replace('\\', "/")
-        ));
+        let normalize = |text: &str| text.replace('\\', "/").replace("//?/", "");
+        let expected = data
+            .join("skills/data-dir-check")
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(normalize(&rendered).contains(&normalize(&expected)));
         assert!(rendered.contains("references/setup.md"));
     }
 
@@ -1698,12 +1700,15 @@ mod tests {
         }
         let first = discover_runtime_from(&data, &workspace).0;
         let second = discover_runtime_from(&data, &workspace).0;
-        let first_path = skills.join("first-skill/SKILL.md");
-        let second_path = skills.join("second-skill/SKILL.md");
+        let first_path = skills.join("first-skill").join("SKILL.md");
+        let second_path = skills.join("second-skill").join("SKILL.md");
         assert!(!first.contains_key("shared-skill"));
         for path in [&first_path, &second_path] {
             let id = legacy_id(path);
-            let keys = first.keys().collect::<Vec<_>>();
+            let keys = first
+                .iter()
+                .map(|(key, skill)| (key.clone(), skill.path.clone()))
+                .collect::<Vec<_>>();
             assert!(first.contains_key(&id), "{id} missing: {keys:?}");
             assert_eq!(first[&id].path, *path);
             assert_eq!(second[&id].path, *path);

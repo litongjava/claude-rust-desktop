@@ -1652,9 +1652,13 @@ mod tests {
     use std::process::Command;
 
     fn git(cwd: &Path, args: &[&str]) {
+        let args: Vec<String> = args
+            .iter()
+            .map(|arg| crate::super_agent::test_git_text(arg))
+            .collect();
         let output = Command::new("git")
-            .current_dir(cwd)
-            .args(args)
+            .current_dir(crate::super_agent::test_git_path(cwd))
+            .args(&args)
             .env("LC_ALL", "C")
             .output()
             .unwrap();
@@ -1707,11 +1711,15 @@ mod tests {
         assert_eq!(record.task_branch, "agent/task-001");
         assert!(record.worktree_path.ends_with("desktop-worktrees/task-001"));
         assert_eq!(
-            std::fs::read_to_string(environment.cwd.join("src/main.txt")).unwrap(),
+            std::fs::read_to_string(environment.cwd.join("src/main.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "develop\n"
         );
         assert_eq!(
-            std::fs::read_to_string(root.join("src/main.txt")).unwrap(),
+            std::fs::read_to_string(root.join("src/main.txt"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "main\n",
             "the source worktree must not be touched"
         );
@@ -2060,7 +2068,7 @@ mod tests {
         assert!(coder
             .skipped
             .iter()
-            .any(|path| path.contains("newdir/node_modules")));
+            .any(|path| path.replace('\\', "/").contains("newdir/node_modules")));
         let error = restore_snapshot(&manifest, &snapshot_dir, &source, &coder).unwrap_err();
         assert!(error.to_string().contains("did not protect"), "{error:#}");
         assert_eq!(

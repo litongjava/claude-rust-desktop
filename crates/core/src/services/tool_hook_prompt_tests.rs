@@ -212,7 +212,7 @@ async fn builtin_retries_and_slow_responses_share_hook_deadline() {
         // A transient failure can retry within one evaluation.
         fixture.transient_failures.store(1, Ordering::Relaxed);
         let out = run(&runner, "retry-success").await;
-        assert!(out.warnings.is_empty() && !out.allow_permission);
+        assert!(out.warnings.is_empty() && !out.allow_permission, "{out:?}");
         assert_eq!(fixture.state.requests.lock().unwrap().len(), 2);
         // Retry-After exceeds the hook deadline; the retry sleep must be cancelled.
         *fixture.state.reply.lock().unwrap() = (429, "{}".into());

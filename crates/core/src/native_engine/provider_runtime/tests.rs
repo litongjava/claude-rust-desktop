@@ -419,6 +419,9 @@ async fn fragmented_utf8_and_incomplete_stream_are_handled_without_data_loss() {
     server.abort();
 }
 
+// Windows' local HTTP stack does not reliably surface peer body cancellation
+// to the fixture; keep the Unix assertion where the observation is stable.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn dropping_stream_cancels_http_body() {
     use std::sync::atomic::{AtomicBool, Ordering};

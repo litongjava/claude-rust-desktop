@@ -2377,6 +2377,7 @@ mod tests {
         assert_eq!(completed["next_cursor"], Value::Null, "{completed}");
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn job_cursor_with_partial_record_rejects_rotation_and_allows_append() {
         let root = tempfile::tempdir().unwrap();

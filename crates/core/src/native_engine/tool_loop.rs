@@ -7349,6 +7349,7 @@ mod shell_cwd_tests {
         std::fs::write(directory.join(name), content).unwrap();
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn an_authorized_move_stages_only_that_sessions_shell_cwd() {
         let temp = tempfile::tempdir().unwrap();

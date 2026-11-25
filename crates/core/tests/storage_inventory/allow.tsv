@@ -1,7 +1,7 @@
 # Path, token, matching lines, SHA-256 of sorted trimmed matching lines, reviewed use
 crates/cli/src/session.rs	peripheral_settings	1	b6f148166fd173121496e329fa682befdbc2d9108dc9cbf36551137ff83e1557	Colocated test setup or SQL fault injection for session
 crates/cli/src/session_binding_tests.rs	peripheral_settings	2	18e92e8978de18be85f3660b2cca0bd522dba2165720550b8dedf18d696b6e90	Colocated test setup or SQL fault injection for session_binding_tests
-crates/cli/src/session_origin_tests.rs	peripheral_settings	2	cdc394f44c943564590a9c6c9e1ab8a25295fb10addc4191df2891884f38b005	Producer and queued-compaction fixtures inspect durable receipts on the admitted rows.
+crates/cli/src/session_origin_tests.rs	peripheral_settings	1	202e6d3ebc8f6ff2cd1447ed24cdc28b099dd382f2fcb10f003c547ab6b728af	Producer and queued-compaction fixtures inspect durable receipts on the admitted rows.
 crates/cli/src/startup_contention_tests.rs	Connection::open	1	556ec7ec48a423d89404683a7813e63e3d33aa93bfbaf326bd5e396c47294afa	Colocated test setup or SQL fault injection for startup_contention_tests
 crates/cli/src/terminal/scrollback.rs	with_conn	1	abccba0e9d55777ced6c325a470957c4ed21d4e4b3fc3ff5ea5d99c7a7fb38bc	Standalone task database fixture
 crates/cli/src/worker_frontend.rs	peripheral_settings	2	4a6c17f633b3166506e5abce35720bdab8d5c15241cf77fc95e58fda6b4ed9db	Colocated test setup or SQL fault injection for worker_frontend
@@ -22,6 +22,7 @@ crates/core/src/db/activity_tests.rs	Connection::open	2	fb05ce67c179e1af6f114383
 crates/core/src/db/activity_tests.rs	peripheral_settings	2	ecf3b999b3e9e84d76abeb89b9eb69ae0ee0baa6e6180a340d759b980fcbc723	activity_tests integration or repository fixture
 crates/core/src/db/activity_tests.rs	with_conn	3	0e22da1bfdf66327d4e1bca716cd9d86f85e28591ac36682bee35f418de32d65	activity_tests integration or repository fixture
 crates/core/src/db/context_search_repo.rs	Connection::open	2	c0489a664d8ff6264fce166e7d13405a55a68d384ca52891155fbd55557ea0f5	Colocated context_search_repo repository fixture
+crates/core/src/db/context_search_index.rs	Connection::open	1	163ce64ba5917a2e56a187b507b856eb05ccc3fae9d62033e6f80ed652db9607	In-memory context-search migration fixture
 crates/core/src/db/conversation_repo.rs	Connection::open	6	c8b1f371832f5784c89e1c40cf2f071be7fc393d97155f5f2eb23edb873bc623	Repository branch SQL and in-memory branch/order fixtures
 crates/core/src/db/conversation_repo.rs	peripheral_settings	2	6a358f836ef25188a405570f1c141fd81c6d67e45c7711098f00e229b99900a4	Repository branch SQL and in-memory branch/order fixtures
 crates/core/src/db/conversation_repo.rs	with_conn	3	e6bb8531238986eb09d02d2238dd7144edc0b9c013d2eba7a37cd1a8913b0eec	Repository branch SQL and in-memory branch/order fixtures
@@ -44,7 +45,7 @@ crates/core/src/native_engine/session_binding/store.rs	with_conn	2	7e016c0314916
 crates/core/src/native_engine/toolscript_job.rs	peripheral_settings	1	1d476f47afb184d96eff628954c27469ed25d71bdfaa9e00cadcc33560c0a88a	Colocated toolscript_job repository fixture
 crates/core/src/native_engine/workspace.rs	Connection::open	2	d135e602ebf1f8bcb111a3d4840b43522e29f99bcf401607edfa8a5035ff72fd	Colocated workspace repository fixture
 crates/core/src/runtime.rs	peripheral_settings	1	217d9659b57fa37fc302ab30db4eb6c2974940a88911b5ecb0f1429729381c0f	SessionStore<DbManager> fixture backend
-crates/core/src/runtime.rs	with_conn	9	92fd3b0bedc253d93d56a9d7b4decad0fecf9d71d3c2f4167e150f5253c033aa	SessionStore<DbManager> fixture backend
+crates/core/src/runtime.rs	with_conn	9	75fba6d7414dbed05fad6082a6c6097ac78bd3b71d55806dfe88b9abd9e41a57	SessionStore<DbManager> fixture backend
 crates/core/src/services/compaction.rs	peripheral_settings	11	4c9ec75b98af001a302a43883bc7fd11c5fec71aec1056c88df7fea8aa9544e7	Connection-scoped compaction SQL for DbManager and repository tests
 crates/core/src/services/compaction.rs	with_conn	2	fa6bf7ddfdcbef622fe1c9ab2792af3e9cfdbea800de28b6d15541eb8fccc73a	Connection-scoped compaction SQL for DbManager and repository tests
 crates/core/src/services/compaction/native.rs	peripheral_settings	1	4e804e1beaaec97169beee4c5edefd8f7bd80e4dd22d1ada363da025a73f12b6	DbManager native-boundary reader
@@ -59,6 +60,7 @@ crates/core/src/services/input_queue.rs	with_conn	14	225b097397455614e3294fac400
 crates/core/src/services/local_coordination/paths.rs	DATABASE_FILE	2	cb5a49ce7c9409446a15c4b6526f1c930d82f0e19a434e1ce8cdae81b64c6796	Coordination registry filename
 crates/core/src/services/local_coordination/store.rs	Connection::open	5	a21bd5f04185154363ffd89b21bfe32eb020b0f98f815afa1134a998d499a255	Independent coordination registry and corruption fixtures
 crates/core/src/services/memory_files.rs	Connection::open	2	b742a7ac59205f819a87de2f622212882847fe35fd280e2773ed47495c75de46	Read-only import of legacy memory.sqlite3 settings and an isolated archive fixture
+crates/core/src/services/memory_files/prompt.rs	peripheral_settings	4	fad08b80b52c8742eaa69266178fb01ecf7525e96e1977a5b54412abf3464fe5	Memory prompt lifecycle reads and writes the per-session peripheral settings row
 crates/core/src/services/mod.rs	peripheral_settings	3	5e60a5962ac4aaefc92ce50197145f7993efaccc9048b0abaac070ce294d70d5	ServiceContext<DbManager> fixture setting adapters
 crates/core/src/services/mod.rs	with_conn	2	3eaea3f074a7ba4bccd75c03f8fd2213d8f37d69ea9b3e63bf1c3325f1624cf9	ServiceContext<DbManager> fixture setting adapters
 crates/core/src/services/permission_authority.rs	with_conn	1	bb5a8ce5afccd0e5afa26a1fb60e28129d536f826d665dca848eedca5eef43dc	DbManager parent-child inheritance adapter

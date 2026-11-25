@@ -757,7 +757,7 @@ fn review_and_integration_operations_are_identified_by_evidence_stage() {
                 "spec_version": task.spec_version,
                 "review_round": task.review_round,
                 "purpose": "implementation",
-                "workspace": "/workspace",
+                "workspace": crate::super_agent::TEST_WORKSPACE,
                 "session_id": "reviewer-session",
                 "job_id": "implementation-job",
                 "prompt": "implementation review",

@@ -18,9 +18,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 fn git(cwd: &Path, args: &[&str]) -> String {
+    let args: Vec<String> = args
+        .iter()
+        .map(|arg| crate::super_agent::test_git_text(arg))
+        .collect();
     let output = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
+        .current_dir(crate::super_agent::test_git_path(cwd))
+        .args(&args)
         .env("LC_ALL", "C")
         .output()
         .unwrap();
@@ -221,12 +225,10 @@ async fn manual_plan_approval_launches_then_resumes_the_same_coder_once() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        conversation.workspace_path.as_deref(),
-        task.repositories[0]
-            .working_path
-            .to_str()
-            .map(str::to_owned)
-            .as_deref()
+        Path::new(conversation.workspace_path.as_deref().unwrap())
+            .canonicalize()
+            .unwrap(),
+        task.repositories[0].working_path.canonicalize().unwrap()
     );
     assert_eq!(fixture.launch_jobs(&task), 1);
 
@@ -394,7 +396,9 @@ async fn the_reviewer_gets_a_pinned_checkout_separate_from_the_coder() {
     assert_ne!(review_workspace, task.repositories[0].working_path);
     assert_eq!(git(&review_workspace, &["rev-parse", "HEAD"]), commit);
     assert_eq!(
-        std::fs::read_to_string(review_workspace.join("file.txt")).unwrap(),
+        std::fs::read_to_string(review_workspace.join("file.txt"))
+            .unwrap()
+            .replace("\r\n", "\n"),
         "implemented\n"
     );
     // The Reviewer cannot write into the Coder's checkout: they are separate.
@@ -408,7 +412,13 @@ async fn the_reviewer_gets_a_pinned_checkout_separate_from_the_coder() {
 async fn an_unusable_target_blocks_the_task_without_creating_a_coder() {
     let fixture = Fixture::new();
     let mut spec = fixture.spec();
-    spec.targets = vec!["/definitely/outside/the/workspace".into()];
+    spec.targets = vec![std::env::temp_dir()
+        .join(format!(
+            "deepseek-code-unusable-target-{}",
+            std::process::id()
+        ))
+        .to_string_lossy()
+        .into_owned()];
     let task = fixture
         .store()
         .create_task(&fixture.router, spec, "create")

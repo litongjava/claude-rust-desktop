@@ -1369,7 +1369,14 @@ mod tests {
         assert!(store.history(&recipient).unwrap().is_empty());
         release.send(()).unwrap();
         holder.join().unwrap();
-        let delivered = owner.target.drain(8).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let delivered = loop {
+            let delivered = owner.target.drain(8).unwrap();
+            if !delivered.is_empty() || std::time::Instant::now() >= deadline {
+                break delivered;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
         assert_eq!(delivered.len(), 1);
         assert!(delivered[0].contains("queued while host writes"));
         assert_eq!(

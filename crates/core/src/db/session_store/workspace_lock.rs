@@ -268,10 +268,10 @@ mod tests {
         let removal = stores.hold_worktree_removal(&worktree)?;
         assert!(resident.acquire_execution().is_err());
         assert!(change().is_err());
-        assert_eq!(moving.workspace()?, source.canonicalize()?);
+        assert_eq!(moving.workspace()?.canonicalize()?, source.canonicalize()?);
         let elsewhere = moving.acquire_execution()?;
         drop((elsewhere, removal));
-        assert_eq!(change()?, target.canonicalize()?);
+        assert_eq!(change()?.canonicalize()?, target.canonicalize()?);
         let lease = moving.acquire_execution()?;
         assert!(stores.hold_worktree_removal(&worktree).is_err());
         drop(lease);

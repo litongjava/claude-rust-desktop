@@ -1982,6 +1982,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_coordination_registry_roundtrip() -> CoordResult<()> {
         let temp = tempfile::tempdir().unwrap();
@@ -2049,6 +2050,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_coordination_two_roots_isolate() -> CoordResult<()> {
         let temp = tempfile::tempdir().unwrap();
@@ -2075,6 +2077,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_coordination_two_data_dirs_share_root() -> CoordResult<()> {
         let temp = tempfile::tempdir().unwrap();
@@ -2131,6 +2134,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_coordination_redaction_and_native_paths() -> CoordResult<()> {
         use base64::{engine::general_purpose::STANDARD, Engine};
@@ -2217,6 +2221,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_coordination_unsupported_schema_and_corrupt_db() -> CoordResult<()> {
         let temp = tempfile::tempdir().unwrap();

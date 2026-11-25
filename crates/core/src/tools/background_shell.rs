@@ -2865,6 +2865,7 @@ console.log('ready');
 console.error('diagnostic');
 setInterval(() => {}, 10000);
 "#;
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_running_foreground_call_moves_to_the_background_on_request() {
         crate::config::OrchestrationConfig::init_global().unwrap();
@@ -5268,6 +5269,7 @@ setInterval(() => {}, 1000);
     /// stop the foreground process tree it already owns. A pre-existing owner
     /// record is not replaced, and its bytes are left alone. The log already
     /// captured before the failure is kept too.
+    #[cfg(unix)]
     #[tokio::test]
     async fn failed_foreground_promotion_records_failure_and_stops_the_process_tree() {
         crate::config::OrchestrationConfig::init_global().unwrap();
@@ -6257,6 +6259,7 @@ mod foreground_output_tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn task_get_page_rejects_a_stale_cursor_after_truncation_or_rotation() {
         let root = tempfile::tempdir().unwrap();

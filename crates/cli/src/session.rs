@@ -888,7 +888,7 @@ impl Session {
             anyhow::ensure!(cli.allowed_tools.is_empty() && cli.disallowed_tools.is_empty(), "This session has active background work; attach without launch tool rules, or stop the worker before changing them");
             anyhow::ensure!(!explicit_mode, "This session has active background work; resume without an explicit permission mode and use /tasks attach {} to change its mode", job.id);
         }
-        let mut selected_mode = if explicit_mode {
+        let selected_mode = if explicit_mode {
             selected_mode
         } else {
             deepseek_code_core::services::session_permission_mode::load(&store.db, &id)?
@@ -915,18 +915,12 @@ impl Session {
                 },
             );
             if let Err(error) = configured {
-                // Auto is the default, but it is only a valid mode with a
-                // configured classifier. Keep an ordinary launch usable and
-                // fall back to the manual mode; an explicit choice still
-                // reports why it cannot be honored.
-                anyhow::ensure!(
-                    !explicit_mode,
-                    "Auto mode is unavailable: {error:#}; configure permissions.auto or choose another mode"
-                );
+                // Auto is deterministic for known local work and only needs the
+                // classifier for unknown tools. Keep the mode usable and let
+                // those tools fall back to manual approval instead.
                 eprintln!(
-                    "Auto mode is unavailable ({error:#}); using ask permissions for this session."
+                    "Auto classifier is unavailable ({error:#}); unknown tools will require manual approval."
                 );
-                selected_mode = PermissionMode::AskPermissions;
             }
         }
         if active_job.is_some() {
@@ -1466,10 +1460,9 @@ impl Session {
         config
             .classifier
             .get_or_insert(ClassifierSelection::Current);
-        config.resolve(
-            &context.paths.providers()?,
-            &self.selected_provider().await?,
-        )?;
+        // Auto remains usable without a classifier: unknown tools then fall
+        // back to manual approval. Validation happens when the classifier is
+        // actually requested, not when the mode is selected.
         Ok(config)
     }
 
@@ -1501,10 +1494,14 @@ impl Session {
         }
         let mode = deepseek_code_core::services::session_permission_mode::parse(value)?;
         if mode == PermissionMode::Auto {
-            deepseek_code_core::native_engine::auto_permissions::configured(
+            if let Err(error) = deepseek_code_core::native_engine::auto_permissions::configured(
                 &crate::services::context(&self.paths)?,
                 &self.selected_provider().await?,
-            )?;
+            ) {
+                eprintln!(
+                    "Auto classifier is unavailable ({error:#}); unknown tools will require manual approval."
+                );
+            }
         }
         anyhow::ensure!(mode != PermissionMode::BypassPermissions || self.bypass_available, "Bypass permissions mode needs a launch with --dangerously-skip-permissions or --allow-dangerously-skip-permissions");
         deepseek_code_core::services::session_permission_mode::set(
@@ -4122,7 +4119,9 @@ mod event_tests {
             .unwrap();
         assert_eq!(resumed.permission_mode(), "plan");
         resumed.set_permission_mode("dontAsk").await.unwrap();
-        assert!(resumed.set_permission_mode("auto").await.is_err());
+        resumed.set_permission_mode("auto").await.unwrap();
+        assert_eq!(resumed.permission_mode(), "auto");
+        resumed.set_permission_mode("dontAsk").await.unwrap();
         assert_eq!(resumed.permission_mode(), "dont-ask");
         resumed.close().await.unwrap();
         let restored = Session::open(&cli, &paths, selection(), Some(&saved))
@@ -4158,7 +4157,7 @@ mod event_tests {
         let safe_resume = Session::open(&cli, &paths, selection(), Some(&saved))
             .await
             .unwrap();
-        assert_eq!(safe_resume.permission_mode(), "ask");
+        assert_eq!(safe_resume.permission_mode(), "auto");
         safe_resume.close().await.unwrap();
     }
 

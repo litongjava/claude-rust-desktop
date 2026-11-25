@@ -208,8 +208,8 @@ mod tests {
         .unwrap();
         let tool = PermissionContext {
             mcp_read_only: false,
-            tool_name: "Write".into(),
-            tool_input: json!({"file_path":".bashrc","content":"fixture"}),
+            tool_name: "WebFetch".into(),
+            tool_input: json!({"url":"https://example.com/public"}),
             conversation_id: parent.clone(),
             workspace_path: Some(root.path().to_string_lossy().into_owned()),
             user_id: None,

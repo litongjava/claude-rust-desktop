@@ -410,7 +410,15 @@ impl Stores {
                 let p = project_repo::require_trusted(c, id)?;
                 ensure!(
                     !p.is_archived
-                        && p.workspace_path.as_deref().map(Path::new) == Some(workspace.as_path()),
+                        && p.workspace_path.as_deref().is_some_and(|stored| {
+                            let stored = Path::new(stored);
+                            stored == workspace
+                                || stored
+                                    .canonicalize()
+                                    .ok()
+                                    .zip(workspace.canonicalize().ok())
+                                    .is_some_and(|(left, right)| left == right)
+                        }),
                     "Selected project is unavailable"
                 );
                 ProjectSelection::Existing(id.into())

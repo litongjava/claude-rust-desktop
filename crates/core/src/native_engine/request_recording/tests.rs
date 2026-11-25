@@ -181,8 +181,10 @@ async fn three_transports_record_exact_wire_bytes_and_private_files() {
         let captured_headers = seen.lock().unwrap()[0].0.clone();
         let expected = captured_headers
             .iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "authorization" | "x-api-key"))
-            .count();
+            .map(|(name, _)| name.as_str())
+            .filter(|name| !matches!(*name, "authorization" | "x-api-key"))
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         assert_eq!(recorded.as_object().unwrap().len(), expected);
         for (name, value) in &captured_headers {
             if !matches!(name.as_str(), "authorization" | "x-api-key") {

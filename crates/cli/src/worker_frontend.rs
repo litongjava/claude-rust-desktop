@@ -48,7 +48,33 @@ impl ProposalRetry {
     }
 }
 
-fn log_proposal_observation(root: &std::path::Path, id: &str, message: &str) {
+/// Tolerates brief task-state read failures without ending the turn. The
+/// supervisor replaces `state.json` about every 100 ms and a filesystem filter
+/// can briefly hide it; one lost poll must not look like a dead worker.
+#[derive(Default)]
+struct StateRetry {
+    since: Option<std::time::Instant>,
+    failures: u32,
+}
+
+impl StateRetry {
+    const FAILURES: u32 = 5;
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// Records a failure and reports whether the view must now give up.
+    fn failed(&mut self, now: std::time::Instant) -> bool {
+        let since = *self.since.get_or_insert(now);
+        self.failures += 1;
+        self.failures > Self::FAILURES || now.duration_since(since) > Self::WINDOW
+    }
+    fn recovered(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let elapsed = self.since.map(|since| now.duration_since(since));
+        *self = Self::default();
+        elapsed
+    }
+}
+
+fn log_job_observation(root: &std::path::Path, id: &str, message: &str) {
     use std::io::Write;
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
@@ -77,6 +103,31 @@ fn proposal_contention_retries_without_blocking_and_reports_only_sustained_failu
     assert_eq!(retry.recovered(now).unwrap().as_secs(), 5);
     assert!(retry.due(now));
     assert!(!retry.failed(now));
+}
+
+#[test]
+fn task_state_retry_tolerates_brief_failures_and_gives_up_after_the_window() {
+    let start = std::time::Instant::now();
+    let mut retry = StateRetry::default();
+    for step in 1..=5 {
+        assert!(
+            !retry.failed(start + std::time::Duration::from_millis(step * 100)),
+            "failure {step} must be tolerated"
+        );
+    }
+    assert!(retry.failed(start + std::time::Duration::from_millis(600)));
+
+    let mut retry = StateRetry::default();
+    assert!(!retry.failed(start));
+    assert!(retry.failed(start + std::time::Duration::from_millis(2_001)));
+
+    let mut retry = StateRetry::default();
+    assert!(!retry.failed(start));
+    assert_eq!(
+        retry.recovered(start + std::time::Duration::from_millis(300)),
+        Some(std::time::Duration::from_millis(300))
+    );
+    assert!(retry.recovered(start).is_none());
 }
 
 pub async fn turn(
@@ -449,6 +500,7 @@ async fn observe(
     let mut final_mode_synced = false;
     let mut shown_proposal = None::<String>;
     let mut proposal_retry = ProposalRetry::default();
+    let mut state_retry = StateRetry::default();
     let mut current_proposal = None;
     let relay = session.remote_relay();
     let mut remote_request: Option<deepseek_code_core::services::remote_control::PermissionRequest> = None;
@@ -479,17 +531,17 @@ async fn observe(
                   match proposal_frontend.map(|frontend| frontend.poll()).transpose() {
                     Ok(proposal) => {
                         if let Some(elapsed) = proposal_retry.recovered(std::time::Instant::now()) {
-                            log_proposal_observation(root, id, &format!("Goal proposal observation recovered after {} ms", elapsed.as_millis()));
+                            log_job_observation(root, id, &format!("Goal proposal observation recovered after {} ms", elapsed.as_millis()));
                         }
                         current_proposal = proposal.flatten();
                     },
                     Err(error) if deepseek_code_core::db::is_contention(&error) => {
                         if proposal_retry.since.is_none() {
-                            log_proposal_observation(root, id, &format!("Goal proposal observation deferred: {error:#}"));
+                            log_job_observation(root, id, &format!("Goal proposal observation deferred: {error:#}"));
                         }
                         if proposal_retry.failed(std::time::Instant::now()) {
                             display.notice("Goal proposal status is delayed by database contention. Task output continues.");
-                            log_proposal_observation(root, id, "Goal proposal observation still deferred after 5000 ms");
+                            log_job_observation(root, id, "Goal proposal observation still deferred after 5000 ms");
                         }
                     },
                     Err(error) => return Err(error.context("Reading goal proposal status")),
@@ -501,7 +553,26 @@ async fn observe(
                     shown_proposal = proposal.as_ref().map(|p| p.id.clone());
                     if let Some(live) = &display.live { live.goal_proposal(proposal.map(|p| (p.id, p.condition))); }
                 }
-                let (job, next, events) = jobs::events_since(root, id, owner, cursor)?;
+                let observation = jobs::events_since(root, id, owner, cursor);
+                let (job, next, events) = match observation {
+                    Ok(observed) => {
+                        if let Some(elapsed) = state_retry.recovered(std::time::Instant::now()) {
+                            log_job_observation(root, id, &format!("Task state observation recovered after {} ms", elapsed.as_millis()));
+                        }
+                        observed
+                    }
+                    // A transient filesystem failure loses one poll, not the turn.
+                    Err(error)
+                        if jobs::is_transient_state_error(&error)
+                            && !state_retry.failed(std::time::Instant::now()) =>
+                    {
+                        if state_retry.failures == 1 {
+                            log_job_observation(root, id, &format!("Task state observation deferred: {error:#}"));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let drained = cursor == next;
                 cursor = next;
                 let finished_mode = job.finished_ms.is_some() && matches!(job.status.as_str(), "completed" | "failed" | "cancelled");
@@ -1043,6 +1114,17 @@ fn failure_message(id: &str, status: &str, diagnostic: &str) -> String {
     // number of HTTP attempts actually made. Never infer these from provider text.
     if let Some(failure) = deepseek_code_core::performance::parse_failure_summary(diagnostic) {
         return structured_failure_message(id, &failure, diagnostic);
+    }
+    // The task's own durable records could not be read. That is not a provider
+    // failure, and the worker may still be running.
+    if lower.contains("reading task state")
+        || lower.contains("parsing task state")
+        || lower.contains("opening task output")
+        || lower.contains("reading pending question")
+    {
+        return format!(
+            "Could not read the task state; the task may still be running. Details: /tasks show {id}"
+        );
     }
     let reason = if lower.contains("timed out") || lower.contains("timeout") {
         "Request timed out".to_owned()
@@ -1659,6 +1741,11 @@ mod failure_tests {
                 "failed",
                 "unknown private credential max_tokens",
                 "Request failed. Details: /tasks show id",
+            ),
+            (
+                "failed",
+                r#"Reading task state C:\Users\me\.deepseek-code\background-tasks\id\state.json: The system cannot find the file specified. (os error 2)"#,
+                "Could not read the task state; the task may still be running. Details: /tasks show id",
             ),
         ] {
             assert_eq!(failure_message("id", status, diagnostic), expected);

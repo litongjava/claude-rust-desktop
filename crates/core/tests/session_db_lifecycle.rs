@@ -266,6 +266,7 @@ fn invalid_session_files_fail_closed_without_recreation() {
             "corrupt" => fs::write(&path, "invalid SQLite").unwrap(),
             other => {
                 let c = Connection::open(&path).unwrap();
+                c.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
                 c.execute_batch(match other {
                     "kind" => "PRAGMA application_id=0x44434c47",
                     "newer" => "PRAGMA user_version=99",

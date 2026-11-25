@@ -74,6 +74,7 @@ fn search_indexes_rollback_with_content_and_cursors_bind_to_the_incarnation() ->
         .as_array()
         .unwrap()
         .is_empty());
+    drop(db);
     a.delete()?;
     assert!(stores
         .create(A, Default::default())?
@@ -714,7 +715,10 @@ fn fix_same_size_and_timestamp_restore_requires_another_read() -> Result<()> {
     );
     let a = s.open_session(A)?;
     std::fs::write(&path, b"later")?;
-    std::fs::File::open(&path)?.set_modified(modified)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_modified(modified)?;
     assert!(a.check_file_write(&path).is_err());
     assert_eq!(a.read_tracked_file(&path)?, b"later");
     a.check_file_write(&path)

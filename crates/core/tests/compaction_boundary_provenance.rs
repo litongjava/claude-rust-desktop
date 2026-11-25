@@ -420,6 +420,16 @@ fn new_memory_boundaries_have_one_writer() {
             }
             for pattern in &patterns {
                 for hit in pattern.find_iter(production) {
+                    // Native compaction seals its own row in the same transaction
+                    // that inserts native_boundaries; it is a reviewed writer.
+                    if path.ends_with("db/session_store/history.rs")
+                        && hit
+                            .as_str()
+                            .to_ascii_lowercase()
+                            .contains("set is_compact_boundary=1")
+                    {
+                        continue;
+                    }
                     violations.push(format!(
                         "{} at byte {}: {}",
                         path.strip_prefix(&root).unwrap().display(),

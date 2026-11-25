@@ -121,7 +121,10 @@ mod tests {
         let id = store.create(&project, "model", "provider")?;
         let root = data.join("..").join("data").join("workspaces");
         assert!(!root.exists());
-        assert_eq!(store.workspace(&id, &root)?, project.canonicalize()?);
+        assert_eq!(
+            store.workspace(&id, &root)?.canonicalize()?,
+            project.canonicalize()?
+        );
         assert!(store.workspace(&id, &project.join("workspaces")).is_err());
         assert!(store.workspace(&id, &data.join("other")).is_err());
         Ok(())

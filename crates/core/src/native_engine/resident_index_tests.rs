@@ -211,8 +211,20 @@ async fn memory_resident_scopes_across_boundaries_and_resume() -> Result<()> {
             let mut offset = 0;
             for (scope, dir) in &visible {
                 let at = wire.find(&format!("FIRST-{scope}!")).unwrap();
+                let memory_path = dir.join("MEMORY.md");
+                let memory_path = memory_path.to_string_lossy();
+                let unescaped_wire = wire.replace("\\\\", "\\");
+                let wire_path = unescaped_wire
+                    .strip_prefix(r"\\?\")
+                    .unwrap_or(&unescaped_wire)
+                    .replace('\\', "/")
+                    .replace("//?/", "");
+                let memory_path = memory_path
+                    .strip_prefix(r"\\?\")
+                    .unwrap_or(&memory_path)
+                    .replace('\\', "/");
                 assert!(
-                    at > offset && wire.contains(dir.join("MEMORY.md").to_str().unwrap()),
+                    at > offset && wire_path.contains(&memory_path),
                     "{kind} {scope}"
                 );
                 offset = at;
@@ -309,7 +321,13 @@ async fn memory_resident_scopes_across_boundaries_and_resume() -> Result<()> {
                     && !wire.contains("MEMORY.md changed."),
                 "{kind}"
             );
-            assert!(wire.contains(shard.memory_directory().to_str().unwrap()));
+            let unescaped_wire = wire.replace("\\\\", "\\");
+            let memory_dir = shard.memory_directory();
+            let memory_dir = memory_dir.to_string_lossy();
+            assert!(
+                unescaped_wire.contains(memory_dir.as_ref())
+                    || unescaped_wire.contains(&memory_dir.replace('\\', "/"))
+            );
             assert_eq!(bytes, memory_request_bytes(&shard, protocol).await);
             fs::write(root.path().join("expected"), bytes)?;
             let resume = std::process::Command::new(std::env::current_exe()?)

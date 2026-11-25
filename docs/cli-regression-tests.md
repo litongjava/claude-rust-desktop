@@ -832,7 +832,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `terminal/input.rs` 的取消通道：L 的 `cancel-manual`、`cancel-empty-manual`、`cancel-invalid-manual`、`cancel-merge-manual`、`post-commit-manual`，并在真实终端确认 `Esc` 不滞留到下一个提示、等待期间 `Ctrl+O` 仍能打开完整记录
 - `status_commands.rs`、`services/context_usage.rs`：`status_commands_tests`、`compaction_status_regressions` 与 L 的 `status-manual`（按边界与配置匹配用量、部分估算、压缩后估算、次数持久化）
 - `session_commands.rs`：L（自动压缩完成输出与次数）；模型请求压缩（`services/compaction_requests.rs`、`prepare_turn` 开头的取用）另见“模型请求压缩（CompactContext）”
-- `worker_frontend.rs`、`background_commands.rs`：B、D、E3、E4、F
+- `worker_frontend.rs`、`background_commands.rs`：B、D、E3、E4、F；任务状态瞬时读失败另需手工场景：长回合运行中把该 job 的 `state.json` 改名约 200ms，回合必须继续，`stderr.log` 出现 `Task state observation deferred` 与 `recovered`；连续失败超过 5 次或 2 秒时，视图以 `Could not read the task state` 结束而 worker 继续运行（`read_job` 的 5×10ms 重试覆盖单次读，前端 `StateRetry` 覆盖更长的外部干扰）。
 - `crates/cli/tests/conpty_worker.rs`、`crates/cli/tests/fixtures/conpty-console.ps1`：见“Windows ConPTY”中的并发启动与进程树清理场景。Linux 仅检查此测试目标可以编译。
 - `memory.rs`、`display_commands.rs`、`crates/core/src/memory`：G
 - `services/customization.rs`、`prompt/`、`native_engine/tool_loop.rs`：H，以及 SDK 测试

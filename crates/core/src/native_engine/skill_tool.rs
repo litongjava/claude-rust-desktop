@@ -284,17 +284,15 @@ mod tests {
             .unwrap();
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("the fixture"), "{instructions}");
-        let rendered = directory.to_string_lossy().replace('\\', "/");
+        let normalize = |text: &str| text.replace('\\', "/").replace("//?/", "");
+        let rendered = normalize(&directory.to_string_lossy());
         assert!(
-            instructions.contains(&rendered),
+            normalize(instructions).contains(&rendered),
             "instructions must name the data-dir skill directory: {instructions}"
         );
         assert_eq!(
-            result["path"].as_str().unwrap().replace('\\', "/"),
-            directory
-                .join("SKILL.md")
-                .to_string_lossy()
-                .replace('\\', "/")
+            normalize(result["path"].as_str().unwrap()),
+            normalize(&directory.join("SKILL.md").to_string_lossy())
         );
     }
 
@@ -331,9 +329,10 @@ mod tests {
             .unwrap();
         let instructions = result["instructions"].as_str().unwrap();
         assert!(instructions.contains("the fixture"), "{instructions}");
-        let rendered = directory.to_string_lossy().replace('\\', "/");
+        let normalize = |text: &str| text.replace('\\', "/").replace("//?/", "");
+        let rendered = normalize(&directory.to_string_lossy());
         assert!(
-            instructions.contains(&rendered),
+            normalize(instructions).contains(&rendered),
             "instructions must name the data-dir skill directory: {instructions}"
         );
         let error = executor

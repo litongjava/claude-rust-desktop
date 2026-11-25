@@ -78,6 +78,13 @@ pub struct PolicySnapshot {
     revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoPolicy {
+    Allow,
+    Confirm,
+    Classify,
+}
+
 pub struct PermissionManager {
     bypass_available: std::sync::atomic::AtomicBool,
     full_access_available: std::sync::atomic::AtomicBool,
@@ -708,6 +715,77 @@ impl PermissionManager {
         )
     }
 
+    /// Auto is a deterministic local policy first, with the model reserved for
+    /// operations that do not fit a known category. This keeps the classifier
+    /// out of ordinary shell and file work while retaining explicit human gates.
+    fn auto_policy(
+        &self,
+        context: &PermissionContext,
+        read_only: bool,
+        shell: bool,
+        delegation: bool,
+    ) -> AutoPolicy {
+        let tool = context.tool_name.as_str();
+        let operation = context.tool_input["operation"].as_str();
+        let url = context.tool_input["url"].as_str().unwrap_or_default();
+        let path = context.tool_input["file_path"]
+            .as_str()
+            .or_else(|| context.tool_input["notebook_path"].as_str())
+            .or_else(|| context.tool_input["path"].as_str());
+        let protected = Self::is_edit_tool(tool)
+            && path.is_some_and(|path| {
+                let cwd = std::path::Path::new(context.workspace_path.as_deref().unwrap_or("."));
+                super::protected_paths::requires_edit_approval(
+                    path,
+                    cwd,
+                    dirs::home_dir().as_deref(),
+                )
+            });
+        let dangerous_shell = shell
+            && context.tool_input["command"]
+                .as_str()
+                .is_some_and(crate::tools::is_dangerous_command);
+        if dangerous_shell || protected || tool == "Delete" {
+            return AutoPolicy::Confirm;
+        }
+        if tool == "WebFetch" && !super::web_fetch::preapproved(url) {
+            return AutoPolicy::Classify;
+        }
+        if tool.starts_with("mcp__") && !context.mcp_read_only {
+            return AutoPolicy::Confirm;
+        }
+        if tool == "GitHub" && !crate::tools::github::is_read_operation(operation) {
+            return AutoPolicy::Confirm;
+        }
+        let config_read = tool == "Config"
+            && matches!(operation, Some("get" | "list" | "merge" | "sources"));
+        if tool == "Config" && !config_read {
+            return AutoPolicy::Confirm;
+        }
+        if matches!(
+            tool,
+            "cron" | "CronCreate" | "CronDelete" | "ScheduleWakeup"
+        ) {
+            return AutoPolicy::Confirm;
+        }
+        if read_only
+            || Self::is_file_edit_tool(tool)
+            || Self::is_own_state_tool(tool)
+            || (shell && context.tool_input["command"].as_str().is_some())
+            || delegation
+            || matches!(
+                tool,
+                "SendMessage" | "TaskStop" | "SearchReplace" | "GlobReplace" | "team"
+            )
+            || context.mcp_read_only
+            || (tool == "GitHub" && crate::tools::github::is_read_operation(operation))
+            || config_read
+        {
+            return AutoPolicy::Allow;
+        }
+        AutoPolicy::Classify
+    }
+
     pub fn check_permission(&self, context: &PermissionContext) -> PermissionResult {
         self.check_permission_inner(context, false)
     }
@@ -962,6 +1040,47 @@ impl PermissionManager {
         if memory_document {
             return decision(PermissionResult::Granted, DefaultOwnState);
         }
+        if auto {
+            // Dangerous shell is a hard human gate. Explicit allow rules may
+            // still authorize ordinary local work below, but never this branch.
+            if shell
+                && context.tool_input["command"]
+                    .as_str()
+                    .is_some_and(crate::tools::is_dangerous_command)
+            {
+                return decision(self.request_confirmation(context), Mode);
+            }
+            if actions.contains(&PermissionAction::Allow) {
+                return decision(PermissionResult::Granted, ExplicitRule);
+            }
+            if setting.as_ref().is_some_and(|p| p.allowed)
+                && !Self::broad_auto_grant(&context.tool_name)
+            {
+                return decision(PermissionResult::Granted, ToolSetting);
+            }
+            let checker = self
+                .always_allow_checker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if !Self::broad_auto_grant(&context.tool_name)
+                && checker.is_some_and(|checker| {
+                    checker(
+                        &context.tool_name,
+                        &self.extract_action_from_context(context),
+                    )
+                })
+            {
+                return decision(PermissionResult::Granted, SavedApproval);
+            }
+            return match self.auto_policy(context, read_only, shell, delegation) {
+                AutoPolicy::Allow => decision(PermissionResult::Granted, Mode),
+                AutoPolicy::Confirm => decision(self.request_confirmation(context), Mode),
+                AutoPolicy::Classify => {
+                    decision(self.request_confirmation(context), DefaultPrompt)
+                }
+            };
+        }
         if shell
             && context.tool_input["command"]
                 .as_str()
@@ -974,9 +1093,6 @@ impl PermissionManager {
             && context.tool_input["command"].as_str().is_some()
         {
             return decision(PermissionResult::Granted, SavedApproval);
-        }
-        if auto && shell && context.tool_input["command"].as_str().is_some() {
-            return decision(PermissionResult::Granted, Mode);
         }
         if actions.contains(&PermissionAction::Allow) {
             return decision(PermissionResult::Granted, ExplicitRule);
@@ -1641,7 +1757,7 @@ mod policy_tests {
     }
 
     #[test]
-    fn mcp_read_only_is_host_owned_and_only_relaxes_plan_boundary() {
+    fn mcp_read_only_is_host_owned_and_auto_or_plan_may_grant() {
         let mut context = context("mcp__fixture__inspect");
         context.tool_input = serde_json::json!({"readOnlyHint":true,"mcp_read_only":true});
         let manager = manager(PermissionMode::PlanMode);
@@ -1654,13 +1770,16 @@ mod policy_tests {
             manager.check_permission(&context),
             PermissionResult::Granted
         );
-        for mode in [PermissionMode::AskPermissions, PermissionMode::Auto] {
-            manager.set_mode(mode);
-            assert!(matches!(
-                manager.check_permission(&context),
-                PermissionResult::RequiresConfirmation(_)
-            ));
-        }
+        manager.set_mode(PermissionMode::AskPermissions);
+        assert!(matches!(
+            manager.check_permission(&context),
+            PermissionResult::RequiresConfirmation(_)
+        ));
+        manager.set_mode(PermissionMode::Auto);
+        assert_eq!(
+            manager.check_permission(&context),
+            PermissionResult::Granted
+        );
         manager.set_mode(PermissionMode::PlanMode);
         for (action, denied) in [
             (PermissionAction::Deny, true),
@@ -2212,7 +2331,7 @@ mod policy_tests {
     }
 
     #[test]
-    fn delegation_defaults_preserve_inherited_authority_but_auto_classifies() {
+    fn delegation_defaults_preserve_inherited_authority_without_classification() {
         for mode in [
             PermissionMode::AskPermissions,
             PermissionMode::PlanMode,
@@ -2222,11 +2341,8 @@ mod policy_tests {
             let manager = manager(mode);
             for name in ["Agent"] {
                 let decision = manager.evaluate_permission(&context(name));
-                if mode == PermissionMode::Auto {
-                    assert!(decision.classifier_eligible);
-                } else {
-                    assert_eq!(decision.result, PermissionResult::Granted);
-                }
+                assert_eq!(decision.result, PermissionResult::Granted);
+                assert!(!decision.classifier_eligible);
                 manager.set_session_rules(
                     "session",
                     HashMap::from([(name.into(), PermissionAction::Deny)]),
@@ -2248,7 +2364,7 @@ mod policy_tests {
     }
 
     #[test]
-    fn auto_filters_broad_grants_without_destroying_saved_rules() {
+    fn auto_grants_delegation_without_consuming_broad_saved_rules() {
         let manager = manager(PermissionMode::Auto);
         manager.set_session_rules(
             "session",
@@ -2257,11 +2373,9 @@ mod policy_tests {
                 ("Agent".into(), PermissionAction::Allow),
             ]),
         );
-        assert!(
-            manager
-                .evaluate_permission(&context("Agent"))
-                .classifier_eligible
-        );
+        let delegation = manager.evaluate_permission(&context("Agent"));
+        assert_eq!(delegation.result, PermissionResult::Granted);
+        assert!(!delegation.classifier_eligible);
         let mut shell = context("Bash");
         shell.tool_input = serde_json::json!({"command":"npm test"});
         assert_eq!(manager.check_permission(&shell), PermissionResult::Granted);
@@ -2335,6 +2449,101 @@ mod policy_tests {
             ));
             assert!(!decision.classifier_eligible);
         }
+    }
+
+    #[test]
+    fn auto_routes_known_work_locally_and_only_unknown_tools_to_classifier() {
+        let manager = manager(PermissionMode::Auto);
+        let allow = |tool: &str, input: serde_json::Value| {
+            let mut call = context(tool);
+            call.tool_input = input;
+            let decision = manager.evaluate_permission(&call);
+            assert_eq!(decision.result, PermissionResult::Granted, "{tool}");
+            assert!(!decision.classifier_eligible, "{tool}");
+        };
+        let human = |tool: &str, input: serde_json::Value| {
+            let mut call = context(tool);
+            call.tool_input = input;
+            let decision = manager.evaluate_permission(&call);
+            assert!(
+                matches!(decision.result, PermissionResult::RequiresConfirmation(_)),
+                "{tool}: {:?}",
+                decision.result
+            );
+            assert!(!decision.classifier_eligible, "{tool}");
+        };
+        let classify = |tool: &str, input: serde_json::Value| {
+            let mut call = context(tool);
+            call.tool_input = input;
+            let decision = manager.evaluate_permission(&call);
+            assert!(
+                matches!(decision.result, PermissionResult::RequiresConfirmation(_)),
+                "{tool}: {:?}",
+                decision.result
+            );
+            assert!(decision.classifier_eligible, "{tool}");
+        };
+
+        // Local, reversible work never asks the model.
+        allow("Read", serde_json::json!({"file_path":"normal.txt"}));
+        allow("Write", serde_json::json!({"file_path":"normal.txt","content":"x"}));
+        allow("Edit", serde_json::json!({"file_path":"normal.txt","old_string":"x","new_string":"y"}));
+        allow("Bash", serde_json::json!({"command":"npm test"}));
+        allow("TodoWrite", serde_json::json!({"todos":[]}));
+        allow("Agent", serde_json::json!({"description":"inspect"}));
+        allow("SendMessage", serde_json::json!({"to":"peer","content":"hi"}));
+        allow("TaskStop", serde_json::json!({"task_id":"t"}));
+        allow("team", serde_json::json!({"operation":"list"}));
+        allow("GitHub", serde_json::json!({"operation":"pr_view"}));
+        allow("Config", serde_json::json!({"operation":"get"}));
+        allow("WebFetch", serde_json::json!({"url":"https://docs.python.org/3/","prompt":"p"}));
+        let mut mcp_read = context("mcp__fixture__inspect");
+        mcp_read.mcp_read_only = true;
+        let decision = manager.evaluate_permission(&mcp_read);
+        assert_eq!(decision.result, PermissionResult::Granted);
+        assert!(!decision.classifier_eligible);
+
+        // Hard human boundaries.
+        human("Bash", serde_json::json!({"command":"shutdown /s"}));
+        human("Write", serde_json::json!({"file_path":".bashrc","content":"x"}));
+        human("Delete", serde_json::json!({"path":"normal.txt"}));
+        human("GitHub", serde_json::json!({"operation":"pr_merge"}));
+        human("Config", serde_json::json!({"operation":"set"}));
+        human("WebFetch", serde_json::json!({"url":"http://127.0.0.1/","prompt":"p"}));
+        human("cron", serde_json::json!({"operation":"create"}));
+        let mut mcp_write = context("mcp__fixture__write");
+        mcp_write.mcp_read_only = false;
+        let decision = manager.evaluate_permission(&mcp_write);
+        assert!(matches!(
+            decision.result,
+            PermissionResult::RequiresConfirmation(_)
+        ));
+        assert!(!decision.classifier_eligible);
+
+        // Unclassified tools are the only model-review path.
+        classify("FutureTool", serde_json::json!({"value":"x"}));
+        classify("WebFetch", serde_json::json!({"url":"https://example.com/","prompt":"p"}));
+        classify("SkillCreate", serde_json::json!({"name":"fixture","content":"x"}));
+
+        // Explicit policy still wins over automatic routing.
+        manager.set_session_rules(
+            "session",
+            HashMap::from([("FutureTool".into(), PermissionAction::Confirm)]),
+        );
+        let explicit = manager.evaluate_permission(&context("FutureTool"));
+        assert!(matches!(
+            explicit.result,
+            PermissionResult::RequiresConfirmation(_)
+        ));
+        assert!(!explicit.classifier_eligible);
+        manager.set_session_rules(
+            "session",
+            HashMap::from([("FutureTool".into(), PermissionAction::Deny)]),
+        );
+        assert!(matches!(
+            manager.check_permission(&context("FutureTool")),
+            PermissionResult::Denied(_)
+        ));
     }
 
     #[test]

@@ -145,6 +145,9 @@ pub struct OpenAIClient {
     stream_override: Option<Client>,
     response_schema: Option<Value>,
     retry_requests: bool,
+    /// The permission classifier uses one bounded attempt; other callers that
+    /// opt out of request-level retries keep the transport's own stream retry.
+    classifier_bound: bool,
     pub(super) request_options: super::request_options::RequestOptions,
 }
 
@@ -162,6 +165,7 @@ impl OpenAIClient {
             request_options: Default::default(),
             response_schema: None,
             retry_requests: true,
+            classifier_bound: false,
         }
     }
 
@@ -219,6 +223,13 @@ impl OpenAIClient {
         self
     }
 
+    /// The classifier response is small and must not spend a second POST or
+    /// grow unbounded. Other no-retry callers keep their normal transport.
+    pub(crate) fn with_classifier_bound(mut self) -> Self {
+        self.classifier_bound = true;
+        self
+    }
+
     pub fn with_response_schema(mut self, schema: Option<Value>) -> Self {
         self.response_schema = schema;
         self
@@ -235,17 +246,33 @@ impl OpenAIClient {
         let provider = &provider.current()?;
         anyhow::ensure!(!crate::services::anthropic_auth::is_oauth_marker(&provider.provider.api_key), "Anthropic OAuth credentials require Anthropic messages API");
         if provider.provider.builtin_id.is_some() {
-            let mut stream = super::provider_runtime::stream_with_options(
-                provider,
-                messages,
-                system_prompt,
-                tools,
-                max_tokens,
-                self.response_schema.as_ref(),
-                None,
-                &self.request_options,
-            )
-            .await?;
+            let mut stream = if !self.classifier_bound {
+                super::provider_runtime::stream_with_options(
+                    provider,
+                    messages,
+                    system_prompt,
+                    tools,
+                    max_tokens,
+                    self.response_schema.as_ref(),
+                    None,
+                    &self.request_options,
+                )
+                .await?
+            } else {
+                super::provider_runtime::stream_with_options_counted_budget(
+                    provider,
+                    messages,
+                    system_prompt,
+                    tools,
+                    max_tokens,
+                    self.response_schema.as_ref(),
+                    None,
+                    &self.request_options,
+                    crate::performance::AttemptBudget::single_attempt(),
+                )
+                .await?
+                .0
+            };
             let mut text = String::new();
             let mut thinking = String::new();
             let mut calls = std::collections::BTreeMap::<usize, Value>::new();
@@ -301,6 +328,14 @@ impl OpenAIClient {
                     if let Some(reported) = value.get("usage").filter(|usage| !usage.is_null()) {
                         usage = Some(serde_json::from_value(reported.clone())?);
                     }
+                }
+                // The classifier has no tool loop and expects a tiny JSON answer.
+                // Keep the builtin transport under the same bound as the direct
+                // without_retries path instead of accepting an unbounded stream.
+                if self.classifier_bound
+                    && text.len().saturating_add(thinking.len()) > 16 * 1024
+                {
+                    anyhow::bail!("Classifier response exceeds size limit");
                 }
             }
             // Record the account and model that issued this provider-native block so a later

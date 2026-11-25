@@ -445,7 +445,16 @@ impl FileMemory {
             );
             let (_, directory) = directories
                 .iter()
-                .find(|(_, dir)| normalized.parent() == Some(dir.as_path()))
+                .find(|(_, dir)| {
+                    normalized.parent().is_some_and(|parent| {
+                        parent
+                            .canonicalize()
+                            .ok()
+                            .zip(dir.canonicalize().ok())
+                            .is_some_and(|(left, right)| left == right)
+                            || parent == dir.as_path()
+                    })
+                })
                 .context("Only the current session's memory scopes are accessible")?;
             let name = normalized
                 .file_name()
@@ -455,7 +464,13 @@ impl FileMemory {
                 name == "MEMORY.md" || super::super::memory::files::valid_filename(name),
                 "Invalid memory filename"
             );
-            managed = Some(if directory == &self.directory {
+            managed = Some(if directory
+                .canonicalize()
+                .ok()
+                .zip(self.directory.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
+                || directory == &self.directory
+            {
                 name.to_owned()
             } else {
                 normalized
@@ -527,7 +542,16 @@ impl FileMemory {
         let directories = self.session_directories()?;
         let (scope, directory) = directories
             .iter()
-            .find(|(_, dir)| target.parent() == Some(dir.as_path()))
+            .find(|(_, dir)| {
+                target.parent().is_some_and(|parent| {
+                    parent
+                        .canonicalize()
+                        .ok()
+                        .zip(dir.canonicalize().ok())
+                        .is_some_and(|(left, right)| left == right)
+                        || parent == dir.as_path()
+                })
+            })
             .context("Memory scope changed")?;
         let data = self.context.paths.data_dir.canonicalize()?;
         let root = if *scope == "team" { directory } else { &data };
@@ -1013,18 +1037,25 @@ mod tests {
     #[test]
     fn file_memory_target_rejects_other_scopes_traversal_and_mixed_patches() {
         let (_root, memory) = fixture();
+        let directory = memory.directory.to_string_lossy();
+        let sep = std::path::MAIN_SEPARATOR;
         for path in [
-            memory.directory.join("../memory/test.md"),
-            memory.directory.join("../../other/memory/test.md"),
+            PathBuf::from(format!("{directory}{sep}..{sep}memory{sep}test.md")),
+            PathBuf::from(format!(
+                "{directory}{sep}..{sep}..{sep}other{sep}memory{sep}test.md"
+            )),
             memory
                 .context
                 .paths
                 .data_dir
                 .join("memory/state/catalog.json"),
         ] {
-            assert!(memory
-                .target("Write", &json!({"file_path":path}), "/")
-                .is_err());
+            assert!(
+                memory
+                    .target("Write", &json!({"file_path":path}), "/")
+                    .is_err(),
+                "{path:?}"
+            );
         }
         let path = memory.directory.join("test.md");
         assert!(memory.target("ApplyPatch",&json!({"patch":format!("*** Begin Patch\n*** Delete File: {}\n*** Delete File: outside.txt\n*** End Patch",path.display())}),"/").is_err());

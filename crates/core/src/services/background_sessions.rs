@@ -527,9 +527,56 @@ pub(crate) fn directory(root: &Path, id: &str) -> Result<PathBuf> {
 }
 pub(crate) fn read_job(dir: &Path) -> Result<Job> {
     let path = dir.join("state.json");
-    let bytes =
-        fs::read(&path).with_context(|| format!("Reading task state {}", path.display()))?;
+    let bytes = read_with_retry(|| fs::read(&path), |error| transient_state_error(error, &path))
+        .with_context(|| format!("Reading task state {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("Parsing task state {}", path.display()))
+}
+
+/// Retries a read while `retry` accepts the error, for at most 50 ms. Windows
+/// filesystem filters can briefly deny or hide a file that is being replaced;
+/// one such window must not fail a whole turn, while a persistent failure is
+/// still reported.
+fn read_with_retry<T>(
+    mut read: impl FnMut() -> std::io::Result<T>,
+    retry: impl Fn(&std::io::Error) -> bool,
+) -> std::io::Result<T> {
+    for attempt in 0..=5 {
+        match read() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt < 5 && retry(&error) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!()
+}
+
+fn transient_state_error(error: &std::io::Error, path: &Path) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    match error.raw_os_error() {
+        // Sharing violation or access denied while a replacement is published.
+        Some(5 | 32) => true,
+        // A replaced name can be unresolvable for a moment. A job that never
+        // published its state must still fail fast.
+        Some(2 | 3) => path.parent().is_some_and(Path::exists),
+        _ => false,
+    }
+}
+
+/// Whether a failed task read may succeed on a later attempt. Frontends use
+/// this to defer one observation instead of treating it as a dead worker.
+pub fn is_transient_state_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| {
+                error.kind() == std::io::ErrorKind::NotFound
+                    || (cfg!(windows) && matches!(error.raw_os_error(), Some(2 | 3 | 5 | 32)))
+            })
+    })
 }
 fn observed(mut job: Job) -> Job {
     if matches!(job.status.as_str(), "starting" | "running")
@@ -2200,6 +2247,65 @@ mod tests {
         .unwrap();
         (root, dir, id)
     }
+
+    #[test]
+    fn task_state_read_retries_transient_failures_and_then_reports_persistent_ones() {
+        let attempts = std::cell::Cell::new(0);
+        let value = read_with_retry(
+            || {
+                let attempt = attempts.get();
+                attempts.set(attempt + 1);
+                if attempt < 2 {
+                    Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+                } else {
+                    Ok(7)
+                }
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(value, 7);
+        assert_eq!(attempts.get(), 3);
+
+        let attempts = std::cell::Cell::new(0);
+        let error = read_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err::<u8, _>(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            |_| true,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts.get(), 6);
+    }
+
+    #[test]
+    fn missing_task_state_is_retried_only_under_an_existing_job_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        // A synthesized kind has no OS code; the retry reads the raw Windows code.
+        let error = std::io::Error::from_raw_os_error(2);
+        let state = temp.path().join("job").join("state.json");
+        #[cfg(windows)]
+        {
+            assert!(!transient_state_error(&error, &state));
+            std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+            assert!(transient_state_error(&error, &state));
+        }
+        #[cfg(not(windows))]
+        assert!(!transient_state_error(&error, &state));
+    }
+
+    #[test]
+    fn frontend_classifies_only_transient_task_reads() {
+        let missing = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound))
+            .context("Reading task state state.json");
+        assert!(is_transient_state_error(&missing));
+        assert!(!is_transient_state_error(&anyhow::anyhow!(
+            "Invalid background stream JSON"
+        )));
+    }
+
     #[cfg(windows)]
     #[test]
     fn pending_question_survives_short_file_lock_but_reports_persistent_failure() {

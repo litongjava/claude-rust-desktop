@@ -1532,6 +1532,21 @@ fn proc_start_ticks(_: u32) -> Option<String> {
     None
 }
 
+#[cfg(not(target_os = "linux"))]
+fn wait_for_republished_state(_: &Path, _: &str) {
+    panic!("the republished-state scenario is Linux-only");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_damaged_job_terminal(_: &Path, _: &str) -> String {
+    panic!("the damaged-job scenario is Linux-only");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn wait_instance_stopped(_: u32, _: &str) -> bool {
+    panic!("the process-identity scenario is Linux-only");
+}
+
 /// A process the completion-gate cleanup must never touch.
 struct Sentinel(std::process::Child);
 

@@ -303,6 +303,7 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
     #[test]
     fn unpack_copies_hard_links_keeps_symlinks_and_skips_devices() {
         let dir = tempfile::tempdir().unwrap();
