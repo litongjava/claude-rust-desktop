@@ -548,6 +548,26 @@ fn todo_lines(input: &Value, failed: bool) -> Option<Vec<Line>> {
     Some(lines)
 }
 
+/// A foreground shell reports its starting directory on the first call and
+/// again when it changes; the transcript shows the final path component.
+fn reported_cwd(name: &str, output: &str) -> Option<String> {
+    if !matches!(name, "Bash" | "PowerShell") {
+        return None;
+    }
+    let body = output.strip_prefix("Error: ").unwrap_or(output);
+    let value: Value = serde_json::from_str(body).ok()?;
+    let cwd = value["cwd"].as_str()?.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    let name = std::path::Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(cwd);
+    Some(printable(name))
+}
+
 /// `● Tool(args) · 0.4s` followed by a short result.
 pub fn finished(
     name: &str,
@@ -565,6 +585,9 @@ pub fn finished(
     let _ = elapsed;
     let (shown, hidden) = summary(name, output, failed);
     let mut lines = vec![change_view::tool_call(&result_label(name, input, output, workspace), "", failed)];
+    if let Some(cwd) = reported_cwd(name, output) {
+        lines.push(change_view::muted(&format!("  cwd: {cwd}")));
+    }
     for (index, line) in shown.iter().enumerate() {
         lines.push(change_view::tool_output(line, index == 0, failed));
     }
@@ -589,6 +612,9 @@ pub fn expanded(
         _ => result_label(name, input, output, workspace),
     };
     let mut lines = vec![change_view::tool_call(&header, if failed { "error" } else { "" }, failed)];
+    if let Some(cwd) = reported_cwd(name, output) {
+        lines.push(change_view::muted(&format!("  cwd: {cwd}")));
+    }
     let diff = change_view::details(name, output, failed);
     let text = diff.unwrap_or_else(|| named_result_text(name, output));
     let rows: Vec<&str> = text.lines().collect();
@@ -1090,6 +1116,24 @@ mod tests {
 
         let lines = text(&finished("Bash", &json!({"command":"cargo x"}), "Bash is not available in plan mode", true, None, None));
         assert_eq!(lines[1], "  \u{23bf}  Bash is not available in plan mode");
+    }
+
+    #[test]
+    fn bash_changed_directory_is_shown_under_the_header() {
+        let output = json!({
+            "exit_code": 0,
+            "cwd": "/Users/ping/code/project/project-harness/deepseek-code-data-layout",
+            "stdout": "",
+            "stderr": ""
+        })
+        .to_string();
+        let input = json!({"command": "cd sub"});
+        let lines = text(&finished("Bash", &input, &output, false, None, None));
+        assert_eq!(lines[0], "\u{25cf} Bash(cd sub)");
+        assert_eq!(lines[1], "  cwd: deepseek-code-data-layout");
+        let full = text(&expanded("Bash", &input, &output, false, None));
+        assert_eq!(full[0], "\u{25cf} Bash(cd sub)");
+        assert_eq!(full[1], "  cwd: deepseek-code-data-layout");
     }
 
     #[test]

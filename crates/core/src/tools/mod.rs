@@ -698,6 +698,15 @@ fn is_path_allowed(resolved_path: &Path, cwd: &str) -> bool {
     false
 }
 
+/// Whether two working directories name the same place; the shell footer
+/// writes canonical paths while the engine may have started from a symlink.
+fn same_directory(a: &str, b: &str) -> bool {
+    match (Path::new(a).canonicalize(), Path::new(b).canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => Path::new(a) == Path::new(b),
+    }
+}
+
 #[cfg(all(test, unix))]
 #[tokio::test]
 async fn bash_keeps_its_directory_and_resets_outside_the_project() {
@@ -708,8 +717,15 @@ async fn bash_keeps_its_directory_and_resets_outside_the_project() {
     let cwd = project.to_str().unwrap();
     let state = project.join("cwd-state");
     let run = |command: &str| serde_json::json!({"command":command,"__cwd_state":state.to_string_lossy()});
-    tool_bash_async(run("cd sub"), cwd).await.unwrap();
+    let initial = tool_bash_async(run("pwd -P"), cwd).await.unwrap();
+    assert_eq!(initial["cwd"], serde_json::json!(cwd));
+    let moved = tool_bash_async(run("cd sub"), cwd).await.unwrap();
+    assert_eq!(
+        moved["cwd"].as_str().unwrap(),
+        project.join("sub").to_str().unwrap()
+    );
     let out = tool_bash_async(run("pwd -P"), cwd).await.unwrap();
+    assert!(out.get("cwd").is_none(), "{out}");
     assert_eq!(
         out["stdout"].as_str().unwrap().trim(),
         project.join("sub").to_str().unwrap()
@@ -722,6 +738,7 @@ async fn bash_keeps_its_directory_and_resets_outside_the_project() {
         .contains("sub"));
     let reset = tool_bash_async(run("cd /"), cwd).await.unwrap();
     assert_eq!(reset["note"], format!("Shell cwd was reset to {cwd}"));
+    assert_eq!(reset["cwd"], serde_json::json!(cwd));
     assert_eq!(
         tool_bash_async(run("pwd -P"), cwd).await.unwrap()["stdout"]
             .as_str()
@@ -1274,9 +1291,14 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
             .ok()
             .map(|text| text.trim_start_matches('\u{feff}').trim().to_owned())
     };
-    let safe_cwd = match cwd_state.as_ref().and_then(saved_cwd) {
-        Some(saved) if Path::new(&saved).is_dir() && is_path_allowed(Path::new(&saved), cwd) => {
-            saved
+    let saved_before = cwd_state.as_ref().and_then(saved_cwd);
+    let report_initial = cwd_state.is_some()
+        && !saved_before.as_deref().is_some_and(|saved| {
+            Path::new(saved).is_dir() && is_path_allowed(Path::new(saved), cwd)
+        });
+    let safe_cwd = match saved_before.as_deref() {
+        Some(saved) if Path::new(saved).is_dir() && is_path_allowed(Path::new(saved), cwd) => {
+            saved.to_owned()
         }
         _ => safe_cwd,
     };
@@ -1458,16 +1480,25 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         }
         if let Some(state) = &cwd_state {
             let moved = saved_cwd(state);
-            if moved
+            let reset = moved
                 .as_deref()
-                .is_some_and(|dir| !is_path_allowed(Path::new(dir), cwd))
-            {
+                .is_some_and(|dir| !is_path_allowed(Path::new(dir), cwd));
+            if reset {
                 let _ = fs::remove_file(state);
                 if let Some(object) = result.as_object_mut() {
                     object.insert(
                         "note".into(),
                         serde_json::json!(format!("Shell cwd was reset to {cwd}")),
                     );
+                    object.insert("cwd".into(), serde_json::json!(cwd));
+                }
+            } else if let Some(moved) = moved {
+                // The first foreground call reports where it started; later
+                // calls report only a change.
+                if report_initial || !same_directory(&moved, &safe_cwd) {
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("cwd".into(), serde_json::json!(moved));
+                    }
                 }
             }
         }

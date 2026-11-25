@@ -512,6 +512,13 @@ fn render_with_spans(
             parts.push("Command failed".into());
         }
         fields.remove("success");
+        // A foreground shell reports a changed directory once, above stdout.
+        if let Some(cwd) = fields
+            .remove("cwd")
+            .and_then(|cwd| cwd.as_str().map(str::to_owned))
+        {
+            parts.push(format!("cwd: {cwd}"));
+        }
         for (key, label) in [
             ("timed_out", "Command timed out"),
             ("is_error", "Tool reported an error"),
@@ -1278,6 +1285,24 @@ mod tests {
         assert!(rendered.contains("more lines remain"));
         assert!(rendered.contains("missing name"));
         assert!(rendered.ends_with("   51\tcode"));
+    }
+
+    #[test]
+    fn changed_shell_directory_is_reported_above_stdout() {
+        let raw = json!({
+            "stdout": "a\n",
+            "stderr": "",
+            "cwd": "/repo/deepseek-code-data-layout",
+            "exit_code": 0
+        })
+        .to_string();
+        let rendered = render("Bash", &raw, None);
+        assert!(rendered.contains("cwd: /repo/deepseek-code-data-layout"), "{rendered}");
+        assert!(
+            rendered.find("cwd: /repo/deepseek-code-data-layout")
+                < rendered.find("Output:\na\n"),
+            "{rendered}"
+        );
     }
 
     #[test]

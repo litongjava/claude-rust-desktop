@@ -9,7 +9,7 @@ use super::background_shell;
 use crate::services::shell_settings::{self, ResolvedShell, ShellSettings};
 use std::sync::Mutex;
 
-const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call starts a fresh shell. Explicit background tasks start in the workspace.
+const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call runs in a new process. Explicit background tasks start in the workspace.
 
 A foreground timeout in a managed session returns recent output and a task_id while the process continues. Without a managed session, the timeout stops the process tree. Read the task with TaskGet, use block:true to wait for completion, or end it with TaskStop.
 
@@ -146,7 +146,7 @@ fn append_execution_note(note: &mut String, shell: &ResolvedShell, host_os: &str
     note.push_str(if name == "fish" {
         " Foreground commands start in the workspace."
     } else {
-        " Foreground commands can reuse the session's last allowed directory."
+        " A foreground call starts in the previous foreground call's directory; the first foreground call of a new session reports its starting directory in `cwd`, and later calls report `cwd` only when they change it. Add a leading `cd` only to change it; use `(cd ... && ...)` or `git -C` for a temporary switch. Other tools still resolve relative paths against the primary working directory."
     });
     if super::pipeline_failure_flag(shell.command_flag, name, shell.wsl.is_some()) {
         note.push_str(" With pipefail enabled, a failing pipeline stage can surface even when the last stage succeeds.");
@@ -529,7 +529,10 @@ mod tests {
             assert_eq!(text.contains("Git Bash"), label == "Git Bash");
             assert_eq!(text.contains("PowerShell 5.1"), name == "powershell");
             assert_eq!(text.contains("PowerShell 7"), name == "pwsh");
-            assert_eq!(text.contains("last allowed directory"), name != "fish");
+            assert_eq!(
+                text.contains("first foreground call of a new session reports"),
+                name != "fish"
+            );
             assert_eq!(
                 text.contains("Foreground commands start in the workspace"),
                 name == "fish"
