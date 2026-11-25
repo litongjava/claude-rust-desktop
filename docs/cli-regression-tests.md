@@ -156,6 +156,20 @@ cargo test --locked -p deepseek-code-cli --test session_worker
 4. 模型运行中重复第 1 步：文本进入草稿，同样不发送。
 5. Windows 说明：ConPTY 把粘贴中的换行（U+000A）报成 `VK_RETURN` 加 `CONTROL` 状态，读成按键就是 Ctrl+Enter。`crates/cli/src/terminal/paste_input.rs` 把这种记录还原成粘贴文本；真实按下的 Enter 带 `\r`，不受影响。改动后要在真实 ConPTY 里复测本条和场景 A 第 6 条。
 
+### A3. 提交提示词时输入框交接无抖动
+
+修改 `crates/cli/src/terminal/editor.rs`、`crates/cli/src/terminal/live.rs`、`crates/cli/src/session.rs` 或 `crates/cli/src/worker_frontend.rs` 的提交/交接渲染逻辑后执行：
+
+```bash
+cargo test --locked -p deepseek-code-cli --bin dcl -- submit_handoff idle_tip_above_input live_first_frame
+cargo test --locked -p deepseek-code-cli --test prompt_submit_stability -- --nocapture
+```
+
+1. 36×100 真实 PTY/ConPTY 首轮打开时，Tip 位于输入框上方而不是 footer 下方；底部的上边框、输入行、下边框、footer 固定占据最后 4 行（`rows - 4 .. rows`）。
+2. 首轮按 `Enter` 提交后（模型响应门控延迟期间），不擦除底部输入框，不产生一行下移；工作态状态行直接出现在输入框上方，且带有初始模型标签。
+3. 首轮流式回复完成并交棒回空闲态、以及第二轮提交并在请求门控期按 `Esc` 取消期间，底部输入框边框与 footer 始终停留在同一组屏幕行，且请求期 `Esc` 可正常中断并返回空闲态。
+4. 满屏状态下提交与接管不会把旧输入框/旧 footer 滚进 transcript。
+
 ### B. 运行中排队和撤回
 
 让模型运行一个较长的命令（如 `sleep 40`），在此期间操作：

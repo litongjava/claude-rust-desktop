@@ -731,36 +731,7 @@ impl Screen {
                 continue;
             }
             queue!(frame, MoveTo(0, (top + offset) as u16))?;
-            if std::env::var_os("NO_COLOR").is_none() {
-                match style {
-                    TextStyle::Colored(color) => queue!(frame, SetForegroundColor(*color))?,
-                    TextStyle::Accent => queue!(
-                        frame,
-                        SetAttribute(Attribute::Bold),
-                        SetForegroundColor(crate::terminal::style::accent())
-                    )?,
-                    TextStyle::Success => {
-                        queue!(frame, SetForegroundColor(crate::terminal::style::success()))?
-                    }
-                    TextStyle::Border => {
-                        queue!(frame, SetForegroundColor(crate::terminal::style::border()))?
-                    }
-                    TextStyle::Plain => queue!(frame, ResetColor)?,
-                    TextStyle::Muted => {
-                        queue!(frame, SetForegroundColor(crate::terminal::style::muted()))?
-                    }
-                    TextStyle::Selected => queue!(
-                        frame,
-                        SetForegroundColor(crate::terminal::style::selected())
-                    )?,
-                }
-            }
-            write!(frame, "{text}")?;
-            // Overwrite first, then erase only the old trailing cells.
-            if matches!(style, TextStyle::Accent) {
-                queue!(frame, SetAttribute(Attribute::Reset))?;
-            }
-            queue!(frame, ResetColor, Clear(ClearType::UntilNewLine))?;
+            write_display_line(&mut frame, text, *style)?;
         }
         queue!(frame, MoveTo(col as u16, (top + row) as u16))?;
         out.write_all(&frame)?;
@@ -923,6 +894,182 @@ impl Screen {
         out.write_all(b"\x1b[?2026l")?;
         out.flush()
     }
+
+    /// Writes the submitted prompt into the transcript while keeping a single-row
+    /// bottom input box in place for the live turn to take over without blinking.
+    fn finish_handoff(
+        &mut self,
+        text: &str,
+        prompt: &str,
+        footer: &DisplayLine,
+        width: usize,
+        history: &mut crate::terminal::scrollback::Scrollback,
+    ) -> io::Result<()> {
+        let (cols, rows) = crate::terminal::size();
+        let mut out = crate::terminal_output::stderr_locked();
+        if let Some(row) = self.finish_handoff_to(
+            &mut out,
+            text,
+            prompt,
+            footer,
+            width,
+            cols as usize,
+            rows as usize,
+            history,
+        )? {
+            crate::terminal::hand_off(row);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_handoff_to(
+        &mut self,
+        out: &mut impl Write,
+        text: &str,
+        prompt: &str,
+        footer: &DisplayLine,
+        width: usize,
+        cols: usize,
+        rows: usize,
+        history: &mut crate::terminal::scrollback::Scrollback,
+    ) -> io::Result<Option<u16>> {
+        let box_lines: [DisplayLine; 4] = [
+            ("\u{2500}".repeat(width), TextStyle::Border),
+            (prompt.to_owned(), TextStyle::Plain),
+            ("\u{2500}".repeat(width), TextStyle::Border),
+            footer.clone(),
+        ];
+        let box_height = box_lines.len();
+        if !self.pinned || rows < box_height + 1 || text.trim().is_empty() {
+            out.write_all(b"\x1b[?2026h")?;
+            self.erase(out)?;
+            if let Some(end) = self.transcript_end.take() {
+                queue!(out, MoveTo(0, end as u16), Clear(ClearType::FromCursorDown))?;
+            }
+            if !text.trim().is_empty() {
+                crate::terminal::prompt_display::write_recorded(out, history, text, width, true)?;
+            }
+            out.write_all(b"\x1b[?2026l")?;
+            out.flush()?;
+            return Ok(None);
+        }
+        let box_top = rows - box_height;
+        let old_top = self.top.take().map(|row| row as usize).unwrap_or(box_top);
+        let transcript_end = self
+            .transcript_end
+            .take()
+            .unwrap_or(old_top)
+            .min(rows.saturating_sub(1));
+        let recorded = crate::terminal::prompt_display::recorded_rows_at_width(history, text, width);
+        let cols = cols.max(1);
+        let written_rows: usize = recorded
+            .iter()
+            .map(|row| crate::terminal::scrollback::screen_rows(row, cols))
+            .sum();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(b"\x1b[?2026h\x1b[?25l");
+        if written_rows > box_top {
+            queue!(
+                frame,
+                MoveTo(0, old_top.min(rows - 1) as u16),
+                Clear(ClearType::FromCursorDown),
+                MoveTo(0, transcript_end as u16),
+                Clear(ClearType::FromCursorDown)
+            )?;
+            for row in &recorded {
+                write!(frame, "{row}\r\n")?;
+            }
+            frame.extend_from_slice(b"\x1b[?25h\x1b[?2026l");
+            out.write_all(&frame)?;
+            out.flush()?;
+            self.previous.clear();
+            self.height = 0;
+            return Ok(None);
+        }
+        let scroll = (transcript_end + written_rows).saturating_sub(box_top);
+        let write_start = if scroll > 0 {
+            // Clear the old bottom composer before scrolling so it never enters scrollback.
+            queue!(
+                frame,
+                MoveTo(0, old_top.min(rows - 1) as u16),
+                Clear(ClearType::FromCursorDown),
+                MoveTo(0, (rows - 1) as u16)
+            )?;
+            for _ in 0..scroll {
+                frame.extend_from_slice(b"\r\n");
+            }
+            transcript_end.saturating_sub(scroll)
+        } else {
+            transcript_end
+        };
+        let mut row_cursor = write_start;
+        for row in &recorded {
+            queue!(frame, MoveTo(0, row_cursor as u16))?;
+            write!(frame, "{row}")?;
+            queue!(frame, ResetColor, Clear(ClearType::UntilNewLine))?;
+            row_cursor += crate::terminal::scrollback::screen_rows(row, cols);
+        }
+        let new_end = row_cursor.min(box_top);
+        let clear_start = if scroll > 0 {
+            new_end
+        } else {
+            old_top.max(new_end)
+        };
+        for row in clear_start..box_top {
+            queue!(
+                frame,
+                MoveTo(0, row as u16),
+                ResetColor,
+                Clear(ClearType::UntilNewLine)
+            )?;
+        }
+        for (offset, (line, style)) in box_lines.iter().enumerate() {
+            queue!(frame, MoveTo(0, (box_top + offset) as u16))?;
+            write_display_line(&mut frame, line, *style)?;
+        }
+        let prompt_col = UnicodeWidthStr::width(prompt).min(width);
+        queue!(frame, MoveTo(prompt_col as u16, (box_top + 1) as u16))?;
+        frame.extend_from_slice(b"\x1b[?25h\x1b[?2026l");
+        out.write_all(&frame)?;
+        out.flush()?;
+        self.previous.clear();
+        self.height = 0;
+        Ok(Some(new_end as u16))
+    }
+}
+
+fn should_handoff_submit(text: &str) -> bool {
+    !matches!(
+        text.trim(),
+        "/exit" | "/quit" | "exit" | "quit" | ".exit" | ":q"
+    )
+}
+
+fn write_display_line(out: &mut impl Write, text: &str, style: TextStyle) -> io::Result<()> {
+    if std::env::var_os("NO_COLOR").is_none() {
+        match style {
+            TextStyle::Colored(color) => queue!(out, SetForegroundColor(color))?,
+            TextStyle::Accent => queue!(
+                out,
+                SetAttribute(Attribute::Bold),
+                SetForegroundColor(crate::terminal::style::accent())
+            )?,
+            TextStyle::Success => queue!(out, SetForegroundColor(crate::terminal::style::success()))?,
+            TextStyle::Border => queue!(out, SetForegroundColor(crate::terminal::style::border()))?,
+            TextStyle::Plain => queue!(out, ResetColor)?,
+            TextStyle::Muted => queue!(out, SetForegroundColor(crate::terminal::style::muted()))?,
+            TextStyle::Selected => {
+                queue!(out, SetForegroundColor(crate::terminal::style::selected()))?
+            }
+        }
+    }
+    write!(out, "{text}")?;
+    // Overwrite first, then erase only the old trailing cells.
+    if matches!(style, TextStyle::Accent) {
+        queue!(out, SetAttribute(Attribute::Reset))?;
+    }
+    queue!(out, ResetColor, Clear(ClearType::UntilNewLine))
 }
 fn write_notice(
     out: &mut impl Write,
@@ -1420,24 +1567,25 @@ impl PromptEditor {
             }];
             let max_input = (rows as usize / 3).max(1);
             // As in the reference CLI one footer line suffices; a tip helps only
-            // before the first prompt.
+            // before the first prompt and sits above the input box so the bottom
+            // composer rows match the live turn layout without shifting.
             let show_tip = search.is_none() && rows >= 12 && self.history.is_empty();
+            let hint_rows = usize::from(show_tip) + usize::from(!self.details.entries.is_empty());
             let first = cursor_row.saturating_sub(max_input - 1);
             let input_height = input_lines.len().saturating_sub(first).min(max_input);
             let panel_budget = (rows as usize)
                 .saturating_sub(
-                    input_height + 5 + usize::from(show_tip) + if items.is_empty() { 0 } else { 4 },
+                    input_height + 5 + hint_rows + if items.is_empty() { 0 } else { 4 },
                 )
                 .min(12);
             let panel = self.details.render(width, panel_budget);
             let panel_height = panel.lines.len();
             let mut lines = panel.lines;
-            let footer_rows =
-                usize::from(show_tip) + 1 + usize::from(!self.details.entries.is_empty());
+            let footer_rows = 1;
             // Five one-line entries at a time above the input box, as in the
             // reference CLI.
             let available = (rows as usize)
-                .saturating_sub(panel_height + input_height + 2 + footer_rows + 1)
+                .saturating_sub(panel_height + input_height + 2 + hint_rows + footer_rows + 1)
                 .min(MENU_ROWS);
             let heights = vec![1; items.len()];
             let (start, end) = menu_page(&heights, selected, available);
@@ -1511,6 +1659,23 @@ impl PromptEditor {
                     .take(limit)
                     .map(|row| (clipped(row, width), TextStyle::Muted)),
             );
+            if !self.details.entries.is_empty() {
+                lines.push((
+                    clipped("Ctrl+O details \u{00b7} PgUp/PgDn scroll", width),
+                    TextStyle::Muted,
+                ));
+            }
+            if show_tip {
+                let tips = [
+                    "Tip: Type / to browse available commands.",
+                    "Tip: Use /color and /rename to tell multiple sessions apart.",
+                    "Tip: Use /btw to ask a side question while the model works.",
+                ];
+                lines.push((
+                    clipped(tips[self.history.len() % tips.len()], width),
+                    TextStyle::Muted,
+                ));
+            }
             // Reserved composer spacing, even for new or resumed sessions.
             lines.push((String::new(), TextStyle::Plain));
             let menu_height = lines.len() - panel_height;
@@ -1618,6 +1783,7 @@ impl PromptEditor {
                 Some((_, color)) if search.is_none() => TextStyle::Colored(color),
                 _ => TextStyle::Muted,
             };
+            let footer_line: DisplayLine = (clipped(&footer, width), footer_style);
             if shortcuts && items.is_empty() && search.is_none() {
                 lines.extend(
                     crate::terminal::style::shortcut_rows(width)
@@ -1625,25 +1791,7 @@ impl PromptEditor {
                         .map(|row| (clipped(&row, width), TextStyle::Muted)),
                 );
             } else {
-                lines.push((clipped(&footer, width), footer_style));
-            }
-
-            if !self.details.entries.is_empty() {
-                lines.push((
-                    clipped("Ctrl+O details \u{00b7} PgUp/PgDn scroll", width),
-                    TextStyle::Muted,
-                ));
-            }
-            if show_tip {
-                let tips = [
-                    "Tip: Type / to browse available commands.",
-                    "Tip: Use /color and /rename to tell multiple sessions apart.",
-                    "Tip: Use /btw to ask a side question while the model works.",
-                ];
-                lines.push((
-                    clipped(tips[self.history.len() % tips.len()], width),
-                    TextStyle::Muted,
-                ));
+                lines.push(footer_line.clone());
             }
             let input_row = panel_height + menu_height + cursor_row - first + 1;
             history_view.set_pinned(&pinned.text, width);
@@ -2520,7 +2668,17 @@ impl PromptEditor {
                             // Restore the main screen before clearing its composer.
                             // Otherwise dropping HistoryView restores a stale input frame.
                             history_view.close()?;
-                            screen.finish(&text, &prompt, &mut above)?;
+                            if should_handoff_submit(&text) {
+                                screen.finish_handoff(
+                                    &text,
+                                    &prompt,
+                                    &footer_line,
+                                    width,
+                                    &mut above,
+                                )?;
+                            } else {
+                                screen.finish(&text, &prompt, &mut above)?;
+                            }
                             if !text.trim().is_empty() && self.history.last() != Some(&text) {
                                 self.history.push(text.clone());
                             }
@@ -2959,6 +3117,179 @@ mod tests {
             history.all().join("\r\n") + "\r\n",
             "Previous answer\r\n".to_owned() + &String::from_utf8(output).unwrap()
         );
+    }
+
+    #[test]
+    fn submit_handoff_keeps_bottom_box_in_place_without_clear_down() {
+        let mut terminal = vt100::Parser::new(24, 80, 100);
+        terminal.process(b"WELCOME\r\nworkspace\r\n");
+        let mut history = crate::terminal::scrollback::Scrollback::default();
+        history.set_welcome("WELCOME\nworkspace\n".into());
+        let width = 79;
+        let rule = "\u{2500}".repeat(width);
+        let footer = ("Ask · high".to_owned(), TextStyle::Muted);
+        // Idle frame with a Tip above the input box (matching the live turn bottom 4 rows).
+        let idle_lines = vec![
+            (
+                "Tip: Type / to browse available commands.".to_owned(),
+                TextStyle::Muted,
+            ),
+            (String::new(), TextStyle::Plain),
+            (rule.clone(), TextStyle::Border),
+            ("❯ hello".to_owned(), TextStyle::Plain),
+            (rule.clone(), TextStyle::Border),
+            footer.clone(),
+        ];
+        let mut screen = Screen::pinned();
+        let mut draw_out = Vec::new();
+        screen
+            .draw_pinned_to(&mut draw_out, &idle_lines, 3, 7, 24, 2)
+            .unwrap();
+        terminal.process(&draw_out);
+        let before: Vec<_> = terminal.screen().rows(0, 80).collect();
+        assert_eq!(before[18], "Tip: Type / to browse available commands.");
+        assert_eq!(before[20], rule);
+        assert_eq!(before[21], "❯ hello");
+        assert_eq!(before[22], rule);
+        assert_eq!(before[23], "Ask · high");
+
+        let mut finish_out = Vec::new();
+        let handoff_row = screen
+            .finish_handoff_to(
+                &mut finish_out,
+                "hello",
+                "❯ ",
+                &footer,
+                width,
+                80,
+                24,
+                &mut history,
+            )
+            .unwrap();
+        let emitted = String::from_utf8(finish_out.clone()).unwrap();
+        assert!(
+            !emitted.contains("\x1b[J"),
+            "submitting with free rows must not emit ED(0) clear-down: {emitted:?}"
+        );
+        terminal.process(&finish_out);
+        let after: Vec<_> = terminal.screen().rows(0, 80).collect();
+        assert_eq!(after[0], "WELCOME");
+        assert_eq!(after[1], "workspace");
+        assert!(
+            after[2..10].iter().any(|row| row.contains("hello")),
+            "submitted prompt should appear below banner: {:?}",
+            &after[..12]
+        );
+        assert_eq!(after[18], "", "old tip row above box should be cleared");
+        assert_eq!(after[20], before[20], "top border row must not move");
+        assert_eq!(after[21].trim_end(), "❯");
+        assert_eq!(after[22], before[22], "bottom border row must not move");
+        assert_eq!(after[23], before[23], "footer row must not move");
+        assert!(handoff_row.is_some_and(|row| row >= 5 && row <= 20));
+    }
+
+    #[test]
+    fn submit_handoff_scrolls_full_screen_without_putting_old_box_into_scrollback() {
+        let mut terminal = vt100::Parser::new(12, 60, 100);
+        for index in 0..8 {
+            terminal.process(format!("history {index}\r\n").as_bytes());
+        }
+        let mut history = crate::terminal::scrollback::Scrollback::default();
+        let width = 59;
+        let rule = "\u{2500}".repeat(width);
+        let footer = ("Ask".to_owned(), TextStyle::Muted);
+        let idle_lines = vec![
+            (rule.clone(), TextStyle::Border),
+            ("❯ submitted question".to_owned(), TextStyle::Plain),
+            (rule.clone(), TextStyle::Border),
+            footer.clone(),
+        ];
+        let mut screen = Screen::pinned();
+        let mut draw_out = Vec::new();
+        screen
+            .draw_pinned_to(&mut draw_out, &idle_lines, 1, 10, 12, 8)
+            .unwrap();
+        terminal.process(&draw_out);
+
+        let mut finish_out = Vec::new();
+        let handoff_row = screen
+            .finish_handoff_to(
+                &mut finish_out,
+                "submitted question",
+                "❯ ",
+                &footer,
+                width,
+                60,
+                12,
+                &mut history,
+            )
+            .unwrap();
+        terminal.process(&finish_out);
+        let after: Vec<_> = terminal.screen().rows(0, 60).collect();
+        assert_eq!(handoff_row, Some(8));
+        assert_eq!(after[8], rule);
+        assert_eq!(after[9].trim_end(), "❯");
+        assert_eq!(after[10], rule);
+        assert_eq!(after[11], "Ask");
+        assert!(
+            after[..8].iter().any(|row| row.contains("submitted question")),
+            "submitted prompt must be visible above bottom box: {after:?}"
+        );
+        assert!(
+            !after[..8].iter().any(|row| row == "Ask"),
+            "old footer must not scroll into transcript: {after:?}"
+        );
+    }
+
+    #[test]
+    fn idle_tip_above_input_keeps_bottom_composer_aligned_with_plain_layout() {
+        let mut plain_term = vt100::Parser::new(24, 60, 100);
+        let mut tip_term = vt100::Parser::new(24, 60, 100);
+        let rule = "\u{2500}".repeat(59);
+        let plain_lines = vec![
+            (String::new(), TextStyle::Plain),
+            (rule.clone(), TextStyle::Border),
+            ("❯ ".to_owned(), TextStyle::Plain),
+            (rule.clone(), TextStyle::Border),
+            ("Ask".to_owned(), TextStyle::Muted),
+        ];
+        let tip_lines = vec![
+            (
+                "Ctrl+O details · PgUp/PgDn scroll".to_owned(),
+                TextStyle::Muted,
+            ),
+            (
+                "Tip: Type / to browse available commands.".to_owned(),
+                TextStyle::Muted,
+            ),
+            (String::new(), TextStyle::Plain),
+            (rule.clone(), TextStyle::Border),
+            ("❯ ".to_owned(), TextStyle::Plain),
+            (rule.clone(), TextStyle::Border),
+            ("Ask".to_owned(), TextStyle::Muted),
+        ];
+        let mut plain_screen = Screen::pinned();
+        let mut plain_out = Vec::new();
+        plain_screen
+            .draw_pinned_to(&mut plain_out, &plain_lines, 2, 2, 24, 3)
+            .unwrap();
+        plain_term.process(&plain_out);
+
+        let mut tip_screen = Screen::pinned();
+        let mut tip_out = Vec::new();
+        tip_screen
+            .draw_pinned_to(&mut tip_out, &tip_lines, 4, 2, 24, 3)
+            .unwrap();
+        tip_term.process(&tip_out);
+
+        let plain_rows: Vec<_> = plain_term.screen().rows(0, 60).collect();
+        let tip_rows: Vec<_> = tip_term.screen().rows(0, 60).collect();
+        for row in 20..24 {
+            assert_eq!(
+                plain_rows[row], tip_rows[row],
+                "bottom composer row {row} shifted when tip/details hints were shown"
+            );
+        }
     }
 
     #[test]

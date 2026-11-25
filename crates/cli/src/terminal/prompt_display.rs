@@ -4,26 +4,33 @@ use crossterm::style::{ResetColor, SetForegroundColor};
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar;
 
+/// Record a submitted prompt and return the exact rows to emit above the box.
+pub(crate) fn recorded_rows_at_width(
+    history: &mut super::scrollback::Scrollback,
+    text: &str,
+    width: usize,
+) -> Vec<String> {
+    if crate::background_commands::is_notification(text) {
+        let mut rows = vec![String::new()];
+        if history.needs_separator() {
+            history.push(String::new(), None);
+        }
+        rows.extend(history.record_prompt_at_width(text, width));
+        return rows;
+    }
+    history.record_prompt_at_width(text, width)
+}
+
 /// Emit exactly the same rows retained for selection and history navigation.
 pub(crate) fn write_recorded(
     output: &mut impl Write,
     history: &mut super::scrollback::Scrollback,
     text: &str,
-    _width: usize,
+    width: usize,
     raw: bool,
 ) -> io::Result<()> {
     let newline = if raw { "\r\n" } else { "\n" };
-    if crate::background_commands::is_notification(text) {
-        write!(output, "{newline}")?;
-        if history.needs_separator() {
-            history.push(String::new(), None);
-        }
-        for row in history.record_prompt(text) {
-            write!(output, "{row}{newline}")?;
-        }
-        return Ok(());
-    }
-    for row in history.record_prompt(text) {
+    for row in recorded_rows_at_width(history, text, width) {
         write!(output, "{row}{newline}")?;
     }
     Ok(())

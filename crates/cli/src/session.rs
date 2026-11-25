@@ -2167,6 +2167,7 @@ impl Session {
         let turn_goal =
             deepseek_code_core::services::session_goals::active(&self.store.db, &self.id)?;
         if let Err(error) = crate::ide_commands::restore(self).await {
+            crate::terminal::release_handoff();
             eprintln!("IDE connection unavailable: {error:#}");
             self.ide.disconnect().await;
         }
@@ -2248,6 +2249,7 @@ impl Session {
                     // Outside Git there are no checkpoints by design; say nothing.
                     let not_git = format!("{error:#}").contains("requires a Git worktree");
                     if input.is_some() && !not_git {
+                        crate::terminal::release_handoff();
                         eprintln!("Code checkpoint unavailable: {error:#}");
                     }
                     None
@@ -2355,7 +2357,46 @@ impl Session {
             .suggestion
             .as_ref()
             .map(|(capture, _)| capture.clone());
-        let request = Box::pin(async {
+        let initial_model_label = if interactive_display {
+            Some(crate::session_commands::model_label(self).await)
+        } else {
+            None
+        };
+        let mut progress = crate::terminal::live::TurnDisplay::new_with_initial(
+            interactive_display,
+            self.permission_mode(),
+            &self.paths.layout().config_file("keybindings.json"),
+            self.store
+                .history(&self.id)?
+                .iter()
+                .filter(|row| row["role"] == "user")
+                .filter_map(|row| row["content"].as_str().map(str::to_owned))
+                .filter(|text| !crate::background_commands::is_notification(text))
+                .collect(),
+            initial_model_label,
+            Some(prompt.to_owned()),
+        )?
+        .with_workspace(&self.workspace);
+        progress.restore_numbers(self)?;
+        progress.set_session_context(&self.paths.data_dir, self.selected_session()?);
+        if progress.is_live() {
+            progress.set_transcript(crate::repl::transcript(self).unwrap_or_default());
+            progress.set_todos(crate::background_commands::todo_items(
+                &self.paths,
+                &self.id,
+            ));
+        }
+        let mut hook_progress = deepseek_code_core::services::hook_progress::subscribe(&self.id);
+        progress.hook_snapshot(hook_progress.snapshot());
+        let mut side_request: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>>,
+        > = None;
+        // Messages typed during this turn that the model has not read yet.
+        let mut pending_inputs = Vec::<String>::new();
+        let mut refresh = tokio::time::interval(std::time::Duration::from_secs(1));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut remote_interrupts = self.remote_interrupts();
+        let mut request = Box::pin(async {
             if hook_wake {
                 match execution_lease {
                     Some(lease) => {
@@ -2374,51 +2415,152 @@ impl Session {
         let worker_cancel =
             deepseek_code_core::services::background_sessions::wait_for_cancellation();
         tokio::pin!(worker_cancel);
-        let mut events = tokio::select! {
-            biased;
-            _ = self.sdk_cancelled() => {
-                self.engine.cancel_turn(&self.id).await;
-                bail!("Interrupted by SDK host");
-            },
-            _ = &mut worker_cancel => bail!("Background task cancelled before model request"),
-            result = crate::hook_progress::during(&self.id, interactive_display, request) => result?,
-            _ = interrupt.interrupted() => {
-                // The engine may have spawned its executor before the request
-                // future completed; cancel it so the turn and its owned tools
-                // are cleaned up instead of left running.
-                self.engine.cancel_turn(&self.id).await;
-                bail!("Interrupted before model request");
-            },
+        let finish_early =
+            |progress: &mut crate::terminal::live::TurnDisplay,
+             input: &mut Option<TerminalInput>,
+             message: &str| {
+                for action in progress.finish(Some(message)) {
+                    match action {
+                        crate::terminal::live::Action::Draft(draft) => {
+                            if let Some(reader) = input.as_ref() {
+                                reader.restore_draft(draft);
+                            }
+                        }
+                        crate::terminal::live::Action::Submit(queued)
+                        | crate::terminal::live::Action::Queue(queued) => {
+                            if let Some(reader) = input.as_mut() {
+                                reader.queue_prompt(queued);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            };
+        let mut events = loop {
+            tokio::select! {
+                biased;
+                _ = self.sdk_cancelled() => {
+                    self.engine.cancel_turn(&self.id).await;
+                    finish_early(&mut progress, input, "Interrupted by SDK host");
+                    bail!("Interrupted by SDK host");
+                },
+                _ = &mut worker_cancel => {
+                    finish_early(&mut progress, input, "Background task cancelled before model request");
+                    bail!("Background task cancelled before model request");
+                },
+                _ = remote_interrupts.next() => {
+                    self.engine.cancel_turn(&self.id).await;
+                    finish_early(&mut progress, input, "Interrupted by Remote Control");
+                    bail!("Interrupted by Remote Control");
+                },
+                _ = interrupt.interrupted() => {
+                    // The engine may have spawned its executor before the request
+                    // future completed; cancel it so the turn and its owned tools
+                    // are cleaned up instead of left running.
+                    self.engine.cancel_turn(&self.id).await;
+                    finish_early(&mut progress, input, "Interrupted before model request");
+                    bail!("Interrupted before model request");
+                },
+                hooks = hook_progress.changed() => {
+                    progress.hook_snapshot(hooks);
+                },
+                result = &mut request => match result {
+                    Ok(events) => break events,
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        finish_early(&mut progress, input, &message);
+                        return Err(error);
+                    }
+                },
+                _ = refresh.tick() => {
+                    progress.tick();
+                },
+                action = progress.action() => {
+                    if action.is_none() && crate::signals::terminating() {
+                        self.engine.cancel_turn(&self.id).await;
+                        finish_early(&mut progress, input, "Interrupted before model request");
+                        bail!("Interrupted before model request");
+                    }
+                    match action.context("Live terminal input closed")? {
+                        crate::terminal::live::Action::CyclePermission => {
+                            match self.cycle_permission_mode().await {
+                                Ok(mode) => progress.set_permission_mode(mode),
+                                Err(error) => progress.notice(&format!("Permission mode: {error:#}")),
+                            }
+                        },
+                        crate::terminal::live::Action::Cancel => {
+                            self.engine.cancel_turn(&self.id).await;
+                            finish_early(&mut progress, input, "Interrupted before model request");
+                            bail!("Interrupted before model request");
+                        },
+                        crate::terminal::live::Action::GoalDecision { .. } => {
+                            progress.notice("Goal proposals require the attached session frontend.");
+                        },
+                        crate::terminal::live::Action::Detach => {
+                            progress.notice("This turn is not owned by a background worker.");
+                        },
+                        crate::terminal::live::Action::Queue(prompt) => {
+                            pending_inputs.push(prompt.clone());
+                            if let Some(reader) = input.as_mut() { reader.queue_prompt(prompt); }
+                        },
+                        crate::terminal::live::Action::Submit(prompt) => {
+                            if let Some(message) = crate::session_commands::live_goal_command(self, &prompt)? {
+                                progress.notice(&message);
+                                progress.set_model_label(&crate::session_commands::model_label(self).await);
+                            } else if let Some(message) = crate::session_commands::live_inspection(self, &prompt).await {
+                                if !matches!(prompt.trim(), "/effort +" | "/effort -") || !message.starts_with("Reasoning effort:") {
+                                    progress.inspection(&prompt, &message);
+                                }
+                                progress.set_model_label(&crate::session_commands::model_label(self).await);
+                            } else if queues_mid_turn(&prompt) {
+                                crate::images::share(&self.id, &prompt);
+                                self.selected_session()?.enqueue_cli_input(deepseek_code_core::services::input_queue::QueueOrigin::User, &prompt)?;
+                                pending_inputs.push(prompt);
+                                progress.queued(pending_inputs.clone());
+                            } else {
+                                if let Some(notice) = crate::session_commands::queued_notice(&prompt) {
+                                    progress.notice(&notice);
+                                }
+                                if let Some(reader) = input.as_mut() { reader.queue_prompt(prompt); }
+                            }
+                        },
+                        crate::terminal::live::Action::BackgroundShell | crate::terminal::live::Action::SendNow => {
+                            deepseek_code_core::tools::background_shell::request_background(&self.paths.data_dir, &self.id)?;
+                        },
+                        crate::terminal::live::Action::EditQueued => {
+                            let taken = recall_queued(self, input, &pending_inputs)?;
+                            pending_inputs.clear();
+                            progress.queued(Vec::new());
+                            if !taken.is_empty() { progress.set_draft(&taken.join("\n")); }
+                        },
+                        crate::terminal::live::Action::Draft(draft) => {
+                            if let Some(reader) = input.as_ref() { reader.restore_draft(draft); }
+                        },
+                        crate::terminal::live::Action::SideQuestion(question) => {
+                            if side_request.is_some() {
+                                progress.notice("A side question is already running; wait for its answer before sending another.");
+                            } else {
+                                side_request = Some(Box::pin(async move {
+                                    crate::background_commands::side_question(self, &question).await
+                                }));
+                            }
+                        },
+                    }
+                },
+                answer = async {
+                    match side_request.as_mut() {
+                        Some(request) => request.await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    side_request = None;
+                    match answer {
+                        Ok(answer) => progress.notice(&format!("Side answer:\n{answer}")),
+                        Err(error) => progress.notice(&format!("Side question failed: {error:#}")),
+                    }
+                },
+            }
         };
-        let mut progress = crate::terminal::live::TurnDisplay::new(
-            interactive_display,
-            self.permission_mode(),
-            &self.paths.layout().config_file("keybindings.json"),
-            self.store
-                .history(&self.id)?
-                .iter()
-                .filter(|row| row["role"] == "user")
-                .filter_map(|row| row["content"].as_str().map(str::to_owned))
-                .filter(|text| !crate::background_commands::is_notification(text))
-                .collect(),
-        )?
-        .with_workspace(&self.workspace);
-        progress.restore_numbers(self)?;
-        progress.set_session_context(&self.paths.data_dir, self.selected_session()?);
-        if progress.is_live() {
-            progress.set_model_label(&crate::session_commands::model_label(self).await);
-            progress.set_pinned_prompt(prompt);
-            progress.set_transcript(crate::repl::transcript(self).unwrap_or_default());
-            progress.set_todos(crate::background_commands::todo_items(
-                &self.paths,
-                &self.id,
-            ));
-        }
-        let mut hook_progress = deepseek_code_core::services::hook_progress::subscribe(&self.id);
-        progress.hook_snapshot(hook_progress.snapshot());
-        let mut side_request: Option<
-            std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + '_>>,
-        > = None;
         let mut text = String::new();
         // Set when a tool runs, so text from the next model round starts on its own paragraph.
         let mut separate_text = false;
@@ -2445,8 +2587,6 @@ impl Session {
             String,
             Vec<deepseek_code_core::services::input_queue::DeliveredInput>,
         >::new();
-        // Messages typed during this turn that the model has not read yet.
-        let mut pending_inputs = Vec::<String>::new();
         // The mode chosen with a plan, applied once the engine has approved it.
         let mut plan_mode_after: Option<(String, &'static str)> = None;
         let mut sdk_messages = if cli.output_format == OutputFormat::StreamJson {
@@ -2465,9 +2605,6 @@ impl Session {
                 || input.is_none()
                 || cli.output_format != OutputFormat::Text;
         let mut live_transcript = BackgroundTranscript::default();
-        let mut refresh = tokio::time::interval(std::time::Duration::from_secs(1));
-        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut remote_interrupts = self.remote_interrupts();
         let turn_result: Result<()> = async {
             loop {
                 let event = tokio::select! {

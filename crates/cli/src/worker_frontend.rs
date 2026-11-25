@@ -203,17 +203,19 @@ async fn single_turn(
         // Task notifications are not prompts to recall.
         .filter(|text| !crate::background_commands::is_notification(text))
         .collect();
-    let mut display = TurnDisplay::new(
+    let model_label = crate::session_commands::model_label(session).await;
+    let mut display = TurnDisplay::new_with_initial(
         true,
         session.permission_mode(),
         &deepseek_code_core::data_layout::DataLayout::from_root(&root)
             .config_file("keybindings.json"),
         history,
-    )?.with_workspace(&session.workspace);
+        Some(model_label),
+        Some(prompt.to_owned()),
+    )?
+    .with_workspace(&session.workspace);
     display.restore_numbers(session)?;
     display.set_session_context(root, session.selected_session()?);
-    display.set_pinned_prompt(prompt);
-    display.set_model_label(&crate::session_commands::model_label(session).await);
     if display.is_live() {
         display.set_transcript(crate::repl::transcript(session).unwrap_or_default());
         display.set_todos(crate::background_commands::todo_items(&session.paths, &session.id));
@@ -323,15 +325,18 @@ pub async fn attach(cli: &Cli, session: &Session, id: &str, input: &mut Option<T
         &job.session_id,
         &session.paths.data_dir.join("data/workspaces"),
     )?;
-    let mut display = TurnDisplay::new(
+    let model_label = crate::session_commands::model_label(session).await;
+    let mut display = TurnDisplay::new_with_initial(
         true,
         session.permission_mode(),
         &session.paths.layout().config_file("keybindings.json"),
         Vec::new(),
-    )?.with_workspace(&workspace);
+        Some(model_label),
+        None,
+    )?
+    .with_workspace(&workspace);
     display.restore_numbers(session)?;
     display.set_session_context(&session.paths.data_dir, jobs::participant_execution(&session.paths.data_dir, &session.selected_session()?, &job)?);
-    display.set_model_label(&crate::session_commands::model_label(session).await);
     display.notice(&format!(
         "Attached to task {id}. Esc cancels; Ctrl+B or /background detaches without restarting."
     ));
