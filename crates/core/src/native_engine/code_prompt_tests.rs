@@ -629,17 +629,17 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
     );
     let reminders = crate::prompt::first_message_reminders(crate::prompt::SessionReminders {
         user_instructions: user_block,
-        environment: Some(environment),
+        standalone_frontend: true,
         project_instructions: project_block,
         resident_indexes: vec!["<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()],
         experience: None,
-        standalone_frontend: true,
         loadable_tools: Some(
             "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
         ),
         available_skills: Some(
             "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
         ),
+        environment: Some(environment),
         date: Some(crate::prompt::date_reminder("2026-11-19")),
         git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
         skills: None,
@@ -665,14 +665,14 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
     let text = |index: usize| parts[index]["text"].as_str().unwrap();
     assert!(text(0).starts_with("<system-reminder>\n") && text(0).contains("user marker"));
     assert!(!text(0).contains("project marker"));
-    assert!(text(1).starts_with("<system-reminder>\n# Working environment\n"));
-    assert!(text(1).contains(" - Project: Demo\n - Primary working directory: "));
-    assert!(text(1).contains(" - Platform: "));
+    assert_eq!(text(1), crate::prompt::standalone_frontend_reminder());
     assert!(text(2).starts_with("<system-reminder>\n") && text(2).contains("project marker"));
     assert!(text(3).contains("MEMORY.md index marker"));
-    assert_eq!(text(4), crate::prompt::standalone_frontend_reminder());
-    assert!(text(5).starts_with("<system-reminder>\nTools you can load with ToolLoad"));
-    assert!(text(6).starts_with("<system-reminder>\nAvailable skills:"));
+    assert!(text(4).starts_with("<system-reminder>\nTools you can load with ToolLoad"));
+    assert!(text(5).starts_with("<system-reminder>\nAvailable skills:"));
+    assert!(text(6).starts_with("<system-reminder>\n# Working environment\n"));
+    assert!(text(6).contains(" - Project: Demo\n - Primary working directory: "));
+    assert!(text(6).contains(" - Platform: "));
     assert_eq!(text(7), crate::prompt::date_reminder("2026-11-19"));
     assert!(text(8).starts_with("<system-reminder>\n# gitStatus"));
     assert_eq!(text(9), "hello");

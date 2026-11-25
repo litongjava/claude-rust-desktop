@@ -296,16 +296,16 @@ pub fn date_reminder(date: &str) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct SessionReminders {
     pub user_instructions: Option<String>,
-    pub environment: Option<String>,
+    pub standalone_frontend: bool,
     pub project_instructions: Option<String>,
     pub resident_indexes: Vec<String>,
     /// The project experience index, frozen on the first request.
     pub experience: Option<String>,
-    pub standalone_frontend: bool,
     /// The tools ToolLoad can load, frozen on the first request.
     pub loadable_tools: Option<String>,
     /// The model-invocable skills, frozen on the first request.
     pub available_skills: Option<String>,
+    pub environment: Option<String>,
     pub date: Option<String>,
     pub git: Option<String>,
     /// Skills invoked earlier whose message a compaction removed.
@@ -313,21 +313,22 @@ pub struct SessionReminders {
 }
 
 /// The reminders that open the first user message: the user's own instructions,
-/// the environment, the project's instructions, the project experience index,
-/// the CLI's frontend facts, the loadable tools, the skills, the date, the Git
-/// snapshot and skills recovered after compaction.
+/// the CLI's frontend facts, the project's instructions, the resident memory
+/// indexes, the project experience index, the loadable tools, the skills, the
+/// environment, the date, the Git snapshot and skills recovered after
+/// compaction.
 pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     let mut blocks = Vec::new();
     blocks.extend(parts.user_instructions);
-    blocks.extend(parts.environment);
-    blocks.extend(parts.project_instructions);
-    blocks.extend(parts.resident_indexes);
-    blocks.extend(parts.experience);
     if parts.standalone_frontend {
         blocks.push(standalone_frontend_reminder());
     }
+    blocks.extend(parts.project_instructions);
+    blocks.extend(parts.resident_indexes);
+    blocks.extend(parts.experience);
     blocks.extend(parts.loadable_tools);
     blocks.extend(parts.available_skills);
+    blocks.extend(parts.environment);
     blocks.extend(parts.date);
     blocks.extend(parts.git);
     blocks.extend(parts.skills);
@@ -1235,34 +1236,34 @@ mod tests {
         add_project_to_environment(&mut environment, "Demo", &[workspace.path().to_str().unwrap()]);
         let blocks = first_message_reminders(SessionReminders {
             user_instructions: Some("<system-reminder>\nuser rules\n</system-reminder>".into()),
-            environment: Some(environment),
-            resident_indexes: vec!["<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()],
-            project_instructions: Some("<system-reminder>\nproject rules\n</system-reminder>".into()),
-            experience: Some("<system-reminder>\n# Experience\nexperience marker\n</system-reminder>".into()),
             standalone_frontend: true,
+            project_instructions: Some("<system-reminder>\nproject rules\n</system-reminder>".into()),
+            resident_indexes: vec!["<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()],
+            experience: Some("<system-reminder>\n# Experience\nexperience marker\n</system-reminder>".into()),
             loadable_tools: Some(
                 "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
             ),
             available_skills: Some(
                 "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
             ),
+            environment: Some(environment),
             date: Some(date_reminder("2026-11-19")),
             git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
             skills: Some("<system-reminder>\ninvoked skills\n</system-reminder>".into()),
         });
         assert_eq!(blocks.len(), 11);
         assert!(blocks[0].contains("user rules"));
-        assert!(blocks[1].starts_with("<system-reminder>\n# Working environment\n"));
-        assert!(blocks[1].contains(" - Project: Demo\n - Primary working directory: "));
-        assert!(blocks[1].contains(" - Platform: "));
-        assert!(!blocks[1].contains("Today's date"));
+        assert_eq!(blocks[1], standalone_frontend_reminder());
+        assert!(blocks[1].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
         assert!(blocks[2].contains("project rules"));
         assert!(blocks[3].contains("MEMORY.md index marker"));
         assert!(blocks[4].contains("experience marker"));
-        assert_eq!(blocks[5], standalone_frontend_reminder());
-        assert!(blocks[5].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
-        assert!(blocks[6].contains("Tools you can load with ToolLoad"));
-        assert!(blocks[7].contains("Available skills"));
+        assert!(blocks[5].contains("Tools you can load with ToolLoad"));
+        assert!(blocks[6].contains("Available skills"));
+        assert!(blocks[7].starts_with("<system-reminder>\n# Working environment\n"));
+        assert!(blocks[7].contains(" - Project: Demo\n - Primary working directory: "));
+        assert!(blocks[7].contains(" - Platform: "));
+        assert!(!blocks[7].contains("Today's date"));
         assert_eq!(blocks[8], date_reminder("2026-11-19"));
         assert_eq!(blocks[9], "<system-reminder>\n# gitStatus\n</system-reminder>");
         assert_eq!(blocks[10], "<system-reminder>\ninvoked skills\n</system-reminder>");
