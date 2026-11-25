@@ -276,24 +276,50 @@ impl HistoryView {
         cursor_col: usize,
         size: (u16, u16),
     ) -> io::Result<bool> {
+        self.draw_with_overlay(composer, &[], cursor_row, cursor_col, size)
+    }
+
+    /// Draws the history viewport, composer, and optional bottom-aligned menu
+    /// overlay in a single synchronized frame so covered rows never flash.
+    pub(super) fn draw_with_overlay(
+        &mut self,
+        composer: &[String],
+        overlay: &[String],
+        cursor_row: usize,
+        cursor_col: usize,
+        size: (u16, u16),
+    ) -> io::Result<bool> {
         let mut frame = Vec::new();
-        self.draw_to(&mut frame, composer, cursor_row, cursor_col, size)?;
+        self.draw_with_overlay_to(&mut frame, composer, overlay, cursor_row, cursor_col, size)?;
         if frame == self.previous {
             return Ok(false);
         }
         let mut out = crate::terminal_output::stderr_locked();
-        out.write_all(b"\x1b[?2026h")?;
+        out.write_all(b"\x1b[?2026h\x1b[?25l")?;
         out.write_all(&frame)?;
-        out.write_all(b"\x1b[?2026l")?;
+        out.write_all(b"\x1b[?25h\x1b[?2026l")?;
         out.flush()?;
         self.previous = frame;
         Ok(true)
     }
 
+    #[cfg(test)]
     fn draw_to(
         &mut self,
         out: &mut impl Write,
         composer: &[String],
+        cursor_row: usize,
+        cursor_col: usize,
+        size: (u16, u16),
+    ) -> io::Result<()> {
+        self.draw_with_overlay_to(out, composer, &[], cursor_row, cursor_col, size)
+    }
+
+    fn draw_with_overlay_to(
+        &mut self,
+        out: &mut impl Write,
+        composer: &[String],
+        overlay: &[String],
         cursor_row: usize,
         cursor_col: usize,
         size: (u16, u16),
@@ -309,9 +335,13 @@ impl HistoryView {
             .unwrap_or(0)
             .min(self.all.len().saturating_sub(page - header));
         self.top = Some(top);
+        let shown = overlay.len().min(page);
+        let overlay_top = page.saturating_sub(shown);
         for row in 0..height {
             queue!(out, MoveTo(0, row as u16))?;
-            if row < header {
+            if row >= overlay_top && row < page {
+                out.write_all(overlay[row - overlay_top].as_bytes())?;
+            } else if row < header {
                 out.write_all(self.pinned.as_bytes())?;
             } else if row < page {
                 if let Some(line) = self.all.get(top + row - header) {
@@ -805,6 +835,36 @@ mod tests {
             assert!(output.ends_with(&format!("\x1b[{input_row};5H")));
             history.top = None;
         }
+    }
+
+    #[test]
+    fn history_draw_with_overlay_replaces_covered_rows_in_one_frame() {
+        let mut history = HistoryView::default();
+        let logged: Vec<String> = (0..10).map(|i| format!("history {i}")).collect();
+        history.refresh(&[], &logged, 40);
+        history.top = Some(0);
+        let composer = vec![
+            "border".into(),
+            "❯ /c".into(),
+            "border".into(),
+            "footer".into(),
+        ];
+        let overlay = vec!["  ❯ /clear".into(), "    /compact".into()];
+        let mut output = Vec::new();
+        history
+            .draw_with_overlay_to(&mut output, &composer, &overlay, 1, 4, (40, 10))
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        // Rows 0..4 show history 0..4, rows 4..6 show the overlay directly without
+        // emitting the covered background lines (history 4 and history 5).
+        assert!(output.contains("history 0"));
+        assert!(output.contains("history 3"));
+        assert!(!output.contains("history 4"));
+        assert!(!output.contains("history 5"));
+        assert!(output.contains("\x1b[5;1H  ❯ /clear"));
+        assert!(output.contains("\x1b[6;1H    /compact"));
+        assert!(output.contains("\x1b[8;1H❯ /c"));
+        history.top = None;
     }
 
     #[test]

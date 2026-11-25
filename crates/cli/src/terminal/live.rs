@@ -1681,8 +1681,9 @@ impl Frame {
         let mut out = std::mem::take(&mut self.pending);
         self.write_logs(&mut out, rows);
         let mut top = self.top.unwrap_or(0) as usize;
-        // The prompt writes a separator row and its own blank row above the box.
-        let height = 2 + input_box.len();
+        // The prompt writes a separator row only when the transcript does not
+        // already end with a blank row, plus its own reserved blank row above the box.
+        let height = usize::from(self.scrollback.needs_separator()) + 1 + input_box.len();
         if top + height > rows {
             out.push_str(&format!("\x1b[{rows};1H"));
             for _ in 0..top + height - rows {
@@ -3709,6 +3710,32 @@ mod tests {
             }
             assert_eq!(terminal.screen().cursor_position(), (height - 6, 0));
         }
+    }
+
+    #[test]
+    fn hand_off_output_skips_extra_separator_when_scrollback_ends_blank() {
+        let rows = 20usize;
+        let mut terminal = vt100::Parser::new(rows as u16, 80, 200);
+        let mut frame = Frame::default();
+        for index in 0..20 {
+            let line = format!("row {index}");
+            frame.log_rendered(&line);
+        }
+        place(&mut frame, &mut terminal, &[], "working", 0);
+        frame.log_rendered("before interrupt");
+        frame.log_rendered("Interrupted");
+        frame.log_rendered("");
+        frame.input_box = true;
+        let (output, row) = frame.hand_off_output(rows).unwrap();
+        terminal.process(output.as_bytes());
+        let done = screen(&terminal);
+        // Scrollback already ends with a blank separator, so only the idle
+        // composer's single reserved blank row sits above the 4-row input box.
+        assert_eq!(row as usize, rows - 5);
+        assert_eq!(done[rows - 7], "Interrupted");
+        assert_eq!(done[rows - 6], "");
+        assert_eq!(done[rows - 5], "");
+        assert_eq!(terminal.screen().cursor_position(), (rows as u16 - 5, 0));
     }
 
     #[test]

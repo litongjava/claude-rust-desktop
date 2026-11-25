@@ -712,8 +712,29 @@ async fn pty_slash_menu_typing_does_not_flash_underlying_rule_or_leak_rows() {
     )
     .await;
 
-    // 5. Press Backspace (`/coxz` -> `/cox` -> `/context` returns cleanly without flashing),
-    //    then Esc: overlay clears and transcript matches idle history without leaking menu rows.
+    // 5. A single Esc dismisses the "No commands match" banner while keeping the
+    //    typed draft, and Backspace re-opens the matching `/context` row cleanly.
+    pty.send(b"\x1b");
+    let after_no_match_esc = pty
+        .wait_for(
+            Duration::from_secs(5),
+            "no-match banner dismissed by single Esc",
+            |rows| {
+                rows[ROWS as usize - 3].contains("❯ /coxz")
+                    && !rows[menu_top..menu_bottom]
+                        .iter()
+                        .any(|row| row.contains("No commands match"))
+            },
+            |_| {},
+        )
+        .await;
+    assert_eq!(
+        after_no_match_esc[menu_top..menu_bottom],
+        idle_with_history[menu_top..menu_bottom],
+        "single Esc on No commands match should restore exact background:\n{}",
+        format_screen(&after_no_match_esc)
+    );
+
     pty.send(b"\x7f");
     pty.wait_for(
         Duration::from_secs(5),
@@ -723,14 +744,7 @@ async fn pty_slash_menu_typing_does_not_flash_underlying_rule_or_leak_rows() {
                 && !rows[ROWS as usize - 3].contains("/coxz")
                 && rows[menu_bottom - 1].contains("/context")
         },
-        |rows| {
-            assert!(
-                rows[menu_bottom - 1].contains('/')
-                    || rows[menu_bottom - 1].contains("No commands match"),
-                "bottom menu row flashed background on Backspace:\n{}",
-                format_screen(rows)
-            );
-        },
+        |_| {},
     )
     .await;
 

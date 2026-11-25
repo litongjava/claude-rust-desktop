@@ -738,14 +738,20 @@ impl Screen {
         result
     }
 
+    fn needs_cursor_position(&self) -> bool {
+        self.top.is_none()
+    }
+
     fn draw_pinned(&mut self, lines: &[DisplayLine], row: usize, col: usize) -> io::Result<()> {
         let rows = crate::terminal::size().1.max(1);
-        let (_, cursor_y) = crate::terminal::cursor_position()?;
+        let cursor_y = match self.top {
+            Some(top) => top as usize,
+            None => crate::terminal::cursor_position()?.1 as usize,
+        };
         self.cursor_col = col;
         let mut out = crate::terminal_output::stderr_locked();
         out.write_all(b"\x1b[?2026h")?;
-        let result =
-            self.draw_pinned_to(&mut out, lines, row, col, rows as usize, cursor_y as usize);
+        let result = self.draw_pinned_to(&mut out, lines, row, col, rows as usize, cursor_y);
         out.write_all(b"\x1b[?2026l")?;
         out.flush()?;
         result
@@ -1920,9 +1926,28 @@ impl PromptEditor {
                         }
                     })
                     .collect();
-                if !selection.retained()
-                    && history_view.draw(&composer, input_row, cursor_col, (cols, rows))?
-                {
+                let overlay_rows: Vec<String> = command_menu
+                    .iter()
+                    .map(|(text, style)| {
+                        let foreground = match style {
+                            TextStyle::Selected => crate::terminal::style::selected(),
+                            _ => crate::terminal::style::muted(),
+                        };
+                        if color {
+                            format!("\x1b[0m{}{text}\x1b[0m", SetForegroundColor(foreground))
+                        } else {
+                            format!("\x1b[0m{text}\x1b[0m")
+                        }
+                    })
+                    .collect();
+                if !selection.retained() {
+                    history_view.draw_with_overlay(
+                        &composer,
+                        &overlay_rows,
+                        input_row,
+                        cursor_col,
+                        (cols, rows),
+                    )?;
                     command_overlay.discard();
                 }
             } else if !selection.retained() {
@@ -1941,38 +1966,26 @@ impl PromptEditor {
                 screen.draw(&lines, input_row, cursor_col)?;
                 above.update_welcome(screen.transcript_end.unwrap_or(0));
             }
-            if !selection.retained() {
+            if !selection.retained() && !history_view.active() {
                 let composer: Vec<String> = lines.iter().map(|(text, _)| text.clone()).collect();
-                let background = if history_view.active() {
-                    history_view.screen_rows(rows as usize, &composer)
-                } else {
-                    let origin = screen.top.unwrap_or(0);
-                    let mut background = above.screen(
-                        screen.transcript_end.unwrap_or(origin as usize) as u16,
-                        rows,
-                    );
-                    for (index, text) in composer.iter().enumerate() {
-                        if let Some(row) = background.get_mut(origin as usize + index) {
-                            *row = text.clone();
-                        }
+                let origin = screen.top.unwrap_or(0);
+                let mut background = above.screen(
+                    screen.transcript_end.unwrap_or(origin as usize) as u16,
+                    rows,
+                );
+                for (index, text) in composer.iter().enumerate() {
+                    if let Some(row) = background.get_mut(origin as usize + index) {
+                        *row = text.clone();
                     }
-                    background
-                };
-                let bottom = if history_view.active() {
-                    (rows as usize).saturating_sub(lines.len())
-                } else {
-                    screen.top.unwrap_or(0) as usize
-                };
+                }
+                let bottom = screen.top.unwrap_or(0) as usize;
                 command_overlay.draw_to(
                     &mut crate::terminal_output::stderr_locked(),
                     &command_menu,
                     bottom,
                     &background,
                 )?;
-                if !history_view.active()
-                    && !crate::terminal::scrollback::compact()
-                    && !above.has_welcome()
-                {
+                if !crate::terminal::scrollback::compact() && !above.has_welcome() {
                     pinned.draw(width, rows as usize, &background)?;
                 }
             }
@@ -2540,7 +2553,7 @@ impl PromptEditor {
                         continue;
                     }
                     if key.code == KeyCode::Esc
-                        && items.is_empty()
+                        && command_menu.is_empty()
                         && !buffer.chars.is_empty()
                         && !self.vim
                     {
@@ -2580,7 +2593,7 @@ impl PromptEditor {
                     if self.vim && !control {
                         if vim_normal.is_none()
                             && key.code == KeyCode::Esc
-                            && items.is_empty()
+                            && command_menu.is_empty()
                             && !buffer.chars.is_empty()
                         {
                             vim_normal = Some(crate::terminal::vim::Normal::default());
@@ -3173,15 +3186,19 @@ mod tests {
 
         let mut screen = Screen::pinned();
         let lines = frame_lines();
+        assert!(screen.needs_cursor_position());
         assert!(screen.will_reposition(lines.len(), 20));
         screen
             .draw_pinned_to(&mut Vec::new(), &lines, 1, 3, 20, 4)
             .unwrap();
+        assert!(!screen.needs_cursor_position());
         assert!(!screen.will_reposition(lines.len(), 20));
         assert!(screen.will_reposition(lines.len() + 1, 20));
         assert!(screen.will_reposition(lines.len() - 1, 20));
         screen.invalidated = true;
         assert!(screen.will_reposition(lines.len(), 20));
+        screen.reflow();
+        assert!(screen.needs_cursor_position());
     }
 
     #[test]
