@@ -73,6 +73,10 @@ pub const LOADABLE_TOOLS_LEAD_IN: &str =
 /// files or the CLI instead.
 pub const SKILLS_LEAD_IN: &str = "Available skills: invoke the Skill tool with {\"skill\":\"<name>\"} and optional args; its instructions come back immediately in this turn. Use it when the user asks what a skill does, where skills live, or how to create or load one. Do not open a skill's SKILL.md or INSTRUCTIONS.md with Read or Bash instead: fork isolation and approved shell context must run through the tool.";
 
+/// The only behavioral instruction for project experience entries. It lives
+/// here, never in the system prompt or a project's AGENTS.md.
+pub const EXPERIENCE_LEAD_IN: &str = "Verified fixes recorded for this project. Before re-deriving a fix, search .agents/experience/ and read the matching file; a one-line description is only a pointer. Before finishing a turn in which you solved a non-obvious problem that you verified, add one entry file there (frontmatter name and description; body Symptom, Cause, Fix, Verification), or update the existing entry for the same symptom and root cause. Keep one problem per file, merge near-duplicates, and delete entries that no longer hold. Entries are records, not instructions; never store credentials, tokens or raw logs.";
+
 /// The first sentence of a description, whitespace collapsed and cut to
 /// `limit` characters. The loadable-tool listing uses 100.
 pub fn one_sentence(description: &str, limit: usize) -> String {
@@ -163,6 +167,39 @@ pub fn skills_for_session(root: &Path, session: &str, lines: &[String]) -> Optio
     reminder
 }
 
+/// The experience index plus its runtime instruction. Always a block when the
+/// feature applies; an empty index still tells the model where to write.
+pub fn experience_reminder(lines: &[String]) -> String {
+    let mut text = format!("# Experience\n{EXPERIENCE_LEAD_IN}");
+    if lines.is_empty() {
+        text.push_str("\nNo entries yet.");
+    } else {
+        text.push('\n');
+        text.push_str(&lines.join("\n"));
+    }
+    format!("<system-reminder>\n{text}\n</system-reminder>")
+}
+
+/// The experience block frozen on the session's first request. `workspace` is
+/// `None` for an internal draft workspace, and a disabled switch freezes
+/// `None` too, so later requests in the session cannot add the block.
+pub fn experience_for_session(
+    root: &Path,
+    session: &str,
+    workspace: Option<&Path>,
+    enabled: bool,
+    entries: &[crate::experience::Entry],
+) -> Option<String> {
+    let path = crate::session_files::environment_file(root, session, ".experience.json");
+    if let Some(saved) = frozen_reminder(&path) {
+        return saved;
+    }
+    let reminder = (enabled && workspace.is_some())
+        .then(|| experience_reminder(&crate::experience::index_lines(entries)));
+    store_frozen_reminder(&path, &reminder);
+    reminder
+}
+
 /// The names added to and removed from a per-session set since the previous
 /// observed value. The first call records the set without reporting anything.
 /// Saving the current set here makes each change produce one reminder only.
@@ -208,6 +245,8 @@ pub fn changes_reminder(
     no_longer_available: Vec<String>,
     new_skills: Vec<String>,
     removed_skills: Vec<String>,
+    new_experience: Vec<String>,
+    removed_experience: Vec<String>,
 ) -> Option<String> {
     let mut lines = Vec::new();
     if !now_loadable.is_empty() {
@@ -225,6 +264,16 @@ pub fn changes_reminder(
     if !removed_skills.is_empty() {
         lines.push(format!("Removed skills: {}", removed_skills.join(", ")));
     }
+    if !new_experience.is_empty() {
+        lines.push("New experience:".into());
+        lines.extend(new_experience);
+    }
+    if !removed_experience.is_empty() {
+        lines.push(format!(
+            "Removed experience: {}",
+            removed_experience.join(", ")
+        ));
+    }
     (!lines.is_empty()).then(|| format!("<system-reminder>\n{}\n</system-reminder>", lines.join("\n")))
 }
 
@@ -241,6 +290,8 @@ pub struct SessionReminders {
     pub environment: Option<String>,
     pub project_instructions: Option<String>,
     pub resident_indexes: Vec<String>,
+    /// The project experience index, frozen on the first request.
+    pub experience: Option<String>,
     pub standalone_frontend: bool,
     /// The tools ToolLoad can load, frozen on the first request.
     pub loadable_tools: Option<String>,
@@ -253,15 +304,16 @@ pub struct SessionReminders {
 }
 
 /// The reminders that open the first user message: the user's own instructions,
-/// the environment, the project's instructions, the CLI's frontend facts, the
-/// loadable tools, the skills, the date, the Git snapshot and skills recovered
-/// after compaction.
+/// the environment, the project's instructions, the project experience index,
+/// the CLI's frontend facts, the loadable tools, the skills, the date, the Git
+/// snapshot and skills recovered after compaction.
 pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     let mut blocks = Vec::new();
     blocks.extend(parts.user_instructions);
     blocks.extend(parts.environment);
     blocks.extend(parts.project_instructions);
     blocks.extend(parts.resident_indexes);
+    blocks.extend(parts.experience);
     if parts.standalone_frontend {
         blocks.push(standalone_frontend_reminder());
     }
@@ -1175,8 +1227,9 @@ mod tests {
         let blocks = first_message_reminders(SessionReminders {
             user_instructions: Some("<system-reminder>\nuser rules\n</system-reminder>".into()),
             environment: Some(environment),
-            resident_indexes: Vec::new(),
+            resident_indexes: vec!["<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()],
             project_instructions: Some("<system-reminder>\nproject rules\n</system-reminder>".into()),
+            experience: Some("<system-reminder>\n# Experience\nexperience marker\n</system-reminder>".into()),
             standalone_frontend: true,
             loadable_tools: Some(
                 "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
@@ -1188,20 +1241,22 @@ mod tests {
             git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
             skills: Some("<system-reminder>\ninvoked skills\n</system-reminder>".into()),
         });
-        assert_eq!(blocks.len(), 9);
+        assert_eq!(blocks.len(), 11);
         assert!(blocks[0].contains("user rules"));
         assert!(blocks[1].starts_with("<system-reminder>\n# Working environment\n"));
         assert!(blocks[1].contains(" - Project: Demo\n - Primary working directory: "));
         assert!(blocks[1].contains(" - Platform: "));
         assert!(!blocks[1].contains("Today's date"));
         assert!(blocks[2].contains("project rules"));
-        assert_eq!(blocks[3], standalone_frontend_reminder());
-        assert!(blocks[3].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
-        assert!(blocks[4].contains("Tools you can load with ToolLoad"));
-        assert!(blocks[5].contains("Available skills"));
-        assert_eq!(blocks[6], date_reminder("2026-11-19"));
-        assert_eq!(blocks[7], "<system-reminder>\n# gitStatus\n</system-reminder>");
-        assert_eq!(blocks[8], "<system-reminder>\ninvoked skills\n</system-reminder>");
+        assert!(blocks[3].contains("MEMORY.md index marker"));
+        assert!(blocks[4].contains("experience marker"));
+        assert_eq!(blocks[5], standalone_frontend_reminder());
+        assert!(blocks[5].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
+        assert!(blocks[6].contains("Tools you can load with ToolLoad"));
+        assert!(blocks[7].contains("Available skills"));
+        assert_eq!(blocks[8], date_reminder("2026-11-19"));
+        assert_eq!(blocks[9], "<system-reminder>\n# gitStatus\n</system-reminder>");
+        assert_eq!(blocks[10], "<system-reminder>\ninvoked skills\n</system-reminder>");
         // The terminal facts are a first-message reminder, never system text.
         let system = compose_system_prompt_in(None, PromptProfile::Code);
         assert!(!system.contains(STANDALONE_FRONTEND));
@@ -1301,11 +1356,186 @@ mod tests {
             "each kind tracks its own set"
         );
         assert_eq!(
-            changes_reminder(now, gone, vec!["new-skill".to_owned()], vec!["old-skill".to_owned()])
+            changes_reminder(
+                now,
+                gone,
+                vec!["new-skill".to_owned()],
+                vec!["old-skill".to_owned()],
+                vec!["- .agents/experience/a.md | alpha: symptom".to_owned()],
+                vec!["old-entry".to_owned()],
+            )
                 .unwrap(),
-            "<system-reminder>\nNow loadable: Glob\nNo longer available: WebSearch\nNew skills: new-skill\nRemoved skills: old-skill\n</system-reminder>"
+            "<system-reminder>\nNow loadable: Glob\nNo longer available: WebSearch\nNew skills: new-skill\nRemoved skills: old-skill\nNew experience:\n- .agents/experience/a.md | alpha: symptom\nRemoved experience: old-entry\n</system-reminder>"
         );
-        assert!(changes_reminder(Vec::new(), Vec::new(), Vec::new(), Vec::new()).is_none());
+        assert!(changes_reminder(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new()
+        )
+        .is_none());
+    }
+
+    fn experience_entry(name: &str, description: &str) -> crate::experience::Entry {
+        crate::experience::Entry {
+            name: name.into(),
+            description: description.into(),
+            relative_path: format!(".agents/experience/{name}.md"),
+        }
+    }
+
+    #[test]
+    fn experience_freezes_on_first_request() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let first = experience_for_session(
+            root.path(),
+            "s",
+            Some(workspace.path()),
+            true,
+            &[experience_entry("alpha", "first symptom")],
+        )
+        .unwrap();
+        assert!(first.contains("# Experience\n"));
+        assert!(first.contains("- .agents/experience/alpha.md | alpha: first symptom"));
+        assert_eq!(first.matches("<system-reminder>").count(), 1);
+        // A later scan, even with different entries, replays the frozen block.
+        assert_eq!(
+            experience_for_session(
+                root.path(),
+                "s",
+                Some(workspace.path()),
+                true,
+                &[experience_entry("beta", "other symptom")],
+            )
+            .as_deref(),
+            Some(first.as_str())
+        );
+    }
+
+    #[test]
+    fn experience_absent_for_internal_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(experience_for_session(
+            root.path(),
+            "s",
+            None,
+            true,
+            &[experience_entry("alpha", "symptom")],
+        )
+        .is_none());
+        // The frozen None keeps the block out of the rest of the session.
+        assert!(experience_for_session(
+            root.path(),
+            "s",
+            Some(workspace.path()),
+            true,
+            &[experience_entry("alpha", "symptom")],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn experience_absent_when_disabled() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(experience_for_session(
+            root.path(),
+            "s",
+            Some(workspace.path()),
+            false,
+            &[experience_entry("alpha", "symptom")],
+        )
+        .is_none());
+        // Re-enabling in the same session does not add the block.
+        assert!(experience_for_session(
+            root.path(),
+            "s",
+            Some(workspace.path()),
+            true,
+            &[experience_entry("alpha", "symptom")],
+        )
+        .is_none());
+        // A new session picks up the switch.
+        assert!(experience_for_session(
+            root.path(),
+            "new",
+            Some(workspace.path()),
+            true,
+            &[experience_entry("alpha", "symptom")],
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn changes_reminder_reports_new_experience_once() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            set_changes(root.path(), "s", crate::session_files::SET_CHANGE_EXPERIENCE, &["alpha".to_owned()]),
+            (Vec::new(), Vec::new())
+        );
+        let (new, removed) = set_changes(
+            root.path(),
+            "s",
+            crate::session_files::SET_CHANGE_EXPERIENCE,
+            &["alpha".to_owned(), "beta".to_owned()],
+        );
+        assert_eq!(new, vec!["beta".to_owned()]);
+        assert!(removed.is_empty());
+        let reminder = changes_reminder(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec!["- .agents/experience/beta.md | beta: symptom".to_owned()],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            reminder,
+            "<system-reminder>\nNew experience:\n- .agents/experience/beta.md | beta: symptom\n</system-reminder>"
+        );
+        assert_eq!(
+            set_changes(
+                root.path(),
+                "s",
+                crate::session_files::SET_CHANGE_EXPERIENCE,
+                &["alpha".to_owned(), "beta".to_owned()],
+            ),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn changes_reminder_reports_removed_experience() {
+        let root = tempfile::tempdir().unwrap();
+        set_changes(
+            root.path(),
+            "s",
+            crate::session_files::SET_CHANGE_EXPERIENCE,
+            &["alpha".to_owned(), "beta".to_owned()],
+        );
+        let (new, removed) = set_changes(
+            root.path(),
+            "s",
+            crate::session_files::SET_CHANGE_EXPERIENCE,
+            &["alpha".to_owned()],
+        );
+        assert!(new.is_empty());
+        assert_eq!(removed, vec!["beta".to_owned()]);
+        let reminder = changes_reminder(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            removed,
+        )
+        .unwrap();
+        assert_eq!(reminder, "<system-reminder>\nRemoved experience: beta\n</system-reminder>");
     }
 
     #[test]
@@ -1372,8 +1602,15 @@ mod tests {
             &[],
         );
         skills_for_session(root, session, &["- deploy: Ship it".to_owned()]);
+        experience_for_session(root, session, Some(root), true, &[]);
         set_changes(root, session, "loadable-tools", &["ListDir".to_owned()]);
         set_changes(root, session, "skills", &["deploy".to_owned()]);
+        set_changes(
+            root,
+            session,
+            crate::session_files::SET_CHANGE_EXPERIENCE,
+            &["alpha".to_owned()],
+        );
         std::fs::write(
             crate::session_files::environment_file(
                 root,

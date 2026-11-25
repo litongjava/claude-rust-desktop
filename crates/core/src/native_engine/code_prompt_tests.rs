@@ -630,6 +630,7 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
         environment: Some(environment),
         project_instructions: project_block,
         resident_indexes: vec!["<system-reminder>\nMEMORY.md index marker\n</system-reminder>".into()],
+        experience: None,
         standalone_frontend: true,
         loadable_tools: Some(
             "<system-reminder>\nTools you can load with ToolLoad (pass exact names in the names array):\n- ListDir: List a directory\n</system-reminder>".into(),
@@ -1034,7 +1035,7 @@ fn a_skill_enabled_mid_session_produces_one_change_reminder_on_the_latest_messag
     );
     assert_eq!(new, vec!["lint".to_owned()]);
     assert!(removed.is_empty());
-    let change = changes_reminder(Vec::new(), Vec::new(), new, removed).unwrap();
+    let change = changes_reminder(Vec::new(), Vec::new(), new, removed, Vec::new(), Vec::new()).unwrap();
     assert_eq!(
         change,
         "<system-reminder>\nNew skills: lint\n</system-reminder>"
@@ -1046,7 +1047,7 @@ fn a_skill_enabled_mid_session_produces_one_change_reminder_on_the_latest_messag
         "skills",
         &["deploy".to_owned(), "lint".to_owned()],
     );
-    assert!(changes_reminder(Vec::new(), Vec::new(), new, removed).is_none());
+    assert!(changes_reminder(Vec::new(), Vec::new(), new, removed, Vec::new(), Vec::new()).is_none());
     // The first message still carries only the frozen listing.
     assert_eq!(
         skills_for_session(

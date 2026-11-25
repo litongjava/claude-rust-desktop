@@ -1311,11 +1311,17 @@ impl QueryEngine {
             .collect::<Vec<_>>();
         let first_message_root = plugin_context.paths.data_dir.clone();
         let first_message_session = conv_id.clone();
+        let experience_enabled = crate::experience::enabled(&plugin_context);
+        let experience_workspace = (!crate::experience::is_internal_workspace(
+            &workspace,
+            &self.workspaces_dir,
+        ))
+        .then(|| workspace.clone());
         let has_user_message = request
             .messages
             .iter()
             .any(|message| message.get("role").and_then(Value::as_str) == Some("user"));
-        let (loadable_tools, available_skills_listing, set_changes) =
+        let (loadable_tools, available_skills_listing, experience, set_changes) =
             tokio::task::spawn_blocking(move || {
                 let loadable_tools = crate::prompt::loadable_tools_for_session(
                     &first_message_root,
@@ -1328,6 +1334,24 @@ impl QueryEngine {
                     &first_message_session,
                     &available_skills,
                 );
+                // One scan per turn feeds both the frozen block and the change
+                // reminder; the frozen file wins once the session has started.
+                let scanned = experience_workspace
+                    .as_deref()
+                    .map(crate::experience::scan)
+                    .unwrap_or_default();
+                let experience = crate::prompt::experience_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    experience_workspace.as_deref(),
+                    experience_enabled,
+                    &scanned.entries,
+                );
+                let experience_names = scanned
+                    .entries
+                    .iter()
+                    .map(|entry| entry.name.clone())
+                    .collect::<Vec<_>>();
                 let changes = (has_user_message && !replay)
                     .then(|| {
                         let (now, gone) = if tool_load_available {
@@ -1346,10 +1370,40 @@ impl QueryEngine {
                             crate::session_files::SET_CHANGE_SKILLS,
                             &available_skill_names,
                         );
-                        crate::prompt::changes_reminder(now, gone, new_skills, removed_skills)
+                        let (new_experience, removed_experience) =
+                            if experience_enabled && experience_workspace.is_some() {
+                                let (new, removed) = crate::prompt::set_changes(
+                                    &first_message_root,
+                                    &first_message_session,
+                                    crate::session_files::SET_CHANGE_EXPERIENCE,
+                                    &experience_names,
+                                );
+                                let rendered = new
+                                    .into_iter()
+                                    .map(|name| {
+                                        scanned
+                                            .entries
+                                            .iter()
+                                            .find(|entry| entry.name == name)
+                                            .map(crate::experience::index_line)
+                                            .unwrap_or(name)
+                                    })
+                                    .collect();
+                                (rendered, removed)
+                            } else {
+                                (Vec::new(), Vec::new())
+                            };
+                        crate::prompt::changes_reminder(
+                            now,
+                            gone,
+                            new_skills,
+                            removed_skills,
+                            new_experience,
+                            removed_experience,
+                        )
                     })
                     .flatten();
-                (loadable_tools, available_skills, changes)
+                (loadable_tools, available_skills, experience, changes)
             })
             .await?;
         if let Some(reminder) = set_changes {
@@ -1498,6 +1552,7 @@ impl QueryEngine {
             environment: Some(environment),
             project_instructions,
             resident_indexes,
+            experience,
             standalone_frontend,
             loadable_tools,
             available_skills: available_skills_listing,

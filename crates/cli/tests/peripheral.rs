@@ -50,6 +50,12 @@ async fn config_memory_switch_is_global_and_shared() {
     // The generic setting reaches the same switch.
     assert!(output(dir.path(), &["config", "set", "memory.enabled", "false"]).await.status.success());
     assert_eq!(run(dir.path(), &["config", "memory"]).await["enabled"], false);
+    // Experience defaults on and uses the same generic setting path.
+    assert_eq!(run(dir.path(), &["config", "show"]).await["experience"]["enabled"], true);
+    assert!(output(dir.path(), &["config", "set", "experience.enabled", "false"]).await.status.success());
+    assert_eq!(run(dir.path(), &["config", "show"]).await["experience"]["enabled"], false);
+    assert!(output(dir.path(), &["config", "set", "experience.enabled", "true"]).await.status.success());
+    assert_eq!(run(dir.path(), &["config", "show"]).await["experience"]["enabled"], true);
 }
 
 #[tokio::test]

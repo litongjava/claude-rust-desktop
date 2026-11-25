@@ -38,6 +38,7 @@ pub mod computer_use;
 pub mod db;
 pub mod permissions;
 pub mod memory;
+pub mod experience;
 pub mod scheduler;
 pub mod diff;
 pub mod im_integration;

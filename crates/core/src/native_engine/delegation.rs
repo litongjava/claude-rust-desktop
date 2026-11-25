@@ -992,10 +992,27 @@ impl ToolLoopExecutor {
                 )
             })
             .collect::<Vec<_>>();
+        let experience_enabled = crate::experience::enabled(context);
+        let experience_workspace = (!crate::experience::is_internal_workspace(
+            &workspace,
+            &root.join("workspaces"),
+        ))
+        .then(|| workspace.clone());
+        let scanned = experience_workspace
+            .as_deref()
+            .map(crate::experience::scan)
+            .unwrap_or_default();
         self.set_session_reminders(crate::prompt::SessionReminders {
             user_instructions,
             project_instructions,
             resident_indexes,
+            experience: crate::prompt::experience_for_session(
+                root,
+                id,
+                experience_workspace.as_deref(),
+                experience_enabled,
+                &scanned.entries,
+            ),
             environment: Some(environment),
             date: Some(date),
             git: crate::services::git_snapshot::for_session(root, id, &workspace)

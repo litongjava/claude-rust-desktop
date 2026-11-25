@@ -52,7 +52,7 @@ fn line(text: &str, max: usize, field: &str) -> Result<()> {
 
 // Inspect parser events before constructing a Value: aliases are never expanded,
 // while punctuation in ordinary quoted scalars/comments remains valid YAML.
-fn yaml_subset(text: &str) -> Result<()> {
+pub(crate) fn yaml_subset(text: &str) -> Result<()> {
     use std::mem::MaybeUninit;
     use unsafe_libyaml as yaml;
     struct Parser(Box<MaybeUninit<yaml::yaml_parser_t>>);
@@ -115,7 +115,7 @@ fn yaml_subset(text: &str) -> Result<()> {
     Err(invalid("too many frontmatter YAML events"))
 }
 
-fn validate_value(value: &Value, depth: usize) -> Result<()> {
+pub(crate) fn validate_value(value: &Value, depth: usize) -> Result<()> {
     if depth > 8 {
         return Err(invalid("frontmatter depth exceeds 8"));
     }

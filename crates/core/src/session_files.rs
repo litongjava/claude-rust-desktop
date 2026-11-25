@@ -13,7 +13,12 @@ pub(crate) const MCP_SNAPSHOT_DIR: &str = "mcp-tool-snapshots";
 /// Kinds tracked by `prompt::set_changes`; each writes `<session>.<kind>.names.json`.
 pub(crate) const SET_CHANGE_SKILLS: &str = "skills";
 pub(crate) const SET_CHANGE_LOADABLE_TOOLS: &str = "loadable-tools";
-const SET_CHANGE_KINDS: &[&str] = &[SET_CHANGE_SKILLS, SET_CHANGE_LOADABLE_TOOLS];
+pub(crate) const SET_CHANGE_EXPERIENCE: &str = "experience";
+const SET_CHANGE_KINDS: &[&str] = &[
+    SET_CHANGE_SKILLS,
+    SET_CHANGE_LOADABLE_TOOLS,
+    SET_CHANGE_EXPERIENCE,
+];
 
 /// Suffixes written directly under `environment/`.
 const ENVIRONMENT_SUFFIXES: &[&str] = &[
@@ -22,6 +27,7 @@ const ENVIRONMENT_SUFFIXES: &[&str] = &[
     ".announced-date",
     ".loadable-tools.json",
     ".skills.json",
+    ".experience.json",
     SUGGESTION_SUFFIX,
 ];
 

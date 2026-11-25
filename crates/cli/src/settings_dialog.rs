@@ -131,6 +131,7 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
     let memory = deepseek_code_core::services::memory_files::config(&crate::services::context(paths)?)
         .map(|config| config.enabled)
         .unwrap_or(true);
+    let experience = deepseek_code_core::experience::enabled(&crate::services::context(paths)?);
     let settings: Vec<(&str, &str, String)> = vec![
         ("model", "Model", session.binding_state().model.clone()),
         ("provider", "Provider", session.binding_state().provider_id.clone()),
@@ -138,6 +139,7 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
         ("effort", "Effort", effort),
         ("autocompact", "Auto-compact", autocompact),
         ("memory", "Long-term memory", if memory { "on" } else { "off" }.into()),
+        ("experience", "Experience", if experience { "on" } else { "off" }.into()),
         ("theme", "Theme", display.theme.clone()),
         // As in the reference CLI; /vim toggles the same setting.
         ("editor", "Editor mode", if crate::terminal::vim::enabled(&paths.data_dir) { "vim" } else { "normal" }.into()),
@@ -166,6 +168,7 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
         "effort" => &crate::session_commands::EFFORTS,
         "autocompact" => &["default", "off", "70%", "80%", "90%"],
         "memory" => &["on", "off"],
+        "experience" => &["on", "off"],
         "theme" => &["dark", "light", "dark-daltonized", "light-daltonized", "dark-ansi", "light-ansi"],
         "color" => &["default", "red", "orange", "yellow", "green", "blue", "purple", "pink", "cyan"],
         "focus" => &["on", "off"],
@@ -190,6 +193,10 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
                     config.enabled = choices[choice] == "on";
                     deepseek_code_core::services::memory_files::save_config(&context, &config)
                 }
+                "experience" => deepseek_code_core::experience::set_enabled(
+                    &crate::services::context(paths)?,
+                    choices[choice] == "on",
+                ),
                 "effort" | "autocompact" => crate::session_commands::handle(&format!("/{key}"), choices[choice], paths, session).await.map(|_| ()),
                 _ => crate::display_commands::handle(&format!("/{key}"), choices[choice], paths, session).await.map(|_| ()),
             },

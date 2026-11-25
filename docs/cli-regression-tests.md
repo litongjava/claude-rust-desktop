@@ -1667,3 +1667,17 @@ cargo test --locked -p deepseek-code-cli --bin dcl shell_configuration_is_shared
 7. 开启沙箱（Linux/macOS）后 Python 被解释器级包装，网络允许列表和主机审批与 Bash 相同；Windows 上明确报错。计划模式拒绝 Python；`Python(*)` 和裸 `Python` 放行任意代码，`Python(import *)` 只按前缀匹配。
 8. 模型预览按 `interpreter:`（仅与请求不同或有工作区虚拟环境覆盖时）→ `script:` → `Exit code:` → 小写 `stdout:`/`stderr:` 顺序显示，路径是单反斜杠，不落入 `Metadata:`。
 9. CLI 审批框显示完整代码、`env`、`cwd`、`interpreter`/`conda` 和 `save_name` 目标；不提供 Allow for Session。工具调用摘要显示 `Python(description | 首行代码或保存路径)`，不再只有描述。`/permissions allow Python(*)` 后的调用不再询问。
+
+### I42. Experience 索引与变更提醒
+
+改动范围：`crates/core/src/experience.rs`、`prompt/mod.rs` 的 `SessionReminders.experience`/`experience_for_session`/`changes_reminder`、`session_files.rs`、`engine_core.rs`、`delegation.rs`、`crates/cli/src/config.rs`、`crates/cli/src/settings_dialog.rs`。
+
+- `cargo test --locked -p deepseek-code-core --lib -- experience prompt`：
+  - `experience::tests` 验证 frontmatter 解析、64 KiB/8 KiB 上限、根与一级子目录扫描、三级目录不扫描、同名跨根去重、确定性排序、`- 相对路径 | 名称: 描述` 行格式、正文不进入索引、凭据启发式跳过，以及 `experience.enabled` 默认 true 与持久化。
+  - `prompt::tests::first_message_reminders_keep_the_stable_order` 断言 Experience 块位于 MEMORY 索引之后、CLI 前端说明之前；`experience_*` 断言首请求冻结、内部草稿工作区与关闭开关都冻结 `None`；`changes_reminder_reports_*` 断言新增/删除各只提醒一次。
+  - `forget_*` 与 `prune_*` 断言 `.experience.json` 和 `<session>.experience.names.json` 纳入会话删除与 30 天清理。
+- `cargo test --locked -p deepseek-code-cli --test experience`：OpenAI 与 Anthropic 各跑一遍。断言首条用户消息只有一个 `# Experience`，根与 `docs/.agents/experience/` 条目在、`docs/sub/.agents/experience/` 不在、行以相对路径开头、正文与无效文件标记不在；恢复后首条消息逐字一致；新增 `gamma` 只出现一次 `New experience:`，删除 `beta` 只出现一次 `Removed experience: beta`；关闭开关的新会话没有块，重新打开恢复。
+- `cargo test --locked -p deepseek-code-cli --test peripheral config_memory_switch`：断言 `config show` 的 `experience.enabled` 默认 true，`config set experience.enabled false|true` 可读回；`/config` 的 Experience 行读取同一设置。
+- 手工终端：在含 `.agents/experience/` 的临时工作区连本地 mock，确认首条消息顺序、`/config` 开关、恢复同一会话和压缩后只有一份块。Windows 与 Desktop WebView 未在本机验证。
+
+已知平台问题：macOS 上 `cargo check -p deepseek-code-cli --all-targets` 会在 `local_coordination_registry` 失败（`private_root` 使用 `#[cfg(unix)]`，CoordinationPaths 导入使用 `#[cfg(target_os = "linux")]`）。这是既有问题，与本次改动无关；本次用 `--bin dcl --test experience --test peripheral` 检查。

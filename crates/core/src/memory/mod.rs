@@ -660,7 +660,7 @@ pub struct ContextManager {
 }
 
 impl ContextManager {
-    fn contains_credentials(content: &str) -> bool {
+    pub(crate) fn contains_credentials(content: &str) -> bool {
         static CREDENTIALS: once_cell::sync::Lazy<Regex> = once_cell::sync::Lazy::new(|| Regex::new(
             r#"(?i)(?:-----BEGIN [A-Z ]*PRIVATE KEY-----|\bbearer\s+[a-z0-9._~+/=-]+|\bsk-[a-z0-9_-]{8,}|\b(?:api[-_ ]?key|password|passwd|secret|access[-_ ]?token|refresh[-_ ]?token)["']?\s*(?:[:=]|is\b)\s*["']?\S+|(?:密码|密钥|令牌)\s*(?:是|为|[:：=])\s*\S+)"#,
         ).expect("credential detection regex is valid"));

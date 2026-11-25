@@ -2,7 +2,7 @@
 //!
 //! Hosts must resolve trusted roots and enforce their permission/Plan/role policy
 //! before opening a store. Possessing a scope key is not user authorization.
-mod format;
+pub(crate) mod format;
 mod index;
 mod name_fold;
 mod safe_dir;

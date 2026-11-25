@@ -221,3 +221,14 @@ npm run test:run -- src/components/ToolPermissionPrompt.test.tsx
 5. 开启沙箱（Linux/macOS）后 Python 仍被包装；Windows 上显示明确的“不支持沙箱”错误，不静默在沙箱外执行。
 6. `save_name` 的目标已存在时审批仍显示同一路径；批准后文件被覆盖，结果为 `script_saved:true` 且 `script_path` 是绝对路径。目标为符号链接时工具报错，不写入。
 7. 后台 Python 调用完成后，`TaskGet` 的结果和 `/tasks` 中的任务名使用描述或保存名，不包含整段代码。
+
+### Experience 索引（2026-11-25）
+
+1. 在项目工作区根与 `docs/.agents/experience/` 各放一个条目，新建会话；首条用户消息在 MEMORY.md 索引之后、前端说明之前出现 Experience 块，索引行是 `- 相对路径 | 名称: 描述`，不含正文，也不含 `docs/sub/.agents/experience/` 的三级条目。
+2. 同一会话让模型新增一个条目：下一轮只出现一次 `New experience:`，首条消息不变；再次请求不重复。
+3. 手动压缩上下文：Experience 块重新附在剩余的第一条用户消息上，只出现一次。
+4. 无项目会话（内部草稿工作区）不出现 Experience 块。
+5. 在 `/config` 关闭 Experience 后新建会话不出现；重新打开后新会话恢复。
+6. 删除一个条目：下一轮出现一次 `Removed experience: <name>`。
+
+本机（macOS）只执行了 core/CLI 自动化；Desktop WebView、Windows 与真实 Tauri 窗口的上述步骤尚未在本轮验证。
