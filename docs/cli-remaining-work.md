@@ -295,4 +295,4 @@ Acceptance evidence: development record `acceptance-20261102.md` and `ux-2026110
 - [x] `/resume`、`/branch`、`/clear` 切换会话时断开 Remote Control，清空 published/deferred/remote_prompts、session relay、`/loop`、草稿、`NEXT_DRAFT` 和 TerminalInput 队列。
 - [x] `session_worker::current` 校验 worker 记录属于目标会话。
 - 测试：CLI 全量单测（589 passed / 1 existing plugins failure / 13 ignored）、core `services::session_worker` 24 项、Desktop `--all-targets` 检查通过；macOS tmux 真实 pty 场景通过。详见 `docs/cli-regression-tests.md` D9 与 `dev-support/deepseek-code/session-occupancy-20261126/`。
-- 未验证：Windows ConPTY；goal proposal 两个本地 frontend 的真实竞态未构造自动化用例；core 全量在并发基线编译期间出现进程/超时类失败，环境相关用例（workspace lock、durability）单独仍失败。
+- 未验证：Windows ConPTY；goal proposal 两个本地 frontend 的真实竞态未构造自动化用例；core 全量在 macOS 上两次运行约为 `2164 passed / 95 failed / 12 ignored`，失败集中在进程/超时/临时 DB 环境类，未获得全绿。已隔离确认 `services::session_worker` 24 项通过、`resume_cancellation...` 通过；`workspace_lock`、`durability` 单独仍失败，属于当前 macOS 环境问题。
