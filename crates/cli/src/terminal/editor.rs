@@ -1734,15 +1734,12 @@ impl PromptEditor {
                 )?;
             }
             let badge_text = if selection.retained() {
-                Some("按 c 复制".to_owned())
+                Some(crate::terminal::corner_badge::copy_hint())
             } else {
-                selection_copy.map(|(characters, copied)| {
-                    if copied {
-                        format!("已复制 {characters} 个字符")
-                    } else {
-                        "复制失败".to_owned()
-                    }
-                })
+                selection_copy
+                    .map(|(characters, copied)| {
+                        crate::terminal::corner_badge::copy_result(characters, copied)
+                    })
             };
             let badge_row = if history_view.active() {
                 rows.checked_sub(lines.len() as u16 + 1)

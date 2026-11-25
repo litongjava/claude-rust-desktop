@@ -7,6 +7,25 @@ use crossterm::{
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthStr;
 
+/// The shortcut hint follows the application language (English or Chinese).
+pub fn copy_hint() -> String {
+    deepseek_code_core::config::ui_language::text("Press c to copy", "按 c 复制").to_owned()
+}
+
+/// The copy result follows the application language (English or Chinese).
+pub fn copy_result(characters: usize, copied: bool) -> String {
+    if !copied {
+        return deepseek_code_core::config::ui_language::text("Copy failed", "复制失败").to_owned();
+    }
+    let english = if characters == 1 {
+        "Copied 1 character".to_owned()
+    } else {
+        format!("Copied {characters} characters")
+    };
+    let chinese = format!("已复制 {characters} 个字符");
+    deepseek_code_core::config::ui_language::text(&english, &chinese).to_owned()
+}
+
 #[derive(Default)]
 pub(super) struct CornerBadge {
     row: Option<u16>,
@@ -21,7 +40,7 @@ impl CornerBadge {
     /// the row since the last loop iteration.
     pub fn show(&mut self, row: u16, text: &str) -> io::Result<()> {
         let (columns, _) = crate::terminal::size();
-        let width = UnicodeWidthStr::width(text) + 2;
+        let width = UnicodeWidthStr::width(text);
         if width + 1 > columns as usize {
             return self.clear();
         }
@@ -34,8 +53,8 @@ impl CornerBadge {
             out,
             SavePosition,
             MoveTo(column, row),
-            SetAttribute(Attribute::Reverse),
-            Print(format!(" {text} ")),
+            SetAttribute(Attribute::Reset),
+            Print(text),
             SetAttribute(Attribute::Reset),
             RestorePosition
         )?;

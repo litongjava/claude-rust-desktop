@@ -2204,15 +2204,10 @@ fn paint_selection_badge(
         return badge.clear();
     }
     let text = if selection.retained() {
-        Some("按 c 复制".to_owned())
+        Some(super::corner_badge::copy_hint())
     } else {
-        selection_copy.map(|(characters, copied)| {
-            if copied {
-                format!("已复制 {characters} 个字符")
-            } else {
-                "复制失败".to_owned()
-            }
-        })
+        selection_copy
+            .map(|(characters, copied)| super::corner_badge::copy_result(characters, copied))
     };
     match text.zip(screen.content_bottom) {
         Some((text, row)) => badge.show(row, &text),
