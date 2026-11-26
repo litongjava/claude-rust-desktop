@@ -1772,10 +1772,13 @@ cargo test --locked -p deepseek-code-cli --bin dcl shell_configuration_is_shared
 cargo test --locked -p deepseek-code-core --lib services::resource_monitor
 cargo test --locked -p deepseek-code-core --test resource_monitor
 cargo test --locked -p deepseek-code-core --lib native_engine::engine_core::resource_monitor_tests
-cargo test --locked -p deepseek-code-cli --bin dcl resource_alert
+cargo test --locked -p deepseek-code-cli --bin dcl resource_alert_renders
+cargo test --locked -p deepseek-code-cli --bin dcl resource_alerts_serialize
 cargo test --locked -p deepseek-code-cli --test resource_monitor
 cargo check --locked -p deepseek-code-desktop --all-targets
 ```
+
+`resource_alert_renders` 覆盖 `worker_frontend` 的 `● System resource warning: ...` 提示；`resource_alerts_serialize` 覆盖 stream-json 的 `kind/summary/details`。核心用例 `stale_undrained_alerts_expire_after_ttl` 与 `preparing_a_turn_updates_the_monitor_workspace` 分别覆盖恢复后陈旧告警清理，以及 EnterWorktree/ExitWorktree 后监控的磁盘目标跟随新工作区。
 
 手工终端（必须人为压低阈值；真实主机负载触发无法在自动用例中稳定复现）：
 
