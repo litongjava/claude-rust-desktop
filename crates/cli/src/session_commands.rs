@@ -35,7 +35,7 @@ impl Settings {
 /// Compacts at 80% of the window by default, leaving a fifth for the next
 /// response and for summarization, e.g. 160k of a 200k window.
 fn default_autocompact_tokens(window: u64) -> Option<u64> {
-    Some(window * 4 / 5).filter(|tokens| *tokens > 0)
+    settings::default_autocompact_tokens(window)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -297,7 +297,7 @@ pub async fn handle(
                 save(&session.store.db, &session.id, &settings)?;
             }
             let status = match (settings.autocompact_percent, settings.autocompact_off) {
-                (Some(percent), _) => format!("{percent}% of configured context window (estimated history size, checked before each turn)"),
+                (Some(percent), _) => format!("{percent}% of configured context window (checked before each turn and during long turns)"),
                 (None, true) => "off".into(),
                 (None, false) => match session.context_window().await.and_then(|window| default_autocompact_tokens(window as u64)) {
                     Some(tokens) => format!("on at {tokens} tokens (default: 80% of the context window)"),

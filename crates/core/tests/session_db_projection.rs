@@ -873,6 +873,7 @@ fn typed_session_settings_resume_in_their_own_shard() -> Result<()> {
                 &Microcompact {
                     boundary: "m".into(),
                     through: 11,
+                    cleared_results: 0,
                 },
             )?;
             w.set_setting(CHILD_PROGRESS, &progress)?;
