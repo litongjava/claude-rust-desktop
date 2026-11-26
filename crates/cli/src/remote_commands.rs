@@ -345,6 +345,23 @@ impl Remote {
         result
     }
 
+    /// Forgets everything tied to the session it was connected for. A remote
+    /// client must not receive the next session's messages or permissions.
+    /// Returns whether a live connection had to be dropped.
+    pub async fn reset_for_session_change(&mut self) -> bool {
+        let bridge = self.bridge.take();
+        self.published = 0;
+        self.deferred.clear();
+        self.remote_prompts.clear();
+        match bridge {
+            Some(bridge) => {
+                let _ = bridge.disconnect().await;
+                true
+            }
+            None => false,
+        }
+    }
+
     async fn close(&mut self) {
         if let Some(bridge) = self.bridge.take() {
             let _ = bridge.disconnect().await;
@@ -524,5 +541,16 @@ mod tests {
         assert_eq!(protocol_mode("accept-edits"), "acceptEdits");
         assert_eq!(protocol_mode("bypass"), "bypassPermissions");
         assert_eq!(protocol_mode("plan"), "plan");
+    }
+
+    #[tokio::test]
+    async fn reset_for_session_change_discards_previous_session_state() {
+        let mut remote = Remote::default();
+        remote.defer("old prompt".into());
+        remote.published = 7;
+        assert!(!remote.reset_for_session_change().await);
+        assert!(remote.take_deferred().is_none());
+        assert!(remote.remote_prompts.is_empty());
+        assert_eq!(remote.published, 0);
     }
 }
