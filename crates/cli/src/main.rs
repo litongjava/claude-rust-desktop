@@ -1438,7 +1438,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                         Err(error) => {
                             let text = format!("{error:#}");
                             if text != last_occupancy_error {
-                                command_eprintln!("Session occupancy: {text}");
+                                input.as_ref().expect("interactive reader").notice(format!("Session occupancy: {text}"));
                                 last_occupancy_error = text;
                             }
                             None
@@ -1455,12 +1455,10 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     if observing && !observe_announced {
                         observe_announced = true;
                         if let Some(occupancy) = occupancy.as_ref() {
-                            command_eprintln!(
-                                "{}",
-                                worker_frontend::observation_banner(&session, occupancy)
-                            );
+                            let reader = input.as_ref().expect("interactive reader");
+                            reader.notice(worker_frontend::observation_banner(&session, occupancy));
                             if let Err(error) = execution_observer.preannounce(&session) {
-                                command_eprintln!("Observation: {error:#}");
+                                reader.notice(format!("Observation: {error:#}"));
                             }
                         }
                         if input
@@ -1522,7 +1520,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                             input.as_ref().expect("interactive reader").notice(format!("Notification hook: {error:#}"));
                         }
                     }
-                    if !session.waiting_for_continue() && !composer.is_pending()
+                    if last_occupancy_error.is_empty() && !session.waiting_for_continue() && !composer.is_pending()
                         && deepseek_code_core::services::async_hooks::has_pending_wake(&paths.data_dir, &session.id)
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         if let Err(error) = session.wake_hooks(cli, &mut input).await {
@@ -1533,7 +1531,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     }
                     if let Err(error) = session.sync_workspace() { command_eprintln!("Worktree: {error:#}"); }
                     // Process due jobs once the composer is idle.
-                    if !session.waiting_for_continue() && !composer.is_pending() {
+                    if last_occupancy_error.is_empty() && !session.waiting_for_continue() && !composer.is_pending() {
                         let scope = deepseek_code_core::tools::cron_jobs::Scope { root: &paths.data_dir, session: &session.id, project: &session.workspace };
                         match deepseek_code_core::tools::cron_jobs::take_due(&scope, chrono::Local::now()) {
                             Ok(due) if !due.is_empty() => {
@@ -1551,7 +1549,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                         }
                     }
                     // A self-paced loop resumes its scheduled prompt.
-                    if !session.waiting_for_continue() && !composer.is_pending() && deepseek_code_core::tools::wakeup::is_due(&paths.data_dir, &session.id, chrono::Utc::now().timestamp())
+                    if last_occupancy_error.is_empty() && !session.waiting_for_continue() && !composer.is_pending() && deepseek_code_core::tools::wakeup::is_due(&paths.data_dir, &session.id, chrono::Utc::now().timestamp())
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         if let Some((prompt, reason)) = deepseek_code_core::tools::wakeup::take_due(&paths.data_dir, &session.id, chrono::Utc::now().timestamp()).unwrap_or(None) {
                             command_eprintln!("\u{21bb} Loop wakeup: {reason}");
@@ -1561,7 +1559,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     }
                     // Dispatch an interval loop once the composer is idle.
                     if let Some(index) = loops.iter().position(|(_, _, next)| *next <= std::time::Instant::now()) {
-                        if !session.waiting_for_continue() && !composer.is_pending() && input.as_mut().expect("interactive reader").yield_prompt().await? {
+                        if last_occupancy_error.is_empty() && !session.waiting_for_continue() && !composer.is_pending() && input.as_mut().expect("interactive reader").yield_prompt().await? {
                             let (every, prompt, next) = &mut loops[index];
                             *next = std::time::Instant::now() + *every;
                             command_eprintln!("\u{21bb} Loop: {prompt}");
@@ -1571,7 +1569,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     }
                     // A background agent waiting for approval asks here, as in the
                     // reference CLI, once the input is empty.
-                    if !session.waiting_for_continue() && !composer.is_pending()
+                    if last_occupancy_error.is_empty() && !session.waiting_for_continue() && !composer.is_pending()
                         && background_commands::agent_question(&paths, &session).is_some()
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         if let Err(error) = background_commands::answer_agent_question(&paths, &session) { command_eprintln!("Agent question: {error:#}"); }
@@ -1580,7 +1578,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     let notices = background_commands::collect_completed(&session)?;
                     // A finished background command starts a turn; its line is
                     // printed first, above that turn.
-                    if !session.waiting_for_continue() && !composer.is_pending()
+                    if last_occupancy_error.is_empty() && !session.waiting_for_continue() && !composer.is_pending()
                         && session.store.db.next_desktop_input(&session.id).ok().flatten().is_some()
                         && input.as_mut().expect("interactive reader").yield_prompt().await? {
                         for notice in notices { command_eprintln!("{notice}"); }
