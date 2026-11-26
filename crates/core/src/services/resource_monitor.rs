@@ -816,6 +816,21 @@ pub struct ResourceEvaluator {
     states: HashMap<ResourceKey, ResourceState>,
 }
 
+#[derive(Debug, Default, PartialEq)]
+pub struct EvaluationOutcome {
+    pub alerts: Vec<ResourceAlert>,
+    /// Keys that returned to their recovery band on this sample. A warning
+    /// queued for one of them is stale even before its TTL expires.
+    pub recovered: Vec<ResourceKey>,
+}
+
+/// What one monitored key did on this sample.
+enum UpdateOutcome {
+    None,
+    Alert,
+    Recovered,
+}
+
 impl ResourceEvaluator {
     pub fn new(config: ResourceMonitorConfig) -> Self {
         Self {
@@ -825,14 +840,28 @@ impl ResourceEvaluator {
     }
 
     pub fn evaluate(&mut self, sample: &ResourceSample, now: Instant) -> Vec<ResourceAlert> {
-        let mut alerts = Vec::new();
+        self.evaluate_with_recovery(sample, now).alerts
+    }
+
+    /// Like [`Self::evaluate`], but also reports every key that returned to its
+    /// recovery band so the monitor can drop a warning queued while idle.
+    pub fn evaluate_with_recovery(
+        &mut self,
+        sample: &ResourceSample,
+        now: Instant,
+    ) -> EvaluationOutcome {
+        let mut outcome = EvaluationOutcome::default();
 
         if let Some(percent) = sample.cpu_percent {
             let breach = self.config.cpu_breach(percent);
             let recovered = self.config.cpu_recovered(percent);
             let required = self.config.cpu_consecutive.max(1);
-            if self.update(ResourceKey::Cpu, breach, recovered, now, required) {
-                alerts.push(ResourceAlert::cpu(percent, &self.config));
+            match self.update(ResourceKey::Cpu, breach, recovered, now, required) {
+                UpdateOutcome::Alert => outcome
+                    .alerts
+                    .push(ResourceAlert::cpu(percent, &self.config)),
+                UpdateOutcome::Recovered => outcome.recovered.push(ResourceKey::Cpu),
+                UpdateOutcome::None => {}
             }
         }
 
@@ -840,8 +869,12 @@ impl ResourceEvaluator {
             let breach = self.config.memory_breach(memory);
             let recovered = self.config.memory_recovered(memory);
             let required = self.config.memory_consecutive.max(1);
-            if self.update(ResourceKey::Memory, breach, recovered, now, required) {
-                alerts.push(ResourceAlert::memory(memory, &self.config));
+            match self.update(ResourceKey::Memory, breach, recovered, now, required) {
+                UpdateOutcome::Alert => outcome
+                    .alerts
+                    .push(ResourceAlert::memory(memory, &self.config)),
+                UpdateOutcome::Recovered => outcome.recovered.push(ResourceKey::Memory),
+                UpdateOutcome::None => {}
             }
         }
 
@@ -850,15 +883,20 @@ impl ResourceEvaluator {
             let recovered = self.config.disk_recovered(disk);
             let required = self.config.disk_consecutive.max(1);
             let key = ResourceKey::Disk(disk.label.clone());
-            if self.update(key, breach, recovered, now, required) {
-                alerts.push(ResourceAlert::disk(disk, &self.config));
+            match self.update(key, breach, recovered, now, required) {
+                UpdateOutcome::Alert => {
+                    outcome.alerts.push(ResourceAlert::disk(disk, &self.config))
+                }
+                UpdateOutcome::Recovered => outcome
+                    .recovered
+                    .push(ResourceKey::Disk(disk.label.clone())),
+                UpdateOutcome::None => {}
             }
         }
 
-        alerts
+        outcome
     }
 
-    /// Returns whether a warning should be emitted now.
     fn update(
         &mut self,
         key: ResourceKey,
@@ -866,7 +904,7 @@ impl ResourceEvaluator {
         recovered: bool,
         now: Instant,
         required: u32,
-    ) -> bool {
+    ) -> UpdateOutcome {
         let cooldown = Duration::from_secs(self.config.cooldown_secs);
         let state = self.states.entry(key).or_default();
 
@@ -877,8 +915,9 @@ impl ResourceEvaluator {
             // latched, so flapping values do not emit a new warning.
             if recovered {
                 state.active = false;
+                return UpdateOutcome::Recovered;
             }
-            return false;
+            return UpdateOutcome::None;
         }
 
         state.consecutive_breaches = state.consecutive_breaches.saturating_add(1);
@@ -891,18 +930,18 @@ impl ResourceEvaluator {
             if state.consecutive_breaches >= required && due {
                 state.active = true;
                 state.last_alerted = Some(now);
-                return true;
+                return UpdateOutcome::Alert;
             }
-            return false;
+            return UpdateOutcome::None;
         }
 
         // Already latched: remind periodically while the pressure lasts, but
         // never more often than the cooldown.
         if due {
             state.last_alerted = Some(now);
-            return true;
+            return UpdateOutcome::Alert;
         }
-        false
+        UpdateOutcome::None
     }
 }
 
@@ -910,13 +949,21 @@ impl ResourceEvaluator {
 // Async handle
 // ---------------------------------------------------------------------------
 
+struct PendingAlert {
+    alert: ResourceAlert,
+    created_at: Instant,
+}
+
 struct Inner {
     enabled: AtomicBool,
     data_dir: PathBuf,
     workspace: Mutex<PathBuf>,
     sampler: Mutex<Box<dyn SystemSampler>>,
     evaluator: Mutex<ResourceEvaluator>,
-    alerts: Mutex<VecDeque<ResourceAlert>>,
+    alerts: Mutex<VecDeque<PendingAlert>>,
+    /// A warning that was not drained within this window is stale: the pressure
+    /// it described may be long gone, so it must never reach a later turn.
+    stale_ttl: Duration,
     latest: Mutex<Option<ResourceSample>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -961,6 +1008,7 @@ impl ResourceMonitor {
         sampler: Box<dyn SystemSampler>,
     ) -> Self {
         let config = config.sanitized();
+        let stale_ttl = Duration::from_secs(config.interval_secs.saturating_mul(2).max(30));
         let runtime = if config.enabled {
             tokio::runtime::Handle::try_current().ok()
         } else {
@@ -980,6 +1028,7 @@ impl ResourceMonitor {
             sampler: Mutex::new(sampler),
             evaluator: Mutex::new(ResourceEvaluator::new(config.clone())),
             alerts: Mutex::new(VecDeque::new()),
+            stale_ttl,
             latest: Mutex::new(None),
             task: Mutex::new(None),
         });
@@ -1006,14 +1055,20 @@ impl ResourceMonitor {
                     // sysctl/statvfs/proc reads are sub-millisecond, so this
                     // stays on the task instead of churning the blocking pool.
                     let sample = lock(&inner.sampler).sample(&targets);
-                    let alerts = lock(&inner.evaluator).evaluate(&sample, Instant::now());
-                    *lock(&inner.latest) = Some(sample);
-                    if !alerts.is_empty() {
+                    let now = Instant::now();
+                    let outcome = lock(&inner.evaluator).evaluate_with_recovery(&sample, now);
+                    {
                         let mut pending = lock(&inner.alerts);
-                        for alert in alerts {
-                            enqueue_alert(&mut pending, alert);
+                        // A recovered or expired warning must be gone before a
+                        // new one for the same key replaces it.
+                        prune_alerts(&mut pending, &outcome.recovered, now, inner.stale_ttl);
+                        for alert in outcome.alerts {
+                            enqueue_alert(&mut pending, alert, now);
                         }
                     }
+                    // Published after the queue update so observers of the
+                    // latest sample see a fully processed tick.
+                    *lock(&inner.latest) = Some(sample);
                 }
             });
             *lock(&inner.task) = Some(task);
@@ -1027,10 +1082,26 @@ impl ResourceMonitor {
         *lock(&self.inner.workspace) = workspace;
     }
 
+    /// The disk target the sampler currently reports as `workspace`.
+    #[cfg(test)]
+    pub fn tracked_workspace(&self) -> PathBuf {
+        lock(&self.inner.workspace).clone()
+    }
+
     /// Returns and clears pending warnings. Active turns call this; idle
     /// processes simply keep the bounded, deduplicated queue.
     pub fn drain_alerts(&self) -> Vec<ResourceAlert> {
-        lock(&self.inner.alerts).drain(..).collect()
+        self.drain_alerts_at(Instant::now())
+    }
+
+    /// Like [`Self::drain_alerts`], with the caller's clock. Expired warnings
+    /// are pruned first, so a turn that starts after a long idle stall can
+    /// never receive a warning the monitor already knows is stale.
+    pub fn drain_alerts_at(&self, now: Instant) -> Vec<ResourceAlert> {
+        let mut pending = lock(&self.inner.alerts);
+        let stale_ttl = self.inner.stale_ttl;
+        pending.retain(|alert| now.saturating_duration_since(alert.created_at) <= stale_ttl);
+        pending.drain(..).map(|pending| pending.alert).collect()
     }
 
     pub fn latest_sample(&self) -> Option<ResourceSample> {
@@ -1050,15 +1121,33 @@ impl ResourceMonitor {
     }
 }
 
-fn enqueue_alert(queue: &mut VecDeque<ResourceAlert>, alert: ResourceAlert) {
-    if let Some(existing) = queue.iter_mut().find(|queued| queued.key == alert.key) {
-        *existing = alert;
+fn enqueue_alert(queue: &mut VecDeque<PendingAlert>, alert: ResourceAlert, created_at: Instant) {
+    if let Some(existing) = queue
+        .iter_mut()
+        .find(|queued| queued.alert.key == alert.key)
+    {
+        *existing = PendingAlert { alert, created_at };
         return;
     }
     if queue.len() >= MAX_PENDING_ALERTS {
         queue.pop_front();
     }
-    queue.push_back(alert);
+    queue.push_back(PendingAlert { alert, created_at });
+}
+
+/// Drops warnings for keys that recovered on this sample and warnings older
+/// than the stale TTL. Leaving either in the queue would inject stale pressure
+/// into a turn that starts much later.
+fn prune_alerts(
+    queue: &mut VecDeque<PendingAlert>,
+    recovered: &[ResourceKey],
+    now: Instant,
+    stale_ttl: Duration,
+) {
+    queue.retain(|pending| {
+        !recovered.contains(&pending.alert.key)
+            && now.saturating_duration_since(pending.created_at) <= stale_ttl
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,6 +1815,36 @@ mod tests {
         }
     }
 
+    /// Returns each sample in order and repeats the last one afterwards.
+    struct SequenceSampler {
+        samples: Vec<ResourceSample>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SequenceSampler {
+        fn new(samples: Vec<ResourceSample>) -> (Self, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    samples,
+                    calls: calls.clone(),
+                },
+                calls,
+            )
+        }
+    }
+
+    impl SystemSampler for SequenceSampler {
+        fn sample(&mut self, _disk_targets: &[(String, PathBuf)]) -> ResourceSample {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.samples
+                .get(index)
+                .or_else(|| self.samples.last())
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
     fn fast_config() -> ResourceMonitorConfig {
         let mut config = ResourceMonitorConfig::default();
         config.interval_secs = 2;
@@ -1846,9 +1965,79 @@ mod tests {
         assert!(monitor.drain_alerts().is_empty());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn recovery_clears_undrained_alert_for_that_key_only() {
+        let mut config = fast_config();
+        config.memory_consecutive = 1;
+        let samples = vec![
+            ResourceSample {
+                cpu_percent: Some(99.0),
+                memory: Some(memory_sample(16, 512)),
+                ..ResourceSample::default()
+            },
+            ResourceSample {
+                cpu_percent: Some(5.0),
+                memory: Some(memory_sample(16, 512)),
+                ..ResourceSample::default()
+            },
+        ];
+        let (sampler, calls) = SequenceSampler::new(samples);
+        let monitor = ResourceMonitor::start_with_sampler(
+            config,
+            PathBuf::from("/workspace"),
+            PathBuf::from("/data"),
+            Box::new(sampler),
+        );
+
+        // Tick 1 breaches both keys while nothing is draining. Tick 2 recovers
+        // CPU while memory stays low, so only the CPU warning must survive
+        // removal.
+        wait_for_calls(&calls, 2).await;
+        let alerts = monitor.drain_alerts();
+        assert_eq!(alerts.len(), 1, "only the still-breaching key is delivered");
+        assert_eq!(alerts[0].key, ResourceKey::Memory);
+        assert_eq!(alerts[0].kind, ResourceKind::Memory);
+        monitor.stop();
+    }
+
+    #[test]
+    fn stale_undrained_alerts_expire_after_ttl() {
+        let mut config = ResourceMonitorConfig::default();
+        config.enabled = false;
+        let monitor =
+            ResourceMonitor::start(config, PathBuf::from("/workspace"), PathBuf::from("/data"));
+        let ttl = monitor.inner.stale_ttl;
+        let now = Instant::now();
+        {
+            let mut pending = lock(&monitor.inner.alerts);
+            pending.push_back(PendingAlert {
+                alert: ResourceAlert::new(
+                    ResourceKey::Cpu,
+                    "stale".to_string(),
+                    "details".to_string(),
+                ),
+                created_at: now - ttl - Duration::from_secs(1),
+            });
+            pending.push_back(PendingAlert {
+                alert: ResourceAlert::new(
+                    ResourceKey::Memory,
+                    "fresh".to_string(),
+                    "details".to_string(),
+                ),
+                created_at: now,
+            });
+        }
+
+        let drained = monitor.drain_alerts_at(now);
+        assert_eq!(drained.len(), 1, "an alert older than the TTL is discarded");
+        assert_eq!(drained[0].key, ResourceKey::Memory);
+        assert!(monitor.drain_alerts_at(now).is_empty());
+    }
+
     #[test]
     fn enqueue_replaces_same_key_and_stays_bounded() {
         let mut queue = VecDeque::new();
+        let now = Instant::now();
         for index in 0..(MAX_PENDING_ALERTS + 3) {
             enqueue_alert(
                 &mut queue,
@@ -1857,11 +2046,12 @@ mod tests {
                     format!("summary {index}"),
                     "details".to_string(),
                 ),
+                now,
             );
         }
         assert_eq!(queue.len(), MAX_PENDING_ALERTS);
         assert_eq!(
-            queue.front().unwrap().key,
+            queue.front().unwrap().alert.key,
             ResourceKey::Disk("disk-3".to_string())
         );
 
@@ -1872,12 +2062,14 @@ mod tests {
                 "newer".to_string(),
                 "details".to_string(),
             ),
+            now + Duration::from_secs(1),
         );
         assert_eq!(queue.len(), MAX_PENDING_ALERTS);
         let replaced = queue
             .iter()
-            .find(|alert| alert.key == ResourceKey::Disk("disk-9".to_string()))
+            .find(|queued| queued.alert.key == ResourceKey::Disk("disk-9".to_string()))
             .unwrap();
-        assert_eq!(replaced.summary, "newer");
+        assert_eq!(replaced.alert.summary, "newer");
+        assert_eq!(replaced.created_at, now + Duration::from_secs(1));
     }
 }

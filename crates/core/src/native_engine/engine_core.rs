@@ -1772,6 +1772,13 @@ impl QueryEngine {
             None
         };
         let history = crate::db::session_store::ExecutorHistory::Session(selected);
+        // The monitor samples disk pressure for the turn's actual workspace, so
+        // a conversation on another mount is measured instead of the data dir.
+        if !replay {
+            if let Some(monitor) = &self.resource_monitor {
+                monitor.update_workspace(workspace_path.clone().into());
+            }
+        }
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,
@@ -2751,5 +2758,87 @@ mod resource_monitor_tests {
         let engine = engine.with_resource_monitor(monitor);
         assert!(engine.resource_monitor().is_some());
         assert!(!engine.resource_monitor().unwrap().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn preparing_a_turn_updates_the_monitor_workspace() {
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let paths = crate::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+        let store = crate::runtime::SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(&workspace, "fixture-model", "fixture").unwrap();
+        let mut turn = store.db.start_turn_timer(&id).unwrap();
+        let assistant_id = turn.ensure_segment().unwrap();
+
+        let provider: crate::native_engine::provider_manager::Provider =
+            serde_json::from_value(serde_json::json!({
+                "id": "fixture",
+                "name": "Fixture",
+                "api_format": "openai",
+                "base_url": "http://127.0.0.1:1/v1",
+                "api_key": "fixture-key",
+                "enabled": true,
+                "models": [{
+                    "id": "fixture-model",
+                    "name": "fixture-model",
+                    "enabled": true,
+                    "max_tokens": 1000,
+                    "context_window": 32000,
+                    "supports_web_search": false
+                }]
+            }))
+            .unwrap();
+
+        // Disabled so the test never samples host load or spawns a task.
+        let mut config = crate::services::resource_monitor::ResourceMonitorConfig::default();
+        config.enabled = false;
+        let previous = temp.path().join("previous-workspace");
+        let monitor = crate::services::resource_monitor::ResourceMonitor::start(
+            config,
+            previous.clone(),
+            paths.data_dir.clone(),
+        );
+        assert_eq!(monitor.tracked_workspace(), previous);
+
+        let engine = QueryEngine::new(
+            Arc::new(Mutex::new(
+                crate::native_engine::provider_manager::ProviderManager::in_memory(
+                    vec![provider],
+                    paths.data_dir.join("config/providers.json"),
+                ),
+            )),
+            store.db.clone(),
+            paths.layout().workspaces(),
+            crate::runtime::default_permissions(),
+            Arc::new(FileCache::new()),
+        )
+        .with_resource_monitor(monitor.clone());
+
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "conversation_id": id,
+            "messages": store
+                .model_history(&id, &crate::native_engine::provider_manager::ApiFormat::OpenAI)
+                .unwrap(),
+            "assistant_message_id": assistant_id,
+            "standalone_frontend": true,
+            "model": "fixture-model",
+            "provider_id": "fixture",
+            "workspace_path": workspace.to_string_lossy(),
+            "max_tokens": 1000
+        }))
+        .unwrap();
+
+        let selected = store.db.open_session(&id).unwrap();
+        let flow = engine
+            .prepare_turn(selected, request, TurnPurpose::Submit)
+            .await
+            .unwrap();
+        assert!(matches!(flow, std::ops::ControlFlow::Continue(_)));
+        assert_eq!(
+            monitor.tracked_workspace(),
+            std::fs::canonicalize(&workspace).unwrap()
+        );
     }
 }

@@ -121,6 +121,38 @@ impl SystemSampler for ScriptedSampler {
     }
 }
 
+/// Breaches for the first `breach_calls` invocations, then reports healthy CPU.
+/// Models a host spike that recovers while no turn is running.
+#[derive(Clone)]
+struct IdleSpikeSampler {
+    calls: Arc<AtomicUsize>,
+    breach_calls: usize,
+}
+
+impl IdleSpikeSampler {
+    fn new(breach_calls: usize) -> (Self, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        (
+            Self {
+                calls: calls.clone(),
+                breach_calls,
+            },
+            calls,
+        )
+    }
+}
+
+impl SystemSampler for IdleSpikeSampler {
+    fn sample(&mut self, _disk_targets: &[(String, PathBuf)]) -> ResourceSample {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let cpu_percent = if call <= self.breach_calls { 99.0 } else { 5.0 };
+        ResourceSample {
+            cpu_percent: Some(cpu_percent),
+            ..ResourceSample::default()
+        }
+    }
+}
+
 fn monitor_config(cooldown_secs: u64) -> ResourceMonitorConfig {
     ResourceMonitorConfig {
         enabled: true,
@@ -135,6 +167,9 @@ fn monitor_config(cooldown_secs: u64) -> ResourceMonitorConfig {
 struct Scenario {
     protocol: Protocol,
     healthy_calls: usize,
+    /// When set, breach for this many samples and then stay healthy instead of
+    /// using `healthy_calls`.
+    initial_spike_calls: Option<usize>,
     tool_steps: usize,
     /// Delay the first response so a monitor tick is guaranteed to land between
     /// the first request being assembled and the follow-up request.
@@ -148,14 +183,34 @@ struct Outcome {
     events: Vec<EngineEvent>,
 }
 
-async fn wait_for_sample(calls: &Arc<AtomicUsize>) {
+async fn wait_for_samples(calls: &Arc<AtomicUsize>, expected: usize) {
     for _ in 0..500 {
-        if calls.load(Ordering::SeqCst) >= 1 {
+        if calls.load(Ordering::SeqCst) >= expected {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("the resource monitor never sampled");
+    panic!(
+        "the resource monitor sampled {} times, expected at least {expected}",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+/// Waits until the healthy tick has fully processed its recovery. The monitor
+/// publishes the latest sample after pruning, so observing it removes the race
+/// between the sampler call and the pruner.
+async fn wait_for_recovery(monitor: &ResourceMonitor) {
+    for _ in 0..500 {
+        if monitor
+            .latest_sample()
+            .and_then(|sample| sample.cpu_percent)
+            .is_some_and(|percent| percent < 50.0)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the resource monitor never reported recovery");
 }
 
 async fn run(scenario: Scenario) -> Outcome {
@@ -245,17 +300,36 @@ async fn run(scenario: Scenario) -> Outcome {
     }))
     .unwrap();
 
-    let (sampler, samples) = ScriptedSampler::new(scenario.healthy_calls);
+    let (sampler, samples): (Box<dyn SystemSampler>, Arc<AtomicUsize>) =
+        match scenario.initial_spike_calls {
+            Some(breach_calls) => {
+                let (sampler, calls) = IdleSpikeSampler::new(breach_calls);
+                (Box::new(sampler), calls)
+            }
+            None => {
+                let (sampler, calls) = ScriptedSampler::new(scenario.healthy_calls);
+                (Box::new(sampler), calls)
+            }
+        };
     let monitor = ResourceMonitor::start_with_sampler(
         monitor_config(scenario.cooldown_secs),
         dir.path().to_path_buf(),
         paths.data_dir.clone(),
-        Box::new(sampler),
+        sampler,
     );
     assert!(monitor.is_enabled());
     // The first tick is immediate; wait for it so the turn starts from a known
-    // sampler phase instead of racing the background task.
-    wait_for_sample(&samples).await;
+    // sampler phase instead of racing the background task. A recovering idle
+    // spike also needs its recovery tick fully processed before the turn.
+    let expected_samples = if scenario.initial_spike_calls.is_some() {
+        2
+    } else {
+        1
+    };
+    wait_for_samples(&samples, expected_samples).await;
+    if scenario.initial_spike_calls.is_some() {
+        wait_for_recovery(&monitor).await;
+    }
 
     let permissions = runtime::default_permissions();
     permissions.set_mode(PermissionMode::BypassPermissions);
@@ -332,6 +406,7 @@ async fn openai_mid_turn_injects_resource_alert() {
     let outcome = run(Scenario {
         protocol: Protocol::OpenAiChat,
         healthy_calls: 1,
+        initial_spike_calls: None,
         tool_steps: 1,
         first_response_delay: Duration::from_millis(2600),
         cooldown_secs: 300,
@@ -360,6 +435,7 @@ async fn anthropic_mid_turn_injects_resource_alert() {
     let outcome = run(Scenario {
         protocol: Protocol::Anthropic,
         healthy_calls: 1,
+        initial_spike_calls: None,
         tool_steps: 1,
         first_response_delay: Duration::from_millis(2600),
         cooldown_secs: 300,
@@ -387,6 +463,7 @@ async fn cooldown_suppresses_alerts_across_iterations() {
     let outcome = run(Scenario {
         protocol: Protocol::OpenAiChat,
         healthy_calls: 0,
+        initial_spike_calls: None,
         tool_steps: 2,
         first_response_delay: Duration::ZERO,
         cooldown_secs: 300,
@@ -413,6 +490,32 @@ async fn cooldown_suppresses_alerts_across_iterations() {
         resource_alerts(&outcome.events).len(),
         1,
         "the cooldown must throttle repeated warnings"
+    );
+}
+
+#[tokio::test]
+async fn idle_spike_that_recovers_before_turn_is_not_injected() {
+    let outcome = run(Scenario {
+        protocol: Protocol::OpenAiChat,
+        healthy_calls: 0,
+        initial_spike_calls: Some(1),
+        tool_steps: 1,
+        first_response_delay: Duration::ZERO,
+        cooldown_secs: 300,
+    })
+    .await;
+
+    assert_eq!(outcome.calls.len(), 2, "one tool round and one final round");
+    for body in &outcome.calls {
+        let messages = body["messages"].to_string();
+        assert!(
+            !messages.contains("<kind>system_resource</kind>"),
+            "a recovered idle spike must not reach a later turn: {messages}"
+        );
+    }
+    assert!(
+        resource_alerts(&outcome.events).is_empty(),
+        "a recovered idle spike must not emit a resource alert"
     );
 }
 
@@ -453,7 +556,7 @@ async fn idle_session_buffers_alerts_without_waking_or_queueing_input() {
     assert!(monitor.is_enabled());
 
     // No turn is started: the monitor ticks and buffers a warning on its own.
-    wait_for_sample(&samples).await;
+    wait_for_samples(&samples, 1).await;
     assert!(monitor.latest_sample().is_some());
     assert!(
         !monitor.drain_alerts().is_empty(),
