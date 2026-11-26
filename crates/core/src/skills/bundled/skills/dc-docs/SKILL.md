@@ -1,14 +1,14 @@
 ---
 name: dc-docs
-description: "DeepSeek Code CLI（dcl）与 Desktop（dcd）的使用与排障指南：调用 dcl 执行任务、运行中发消息引导、审查执行步骤、DEEPSEEK_CODE_DATA_DIR 布局、大模型请求分析、测试分层、REPL 面板及 MCP 服务器配置。"
-whenToUse: "当需要使用 dcl 或 dcd 执行任务、在运行中向 dcl 发送消息或审查其执行过程、定位 DEEPSEEK_CODE_DATA_DIR 数据目录、分析发往大模型的 HTTP 请求、驱动 REPL 面板、验证 CLI/core 改动，或配置排障 MCP 服务器时使用。"
+description: "DeepSeek Code（dc，包括 CLI dcl 与 Desktop dcd）的使用与排障指南：调用 dcl 执行任务、运行中发消息引导、审查执行步骤、DEEPSEEK_CODE_DATA_DIR 布局、大模型请求分析、测试分层、REPL 面板及 MCP 服务器配置。"
+whenToUse: "当需要使用 dc（deepseek-code，含 CLI dcl 与 Desktop dcd）执行任务、在运行中向 dcl 发送消息或审查其执行过程、定位 DEEPSEEK_CODE_DATA_DIR 数据目录、分析 dc 发往大模型的 HTTP 请求、驱动 REPL 面板、验证 CLI/core 改动，或配置排障 MCP 服务器时使用。"
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# DeepSeek Code（dcl / dcd）使用与诊断指南
+# DeepSeek Code（dc）使用与诊断指南
 
-`dcl` 是 DeepSeek Code CLI，与 Desktop（`dcd`）共用同一个 Rust 引擎、数据目录、权限规则和工具实现。
+`dc` 指 DeepSeek Code，包含命令行版本 **CLI（`dcl`）** 与桌面端 **Desktop（`dcd`）**。两者共用同一个 Rust 引擎、数据目录（`DEEPSEEK_CODE_DATA_DIR`）、权限规则、MCP 配置和工具实现。
 
 本 skill 自带资源（路径相对本 skill 目录）：
 
