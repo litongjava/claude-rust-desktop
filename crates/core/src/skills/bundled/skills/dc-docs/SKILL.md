@@ -1,15 +1,14 @@
 ---
 name: dc-docs
-description: "DeepSeek Code CLI（dcl）与 Desktop 的使用和排障：构建/运行 dcl、REPL 面板、会话与请求检查、测试分层，以及 MCP 服务器的安装、配置、验证与排障。"
-whenToUse: "用于安装或修复 MCP 服务器、使用 dcl 检查会话/请求、驱动 REPL 面板，或验证 CLI/core 改动。"
+description: "DeepSeek Code CLI（dcl）与 Desktop(dcd) 的使用文档：构建/运行 dcl、REPL 面板、会话与请求检查、测试分层，以及 MCP 服务器的安装、配置、验证与排障。"
+whenToUse: "用于使用dcl or dcd 包括使用 dcl 执行任务 检查会话/请求、驱动 REPL 面板，或验证 CLI/core 改动,安装MCP 服务器。"
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# DeepSeek Code 使用与 MCP
+# DeepSeek Code 使用
 
-dcl 是 DeepSeek Code CLI。先选最便宜、能证伪结论的验证层：单元测试不能证明 REPL 渲染，PTY 也不能证明解析逻辑。
-
+dcl 是 DeepSeek Code CLI
 本 skill 自带以下资源（路径相对本 skill 目录）：
 
 - `scripts/probe_mcp.py`：stdio MCP 握手、`tools/list` 与可选 `tools/call` 探针。
