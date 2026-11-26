@@ -3427,9 +3427,10 @@ impl ToolLoopExecutor {
             self.shell_cwd_needs_report
                 .store(false, std::sync::atomic::Ordering::Release);
             let hinted = result.as_ref().ok().is_some_and(|value| {
-                value["note"]
-                    .as_str()
-                    .is_some_and(|note| note.starts_with(crate::tools::REDUNDANT_CD_NOTE_PREFIX))
+                value["note"].as_str().is_some_and(|note| {
+                    note.starts_with(crate::tools::REDUNDANT_CD_NOTE_PREFIX)
+                        || note.starts_with(crate::tools::SHELL_READ_SEARCH_NOTE_PREFIX)
+                })
             });
             update_redundant_cd_cooldown(&self.shell_redundant_cd_cooldown, hinted);
         }
@@ -8121,8 +8122,8 @@ mod shell_cwd_tests {
 }
 
 /// Number of foreground `Bash` calls to skip after emitting a redundant-`cd`
-/// coaching note so repeated calls do not spam `tool_result` with the same hint.
-const REDUNDANT_CD_HINT_COOLDOWN_CALLS: usize = 5;
+/// or shell-read/search coaching note so repeated calls do not spam `tool_result`.
+const REDUNDANT_CD_HINT_COOLDOWN_CALLS: usize = 3;
 
 fn update_redundant_cd_cooldown(cooldown: &std::sync::atomic::AtomicUsize, hinted: bool) {
     if hinted {

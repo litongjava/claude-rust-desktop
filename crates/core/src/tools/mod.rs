@@ -729,6 +729,69 @@ fn same_directory(a: &str, b: &str) -> bool {
 /// when the command starts with a redundant `cd` into the already-active cwd.
 pub(crate) const REDUNDANT_CD_NOTE_PREFIX: &str = "Bash already runs in ";
 
+/// Prefix of the one-line coaching note added to a foreground `Bash` result
+/// when the command only reads or searches files via shell utilities instead
+/// of using parallel `Read`/`Grep`/`Glob` tool calls.
+pub(crate) const SHELL_READ_SEARCH_NOTE_PREFIX: &str = "Use dedicated Read/Grep/Glob";
+
+/// Returns true when `command` only uses shell read/search utilities (`cat`,
+/// `sed -n`, `head`, `tail`, `grep`, `rg`, `find`) — optionally separated by
+/// `echo`, `;`, `&&`, or a leading `cd` — with no file writes or real build/git
+/// commands. Commands like `cargo test | tail -40`, `git diff | grep`, or
+/// `sed -i` return `false`.
+pub(crate) fn is_pure_shell_read_or_search(command: &str) -> bool {
+    // Any output redirection or in-place sed edit is not a pure read/search.
+    if command.contains('>') {
+        return false;
+    }
+    let mut saw_read_or_search = false;
+    for raw_part in command.split([';', '\n']) {
+        for sub in raw_part.split("&&") {
+            let segment = sub.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            // Ignore separator echoes and leading `cd` segments.
+            let first = segment.split_whitespace().next().unwrap_or_default();
+            if matches!(first, "echo" | "printf" | "cd") {
+                continue;
+            }
+            // Every pipe stage in this segment must be a read/search/filter utility.
+            for (idx, pipe_stage) in segment.split('|').enumerate() {
+                let stage = pipe_stage.trim();
+                let mut words = stage.split_whitespace();
+                let Some(cmd) = words.next() else {
+                    return false;
+                };
+                if idx == 0 {
+                    match cmd {
+                        "cat" | "head" | "tail" | "grep" | "rg" | "find" => {
+                            saw_read_or_search = true;
+                        }
+                        "sed" => {
+                            // Only treat `sed -n` (line-range printing) as read; never `sed -i`.
+                            let args: Vec<&str> = words.collect();
+                            if args.iter().any(|a| *a == "-i" || a.starts_with("-i"))
+                                || !args.iter().any(|a| *a == "-n")
+                            {
+                                return false;
+                            }
+                            saw_read_or_search = true;
+                        }
+                        _ => return false,
+                    }
+                } else if !matches!(
+                    cmd,
+                    "head" | "tail" | "grep" | "rg" | "sed" | "wc" | "sort" | "uniq" | "cut"
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+    saw_read_or_search
+}
+
 /// Returns true when `command` begins with a leading `cd <target>` that
 /// resolves to `current_cwd` itself (so the `cd` is a no-op).
 ///
@@ -847,6 +910,25 @@ fn redundant_leading_cd_detection_cases() {
     assert!(!has_redundant_leading_cd(&format!("git status && cd {cwd}"), cwd));
     assert!(!has_redundant_leading_cd(&format!("echo 'cd {cwd}'"), cwd));
     assert!(!has_redundant_leading_cd(&format!("cd {cwd} || exit 1"), cwd));
+}
+
+#[cfg(test)]
+#[test]
+fn pure_shell_read_or_search_detection_cases() {
+    assert!(is_pure_shell_read_or_search("sed -n '1,100p' src/lib.rs"));
+    assert!(is_pure_shell_read_or_search(
+        "sed -n '1,50p' a.rs; echo '==='; sed -n '60,120p' b.rs"
+    ));
+    assert!(is_pure_shell_read_or_search("grep -rn \"foo\" src/ | head -30"));
+    assert!(is_pure_shell_read_or_search("cd /repo && grep -n \"bar\" a.rs"));
+    assert!(is_pure_shell_read_or_search("cat src/lib.rs"));
+
+    assert!(!is_pure_shell_read_or_search("cargo test 2>&1 | tail -40"));
+    assert!(!is_pure_shell_read_or_search("git diff | grep foo"));
+    assert!(!is_pure_shell_read_or_search("sed -i '' 's/a/b/' a.rs"));
+    assert!(!is_pure_shell_read_or_search("cat a.rs > b.rs"));
+    assert!(!is_pure_shell_read_or_search("codegraph explore foo | head -20"));
+    assert!(!is_pure_shell_read_or_search("git status --short"));
 }
 
 #[cfg(all(test, unix))]
@@ -1794,15 +1876,23 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                 }
             }
         }
-        if input["__hint_redundant_cd"].as_bool().unwrap_or(false)
-            && has_redundant_leading_cd(&raw_command, &safe_cwd)
-        {
-            if let Some(object) = result.as_object_mut() {
-                object.entry("note".to_owned()).or_insert_with(|| {
-                    serde_json::json!(format!(
-                        "{REDUNDANT_CD_NOTE_PREFIX}{safe_cwd}; omit redundant leading 'cd'."
-                    ))
-                });
+        if input["__hint_redundant_cd"].as_bool().unwrap_or(false) {
+            if has_redundant_leading_cd(&raw_command, &safe_cwd) {
+                if let Some(object) = result.as_object_mut() {
+                    object.entry("note".to_owned()).or_insert_with(|| {
+                        serde_json::json!(format!(
+                            "{REDUNDANT_CD_NOTE_PREFIX}{safe_cwd}; omit redundant leading 'cd'."
+                        ))
+                    });
+                }
+            } else if is_pure_shell_read_or_search(&raw_command) {
+                if let Some(object) = result.as_object_mut() {
+                    object.entry("note".to_owned()).or_insert_with(|| {
+                        serde_json::json!(format!(
+                            "{SHELL_READ_SEARCH_NOTE_PREFIX} tools in parallel instead of Bash cat/sed/grep."
+                        ))
+                    });
+                }
             }
         }
         Ok(result)
