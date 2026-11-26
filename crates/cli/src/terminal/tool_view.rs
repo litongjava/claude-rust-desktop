@@ -548,14 +548,17 @@ fn todo_lines(input: &Value, failed: bool) -> Option<Vec<Line>> {
     Some(lines)
 }
 
-/// A foreground shell reports its starting directory on the first call and
-/// again when it changes; the transcript shows the final path component.
+/// A foreground shell always returns its directory for the model; the user
+/// transcript only shows the final path component on the first call or change.
 fn reported_cwd(name: &str, output: &str) -> Option<String> {
     if !matches!(name, "Bash" | "PowerShell") {
         return None;
     }
     let body = output.strip_prefix("Error: ").unwrap_or(output);
     let value: Value = serde_json::from_str(body).ok()?;
+    if value.get("cwd_changed").and_then(Value::as_bool) == Some(false) {
+        return None;
+    }
     let cwd = value["cwd"].as_str()?.trim();
     if cwd.is_empty() {
         return None;
@@ -1549,6 +1552,22 @@ mod result_regressions {
             assert_eq!(result_label(name, &serde_json::json!({}), output, None), format!("{name}(Run checks)"));
         }
     }
+    #[test]
+    fn unchanged_cwd_is_hidden_in_terminal_view() {
+        assert_eq!(
+            reported_cwd("Bash", r#"{"cwd":"/repo/worktree","cwd_changed":true}"#),
+            Some("worktree".into())
+        );
+        assert_eq!(
+            reported_cwd("Bash", r#"{"cwd":"/repo/worktree","cwd_changed":false}"#),
+            None
+        );
+        assert_eq!(
+            reported_cwd("Bash", r#"{"cwd":"/repo/worktree"}"#),
+            Some("worktree".into())
+        );
+    }
+
     #[test]
     fn approved_plan_remains_available_in_expanded_history() {
         let output = serde_json::json!({"approved":true,"planFilePath":"plan.md","plan":"# Plan\n中文内容","message":"Plan approved."}).to_string();
