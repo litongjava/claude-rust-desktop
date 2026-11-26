@@ -12,6 +12,7 @@ disable-model-invocation: false
 
 本 skill 自带资源（路径相对本 skill 目录）：
 
+- `scripts/inspect_dcl.py`：零外部依赖的审计脚本，支持 `session`（分析 `session.db` 耗时/缓存/工具/Shell 反模式）、`stream`（实时或事后解析 `stream-json` 运行流）与 `requests`（检查 `request-records` 工具列表及相邻请求前缀 diff）。
 - `scripts/probe_mcp.py`：stdio MCP 握手、`tools/list` 与可选 `tools/call` 探针。
 - `scripts/drive_dcl.py`：通过 ConPTY 驱动 `dcl` 并用 `pyte` 渲染屏幕。
 - `references/pty-harness.md`：PTY/ConPTY 细节与临时数据目录初始化。
@@ -118,7 +119,15 @@ dcl -C /path/to/repo \
 
 ### 3.2 事后深度审计 `session.db`
 
-每个会话的完整轨迹保存在 `<DATA_DIR>/data/sessions/<session_id>/session.db`（SQLite）。审计正在运行的会话时建议先复制到临时目录再只读查询，避免锁冲突。
+每个会话的完整轨迹保存在 `<DATA_DIR>/data/sessions/<session_id>/session.db`（SQLite）。可直接运行本 skill 自带的 `scripts/inspect_dcl.py`（仅依赖 Python 标准库，内部自动复制到临时快照以只读打开，不会与运行中的 `dcl` 争锁）：
+
+```bash
+# 审计已完成或运行中的会话（耗时拆解、缓存命中、单工具轮次、cd/sleep 反模式、最慢工具）
+python3 "~/.deepseek-code/skills/bundled/dc-docs/scripts/inspect_dcl.py" session <session_id> --top 10
+
+# 实时或事后解析 --output-format stream-json --verbose 输出的 run.jsonl
+python3 "~/.deepseek-code/skills/bundled/dc-docs/scripts/inspect_dcl.py" stream run.jsonl --tail 15
+```
 
 核心表结构：
 
@@ -211,21 +220,42 @@ dcl requests <session_id>   # 列出全部请求序号、purpose、model、HTTP 
 
 ### 5.3 典型排查手法
 
-1. **验证 System Prompt、Reminder 与工具 Schema**：直接检查 `0001-*.request.json` 中的 `system` / `messages[0]` 与 `tools` 数组，确认常驻工具、MCP 工具或 skill reminder 是否按预期注入。
-2. **定位 Prompt Cache 失效**：用 Python 对比相邻两次 `.request.json` 的 `tools`、`system` 与 `messages` 前缀字节，找出导致前缀变化的字段。
-3. **排查 4xx/5xx、截断与重试**：先跑 `dcl requests <session_id>` 找异常序号，再对照 `.meta.json`（确认 `stream_completed` 与 `recording_error`，HTTP 200 不等于流完整）、`.response.json`/`.sse.txt` 以及 `request-attempts/<session_id>.jsonl`。
+可直接用本 skill 自带的 `scripts/inspect_dcl.py requests` 辅助排查：
+
+```bash
+# 列出该会话所有 HTTP 请求尝试、状态、耗时、字节数与压缩文件
+python3 "~/.deepseek-code/skills/bundled/dc-docs/scripts/inspect_dcl.py" requests <session_id>
+
+# 检查第 1 次请求实际发给模型的 model / reasoning / system 长度 / 工具名称列表
+python3 "~/.deepseek-code/skills/bundled/dc-docs/scripts/inspect_dcl.py" requests <session_id> --show-tools 1
+
+# 对比相邻两次请求的 system / tools / messages 前缀差异，定位 prompt cache 失效点
+python3 "~/.deepseek-code/skills/bundled/dc-docs/scripts/inspect_dcl.py" requests <session_id> --prefix-diff 1 2
+```
+
+1. **验证 System Prompt、Reminder 与工具 Schema**：用 `--show-tools 1` 或直接检查 `0001-*.request.json` 中的 `system` / `messages[0]` 与 `tools` 数组，确认常驻工具、MCP 工具或 skill reminder 是否按预期注入。
+2. **定位 Prompt Cache 失效**：用 `--prefix-diff A B` 对比相邻两次 `.request.json` 的 `tools`、`system` 与 `messages` 前缀，找出导致前缀变化的字段。
+3. **排查 4xx/5xx、截断与重试**：先跑 `dcl requests <session_id>` 或 `inspect_dcl.py requests <session_id>` 找异常序号，再对照 `.meta.json`（确认 `stream_completed` 与 `recording_error`，HTTP 200 不等于流完整）、`.response.json`/`.sse.txt` 以及 `request-attempts/<session_id>.jsonl`。
 4. **排查上下文压缩问题**：打开 `compaction-NNNN.json`，沿 `request_sequences` 核对分段摘要与合并请求。
 
 ---
 
 ## 6. 开发构建、测试分层与 REPL 面板
 
-### 6.1 构建与测试分层
+### 6.1 构建、安装与测试分层
 
 ```bash
 cargo build --locked -p deepseek-code-cli --bin dcl
 ./target/debug/dcl --version   # Windows: ./target/debug/dcl.exe --version
+
+# Release 构建
+cargo build --release --locked -p deepseek-code-cli --bin dcl
 ```
+
+**安装路径约定**：
+
+- **临时编译安装（开发/灰度验证）**：复制到 `~/bin/dcl{N}`，`N` 从 `1` 开始取当前已有最大编号 + 1 递增（例如已有 `~/bin/dcl7` 时安装为 `~/bin/dcl8`），不覆盖正在运行的旧版本。
+- **正式安装**：安装到 `/usr/bin/dcl`。
 
 | 要证明的结论 | 运行 |
 | --- | --- |
