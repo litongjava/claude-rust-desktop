@@ -9,17 +9,15 @@ use super::background_shell;
 use crate::services::shell_settings::{self, ResolvedShell, ShellSettings};
 use std::sync::Mutex;
 
-const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call spawns a new process, while foreground calls keep the previous foreground directory across calls. Explicit background tasks start in the workspace.
+const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call spawns a new process; foreground calls start in the workspace and keep their directory across calls, so do not repeat a leading `cd` to the workspace. Explicit background tasks start in the workspace.
 
-Combine related steps into one call with `&&` (dependent) or `;` (independent checks) instead of issuing one short command per turn.
+Use `Read`, `Grep`, and `Glob` instead of `cat`/`sed`/`head`/`tail`/`grep`/`find` so read and search calls run in parallel. Combine dependent steps with `&&` and independent checks or test runs with `;` or `&&` in one compound command; fix all errors before re-running.
 
-Background tasks (`run_in_background: true`) and timed-out managed foreground commands notify and wake you automatically when they finish. You do not need to call TaskGet or poll with `sleep`: continue with other steps or finish your turn to handle new user input. Call TaskGet only when you need intermediate output or must wait (`block: true`) before proceeding, or TaskStop to end the task. Without a managed session, a foreground timeout stops the process tree.
+Background tasks (`run_in_background: true`) and timed-out managed foreground commands notify and wake you automatically on completion. Never poll with foreground `sleep` loops or repeated TaskGet calls: continue other work or finish your turn, and call TaskGet only for intermediate output or `block: true`, or TaskStop to stop it. Without a managed session, a foreground timeout stops the process tree.
 
-When a call ends, every process it started is stopped, including background children. A server, daemon or other service that must keep running after the call has to be started with `detach: true`, which returns its PID and log files; stop it yourself when it is no longer needed.
+When a call ends, every process it started is stopped, including background children. Start a server or daemon that must keep running after the call with `detach: true` (returns PID and log paths; stop it yourself when done).
 
-Ordinary capture keeps up to 1 MiB per stream. Long results show the beginning and end within the configured preview budget (100 KiB per stream by default).
-
-Command permission checks also apply outside the sandbox.";
+Ordinary capture keeps up to 1 MiB per stream; long results show head and tail within the preview budget (100 KiB per stream by default). Command permission checks also apply outside the sandbox.";
 
 const GIT_BASH_NOTE: &str = "The default is Git Bash. Use $NAME for variables, /dev/null for discarded output and slash-separated paths. Native Windows executables receive translated path arguments. Set MSYS_NO_PATHCONV=1 for a command that needs its arguments verbatim, or use cygpath -w to supply a Windows path explicitly.";
 const POWER_SHELL_NOTE: &str = "The default is Windows PowerShell 5.1 with UTF-8 I/O. Read environment values with $env:NAME and discard output with Out-Null. Use a newline between statements and test $? for conditional execution. Backticks escape special characters.";
@@ -590,5 +588,14 @@ mod tests {
     fn cached_description_is_stable_for_the_process() {
         assert_eq!(bash_tool(), bash_tool());
         assert!(!bash_tool().shell_parameter().is_empty());
+    }
+
+    #[test]
+    fn bash_description_reinforces_efficiency_rules() {
+        assert!(BASH_DESCRIPTION.contains("do not repeat a leading `cd`"));
+        assert!(BASH_DESCRIPTION.contains("Use `Read`, `Grep`, and `Glob` instead"));
+        assert!(BASH_DESCRIPTION.contains("Combine dependent steps with `&&`"));
+        assert!(BASH_DESCRIPTION.contains("fix all errors before re-running"));
+        assert!(BASH_DESCRIPTION.contains("Never poll with foreground `sleep` loops"));
     }
 }
