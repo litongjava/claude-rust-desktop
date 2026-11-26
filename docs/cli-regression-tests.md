@@ -527,7 +527,8 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
 - `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics`：真实 CLI 进程对本地故障服务，核对最终输出、服务端实际请求数与 SQLite 中的请求快照。
 - `cargo test --locked -p deepseek-code-core --lib builtin_chat_`：内置 Chat Completions 的发送重试与“内容前正文重试”共用一个预算，核对真实回环 HTTP 的次数、请求 ID、重试头、可取消等待、已开始内容不重放、原始帧/终端标记/未知内容边界、提供方错误脱敏、损坏配置在开请求前失败与本地请求记录。
 - `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics builtin_chat_`：真实 CLI 使用 `config.json` 中的内置 OpenCode Go，内容前断流后重连成功，覆盖只有思考或未完成工具调用的失败，并核对提供方错误回显不会进入最终输出、尝试事件/日志与 SQLite 快照。
-- `cargo test --locked -p deepseek-code-core --lib native_engine::model_http::tests::`：流式客户端的空闲读取超时按每个线上分块重置（注释、跨分块的 SSE 帧与跨分块的 UTF-8 字符），并区分“等待响应头”和“正文静默”两种超时；取消挂起的读取会关闭正文，配置为 0 时在开请求前报错。
+- `cargo test --locked -p deepseek-code-core --lib native_engine::model_http::tests::`：流式客户端的空闲读取超时按每个线上分块重置（注释、跨分块的 SSE 帧与跨分块的 UTF-8 字符），并区分“等待响应头”和“正文静默”两种超时；取消挂起的读取会关闭正文，`request_timeout_secs = 0` 与 `pool_idle_timeout_secs = 0` 都在开请求前报错且 0 次连接；进程级共享连接池在顺序请求及并发后复用同一回环 TCP 连接，`Redirect::Default` / `Redirect::None` / `single_post` 各自保持独立策略。
+- `cargo test --locked -p deepseek-code-core --lib config::tests`：`[http].pool_idle_timeout_secs` 默认 300、显式值解析及缺省旧文件兼容。
 - `cargo test --locked -p deepseek-code-core --lib buffered_model_requests_keep_the_total_deadline`：直连 OpenAI 与直连 Anthropic 的缓冲请求仍受各自总超时约束，缓慢正文超时后只发送一次且不含 `stream:true`。
 - `cargo test --locked -p deepseek-code-cli --test api_failure_diagnostics stream_timeout_uses_idle_configuration_for_all_model_transports`：真实 CLI 在本地正值空闲配置下覆盖四种模型传输的健康流、内容后静默、只有响应头、两次 POST 恢复、内置 Responses 单次与退避取消，以及内置 Chat 的原始边界。
 - `cargo test --locked -p deepseek-code-core --lib typed_stream_body_timeout_survives_the_retry_layer`：正文读取超时、终端标记、提前 EOF、提供方超时形状的 SSE 错误与响应头前超时在共享重试层后的类型化事实（见下方第 18 条）。
@@ -564,6 +565,11 @@ Windows ConPTY 使用独立数据目录重跑第 1、2、3、5、8 条。当前�
     - 只有 `class=transient`、`is_stream_body_timeout()` 为真、当前响应已观察到内容、`terminal_marker_observed() != Some(true)`、请求快照未记录 `[DONE]`/任意 choice 的 `finish_reason`/提供方 SSE 错误、消费端仍在，且首段真实尝试次数小于 `AttemptBudget::configured().max()` 时才重放。替换本身只有一个 POST（响应头停顿、重定向都不额外发）。替换再次失败、后续步骤超时或预算已用尽都不再重放，只提交最后一次尝试的暂存输出并走原有失败路径。
     - 开启期间该步骤的文本/思考在步骤完成时才出现（实时增量暂时缺失）；取消发生在提示之后、替换之前时不发替换 POST，发生在替换正文打开期间时不再读取、也不再发 POST，未提交的暂存输出被丢弃。
     - 第 14 轮修复（第 15 轮验证）：直连 Chat 的两种提供方错误形态（嵌套 `error` 与顶层 `{"type":"error"}`）都在正文随后真的空闲超时时否决重放；文本/思考/工具增量出现在非首个 choice 时同样算作已产生内容并允许重放（仅角色或空增量仍走 A 的内容前重试，且请求 ID 不变）。关闭（省略或显式 `false`）时快照键集与 `stop_reason` 与第 13 轮对照完全一致：`message_trajectory.requests_json` 的 41 个键（第二个模型步骤多 `responseModel`），既没有 `replacesRequestId` 也没有 `abandonedForRecovery`，结果 `stop_reason` 为第一步的 `stop`、正文为 `Before \n\nAfter`。消费端关闭会在退避、替换开打与替换读取三个阶段立即返回 `interrupted`，不再等待计时器或空闲超时。
+20. 进程级流式连接复用（`[http].pool_idle_timeout_secs`，默认 `300` 秒）：
+    - 所有生产流式模型请求共享 `model_http` 中的三个进程级连接池（`Redirect::Default`、`Redirect::None`、`single_post`），每池每 host 最多保留 32 条空闲连接；不再按请求新建流式客户端。
+    - 同一回环 keep-alive 服务器上连续两次流式 POST 只触发 1 次 TCP `accept`；4 个并发请求结束后再发顺序请求复用已有空闲连接、不新增 `accept`。
+    - `Redirect::Default` 与 `Redirect::None` 保持隔离，`single_post` 既不跟随重定向也不触发内部重试；`pool_idle_timeout_secs = 0` 在发起任何请求前报配置错误且产生 0 次连接。
+    - 手工/本机 mock 验证：默认配置下同一服务地址跨轮次连续发送两条消息只建立 1 条连接；`pool_idle_timeout_secs = 1` 等待超过 1 秒后触发新 `accept`；取消正在输出的流后，下一条消息不复用被取消的连接。
 
 同一目录的 `desktop/fixture.py` 配合真实 Desktop 窗口核对错误卡片上的阶段、次数与脱敏结果。
 

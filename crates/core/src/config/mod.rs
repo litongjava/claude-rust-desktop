@@ -75,6 +75,8 @@ pub struct BridgeConfig {
 pub struct HttpConfig {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     #[serde(default = "default_retry_base_backoff_ms")]
@@ -115,6 +117,7 @@ fn default_display_height() -> u32 { 1080 }
 fn default_true() -> bool { true }
 fn default_bridge_port() -> u16 { 30085 }
 fn default_request_timeout_secs() -> u64 { 300 }
+fn default_pool_idle_timeout_secs() -> u64 { 300 }
 fn default_max_retries() -> u32 { 7 }
 fn default_retry_base_backoff_ms() -> u64 { 2000 }
 fn default_log_level() -> String { "info".to_string() }
@@ -142,6 +145,7 @@ impl Default for OrchestrationConfig {
             },
             http: HttpConfig {
                 request_timeout_secs: default_request_timeout_secs(),
+                pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
                 max_retries: default_max_retries(),
                 retry_base_backoff_ms: default_retry_base_backoff_ms(),
                 post_content_timeout_recovery: false,
@@ -213,6 +217,7 @@ impl OrchestrationConfig {
     pub fn max_retries() -> u32 { Self::get().http.max_retries }
     pub fn retry_base_backoff_ms() -> u64 { Self::get().http.retry_base_backoff_ms }
     pub fn request_timeout_secs() -> u64 { Self::get().http.request_timeout_secs }
+    pub fn pool_idle_timeout_secs() -> u64 { Self::get().http.pool_idle_timeout_secs }
     /// Read once per turn; a stalled post-content step is replayed only when set.
     pub fn post_content_timeout_recovery() -> bool { Self::get().http.post_content_timeout_recovery }
     pub fn bridge_port() -> u16 { Self::get().bridge.port }
@@ -481,6 +486,7 @@ mod tests {
 
         // HttpConfig
         assert_eq!(config.http.request_timeout_secs, 300);
+        assert_eq!(config.http.pool_idle_timeout_secs, 300);
         assert_eq!(config.http.max_retries, 7);
         assert_eq!(config.http.retry_base_backoff_ms, 2000);
 
@@ -490,6 +496,31 @@ mod tests {
 
         // TelemetryConfig
         assert!(config.telemetry.otlp_endpoint.is_empty());
+    }
+
+    #[test]
+    fn pool_idle_timeout_defaults_to_300_and_parses_explicit_values() {
+        assert_eq!(OrchestrationConfig::default().http.pool_idle_timeout_secs, 300);
+        let document = |http: &str| {
+            format!(
+                "[tool_loop]\n[tools]\n[memory]\n[bridge]\n[http]\n{http}[logging]\n[telemetry]\n"
+            )
+        };
+        // An older valid file without the key keeps the 300-second default.
+        let older: OrchestrationConfig = toml::from_str(&document("")).unwrap();
+        assert_eq!(older.http.pool_idle_timeout_secs, 300);
+
+        // Older file with only existing [http] keys still loads cleanly.
+        let legacy: OrchestrationConfig = toml::from_str(&document(
+            "request_timeout_secs = 120\nmax_retries = 5\nretry_base_backoff_ms = 1000\n",
+        ))
+        .unwrap();
+        assert_eq!(legacy.http.pool_idle_timeout_secs, 300);
+
+        // Explicit positive value is respected.
+        let explicit: OrchestrationConfig =
+            toml::from_str(&document("pool_idle_timeout_secs = 600\n")).unwrap();
+        assert_eq!(explicit.http.pool_idle_timeout_secs, 600);
     }
 
     #[test]
