@@ -742,6 +742,12 @@ async fn independent_search_provider(
     };
     let defaults = crate::config::DeepSeekSearchConfig::default();
     if settings.api_key.trim().is_empty()
+        && settings
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
         && settings.base_url == defaults.base_url
         && settings.model == defaults.model
     {

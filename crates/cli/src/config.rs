@@ -521,6 +521,10 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
                     "api_key" => search.api_key = value.trim().into(),
                     "base_url" => search.base_url = value.trim().into(),
                     "model" => search.model = value.trim().into(),
+                    "provider" => {
+                        let provider = value.trim().to_ascii_lowercase();
+                        search.provider = (!provider.is_empty()).then_some(provider);
+                    }
                     _ => bail!("Unsupported setting: {key}"),
                 }
                 search.validate()?;
@@ -836,14 +840,17 @@ mod search_tests {
         let set = |key: &str, value: &str| run(&paths, &ConfigCommands::Set { key: key.into(), value: value.into() });
         set("search.api_key", " search-key ").unwrap();
         set("search.model", "deepseek-pro").unwrap();
+        set("search.provider", "OpenAI").unwrap();
         assert!(set("search.base_url", "ftp://example.com").is_err());
         assert!(set("search.other", "x").is_err());
+        assert!(set("search.provider", "gemini").is_err());
         let saved: deepseek_code_core::config::AppConfig = serde_json::from_slice(
             &std::fs::read(paths.layout().config_file("config.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(saved.deepseek_search.api_key, "search-key");
         assert_eq!(saved.deepseek_search.model, "deepseek-pro");
+        assert_eq!(saved.deepseek_search.provider.as_deref(), Some("openai"));
         assert_eq!(saved.deepseek_search.base_url, "https://api.deepseek.com/anthropic/v1");
         let mut shown = json!({"config": saved});
         redact(&mut shown);

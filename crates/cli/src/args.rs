@@ -877,7 +877,7 @@ pub enum ConfigCommands {
     /// Show effective saved configuration with credentials redacted.
     Show,
     /// Set model, base_url, api_format, api_key, max_tokens, tools.<name>.enabled|on_demand, or permissions.auto for the CLI provider;
-    /// search.api_key, search.base_url and search.model configure DeepSeek web search;
+    /// search.api_key, search.base_url, search.model and search.provider configure web search (provider: deepseek, openai, anthropic);
     /// fetch.proxy (alias web_fetch.proxy) sets or clears the WebFetch HTTP proxy.
     Set { key: String, value: String },
     /// Remove only the CLI-managed provider and CLI preferences.
