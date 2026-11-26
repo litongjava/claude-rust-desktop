@@ -45,7 +45,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "Branch this conversation and switch to it: [TITLE]",
     ),
     ("/config", "Show settings and commands to change them"),
-    ("/search-config", "Configure DeepSeek web search API key, base URL and model"),
+    ("/search-config", "Configure web search provider, API key, base URL and model"),
     ("/copy", "Copy the latest assistant response: [N]"),
     ("/copy-session-id", "Copy the current session ID to the clipboard"),
     ("/export", "Export transcript: FILE or clipboard"),

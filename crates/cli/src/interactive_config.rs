@@ -1518,10 +1518,11 @@ pub async fn setup(paths: &RuntimePaths, input: &mut TerminalInput) -> Result<co
     }
 }
 
-/// One-line DeepSeek search state; the API key is never printed.
+/// One-line search state; the API key is never printed.
 pub(crate) fn search_summary(search: &DeepSeekSearchConfig) -> String {
     format!(
-        "DeepSeek search: base URL {} | model {} | API key {}",
+        "Web search: provider {} | base URL {} | model {} | API key {}",
+        search_provider_label(search.effective_provider()),
         search.base_url.trim(),
         search.model.trim(),
         if search.api_key.trim().is_empty() {
@@ -1537,7 +1538,66 @@ pub(crate) fn search_status(search: &DeepSeekSearchConfig) -> String {
     if search.api_key.trim().is_empty() {
         "not configured".into()
     } else {
-        format!("configured ({})", search.model.trim())
+        format!(
+            "configured ({}: {})",
+            search.effective_provider(),
+            search.model.trim()
+        )
+    }
+}
+
+/// The search providers offered by the wizard, in prompt order.
+const SEARCH_PRESETS: &[(&str, &str, &str)] = &[
+    (
+        "deepseek",
+        "DeepSeek",
+        "https://api.deepseek.com/anthropic/v1",
+    ),
+    ("openai", "OpenAI", "https://api.openai.com/v1"),
+    ("anthropic", "Anthropic", "https://api.anthropic.com"),
+];
+
+fn search_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "OpenAI",
+        "anthropic" => "Anthropic",
+        _ => "DeepSeek",
+    }
+}
+
+fn search_provider_models(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openai" => &["gpt-5-mini", "gpt-5.1", "gpt-4.1"],
+        "anthropic" => &["claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-6"],
+        _ => &["deepseek-flash", "deepseek-v4-pro"],
+    }
+}
+
+/// The host part of an HTTP(S) URL, without a port or userinfo.
+fn search_url_host(url: &str) -> Option<String> {
+    let rest = url.trim().split_once("://")?.1;
+    let authority = rest.split('/').next()?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// A provider implied by a well-known host; a custom host keeps the current
+/// effective provider.
+fn search_provider_from_url(url: &str) -> Option<&'static str> {
+    match search_url_host(url)?.as_str() {
+        "api.deepseek.com" => Some("deepseek"),
+        "api.openai.com" => Some("openai"),
+        "api.anthropic.com" => Some("anthropic"),
+        _ => None,
+    }
+}
+
+fn parse_search_protocol(value: &str) -> std::result::Result<String, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "deepseek" => Ok("deepseek".into()),
+        "2" | "openai" => Ok("openai".into()),
+        "3" | "anthropic" | "claude" => Ok("anthropic".into()),
+        _ => Err("Enter 1, 2 or 3 (deepseek, openai or anthropic).".into()),
     }
 }
 
@@ -1610,11 +1670,20 @@ pub(crate) async fn search_config(
                 ensure!(!value.is_empty(), "Usage: /config search model MODEL");
                 search.model = value.into();
             }
+            "provider" => {
+                ensure!(
+                    !value.is_empty(),
+                    "Usage: /config search provider deepseek|openai|anthropic"
+                );
+                search.provider = Some(value.to_ascii_lowercase());
+            }
             "clear" => {
                 ensure!(value.is_empty(), "Usage: /config search clear");
                 search.api_key.clear();
             }
-            _ => bail!("Usage: /config search [api_key KEY|base_url URL|model MODEL|clear]"),
+            _ => bail!(
+                "Usage: /config search [provider deepseek|openai|anthropic|api_key KEY|base_url URL|model MODEL|clear]"
+            ),
         }
         search.validate()?;
         let summary = search_summary(&search);
@@ -1623,11 +1692,102 @@ pub(crate) async fn search_config(
         return Ok(());
     }
     command_eprintln!("{}", search_summary(&search));
+    command_eprintln!("/cancel cancels; blank keeps the current value at each step.");
+    let original_provider = search.effective_provider().to_owned();
+    let original_model = search.model.clone();
+
+    // Step 1: the provider preset, a custom endpoint, or a pasted base URL.
+    command_eprintln!("Provider:");
+    for (index, (_, label, url)) in SEARCH_PRESETS.iter().enumerate() {
+        command_eprintln!("  {}. {label} — {url}", index + 1);
+    }
+    command_eprintln!("  4. Custom URL — enter a custom HTTP(S) base URL");
+    let mut accepted = false;
+    for _ in 0..3 {
+        let answer = ask(
+            input,
+            "Search provider (1-4, a provider name, or a base URL; blank keeps current)",
+        )
+        .await?;
+        let choice = answer.to_ascii_lowercase();
+        match choice.as_str() {
+            "" => {
+                accepted = true;
+                break;
+            }
+            "1" | "deepseek" => {
+                search.provider = Some("deepseek".into());
+                search.base_url = SEARCH_PRESETS[0].2.into();
+                accepted = true;
+                break;
+            }
+            "2" | "openai" => {
+                search.provider = Some("openai".into());
+                search.base_url = SEARCH_PRESETS[1].2.into();
+                accepted = true;
+                break;
+            }
+            "3" | "anthropic" | "claude" => {
+                search.provider = Some("anthropic".into());
+                search.base_url = SEARCH_PRESETS[2].2.into();
+                accepted = true;
+                break;
+            }
+            "4" | "custom" => {
+                let base_url = ask_valid(
+                    input,
+                    "Search API base URL",
+                    Some(&search.base_url),
+                    search_base_url,
+                )
+                .await?;
+                let protocol = ask_valid(
+                    input,
+                    "Search protocol (1. deepseek, 2. openai, 3. anthropic)",
+                    Some(search.effective_provider()),
+                    parse_search_protocol,
+                )
+                .await?;
+                search.base_url = base_url;
+                search.provider = Some(protocol);
+                accepted = true;
+                break;
+            }
+            _ if answer.starts_with("http://") || answer.starts_with("https://") => {
+                match search_base_url(&answer) {
+                    Ok(base_url) => {
+                        let current = search.effective_provider().to_owned();
+                        search.provider = Some(
+                            search_provider_from_url(&base_url)
+                                .map(str::to_owned)
+                                .unwrap_or(current),
+                        );
+                        search.base_url = base_url;
+                        accepted = true;
+                        break;
+                    }
+                    Err(reason) => command_eprintln!("  {reason}"),
+                }
+            }
+            _ => command_eprintln!(
+                "  Enter 1-4, deepseek/openai/anthropic, custom, or an http(s) base URL."
+            ),
+        }
+    }
+    ensure!(
+        accepted,
+        "Search provider setup cancelled after three invalid answers; nothing was saved"
+    );
+
+    // Step 2: the API key, kept hidden.
     let mut accepted = false;
     for _ in 0..3 {
         let key = ask_secret(
             input,
-            "DeepSeek Search API key (hidden; blank keeps current, 'clear' removes)",
+            &format!(
+                "{} Search API key (hidden; blank keeps current, 'clear' removes)",
+                search_provider_label(search.effective_provider())
+            ),
         )
         .await?;
         if key.is_empty() {
@@ -1652,16 +1812,52 @@ pub(crate) async fn search_config(
         accepted,
         "Search API key setup cancelled after three invalid answers; nothing was saved"
     );
-    let current_base_url = search.base_url.clone();
-    search.base_url = ask_valid(
-        input,
-        "Search API base URL",
-        Some(&current_base_url),
-        search_base_url,
-    )
-    .await?;
-    let current_model = search.model.clone();
-    search.model = ask_valid(input, "Search model", Some(&current_model), search_model).await?;
+
+    // Step 3: a preset model for the chosen provider, or a typed model ID.
+    let provider_changed = search.effective_provider() != original_provider;
+    let provider = search.effective_provider();
+    let presets = search_provider_models(provider);
+    let default_model = if provider_changed {
+        presets[0].to_owned()
+    } else {
+        original_model
+    };
+    command_eprintln!("{} search models:", search_provider_label(provider));
+    for (index, model) in presets.iter().enumerate() {
+        command_eprintln!("  {}. {model}", index + 1);
+    }
+    let mut accepted = false;
+    for _ in 0..3 {
+        let answer = ask(input, &format!("Model ID or number [{default_model}]")).await?;
+        let candidate = if answer.is_empty() {
+            default_model.clone()
+        } else if let Ok(number) = answer.parse::<usize>() {
+            match number.checked_sub(1).and_then(|index| presets.get(index)) {
+                Some(model) => (*model).to_owned(),
+                None => {
+                    command_eprintln!(
+                        "  Enter a number from 1 to {} or a model ID.",
+                        presets.len()
+                    );
+                    continue;
+                }
+            }
+        } else {
+            answer
+        };
+        match search_model(&candidate) {
+            Ok(model) => {
+                search.model = model;
+                accepted = true;
+                break;
+            }
+            Err(reason) => command_eprintln!("  {reason}"),
+        }
+    }
+    ensure!(
+        accepted,
+        "Search model setup cancelled after three invalid answers; nothing was saved"
+    );
     search.validate()?;
     let summary = search_summary(&search);
     manager.update_config(|c| c.deepseek_search = search)?;
@@ -3485,7 +3681,8 @@ mod tests {
         let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
         let mut session = config_test_session(&paths).await;
 
-        let mut input = answers(&["sk-search-fixture", "", "deepseek-pro"]);
+        // Step 1 keeps the provider, step 2 stores the key, step 3 takes a typed model.
+        let mut input = answers(&["", "sk-search-fixture", "deepseek-pro"]);
         handle("/search-config", &paths, &mut session, &mut input)
             .await
             .unwrap();
@@ -3493,9 +3690,12 @@ mod tests {
         assert_eq!(saved.api_key, "sk-search-fixture");
         assert_eq!(saved.base_url, "https://api.deepseek.com/anthropic/v1");
         assert_eq!(saved.model, "deepseek-pro");
+        assert!(saved.provider.is_none(), "blank keeps the unset provider");
         let summary = search_summary(&saved);
+        assert!(summary.contains("DeepSeek"), "{summary}");
         assert!(summary.contains("[set]"), "{summary}");
         assert!(!summary.contains("sk-search-fixture"), "{summary}");
+        assert_eq!(search_status(&saved), "configured (deepseek: deepseek-pro)");
 
         let mut empty = answers(&[]);
         handle(
@@ -3506,13 +3706,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let mut interactive = answers(&["", "https://search.example/v1", ""]);
+        // A base URL typed at step 1 keeps the current effective provider.
+        let mut interactive = answers(&["https://search.example/v1", "", ""]);
         handle("/config search", &paths, &mut session, &mut interactive)
             .await
             .unwrap();
         let saved = paths.read_config().unwrap().deepseek_search;
         assert_eq!(saved.api_key, "quick-key");
         assert_eq!(saved.base_url, "https://search.example/v1");
+        assert_eq!(saved.provider.as_deref(), Some("deepseek"));
         assert_eq!(saved.model, "deepseek-pro", "blank keeps the current model");
 
         assert!(handle(
@@ -3529,15 +3731,56 @@ mod tests {
             "a rejected base URL keeps the saved value"
         );
 
+        handle(
+            "/config search provider OpenAI",
+            &paths,
+            &mut session,
+            &mut empty,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            paths
+                .read_config()
+                .unwrap()
+                .deepseek_search
+                .provider
+                .as_deref(),
+            Some("openai")
+        );
+        handle(
+            "/search-config provider anthropic",
+            &paths,
+            &mut session,
+            &mut empty,
+        )
+        .await
+        .unwrap();
+        assert!(handle(
+            "/config search provider gemini",
+            &paths,
+            &mut session,
+            &mut empty
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            paths
+                .read_config()
+                .unwrap()
+                .deepseek_search
+                .provider
+                .as_deref(),
+            Some("anthropic"),
+            "a rejected provider keeps the saved value"
+        );
+
         handle("/config search clear", &paths, &mut session, &mut empty)
             .await
             .unwrap();
-        assert!(paths
-            .read_config()
-            .unwrap()
-            .deepseek_search
-            .api_key
-            .is_empty());
+        let cleared = paths.read_config().unwrap().deepseek_search;
+        assert!(cleared.api_key.is_empty());
+        assert_eq!(search_status(&cleared), "not configured");
         session.close().await.unwrap();
     }
 
@@ -3547,7 +3790,8 @@ mod tests {
         let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
         let mut session = config_test_session(&paths).await;
 
-        let mut input = answers(&["sk-bad key", "sk-good-key", "", ""]);
+        // Step 1 keeps the provider, then two keys are tried at step 2.
+        let mut input = answers(&["", "sk-bad key", "sk-good-key", ""]);
         handle("/search-config", &paths, &mut session, &mut input)
             .await
             .unwrap();
@@ -3557,7 +3801,7 @@ mod tests {
             "a key with whitespace is rejected and the next answer is used"
         );
 
-        let mut invalid = answers(&["a b", "c\td", "e f"]);
+        let mut invalid = answers(&["", "a b", "c\td", "e f"]);
         assert!(handle("/search-config", &paths, &mut session, &mut invalid)
             .await
             .is_err());
@@ -3566,6 +3810,152 @@ mod tests {
             "sk-good-key",
             "three invalid keys save nothing"
         );
+
+        let mut invalid = answers(&["gemini", "1.5", "nope"]);
+        assert!(handle("/search-config", &paths, &mut session, &mut invalid)
+            .await
+            .is_err());
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert!(
+            saved.provider.is_none(),
+            "three invalid providers save nothing"
+        );
+        assert_eq!(saved.api_key, "sk-good-key");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_config_presets_switch_provider_and_default_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+        let mut empty = answers(&[]);
+        handle(
+            "/config search api_key deepseek-key",
+            &paths,
+            &mut session,
+            &mut empty,
+        )
+        .await
+        .unwrap();
+        handle(
+            "/config search model deepseek-v4-pro",
+            &paths,
+            &mut session,
+            &mut empty,
+        )
+        .await
+        .unwrap();
+
+        // OpenAI preset: a blank model picks the new provider's first preset,
+        // and an invalid number is retried.
+        let mut input = answers(&["2", "openai-key", "9", "1"]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.provider.as_deref(), Some("openai"));
+        assert_eq!(saved.base_url, "https://api.openai.com/v1");
+        assert_eq!(saved.api_key, "openai-key");
+        assert_eq!(saved.model, "gpt-5-mini");
+
+        // Anthropic by name, second preset model by number, blank key kept.
+        let mut input = answers(&["anthropic", "", "2"]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(saved.base_url, "https://api.anthropic.com");
+        assert_eq!(saved.api_key, "openai-key");
+        assert_eq!(saved.model, "claude-sonnet-4-5");
+
+        // Back to DeepSeek by number, first preset model.
+        let mut input = answers(&["1", "", "1"]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.provider.as_deref(), Some("deepseek"));
+        assert_eq!(saved.base_url, "https://api.deepseek.com/anthropic/v1");
+        assert_eq!(saved.api_key, "openai-key");
+        assert_eq!(saved.model, "deepseek-flash");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_config_custom_url_and_direct_url_choose_the_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+
+        // Option 4 asks for the URL and then the protocol.
+        let mut input = answers(&[
+            "4",
+            "https://gateway.example/search",
+            "2",
+            "gateway-key",
+            "1",
+        ]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.provider.as_deref(), Some("openai"));
+        assert_eq!(saved.base_url, "https://gateway.example/search");
+        assert_eq!(saved.api_key, "gateway-key");
+        assert_eq!(saved.model, "gpt-5-mini");
+
+        // A direct URL infers a known host.
+        let mut input = answers(&["https://api.anthropic.com", "", ""]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(saved.base_url, "https://api.anthropic.com");
+        assert_eq!(saved.api_key, "gateway-key");
+        assert_eq!(saved.model, "claude-haiku-4-5");
+
+        // Option 4 defaults the protocol to the current effective provider.
+        let mut input = answers(&["4", "https://gateway.example/messages", "", "", "3"]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(saved.base_url, "https://gateway.example/messages");
+        assert_eq!(saved.model, "claude-opus-4-6");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_config_blank_answers_keep_current_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+        let mut input = answers(&[]);
+        for command in [
+            "/config search provider openai",
+            "/config search base_url https://api.openai.com/v1",
+            "/config search model gpt-5.1",
+            "/config search api_key keep-key",
+        ] {
+            handle(command, &paths, &mut session, &mut input)
+                .await
+                .unwrap();
+        }
+        let before = paths.read_config().unwrap().deepseek_search;
+        let mut blank = answers(&["", "", ""]);
+        handle("/search-config", &paths, &mut session, &mut blank)
+            .await
+            .unwrap();
+        let after = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(after.provider, before.provider);
+        assert_eq!(after.base_url, before.base_url);
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.api_key, before.api_key);
+        assert_eq!(after.model, "gpt-5.1");
         session.close().await.unwrap();
     }
 
