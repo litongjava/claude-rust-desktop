@@ -156,6 +156,8 @@ impl ToolLoopExecutor {
         if boundary.is_some() {
             self.shell_cwd_needs_report
                 .store(true, std::sync::atomic::Ordering::Release);
+            self.shell_redundant_cd_cooldown
+                .store(0, std::sync::atomic::Ordering::Release);
         }
         self.context_boundary_id = boundary;
         Ok((cut, microcompact_changed))

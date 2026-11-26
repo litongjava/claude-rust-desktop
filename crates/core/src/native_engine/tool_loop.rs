@@ -311,6 +311,9 @@ pub struct ToolLoopExecutor {
     /// and again after compaction, so the model never loses track of it while
     /// unchanged subsequent calls stay free of repeated `cwd` lines.
     shell_cwd_needs_report: Arc<std::sync::atomic::AtomicBool>,
+    /// Cooldown (in foreground `Bash` calls) before emitting another redundant
+    /// leading-`cd` coaching note. Resets to 0 on compaction.
+    shell_redundant_cd_cooldown: Arc<std::sync::atomic::AtomicUsize>,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_tool_iterations: Option<usize>,
@@ -1669,6 +1672,7 @@ impl ToolLoopExecutor {
             context_boundary_id: None,
             applied_compaction: false,
             shell_cwd_needs_report: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            shell_redundant_cd_cooldown: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             system_prompt,
             max_tokens,
             max_tool_iterations: crate::config::OrchestrationConfig::max_tool_iterations(),
@@ -1797,6 +1801,8 @@ impl ToolLoopExecutor {
         if applied {
             self.shell_cwd_needs_report
                 .store(true, std::sync::atomic::Ordering::Release);
+            self.shell_redundant_cd_cooldown
+                .store(0, std::sync::atomic::Ordering::Release);
         }
         self
     }
@@ -3178,6 +3184,14 @@ impl ToolLoopExecutor {
         {
             input["__report_cwd"] = json!(true);
         }
+        if foreground_bash
+            && self
+                .shell_redundant_cd_cooldown
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+        {
+            input["__hint_redundant_cd"] = json!(true);
+        }
         let asker = input
             .get("__sandbox")
             .filter(|_| tool_input["dangerouslyDisableSandbox"] != true)
@@ -3225,6 +3239,12 @@ impl ToolLoopExecutor {
         if foreground_bash && result.is_ok() {
             self.shell_cwd_needs_report
                 .store(false, std::sync::atomic::Ordering::Release);
+            let hinted = result.as_ref().ok().is_some_and(|value| {
+                value["note"]
+                    .as_str()
+                    .is_some_and(|note| note.starts_with(crate::tools::REDUNDANT_CD_NOTE_PREFIX))
+            });
+            update_redundant_cd_cooldown(&self.shell_redundant_cd_cooldown, hinted);
         }
         result
     }
@@ -7834,14 +7854,66 @@ mod shell_cwd_tests {
     }
 }
 
+/// Number of foreground `Bash` calls to skip after emitting a redundant-`cd`
+/// coaching note so repeated calls do not spam `tool_result` with the same hint.
+const REDUNDANT_CD_HINT_COOLDOWN_CALLS: usize = 5;
+
+fn update_redundant_cd_cooldown(cooldown: &std::sync::atomic::AtomicUsize, hinted: bool) {
+    if hinted {
+        cooldown.store(
+            REDUNDANT_CD_HINT_COOLDOWN_CALLS,
+            std::sync::atomic::Ordering::Release,
+        );
+    } else {
+        let mut current = cooldown.load(std::sync::atomic::Ordering::Acquire);
+        while current > 0 {
+            match cooldown.compare_exchange_weak(
+                current,
+                current - 1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
 #[path = "toolscript_approval.rs"]
 pub(crate) mod toolscript_approval;
 
 #[cfg(test)]
 mod shell_state_input_tests {
-    use super::shell_state_input;
+    use super::{
+        shell_state_input, update_redundant_cd_cooldown, REDUNDANT_CD_HINT_COOLDOWN_CALLS,
+    };
     use crate::permissions::PermissionMode;
     use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn redundant_cd_cooldown_rate_limits_hints() {
+        let cooldown = AtomicUsize::new(0);
+        // Normal calls at 0 stay at 0 without underflowing.
+        update_redundant_cd_cooldown(&cooldown, false);
+        assert_eq!(cooldown.load(Ordering::Acquire), 0);
+
+        // Emitting a hint arms the cooldown.
+        update_redundant_cd_cooldown(&cooldown, true);
+        assert_eq!(
+            cooldown.load(Ordering::Acquire),
+            REDUNDANT_CD_HINT_COOLDOWN_CALLS
+        );
+
+        // Each subsequent unhinted call ticks the cooldown down until 0.
+        for expected in (0..REDUNDANT_CD_HINT_COOLDOWN_CALLS).rev() {
+            update_redundant_cd_cooldown(&cooldown, false);
+            assert_eq!(cooldown.load(Ordering::Acquire), expected);
+        }
+        update_redundant_cd_cooldown(&cooldown, false);
+        assert_eq!(cooldown.load(Ordering::Acquire), 0);
+    }
 
     #[test]
     fn python_gets_the_sandbox_policy_like_bash() {

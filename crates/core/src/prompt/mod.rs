@@ -1028,6 +1028,17 @@ mod tests {
         assert!(prompt.contains("In a non-interactive run (no user to reply)"));
         assert!(prompt.contains("Do not duplicate work already assigned to a subagent."));
         assert!(prompt.contains("prefer the Python tool over a Bash heredoc"));
+        assert_eq!(prompt.matches("# Working efficiently").count(), 1);
+        for required in [
+            "Stay strictly on task",
+            "Batch independent tool calls in one turn",
+            "Prefer dedicated read/search tools and omit redundant `cd`",
+            "Verify once with a compound command; do not re-run passing checks",
+            "Use `MultiEdit` for multiple edits in one file",
+            "Never poll with `sleep`",
+        ] {
+            assert!(prompt.contains(required), "missing efficiency rule: {required}");
+        }
         for removed in [
             "historical name of the shell tool",
             "Bash timeout is in milliseconds",
