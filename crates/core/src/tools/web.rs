@@ -13,9 +13,10 @@ use std::{
 const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_CHARS: usize = 12_000;
 const MAX_CHARS: usize = 50_000;
-const FETCH_TIMEOUT: Duration = Duration::from_secs(12);
+const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
-const JINA_TIMEOUT: Duration = Duration::from_secs(20);
+const JINA_TIMEOUT: Duration = Duration::from_secs(30);
 /// Reader fallback for pages whose text is hidden behind client-side rendering.
 const JINA_READER_BASE: &str = "https://r.jina.ai/";
 const MAX_REDIRECTS: usize = 10;
@@ -373,7 +374,7 @@ fn is_thin_html(page: &Page, result: &Value, input: &Value) -> bool {
 fn async_client(proxy: Option<&str>, allow_local_target: bool) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .connect_timeout(Duration::from_secs(4))
+        .connect_timeout(FETCH_CONNECT_TIMEOUT)
         .user_agent(USER_AGENT)
         .redirect(redirect_policy(allow_local_target));
     if allow_local_target {
@@ -392,7 +393,7 @@ fn blocking_client(
 ) -> Result<reqwest::blocking::Client> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(FETCH_TIMEOUT)
-        .connect_timeout(Duration::from_secs(4))
+        .connect_timeout(FETCH_CONNECT_TIMEOUT)
         .user_agent(USER_AGENT)
         .redirect(redirect_policy(allow_local_target));
     if allow_local_target {
@@ -850,6 +851,15 @@ impl SafeError for anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fetch_timeouts_allow_cold_proxies_and_redirects() {
+        assert_eq!(FETCH_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(FETCH_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(JINA_TIMEOUT, Duration::from_secs(30));
+        assert!(FETCH_CONNECT_TIMEOUT < FETCH_TIMEOUT);
+        assert!(JINA_TIMEOUT >= FETCH_TIMEOUT);
+    }
 
     #[test]
     fn user_agent_names_the_product_and_its_version() {
