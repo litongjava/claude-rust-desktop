@@ -679,6 +679,9 @@ pub(crate) struct Screen {
     /// The prompt follows transcript output and scrolls only when needed instead of
     /// following the cursor. Modals that follow output stay unpinned.
     pinned: bool,
+    /// A full-screen frame anchored to terminal row 0 instead of following the
+    /// cursor, so alternate-screen tabs never jump vertically.
+    top_anchored: bool,
     /// Screen row of the frame's first line while pinned.
     top: Option<u16>,
     /// End of transcript before the composer was pinned below empty screen rows.
@@ -691,6 +694,13 @@ impl Screen {
     pub(crate) fn pinned() -> Self {
         Self {
             pinned: true,
+            ..Self::default()
+        }
+    }
+    /// A frame anchored to the terminal's top row, for alternate-screen panels.
+    pub(crate) fn top_anchored() -> Self {
+        Self {
+            top_anchored: true,
             ..Self::default()
         }
     }
@@ -727,6 +737,9 @@ impl Screen {
         }
         if self.pinned {
             return self.draw_pinned(lines, row, col);
+        }
+        if self.top_anchored {
+            return self.draw_top_anchored(lines, row, col);
         }
         self.cursor_col = col;
         let mut out = crate::terminal_output::stderr_locked();
@@ -918,6 +931,66 @@ impl Screen {
         self.invalidated = false;
         Ok(())
     }
+
+    pub(crate) fn draw_top_anchored(
+        &mut self,
+        lines: &[DisplayLine],
+        row: usize,
+        col: usize,
+    ) -> io::Result<()> {
+        let rows = crate::terminal::size().1.max(1) as usize;
+        let mut out = crate::terminal_output::stderr_locked();
+        out.write_all(b"\x1b[?2026h")?;
+        let result = self.draw_top_anchored_to(&mut out, lines, row, col, rows);
+        out.write_all(b"\x1b[?2026l")?;
+        out.flush()?;
+        result
+    }
+
+    /// Draws a top-anchored frame. Line 0 always goes to terminal row 0, rows
+    /// beyond `rows` are dropped, and leftover rows from a taller frame are
+    /// cleared, so switching tabs cannot scroll the alternate screen.
+    pub(crate) fn draw_top_anchored_to(
+        &mut self,
+        out: &mut impl Write,
+        lines: &[DisplayLine],
+        row: usize,
+        col: usize,
+        rows: usize,
+    ) -> io::Result<()> {
+        let rows = rows.max(1);
+        let visible = &lines[..lines.len().min(rows)];
+        let mut frame = Vec::new();
+        let repaint = self.invalidated;
+        for (offset, (text, style)) in visible.iter().enumerate() {
+            if !repaint && self.previous.get(offset) == Some(&(text.clone(), *style)) {
+                continue;
+            }
+            queue!(frame, MoveTo(0, offset as u16))?;
+            write_display_line(&mut frame, text, *style)?;
+        }
+        // A shorter tab leaves the previous tab's tail behind; clear it without
+        // scrolling so the header stays on row 0.
+        if visible.len() < rows && (self.invalidated || self.height > visible.len()) {
+            queue!(
+                frame,
+                MoveTo(0, visible.len() as u16),
+                Clear(ClearType::FromCursorDown)
+            )?;
+        }
+        let cursor = row.min(visible.len().saturating_sub(1));
+        queue!(frame, MoveTo(col as u16, cursor as u16))?;
+        out.write_all(&frame)?;
+        out.flush()?;
+        // Store the requested row so an unchanged redraw still short-circuits in
+        // `draw`, while the terminal cursor stays inside the visible frame.
+        self.cursor_row = row;
+        self.cursor_col = col;
+        self.height = visible.len();
+        self.previous = visible.to_vec();
+        self.invalidated = false;
+        Ok(())
+    }
     pub(crate) fn shortcut_popup(
         &mut self,
         context: crate::terminal::shortcuts::Context,
@@ -925,11 +998,15 @@ impl Screen {
     ) -> io::Result<()> {
         let (cols, rows) = crate::terminal::size();
         // A terminal that does not answer the cursor query still gets the popup.
-        let top = self.top.unwrap_or_else(|| {
-            crate::terminal::cursor_position()
-                .map_or(0, |(_, row)| row)
-                .saturating_sub(self.cursor_row as u16)
-        });
+        let top = if self.top_anchored {
+            0
+        } else {
+            self.top.unwrap_or_else(|| {
+                crate::terminal::cursor_position()
+                    .map_or(0, |(_, row)| row)
+                    .saturating_sub(self.cursor_row as u16)
+            })
+        };
         let mut background = crate::terminal::scrollback::Scrollback::snapshot().screen(top, rows);
         for (index, (text, _)) in self.previous.iter().enumerate() {
             if let Some(row) = background.get_mut(top as usize + index) {
@@ -955,6 +1032,13 @@ impl Screen {
     }
     /// Erases the frame, leaving the cursor on its first row.
     fn erase(&mut self, out: &mut impl Write) -> io::Result<()> {
+        if self.top_anchored {
+            queue!(out, MoveTo(0, 0), Clear(ClearType::FromCursorDown), ResetColor)?;
+            self.previous.clear();
+            self.height = 0;
+            self.cursor_row = 0;
+            return Ok(());
+        }
         if self.pinned {
             if let Some(top) = self.top.take() {
                 queue!(out, MoveTo(0, top), Clear(ClearType::FromCursorDown))?;
@@ -3332,6 +3416,94 @@ mod tests {
         let mut output = Vec::new();
         screen.draw_to(&mut output, &lines, 1, 2).unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "\x1b[3G");
+    }
+
+    #[test]
+    fn top_anchored_frame_starts_at_row_zero_without_scrolling() {
+        let mut screen = Screen::top_anchored();
+        let lines: Vec<DisplayLine> = (0..5)
+            .map(|index| (format!("line {index}"), TextStyle::Plain))
+            .collect();
+        let mut out = Vec::new();
+        screen.draw_top_anchored_to(&mut out, &lines, 0, 1, 24).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.starts_with("\x1b[1;1H"), "{output:?}");
+        assert!(output.contains("line 0") && output.contains("line 4"), "{output:?}");
+        assert!(!output.contains('\n'), "{output:?}");
+        // An unchanged redraw only moves the cursor.
+        let mut out = Vec::new();
+        screen.draw_top_anchored_to(&mut out, &lines, 0, 1, 24).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "\x1b[1;2H");
+    }
+
+    #[test]
+    fn top_anchored_tab_switch_clears_a_taller_frame_without_jumping() {
+        let mut screen = Screen::top_anchored();
+        let tall: Vec<DisplayLine> = std::iter::once(("Tall".to_owned(), TextStyle::Accent))
+            .chain((1..20).map(|index| (format!("tall row {index}"), TextStyle::Plain)))
+            .collect();
+        screen
+            .draw_top_anchored_to(&mut Vec::new(), &tall, 0, 1, 24)
+            .unwrap();
+        assert_eq!(screen.height, 20);
+
+        let short: Vec<DisplayLine> = std::iter::once(("Short".to_owned(), TextStyle::Accent))
+            .chain((1..5).map(|index| (format!("short row {index}"), TextStyle::Plain)))
+            .collect();
+        let mut out = Vec::new();
+        screen
+            .draw_top_anchored_to(&mut out, &short, 0, 1, 24)
+            .unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.starts_with("\x1b[1;1H"), "{output:?}");
+        assert!(output.contains("\x1b[6;1H\x1b[J"), "{output:?}");
+        assert!(!output.contains('\n'), "{output:?}");
+        assert_eq!(screen.height, 5);
+
+        // Switching back repaints the header at row 0 and grows downward.
+        let mut out = Vec::new();
+        screen
+            .draw_top_anchored_to(&mut out, &tall, 0, 1, 24)
+            .unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.starts_with("\x1b[1;1H"), "{output:?}");
+        assert!(output.contains("tall row 19"), "{output:?}");
+        assert!(!output.contains('\n'), "{output:?}");
+        assert_eq!(screen.height, 20);
+    }
+
+    #[test]
+    fn top_anchored_frame_drops_rows_below_the_terminal() {
+        let mut screen = Screen::top_anchored();
+        let lines: Vec<DisplayLine> = (0..30)
+            .map(|index| (format!("row {index}"), TextStyle::Plain))
+            .collect();
+        let mut out = Vec::new();
+        screen
+            .draw_top_anchored_to(&mut out, &lines, 25, 0, 10)
+            .unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(!output.contains("row 10"), "{output:?}");
+        assert_eq!(screen.height, 10);
+        // The requested row is remembered, but the terminal cursor stays visible.
+        assert_eq!(screen.cursor_row, 25);
+        assert!(output.ends_with("\x1b[10;1H"), "{output:?}");
+    }
+
+    #[test]
+    fn top_anchored_erase_returns_to_row_zero() {
+        let mut screen = Screen::top_anchored();
+        let lines = frame_lines();
+        screen
+            .draw_top_anchored_to(&mut Vec::new(), &lines, 0, 1, 24)
+            .unwrap();
+        let mut out = Vec::new();
+        screen.erase(&mut out).unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.starts_with("\x1b[1;1H\x1b[J"), "{output:?}");
+        assert_eq!(screen.height, 0);
+        assert_eq!(screen.cursor_row, 0);
+        assert!(screen.previous.is_empty());
     }
 
     #[test]

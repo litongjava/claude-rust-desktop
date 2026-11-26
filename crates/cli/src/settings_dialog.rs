@@ -1,8 +1,9 @@
 //! The settings dialog shared by /status, /config and /cost, as in the
 //! reference CLI: Status, Config and Usage tabs switched with ←/→.
 use crate::session::Session;
+use crate::terminal::input::editor::Screen;
 use crate::terminal::input::TerminalInput;
-use crate::terminal::picker::{details, Entry, Key, Picked, Picker};
+use crate::terminal::picker::{details_from_top_with, Entry, Key, Picked, Picker};
 use anyhow::Result;
 use deepseek_code_core::runtime::RuntimePaths;
 
@@ -11,6 +12,9 @@ struct SettingsScreen;
 
 impl SettingsScreen {
     fn enter() -> std::io::Result<Self> {
+        // Drop the finished turn's input box before the alternate screen takes
+        // over; releasing it afterwards would jump the cursor on the new screen.
+        crate::terminal::release_handoff();
         crossterm::execute!(crate::terminal_output::stderr(), crossterm::terminal::EnterAlternateScreen,
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
             crossterm::cursor::MoveTo(0, 0))?;
@@ -38,6 +42,7 @@ fn tab_bar(current: usize) -> String {
 
 pub async fn run(start: &str, paths: &RuntimePaths, session: &mut Session, input: &mut TerminalInput) -> Result<()> {
     let _screen = SettingsScreen::enter()?;
+    let mut frame = Screen::top_anchored();
     let mut tab = TABS.iter().position(|tab| tab.eq_ignore_ascii_case(start)).unwrap_or(0);
     let mut selected = 0;
     let mut range = 0;
@@ -47,7 +52,7 @@ pub async fn run(start: &str, paths: &RuntimePaths, session: &mut Session, input
             3 => {
                 notice = None;
                 let rows = crate::stats_view::rows(&crate::stats_view::load(session)?, range, chrono::Local::now().date_naive());
-                match details(&tab_bar(tab), &rows, "r to change range \u{b7} \u{2190}/\u{2192} to switch tabs \u{b7} Esc to close", &['r'])? {
+                match details_from_top_with(&tab_bar(tab), &rows, "r to change range \u{b7} \u{2190}/\u{2192} to switch tabs \u{b7} Esc to close", &['r'], &mut frame)? {
                     Some('r') => {
                         range = (range + 1) % crate::stats_view::RANGES.len();
                         continue;
@@ -57,7 +62,7 @@ pub async fn run(start: &str, paths: &RuntimePaths, session: &mut Session, input
                     _ => return Ok(()),
                 }
             }
-            1 => match config(paths, session, input, selected, notice.as_deref()).await? {
+            1 => match config(paths, session, input, selected, notice.as_deref(), &mut frame).await? {
                 ConfigOutcome::Switch(step) => {
                     notice = None;
                     step
@@ -72,7 +77,7 @@ pub async fn run(start: &str, paths: &RuntimePaths, session: &mut Session, input
             _ => {
                 notice = None;
                 let rows = if tab == 0 { status_rows(session).await? } else { usage_rows(session, paths)? };
-                match details(&tab_bar(tab), &rows, "\u{2190}/\u{2192} to switch tabs \u{b7} Esc to close", &[])? {
+                match details_from_top_with(&tab_bar(tab), &rows, "\u{2190}/\u{2192} to switch tabs \u{b7} Esc to close", &[], &mut frame)? {
                     Some('<') => -1,
                     Some('>') => 1,
                     _ => return Ok(()),
@@ -140,7 +145,7 @@ fn outcome_notice(label: &str, result: &Result<()>) -> Option<String> {
 }
 
 /// The Config tab: each setting with its value; Enter changes it.
-async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut TerminalInput, selected: usize, notice: Option<&str>) -> Result<ConfigOutcome> {
+async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut TerminalInput, selected: usize, notice: Option<&str>, frame: &mut Screen) -> Result<ConfigOutcome> {
     let display = crate::display_commands::load(session)?;
     let effort = crate::session_commands::session_effort(session)?.unwrap_or_else(|| "default".into());
     let autocompact = crate::session_commands::autocompact_label(session)?;
@@ -175,7 +180,7 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
         .collect();
     let bar = tab_bar(1);
     let picker = Picker { heading: &bar, subtitle: notice, entries: &entries, search: true, hint: "Type to filter \u{b7} Enter/Space to change \u{b7} \u{2190}/\u{2192} to switch tabs \u{b7} Esc to close", selected };
-    let index = match picker.run_keys(&[Key::Left, Key::Right, Key::Space])? {
+    let index = match picker.run_keys_filling_with(&[Key::Left, Key::Right, Key::Space], frame)? {
         Picked::Entry(index) | Picked::Key(Key::Space, Some(index)) => index,
         Picked::Key(Key::Left, _) => return Ok(ConfigOutcome::Switch(-1)),
         Picked::Key(Key::Right, _) => return Ok(ConfigOutcome::Switch(1)),
@@ -210,7 +215,10 @@ async fn config(paths: &RuntimePaths, session: &mut Session, input: &mut Termina
             "fetch-proxy" => "/config fetch-proxy".to_owned(),
             _ => format!("/{key}"),
         };
-        Box::pin(crate::interactive_config::handle(&command, paths, session, input)).await.map(|_| ())
+        let result = Box::pin(crate::interactive_config::handle(&command, paths, session, input)).await.map(|_| ());
+        // The line-oriented prompt drew over the alternate screen; repaint this frame.
+        frame.reflow();
+        result
     } else {
         // As in the reference CLI, Enter or Space moves to the next value in place.
         let choice = choices.iter().position(|choice| choice == value).map_or(0, |current| (current + 1) % choices.len());
