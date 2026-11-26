@@ -748,8 +748,20 @@ async fn bash_keeps_its_directory_and_resets_outside_the_project() {
         out["stdout"].as_str().unwrap().trim(),
         project.join("sub").to_str().unwrap()
     );
+    // Resume/compaction forces a single cwd reminder even when unchanged.
+    let reminded = tool_bash_async(
+        serde_json::json!({"command":"pwd -P","__cwd_state":state.to_string_lossy(),"__report_cwd":true}),
+        cwd,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reminded["cwd"].as_str().unwrap(),
+        project.join("sub").to_str().unwrap()
+    );
     // Exiting early keeps the previous directory.
-    let _ = tool_bash_async(run("cd /; exit 3"), cwd).await;
+    let early = tool_bash_async(run("cd /; exit 3"), cwd).await.unwrap();
+    assert!(early.get("cwd").is_none(), "{early}");
     assert!(tool_bash_async(run("pwd -P"), cwd).await.unwrap()["stdout"]
         .as_str()
         .unwrap()
@@ -778,6 +790,32 @@ async fn bash_keeps_its_directory_and_resets_outside_the_project() {
             .trim(),
         cwd
     );
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn concurrent_foreground_bash_calls_preserve_saved_cwd() {
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let sub = project.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    let cwd = project.to_str().unwrap();
+    let state = project.join("cwd-state");
+    let run = |command: &str| serde_json::json!({"command":command,"__cwd_state":state.to_string_lossy()});
+    let moved = tool_bash_async(run("cd sub"), cwd).await.unwrap();
+    assert_eq!(moved["cwd"], serde_json::json!(sub.to_str().unwrap()));
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| tool_bash_async(run("pwd -P"), cwd))
+        .collect();
+    for result in futures::future::try_join_all(handles).await.unwrap() {
+        assert!(result.get("cwd").is_none(), "{result}");
+        assert_eq!(
+            result["stdout"].as_str().unwrap().trim(),
+            sub.to_str().unwrap()
+        );
+    }
 }
 
 /// A batch file captures errorlevel on a separate parsed line before bookkeeping.
@@ -1359,22 +1397,45 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
     } else {
         command
     };
-    let command = match &cwd_state {
-        // A command that exits early keeps the previous directory.
-        Some(state) if resolved.wsl.is_some() => {
-            let path = crate::services::wsl::linux_path(resolved.wsl.as_ref().unwrap(), state).await?;
+    struct CwdCaptureFile(PathBuf);
+    impl Drop for CwdCaptureFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let cwd_capture = cwd_state.as_ref().map(|state| {
+        if let Some(parent) = state.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let name = state
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("shell-cwd");
+        CwdCaptureFile(
+            state.with_file_name(format!(".{name}.tmp.{}", uuid::Uuid::new_v4())),
+        )
+    });
+    let command = match &cwd_capture {
+        // Each call writes its ending directory to a per-call temp file so
+        // concurrent read-only foreground calls never truncate the shared state.
+        // A command that exits early leaves the temp file unwritten and keeps
+        // the previous directory.
+        Some(capture) if resolved.wsl.is_some() => {
+            let path =
+                crate::services::wsl::linux_path(resolved.wsl.as_ref().unwrap(), &capture.0)
+                    .await?;
             format!("{command}\n__dcl_status=$?\nwslpath -w \"$PWD\" > '{}' 2>/dev/null\nexit $__dcl_status", path.replace('\'', "'\"'\"'"))
         }
-        Some(state) if powershell => format!(
+        Some(capture) if powershell => format!(
             "{command}\n$__dcl_ok = $?; $__dcl_code = $global:LASTEXITCODE\ntry {{ [System.IO.File]::WriteAllText('{}', (Get-Location).ProviderPath) }} catch {{}}\nif (-not $__dcl_ok) {{ if ($__dcl_code) {{ exit $__dcl_code }} else {{ exit 1 }} }}",
-            state.to_string_lossy().replace('\'', "''")
+            capture.0.to_string_lossy().replace('\'', "''")
         ),
-        Some(state) if cmd_shell => cmd_cwd_footer(&command, &state.to_string_lossy()),
+        Some(capture) if cmd_shell => cmd_cwd_footer(&command, &capture.0.to_string_lossy()),
         // Git Bash on Windows prints C:/... with -W; elsewhere -P is the path.
-        Some(state) => format!(
+        Some(capture) => format!(
             "{command}\n__dcl_status=$?\n{} > '{}' 2>/dev/null\nexit $__dcl_status",
             if cfg!(windows) { "{ pwd -W 2>/dev/null || pwd -P; }" } else { "pwd -P" },
-            state.to_string_lossy().replace('\'', "'\"'\"'")
+            capture.0.to_string_lossy().replace('\'', "'\"'\"'")
         ),
         None => command,
     };
@@ -1499,8 +1560,9 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                 object.insert("sandbox_network".into(), serde_json::json!(format!("The sandbox blocked network access to {}: not in sandbox.network.allowedDomains (or listed in deniedDomains) in settings.json. Ask the user to allow the domain; do not retry with other hosts.", hosts.join(", "))));
             }
         }
-        if let Some(state) = &cwd_state {
-            let moved = saved_cwd(state);
+        let force_report_cwd = input["__report_cwd"].as_bool().unwrap_or(false);
+        if let (Some(state), Some(capture)) = (&cwd_state, &cwd_capture) {
+            let moved = saved_cwd(&capture.0).filter(|dir| !dir.is_empty());
             let reset = moved
                 .as_deref()
                 .is_some_and(|dir| !is_path_allowed(Path::new(dir), cwd));
@@ -1514,12 +1576,24 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                     object.insert("cwd".into(), serde_json::json!(cwd));
                 }
             } else if let Some(moved) = moved {
-                // The first foreground call reports where it started; later
-                // calls report only a change.
-                if report_initial || !same_directory(&moved, &safe_cwd) {
+                let changed = report_initial || !same_directory(&moved, &safe_cwd);
+                if changed || !state.exists() {
+                    // Atomically promote the per-call capture file so concurrent
+                    // readers never observe a truncated state file.
+                    if fs::rename(&capture.0, state).is_err() {
+                        let _ = fs::write(state, format!("{moved}\n"));
+                    }
+                }
+                if changed || force_report_cwd {
                     if let Some(object) = result.as_object_mut() {
                         object.insert("cwd".into(), serde_json::json!(moved));
                     }
+                }
+            } else if (report_initial || force_report_cwd)
+                && result.as_object().is_some()
+            {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("cwd".into(), serde_json::json!(safe_cwd));
                 }
             }
         }

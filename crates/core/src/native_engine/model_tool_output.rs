@@ -517,7 +517,8 @@ fn render_with_spans(
             parts.push("Command failed".into());
         }
         fields.remove("success");
-        // A foreground shell reports a changed directory once, above stdout.
+        // A foreground shell reports its directory on first call, change, reset,
+        // or after resume/compaction, above stdout.
         if let Some(cwd) = fields
             .remove("cwd")
             .and_then(|cwd| cwd.as_str().map(str::to_owned))

@@ -93,6 +93,7 @@ fn the_request_carries_only_the_core_tools_by_default() {
         "Read",
         "Write",
         "Edit",
+        "MultiEdit",
         "Grep",
         "Glob",
         "Skill",
@@ -100,7 +101,10 @@ fn the_request_carries_only_the_core_tools_by_default() {
         "AskUserQuestion",
         "EnterPlanMode",
         "ExitPlanMode",
+        "TaskGet",
         "TaskStop",
+        "WebFetch",
+        "WebSearch",
     ] {
         assert!(
             names.contains(&name.to_owned()),
@@ -109,8 +113,8 @@ fn the_request_carries_only_the_core_tools_by_default() {
     }
     for name in [
         "ListDir",
-        "WebFetch",
-        "WebSearch",
+        "Monitor",
+        "NotebookEdit",
         "computer_use",
         "ContextSearch",
         "Agent",
@@ -386,50 +390,50 @@ fn only_a_paired_tool_load_result_restores_the_tools_of_this_session() {
     // A real ToolLoad call and its matching result.
     assert!(restore(vec![
         openai_call("c1", "ToolLoad"),
-        openai_result("c1", &loaded(&["WebSearch"]))
+        openai_result("c1", &loaded(&["Monitor"]))
     ])
-    .contains(&"WebSearch".to_owned()));
+    .contains(&"Monitor".to_owned()));
 
     // The Anthropic shape read the same way.
     let anthropic = vec![
-        json!({"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"ToolLoad","input":{"names":["WebFetch"]}}]}),
-        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":loaded(&["WebFetch"]).to_string()}]}),
+        json!({"role":"assistant","content":[{"type":"tool_use","id":"a1","name":"ToolLoad","input":{"names":["ListDir"]}}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a1","content":loaded(&["ListDir"]).to_string()}]}),
     ];
-    assert!(restore(anthropic).contains(&"WebFetch".to_owned()));
+    assert!(restore(anthropic).contains(&"ListDir".to_owned()));
 
     // An error result never loads, even with the right pairing.
     let errored = vec![
         json!({"role":"assistant","content":[{"type":"tool_use","id":"a2","name":"ToolLoad","input":{}}]}),
-        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a2","is_error":true,"content":loaded(&["WebSearch"]).to_string()}]}),
+        json!({"role":"user","content":[{"type":"tool_result","tool_use_id":"a2","is_error":true,"content":loaded(&["Monitor"]).to_string()}]}),
     ];
-    assert!(!restore(errored).contains(&"WebSearch".to_owned()));
+    assert!(!restore(errored).contains(&"Monitor".to_owned()));
 
     // An orphan result, a mismatched id, another tool's result and a user's own
     // JSON each fail to grant anything.
-    assert!(!restore(vec![openai_result("c1", &loaded(&["WebSearch"]))])
-        .contains(&"WebSearch".to_owned()));
+    assert!(!restore(vec![openai_result("c1", &loaded(&["Monitor"]))])
+        .contains(&"Monitor".to_owned()));
     assert!(!restore(vec![
         openai_call("c1", "ToolLoad"),
-        openai_result("c2", &loaded(&["WebSearch"]))
+        openai_result("c2", &loaded(&["Monitor"]))
     ])
-    .contains(&"WebSearch".to_owned()));
+    .contains(&"Monitor".to_owned()));
     assert!(!restore(vec![
         openai_call("c1", "Glob"),
-        openai_result("c1", &loaded(&["WebSearch"]))
+        openai_result("c1", &loaded(&["Monitor"]))
     ])
-    .contains(&"WebSearch".to_owned()));
+    .contains(&"Monitor".to_owned()));
     assert!(!restore(vec![
-        json!({"role":"user","content":loaded(&["WebSearch"]).to_string()})
+        json!({"role":"user","content":loaded(&["Monitor"]).to_string()})
     ])
-    .contains(&"WebSearch".to_owned()));
+    .contains(&"Monitor".to_owned()));
 
     // A tool switched off after it was loaded does not come back.
-    write_switches(temp.path(), &[("WebSearch", false, false)]);
+    write_switches(temp.path(), &[("Monitor", false, false)]);
     assert!(!restore(vec![
         openai_call("c1", "ToolLoad"),
-        openai_result("c1", &loaded(&["WebSearch"]))
+        openai_result("c1", &loaded(&["Monitor"]))
     ])
-    .contains(&"WebSearch".to_owned()));
+    .contains(&"Monitor".to_owned()));
 }
 
 /// Stored history and old settings cannot resurrect a removed model tool: it is
@@ -477,7 +481,7 @@ async fn retired_task_output_is_not_advertised_searched_or_restored() {
     let temp = tempfile::tempdir().unwrap();
     let mut probe = executor(temp.path());
     let names = names(&probe);
-    assert!(!names.contains(&"TaskGet".to_owned()), "{names:?}");
+    assert!(names.contains(&"TaskGet".to_owned()), "{names:?}");
     assert!(!names.contains(&"TaskOutput".to_owned()), "{names:?}");
     assert!(crate::tools::get_tool_definitions()
         .iter()
@@ -492,14 +496,14 @@ async fn retired_task_output_is_not_advertised_searched_or_restored() {
     assert_eq!(value["loaded_tools"], json!([]), "{output}");
     assert_eq!(value["tools"], json!([]), "{output}");
 
-    // TaskGet itself is deferred, but the same search still loads it.
+    // TaskGet is resident by default, so ToolLoad reports it as already available.
     let (_, output, failed) = probe
         .execute_tool_call("ToolLoad", &json!({"names":["TaskGet"]}), "search")
         .await;
     assert!(!failed, "{output}");
     let value: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(value["loaded_tools"], json!(["TaskGet"]), "{output}");
-    assert_eq!(value["tools"].as_array().map(Vec::len), Some(1), "{output}");
+    assert_eq!(value["already_available"], json!(["TaskGet"]), "{output}");
+    assert_eq!(value["loaded_tools"], json!([]), "{output}");
 
     // A stored search result from before the consolidation cannot restore the
     // retired name either.
@@ -573,38 +577,27 @@ async fn task_get_can_be_discovered_on_demand_and_invoked() {
 }
 
 #[tokio::test]
-async fn task_get_is_deferred_and_loadable() {
+async fn task_get_is_resident_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let session = uuid::Uuid::new_v4().to_string();
     let mut executor = executor(temp.path()).with_conv_id(session.clone());
     let initial = names(&executor);
-    assert!(!initial.contains(&"TaskGet".to_owned()), "{initial:?}");
+    assert!(initial.contains(&"TaskGet".to_owned()), "{initial:?}");
     executor.exposed_tools = Some(initial.into_iter().collect());
-
-    let (_, output, failed) = executor
-        .execute_tool_call("ToolLoad", &json!({"names":["TaskGet"]}), "search")
-        .await;
-    assert!(!failed, "{output}");
-    let loaded: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(loaded["success"], true, "{output}");
-    assert_eq!(loaded["loaded_tools"], json!(["TaskGet"]), "{output}");
 
     let task = crate::tools::tasks::execute_for_session(
         "TaskCreate",
-        json!({"subject":"deferred task"}),
+        json!({"subject":"resident task"}),
         temp.path(),
         &session,
     )
     .unwrap();
-    let next: std::collections::HashSet<String> = names(&executor).into_iter().collect();
-    assert!(next.contains("TaskGet"), "{next:?}");
-    executor.exposed_tools = Some(next);
     let (_, output, failed) = executor
         .execute_tool_call("TaskGet", &json!({"id":task["id"]}), "get")
         .await;
     assert!(!failed, "{output}");
     let value: Value = serde_json::from_str(&output).unwrap();
-    assert_eq!(value["subject"], "deferred task");
+    assert_eq!(value["subject"], "resident task");
 }
 
 #[test]
@@ -759,10 +752,10 @@ fn a_restored_tool_needs_an_assistant_call_before_its_own_result() {
         executor.restore_loaded_tools();
         names(&executor)
     };
-    let loaded = || json!({"success":true,"loaded_tools":["WebSearch"],"tools":[]}).to_string();
+    let loaded = || json!({"success":true,"loaded_tools":["Monitor"],"tools":[]}).to_string();
     let call = |role: &str, id: &str| json!({"role":role,"content":[{"type":"tool_use","id":id,"name":"ToolLoad","input":{}}]});
     let result = |id: &str| json!({"role":"user","content":[{"type":"tool_result","tool_use_id":id,"content":loaded()}]});
-    let granted = |messages: Vec<Value>| restore(messages).contains(&"WebSearch".to_owned());
+    let granted = |messages: Vec<Value>| restore(messages).contains(&"Monitor".to_owned());
 
     // A tool_use on a user turn is not an assistant call.
     assert!(!granted(vec![call("user", "x1"), result("x1")]));
@@ -793,9 +786,9 @@ fn a_reused_call_id_never_grants_a_tool() {
         let mut executor = executor(temp.path());
         executor.messages = messages;
         executor.restore_loaded_tools();
-        names(&executor).contains(&"WebSearch".to_owned())
+        names(&executor).contains(&"Monitor".to_owned())
     };
-    let loaded = || json!({"success":true,"loaded_tools":["WebSearch"],"tools":[]}).to_string();
+    let loaded = || json!({"success":true,"loaded_tools":["Monitor"],"tools":[]}).to_string();
     let openai_call = |id: &str, name: &str| json!({"role":"assistant","content":"","tool_calls":[{"id":id,"type":"function","function":{"name":name,"arguments":"{}"}}]});
     let openai_result =
         |id: &str, text: &str| json!({"role":"tool","tool_call_id":id,"content":text});
@@ -893,7 +886,7 @@ fn an_executor_without_a_data_directory_uses_the_same_defaults() {
     for name in ["Read", "Grep", "Glob", "ToolLoad"] {
         assert!(names.contains(&name.to_owned()), "{name}: {names:?}");
     }
-    for name in ["ListDir", "WebFetch", "computer_use"] {
+    for name in ["ListDir", "Monitor", "computer_use"] {
         assert!(!names.contains(&name.to_owned()), "{name}: {names:?}");
     }
 }
@@ -1051,7 +1044,7 @@ async fn loaded_tools_are_appended_after_the_resident_prefix_in_load_order() {
     let resident_prefix = serde_json::to_string(&resident).unwrap();
     executor.exposed_tools = Some(resident_names.iter().cloned().collect());
 
-    for (name, id) in [("WebFetch", "load-web"), ("ListDir", "load-dir")] {
+    for (name, id) in [("Monitor", "load-mon"), ("ListDir", "load-dir")] {
         let (_, output, failed) = executor
             .execute_tool_call("ToolLoad", &json!({"names":[name]}), id)
             .await;
@@ -1067,7 +1060,7 @@ async fn loaded_tools_are_appended_after_the_resident_prefix_in_load_order() {
     );
     assert_eq!(
         &after_names[resident_names.len()..],
-        ["WebFetch", "ListDir"],
+        ["Monitor", "ListDir"],
         "loaded tools follow the order they were loaded: {after_names:?}"
     );
     assert_eq!(
@@ -1111,12 +1104,12 @@ async fn loading_a_tool_keeps_a_user_tool_in_the_resident_prefix() {
     );
     executor.exposed_tools = Some(resident.iter().cloned().collect());
     let (_, output, failed) = executor
-        .execute_tool_call("ToolLoad", &json!({"names":["WebFetch"]}), "load")
+        .execute_tool_call("ToolLoad", &json!({"names":["Monitor"]}), "load")
         .await;
     assert!(!failed, "{output}");
     let after = names(&executor);
     assert_eq!(&after[..resident.len()], resident.as_slice(), "{after:?}");
-    assert_eq!(after.last().map(String::as_str), Some("WebFetch"), "{after:?}");
+    assert_eq!(after.last().map(String::as_str), Some("Monitor"), "{after:?}");
 }
 
 #[test]
@@ -1776,7 +1769,7 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
                             format,
                             "search-1",
                             "ToolLoad",
-                            json!({"names":["ListDir","WebFetch"]}),
+                            json!({"names":["ListDir","Monitor"]}),
                         ),
                         1 => tool_call_events(format, "list-1", "ListDir", json!({"path":"."})),
                         _ => text_events(format, "done"),
@@ -1848,7 +1841,7 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
         let structured: Value = serde_json::from_str(&tool_load_outputs[0]).unwrap();
         assert_eq!(
             structured["loaded_tools"],
-            json!(["ListDir", "WebFetch"]),
+            json!(["ListDir", "Monitor"]),
             "{format}"
         );
         assert!(
@@ -1873,7 +1866,7 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
             "{format}: {second:?}"
         );
         assert!(
-            second.contains(&"WebFetch".to_owned()),
+            second.contains(&"Monitor".to_owned()),
             "{format}: {second:?}"
         );
         // The resident tools keep their exact prefix, and the loaded tools
@@ -1887,7 +1880,7 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
         );
         assert_eq!(
             &second[first_tools.len()..],
-            ["ListDir", "WebFetch"],
+            ["ListDir", "Monitor"],
             "{format}: {second:?}"
         );
         assert!(
@@ -1899,7 +1892,7 @@ async fn every_transport_adds_loaded_tools_to_the_next_request() {
         let outputs = request_tool_outputs(&requests[1], format);
         assert_eq!(
             outputs,
-            ["Loaded ListDir, WebFetch. Available from the next request."],
+            ["Loaded ListDir, Monitor. Available from the next request."],
             "{format}: {outputs:?}"
         );
         assert!(requests[2].to_string().contains("needle.txt"), "{format}");
@@ -2129,10 +2122,12 @@ async fn every_transport_moves_the_loadable_tool_list_to_the_first_message() {
             "{format}: the listing uses the configured override: {user}"
         );
         assert!(user.contains("- WebSearch:"), "{format}: {user}");
-        assert!(user.contains("- MultiEdit:"), "{format}: {user}");
+        assert!(user.contains("- Monitor:"), "{format}: {user}");
         for absent in [
             "- Bash",
             "- WebFetch",
+            "- MultiEdit",
+            "- TaskGet",
             "computer_use",
             "private_tool",
             "git_status",
@@ -2147,7 +2142,7 @@ async fn every_transport_moves_the_loadable_tool_list_to_the_first_message() {
         let frozen_user = request_first_user(&requests[1], format);
         assert!(frozen_user.contains("- ListDir: Directory listing from the shared snapshot"), "{format}: {frozen_user}");
         assert!(frozen_user.contains("- WebSearch:"), "{format}: {frozen_user}");
-        assert!(frozen_user.contains("- MultiEdit:"), "{format}: {frozen_user}");
+        assert!(frozen_user.contains("- Monitor:"), "{format}: {frozen_user}");
         assert_eq!(
             frozen_user.matches("Tools you can load with ToolLoad").count(),
             1,
@@ -2986,11 +2981,9 @@ async fn tool_load_loads_multiple_exact_names_and_handles_already_loaded_names()
     let mut executor = executor(root.path());
     let wanted = [
         "ListDir",
-        "MultiEdit",
-        "WebFetch",
-        "WebSearch",
+        "Monitor",
+        "NotebookEdit",
         "TaskCreate",
-        "TaskGet",
         "TaskList",
     ];
     let (_, output, failed) = executor

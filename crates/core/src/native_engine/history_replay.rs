@@ -153,6 +153,10 @@ impl ToolLoopExecutor {
         self.turn_context = entries;
         self.messages = messages;
         self.applied_compaction = boundary.is_some();
+        if boundary.is_some() {
+            self.shell_cwd_needs_report
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.context_boundary_id = boundary;
         Ok((cut, microcompact_changed))
     }

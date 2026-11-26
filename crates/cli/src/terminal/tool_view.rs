@@ -548,8 +548,8 @@ fn todo_lines(input: &Value, failed: bool) -> Option<Vec<Line>> {
     Some(lines)
 }
 
-/// A foreground shell reports its starting directory on the first call and
-/// again when it changes; the transcript shows the final path component.
+/// A foreground shell reports its directory on first call, change, reset, or
+/// after resume/compaction; the transcript shows the final path component.
 fn reported_cwd(name: &str, output: &str) -> Option<String> {
     if !matches!(name, "Bash" | "PowerShell") {
         return None;

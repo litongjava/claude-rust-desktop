@@ -307,6 +307,10 @@ pub struct ToolLoopExecutor {
     /// stored latest boundary may already describe a different transcript.
     context_boundary_id: Option<String>,
     applied_compaction: bool,
+    /// Reports the persisted foreground shell `cwd` once at process start/resume
+    /// and again after compaction, so the model never loses track of it while
+    /// unchanged subsequent calls stay free of repeated `cwd` lines.
+    shell_cwd_needs_report: Arc<std::sync::atomic::AtomicBool>,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_tool_iterations: Option<usize>,
@@ -1664,6 +1668,7 @@ impl ToolLoopExecutor {
             messages,
             context_boundary_id: None,
             applied_compaction: false,
+            shell_cwd_needs_report: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             system_prompt,
             max_tokens,
             max_tool_iterations: crate::config::OrchestrationConfig::max_tool_iterations(),
@@ -1789,6 +1794,10 @@ impl ToolLoopExecutor {
 
     pub(super) fn with_applied_compaction(mut self, applied: bool) -> Self {
         self.applied_compaction = applied;
+        if applied {
+            self.shell_cwd_needs_report
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self
     }
 
@@ -3148,7 +3157,7 @@ impl ToolLoopExecutor {
         cwd: &str,
         approved: bool,
     ) -> Result<Value> {
-        let input = shell_state_input(
+        let mut input = shell_state_input(
             tool_name,
             &self.tool_run_input(tool_name, tool_input),
             cwd,
@@ -3159,6 +3168,16 @@ impl ToolLoopExecutor {
                 .map(|manager| manager.get_mode())
                 .unwrap_or_default(),
         );
+        let foreground_bash = tool_name == "Bash"
+            && input["run_in_background"] != true
+            && input["detach"] != true;
+        if foreground_bash
+            && self
+                .shell_cwd_needs_report
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            input["__report_cwd"] = json!(true);
+        }
         let asker = input
             .get("__sandbox")
             .filter(|_| tool_input["dangerouslyDisableSandbox"] != true)
@@ -3190,18 +3209,24 @@ impl ToolLoopExecutor {
                 ),
             ),
         ));
-        let Some((_guard, mut questions)) = asker else {
-            return run.await;
-        };
-        loop {
-            tokio::select! {
-                result = &mut run => return result,
-                Some((host, reply)) = questions.recv() => {
-                    let allowed = Box::pin(self.approve_sandbox_host(&host)).await;
-                    let _ = reply.send(allowed);
+        let result = if let Some((_guard, mut questions)) = asker {
+            loop {
+                tokio::select! {
+                    result = &mut run => break result,
+                    Some((host, reply)) = questions.recv() => {
+                        let allowed = Box::pin(self.approve_sandbox_host(&host)).await;
+                        let _ = reply.send(allowed);
+                    }
                 }
             }
+        } else {
+            run.await
+        };
+        if foreground_bash && result.is_ok() {
+            self.shell_cwd_needs_report
+                .store(false, std::sync::atomic::Ordering::Release);
         }
+        result
     }
 
     async fn task_display_title(&self, name: &str, input: &Value) -> Option<String> {

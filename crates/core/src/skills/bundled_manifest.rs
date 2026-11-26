@@ -197,6 +197,7 @@ pub(crate) const FILES: &[(&str, &str, &[u8])] = &[
     ("dc-docs", "SKILL.md", include_bytes!("bundled/skills/dc-docs/SKILL.md")),
     ("dc-docs", "references/pty-harness.md", include_bytes!("bundled/skills/dc-docs/references/pty-harness.md")),
     ("dc-docs", "scripts/drive_dcl.py", include_bytes!("bundled/skills/dc-docs/scripts/drive_dcl.py")),
+    ("dc-docs", "scripts/inspect_dcl.py", include_bytes!("bundled/skills/dc-docs/scripts/inspect_dcl.py")),
     ("dc-docs", "scripts/probe_mcp.py", include_bytes!("bundled/skills/dc-docs/scripts/probe_mcp.py")),
     ("debug", "SKILL.md", include_bytes!("bundled/skills/debug/SKILL.md")),
     ("deep-research", "SKILL.md", include_bytes!("bundled/skills/deep-research/SKILL.md")),
