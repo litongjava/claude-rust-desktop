@@ -1770,8 +1770,10 @@ cargo test --locked -p deepseek-code-cli --bin dcl shell_configuration_is_shared
 
 ```bash
 cargo test --locked -p deepseek-code-core --lib services::resource_monitor
+cargo test --locked -p deepseek-code-core --test resource_monitor
 cargo test --locked -p deepseek-code-core --lib native_engine::engine_core::resource_monitor_tests
 cargo test --locked -p deepseek-code-cli --bin dcl resource_alert
+cargo test --locked -p deepseek-code-cli --test resource_monitor
 cargo check --locked -p deepseek-code-desktop --all-targets
 ```
 
