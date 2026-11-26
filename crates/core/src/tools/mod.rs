@@ -188,7 +188,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             summary: Some("Replace one exact string in a workspace file".into()),
             name: "Edit".to_string(),
-            description: "Change a file by replacing an exact string. Read the file first in this conversation and leave it unchanged since, or the call is refused. old_string must match exactly once, indentation included, unless replace_all is true. LF and CRLF compare as equal, and replacements keep the file's existing line-ending style. A miss or duplicate match returns an error and writes nothing. Exclude the line-number prefix that Read adds; match only the file text.".to_string(),
+            description: "Change a file by replacing one exact string. If you need two or more non-adjacent edits in the same file, use MultiEdit in one call instead of sequential Edit calls; batch edits to independent files in parallel in one turn. Read the file first in this conversation and leave it unchanged since, or the call is refused. old_string must match exactly once, indentation included, unless replace_all is true. LF and CRLF compare as equal, and replacements keep the file's existing line-ending style. A miss or duplicate match returns an error and writes nothing. Exclude the line-number prefix that Read adds; match only the file text.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -256,7 +256,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             summary: Some("Read a web page and answer a prompt from it with the session model".into()),
             name: "WebFetch".to_string(),
-            description: "Read a web page and answer prompt from it with the session's model. The result is that answer, not the page markup or the raw response body. http(s) only; public http is upgraded to https. Local and private addresses need the user's approval unless the session is in bypass mode. Same-host redirects are followed; a cross-host redirect is returned for you to fetch. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page; a successful download is reused for fifteen minutes. When you need the exact response body, such as from a local JSON endpoint, run curl or a similar command through Bash instead.".to_string(),
+            description: "Read a web page and answer prompt from it with the session's model. The result is that answer, not the page markup or the raw response body. http(s) only; public http is upgraded to https. Local and private addresses need the user's approval unless the session is in bypass mode. Public redirects are followed automatically, but a public page is never allowed to redirect to a local or private address. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Cleaned text of 20,000 characters or fewer is returned directly; only longer text is summarized by the model from prompt, and a summary that exceeds its output limit falls back to the first 20,000 characters of the page text. A failed direct fetch or a JavaScript-only shell page falls back to the Jina Reader automatically. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page; a successful download is reused for fifteen minutes. When you need the exact response body, such as from a local JSON endpoint, run curl or a similar command through Bash instead.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -287,7 +287,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             summary: Some("Apply several exact replacements to one file in a single call".into()),
             name: "MultiEdit".to_string(),
-            description: "Apply several exact replacements to one file in a single call. Edits run in order against the working text, and the file is written only if every edit succeeds; one failure returns the failing edit's error and leaves the file unchanged. Read the file first and leave it unchanged since. Each old_string must be unique unless its replace_all is true, and LF and CRLF compare as equal.".to_string(),
+            description: "Apply several exact replacements to one file in a single call. Prefer MultiEdit over sequential Edit calls whenever making two or more non-adjacent changes to the same file (e.g. imports + logic + tests in one call: {\"file_path\":\"src/lib.rs\",\"edits\":[{\"old_string\":\"...\",\"new_string\":\"...\"},{\"old_string\":\"...\",\"new_string\":\"...\"}]}). Edits run in order against the working text, and the file is written only if every edit succeeds; one failure returns the failing edit's error and leaves the file unchanged. Read the file first and leave it unchanged since. Each old_string must be unique unless its replace_all is true, and LF and CRLF compare as equal.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -723,6 +723,284 @@ fn same_directory(a: &str, b: &str) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => Path::new(a) == Path::new(b),
     }
+}
+
+/// Prefix of the one-line coaching note added to a foreground `Bash` result
+/// when the command starts with a redundant `cd` into the already-active cwd.
+pub(crate) const REDUNDANT_CD_NOTE_PREFIX: &str = "Bash already runs in ";
+
+/// Prefix of the one-line coaching note added to a foreground `Bash` result
+/// when the command only reads or searches files via shell utilities instead
+/// of using parallel `Read`/`Grep`/`Glob` tool calls.
+pub(crate) const SHELL_READ_SEARCH_NOTE_PREFIX: &str = "Use dedicated Read/Grep/Glob";
+
+/// Returns true when `command` only uses shell read/search utilities (`cat`,
+/// `sed -n`, `head`, `tail`, `grep`, `rg`, `find`) — optionally separated by
+/// `echo`, `;`, `&&`, or a leading `cd` — with no file writes or real build/git
+/// commands. Commands like `cargo test | tail -40`, `git diff | grep`, or
+/// `sed -i` return `false`.
+pub(crate) fn is_pure_shell_read_or_search(command: &str) -> bool {
+    // Any output redirection or in-place sed edit is not a pure read/search.
+    if command.contains('>') {
+        return false;
+    }
+    let mut saw_read_or_search = false;
+    for raw_part in command.split([';', '\n']) {
+        for sub in raw_part.split("&&") {
+            let segment = sub.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            // Ignore separator echoes and leading `cd` segments.
+            let first = segment.split_whitespace().next().unwrap_or_default();
+            if matches!(first, "echo" | "printf" | "cd") {
+                continue;
+            }
+            // Every pipe stage in this segment must be a read/search/filter utility.
+            for (idx, pipe_stage) in segment.split('|').enumerate() {
+                let stage = pipe_stage.trim();
+                let mut words = stage.split_whitespace();
+                let Some(cmd) = words.next() else {
+                    return false;
+                };
+                if idx == 0 {
+                    match cmd {
+                        "cat" | "head" | "tail" | "grep" | "rg" | "find" => {
+                            saw_read_or_search = true;
+                        }
+                        "sed" => {
+                            // Only treat `sed -n` (line-range printing) as read; never `sed -i`.
+                            let args: Vec<&str> = words.collect();
+                            if args.iter().any(|a| *a == "-i" || a.starts_with("-i"))
+                                || !args.iter().any(|a| *a == "-n")
+                            {
+                                return false;
+                            }
+                            saw_read_or_search = true;
+                        }
+                        _ => return false,
+                    }
+                } else if !matches!(
+                    cmd,
+                    "head" | "tail" | "grep" | "rg" | "sed" | "wc" | "sort" | "uniq" | "cut"
+                ) {
+                    return false;
+                }
+            }
+        }
+    }
+    saw_read_or_search
+}
+
+/// Returns true when `command` begins with a leading `cd <target>` that
+/// resolves to `current_cwd` itself (so the `cd` is a no-op).
+///
+/// Only recognizes unambiguous literal targets (unquoted, single-quoted, or
+/// double-quoted without shell expansion) followed by `&&`, `;`, newline, or
+/// end-of-command. Subshells, variables, `cd -`, bare `cd`, and moves into a
+/// different directory return `false`.
+pub(crate) fn has_redundant_leading_cd(command: &str, current_cwd: &str) -> bool {
+    let trimmed = command.trim_start();
+    let Some(rest) = trimmed.strip_prefix("cd") else {
+        return false;
+    };
+    let Some(first) = rest.chars().next() else {
+        return false;
+    };
+    if !matches!(first, ' ' | '\t') {
+        return false;
+    }
+    let mut rest = rest.trim_start_matches([' ', '\t']);
+    if let Some(after_dash) = rest.strip_prefix("--") {
+        if after_dash.starts_with([' ', '\t']) {
+            rest = after_dash.trim_start_matches([' ', '\t']);
+        }
+    }
+    if rest.is_empty() || rest.starts_with('-') {
+        return false;
+    }
+    let (target, after) = match rest.as_bytes()[0] {
+        b'\'' => {
+            let inner = &rest[1..];
+            let Some(end) = inner.find('\'') else {
+                return false;
+            };
+            (&inner[..end], &inner[end + 1..])
+        }
+        b'"' => {
+            let inner = &rest[1..];
+            let Some(end) = inner.find('"') else {
+                return false;
+            };
+            let candidate = &inner[..end];
+            if candidate.contains(['$', '`', '\\']) {
+                return false;
+            }
+            (candidate, &inner[end + 1..])
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '&' | ';' | '|' | '>' | '<'))
+                .unwrap_or(rest.len());
+            let candidate = &rest[..end];
+            if candidate.is_empty() || candidate.contains(['$', '`', '\\', '~', '*', '?']) {
+                return false;
+            }
+            (candidate, &rest[end..])
+        }
+    };
+    if target.is_empty() {
+        return false;
+    }
+    let after = after.trim_start_matches([' ', '\t']);
+    if !(after.is_empty()
+        || after.starts_with('\n')
+        || after.starts_with('\r')
+        || after.starts_with(';')
+        || after.starts_with("&&"))
+    {
+        return false;
+    }
+    if target == "." || target == "./" {
+        return true;
+    }
+    let resolved = if Path::new(target).is_absolute() {
+        PathBuf::from(target)
+    } else {
+        Path::new(current_cwd).join(target)
+    };
+    let Some(resolved) = resolved.to_str() else {
+        return false;
+    };
+    same_directory(resolved, current_cwd)
+}
+
+#[cfg(test)]
+#[test]
+fn redundant_leading_cd_detection_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let sub = project.join("sub");
+    let spaced = project.join("my repo");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(&spaced).unwrap();
+    let cwd = project.to_str().unwrap();
+    let sub_str = sub.to_str().unwrap();
+    let spaced_str = spaced.to_str().unwrap();
+
+    // Redundant leading `cd` into the already-active cwd.
+    assert!(has_redundant_leading_cd(&format!("cd {cwd} && git status"), cwd));
+    assert!(has_redundant_leading_cd(&format!("  cd {cwd}/ && ls"), cwd));
+    assert!(has_redundant_leading_cd(&format!("cd -- {cwd}; pwd"), cwd));
+    assert!(has_redundant_leading_cd(&format!("cd '{spaced_str}' && ls"), spaced_str));
+    assert!(has_redundant_leading_cd(&format!("cd \"{spaced_str}\"\nls"), spaced_str));
+    assert!(has_redundant_leading_cd("cd . && git diff", cwd));
+    assert!(has_redundant_leading_cd("cd ./ ; git diff", cwd));
+    assert!(has_redundant_leading_cd(&format!("cd {cwd}"), cwd));
+
+    // Legitimate directory changes or ambiguous shell syntax must not match.
+    assert!(!has_redundant_leading_cd(&format!("cd {sub_str} && ls"), cwd));
+    assert!(!has_redundant_leading_cd("cd sub && ls", cwd));
+    assert!(!has_redundant_leading_cd("cd .. && ls", cwd));
+    assert!(!has_redundant_leading_cd("cd - && ls", cwd));
+    assert!(!has_redundant_leading_cd("cd && ls", cwd));
+    assert!(!has_redundant_leading_cd("cd $REPO && ls", cwd));
+    assert!(!has_redundant_leading_cd("cd \"$REPO\" && ls", cwd));
+    assert!(!has_redundant_leading_cd(&format!("(cd {cwd} && ls)"), cwd));
+    assert!(!has_redundant_leading_cd(&format!("git status && cd {cwd}"), cwd));
+    assert!(!has_redundant_leading_cd(&format!("echo 'cd {cwd}'"), cwd));
+    assert!(!has_redundant_leading_cd(&format!("cd {cwd} || exit 1"), cwd));
+}
+
+#[cfg(test)]
+#[test]
+fn pure_shell_read_or_search_detection_cases() {
+    assert!(is_pure_shell_read_or_search("sed -n '1,100p' src/lib.rs"));
+    assert!(is_pure_shell_read_or_search(
+        "sed -n '1,50p' a.rs; echo '==='; sed -n '60,120p' b.rs"
+    ));
+    assert!(is_pure_shell_read_or_search("grep -rn \"foo\" src/ | head -30"));
+    assert!(is_pure_shell_read_or_search("cd /repo && grep -n \"bar\" a.rs"));
+    assert!(is_pure_shell_read_or_search("cat src/lib.rs"));
+
+    assert!(!is_pure_shell_read_or_search("cargo test 2>&1 | tail -40"));
+    assert!(!is_pure_shell_read_or_search("git diff | grep foo"));
+    assert!(!is_pure_shell_read_or_search("sed -i '' 's/a/b/' a.rs"));
+    assert!(!is_pure_shell_read_or_search("cat a.rs > b.rs"));
+    assert!(!is_pure_shell_read_or_search("codegraph explore foo | head -20"));
+    assert!(!is_pure_shell_read_or_search("git status --short"));
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn bash_adds_redundant_cd_note_only_when_requested_for_same_cwd() {
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let sub = project.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let cwd = project.to_str().unwrap();
+    let sub_str = sub.to_str().unwrap();
+    let state = project.join("cwd-state");
+
+    // Without __hint_redundant_cd, no coaching note is attached.
+    let quiet = tool_bash_async(
+        serde_json::json!({
+            "command": format!("cd {cwd} && pwd -P"),
+            "__cwd_state": state.to_string_lossy()
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    assert!(quiet.get("note").is_none(), "{quiet}");
+
+    // With __hint_redundant_cd, redundant leading cd gets a concise note.
+    let hinted = tool_bash_async(
+        serde_json::json!({
+            "command": format!("cd {cwd} && pwd -P"),
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_redundant_cd": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    let note = hinted["note"].as_str().unwrap_or_default();
+    assert!(
+        note.starts_with(REDUNDANT_CD_NOTE_PREFIX) && note.contains(cwd),
+        "expected redundant-cd note, got: {hinted}"
+    );
+
+    // Moving into a different directory never triggers the redundant-cd note.
+    let moved = tool_bash_async(
+        serde_json::json!({
+            "command": format!("cd {sub_str} && pwd -P"),
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_redundant_cd": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    assert!(moved.get("note").is_none(), "{moved}");
+
+    // Once persisted cwd is `sub`, a redundant `cd sub_str` is detected against `sub`.
+    let hinted_sub = tool_bash_async(
+        serde_json::json!({
+            "command": format!("cd {sub_str} && pwd -P"),
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_redundant_cd": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    let sub_note = hinted_sub["note"].as_str().unwrap_or_default();
+    assert!(
+        sub_note.starts_with(REDUNDANT_CD_NOTE_PREFIX) && sub_note.contains(sub_str),
+        "expected redundant-cd note for persisted sub cwd, got: {hinted_sub}"
+    );
 }
 
 #[cfg(all(test, unix))]
@@ -1362,6 +1640,7 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         _ => safe_cwd,
     };
 
+    let raw_command = command.to_owned();
     let command = if flag == "-Command" {
         cmd.args(["-NoProfile", "-NonInteractive"]);
         utf8::powershell_command(command)
@@ -1597,6 +1876,25 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                 }
             }
         }
+        if input["__hint_redundant_cd"].as_bool().unwrap_or(false) {
+            if has_redundant_leading_cd(&raw_command, &safe_cwd) {
+                if let Some(object) = result.as_object_mut() {
+                    object.entry("note".to_owned()).or_insert_with(|| {
+                        serde_json::json!(format!(
+                            "{REDUNDANT_CD_NOTE_PREFIX}{safe_cwd}; omit redundant leading 'cd'."
+                        ))
+                    });
+                }
+            } else if is_pure_shell_read_or_search(&raw_command) {
+                if let Some(object) = result.as_object_mut() {
+                    object.entry("note".to_owned()).or_insert_with(|| {
+                        serde_json::json!(format!(
+                            "{SHELL_READ_SEARCH_NOTE_PREFIX} tools in parallel instead of Bash cat/sed/grep."
+                        ))
+                    });
+                }
+            }
+        }
         Ok(result)
     }
 }
@@ -1803,6 +2101,13 @@ fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value
 }
 async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Value> {
     web::fetch(model_fetch_input(input)?).await
+}
+/// WebFetch with the configured transport proxy, after the same URL policy.
+pub(crate) async fn execute_web_fetch_async(
+    input: serde_json::Value,
+    proxy: Option<&str>,
+) -> Result<serde_json::Value> {
+    web::fetch_with_proxy(model_fetch_input(input)?, proxy).await
 }
 fn tool_web_search_blocking(_input: serde_json::Value) -> Result<serde_json::Value> {
     Err(anyhow!("WebSearch requires a conversation provider and its search settings. Start search from a conversation."))

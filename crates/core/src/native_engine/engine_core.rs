@@ -1238,7 +1238,7 @@ impl QueryEngine {
         }
         let model_skills: Vec<_> = discovered_skills
             .values()
-            .filter(|skill| skill.model_invocable())
+            .filter(|skill| skill.model_invocable() && !skill.always_inline)
             .collect();
         let available_skills = model_skills
             .iter()
@@ -1255,6 +1255,10 @@ impl QueryEngine {
             .iter()
             .map(|skill| skill.name.clone())
             .collect::<Vec<_>>();
+        // Skills in `SkillState::Always` have their full body injected into the
+        // first user message, so the model has their complete instructions on
+        // turn 1 without spending a turn calling `Skill`.
+        let inline_blocks = crate::prompt::inline_skill_blocks(&discovered_skills);
         // The set of tools ToolLoad can offer and the model-invocable skills
         // are frozen into the first user message. A later discovery only adds a
         // change reminder to the latest message, never an edit to that prefix.
@@ -1326,7 +1330,7 @@ impl QueryEngine {
             .messages
             .iter()
             .any(|message| message.get("role").and_then(Value::as_str) == Some("user"));
-        let (loadable_tools, available_skills_listing, experience, set_changes) =
+        let (loadable_tools, available_skills_listing, inline_skills, experience, set_changes) =
             tokio::task::spawn_blocking(move || {
                 let loadable_tools = crate::prompt::loadable_tools_for_session(
                     &first_message_root,
@@ -1338,6 +1342,11 @@ impl QueryEngine {
                     &first_message_root,
                     &first_message_session,
                     &available_skills,
+                );
+                let inline_skills = crate::prompt::inline_skills_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &inline_blocks,
                 );
                 // One scan per turn feeds both the frozen block and the change
                 // reminder; the frozen file wins once the session has started.
@@ -1408,7 +1417,7 @@ impl QueryEngine {
                         )
                     })
                     .flatten();
-                (loadable_tools, available_skills, experience, changes)
+                (loadable_tools, available_skills, inline_skills, experience, changes)
             })
             .await?;
         if let Some(reminder) = set_changes {
@@ -1561,6 +1570,7 @@ impl QueryEngine {
             standalone_frontend,
             loadable_tools,
             available_skills: available_skills_listing,
+            inline_skills,
             date: Some(frozen_date),
             git: git_snapshot
                 .as_deref()

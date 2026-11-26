@@ -17,6 +17,8 @@ pub struct SkillCommand {
     pub disable_model_invocation: bool,
     /// Listed to the model by name only; still invocable.
     pub listing_name_only: bool,
+    /// Full skill body is injected into the first-turn context.
+    pub always_inline: bool,
     pub context: Option<String>,
     pub shell: Option<String>,
     pub agent: Option<String>,
@@ -304,6 +306,7 @@ pub fn discover_plugin(
                             false,
                         )?,
                         listing_name_only: false,
+                        always_inline: false,
                         context: metadata
                             .get("context")
                             .and_then(Value::as_str)
@@ -597,6 +600,7 @@ fn command_from(path: &Path, name: String, definition: Definition) -> Result<Ski
         )?,
         disable_model_invocation: boolean(&metadata, "disable-model-invocation", false)?,
         listing_name_only: false,
+        always_inline: false,
         context: metadata
             .get("context")
             .and_then(Value::as_str)

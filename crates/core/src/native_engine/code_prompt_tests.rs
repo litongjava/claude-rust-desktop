@@ -639,6 +639,7 @@ async fn environment_is_its_own_responses_part_in_first_message_order() {
         available_skills: Some(
             "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
         ),
+        inline_skills: None,
         environment: Some(environment),
         date: Some(crate::prompt::date_reminder("2026-11-19")),
         git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
