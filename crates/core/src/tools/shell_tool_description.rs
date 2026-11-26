@@ -13,7 +13,7 @@ const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call spa
 
 Combine related steps into one call with `&&` (dependent) or `;` (independent checks) instead of issuing one short command per turn.
 
-A foreground timeout in a managed session returns recent output and a task_id while the process continues. Without a managed session, the timeout stops the process tree. Read the task with TaskGet, use block:true to wait for completion, or end it with TaskStop. Do not poll background tasks with `sleep` loops: wait for completion notifications, run a command you must wait on in the foreground with an explicit `timeout`, or use TaskGet (`block: true`) / Monitor.
+Background tasks (`run_in_background: true`) and timed-out managed foreground commands notify and wake you automatically when they finish. You do not need to call TaskGet or poll with `sleep`: continue with other steps or finish your turn to handle new user input. Call TaskGet only when you need intermediate output or must wait (`block: true`) before proceeding, or TaskStop to end the task. Without a managed session, a foreground timeout stops the process tree.
 
 When a call ends, every process it started is stopped, including background children. A server, daemon or other service that must keep running after the call has to be started with `detach: true`, which returns its PID and log files; stop it yourself when it is no longer needed.
 
@@ -148,7 +148,7 @@ fn append_execution_note(note: &mut String, shell: &ResolvedShell, host_os: &str
     note.push_str(if name == "fish" {
         " Foreground commands start in the workspace."
     } else {
-        " A foreground call starts in the previous foreground call's directory and always reports its resulting directory in `cwd`. Do not repeat `cd` to a directory you are already in; add a leading `cd` only to change directories, or use `(cd ... && ...)` or `git -C` for a temporary switch. Other tools still resolve relative paths against the primary working directory."
+        " A foreground call starts in the previous foreground call's directory. It reports `cwd` on the first call, when the directory changes or resets, and once after resume or context compaction; when `cwd` is omitted, assume the last reported directory and do not repeat `cd`. Add a leading `cd` only to change directories, or use `(cd ... && ...)` or `git -C` for a temporary switch. Other tools still resolve relative paths against the primary working directory."
     });
     if super::pipeline_failure_flag(shell.command_flag, name, shell.wsl.is_some()) {
         note.push_str(" With pipefail enabled, a failing pipeline stage can surface even when the last stage succeeds.");
@@ -532,7 +532,7 @@ mod tests {
             assert_eq!(text.contains("PowerShell 5.1"), name == "powershell");
             assert_eq!(text.contains("PowerShell 7"), name == "pwsh");
             assert_eq!(
-                text.contains("always reports its resulting directory in `cwd`"),
+                text.contains("when the directory changes or resets, and once after resume or context compaction"),
                 name != "fish"
             );
             assert_eq!(
