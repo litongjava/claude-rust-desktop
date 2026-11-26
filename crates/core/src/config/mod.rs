@@ -6,7 +6,9 @@ pub mod api_endpoints;
 pub mod command_output;
 mod deepseek_search;
 pub mod ui_language;
+mod web_fetch;
 pub use deepseek_search::DeepSeekSearchConfig;
+pub use web_fetch::WebFetchConfig;
 
 use anyhow::Result;
 use once_cell::sync::OnceCell;
@@ -265,6 +267,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub deepseek_search: DeepSeekSearchConfig,
     #[serde(default)]
+    pub web_fetch: WebFetchConfig,
+    #[serde(default)]
     pub default_provider_id: Option<String>,
     #[serde(default)]
     pub theme: Option<String>,
@@ -277,6 +281,7 @@ impl Default for AppConfig {
         Self {
             providers: Vec::new(),
             deepseek_search: DeepSeekSearchConfig::default(),
+            web_fetch: WebFetchConfig::default(),
             default_provider_id: None,
             theme: None,
             language: None,
@@ -541,6 +546,7 @@ mod tests {
     fn test_app_config_default() {
         let config = AppConfig::default();
         assert!(config.providers.is_empty());
+        assert_eq!(config.web_fetch, WebFetchConfig::default());
         assert!(config.default_provider_id.is_none());
         assert!(config.theme.is_none());
         assert!(config.language.is_none());

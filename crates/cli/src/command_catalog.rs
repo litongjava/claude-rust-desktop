@@ -45,6 +45,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
         "Branch this conversation and switch to it: [TITLE]",
     ),
     ("/config", "Show settings and commands to change them"),
+    ("/search-config", "Configure DeepSeek web search API key, base URL and model"),
     ("/copy", "Copy the latest assistant response: [N]"),
     ("/copy-session-id", "Copy the current session ID to the clipboard"),
     ("/export", "Export transcript: FILE or clipboard"),
@@ -151,4 +152,14 @@ fn provider_and_model_help_mention_refresh() {
             .expect("the command is discoverable");
         assert!(description.contains("refresh"), "{command}: {description}");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn search_config_is_discoverable() {
+    let (_, description) = COMMANDS
+        .iter()
+        .find(|(name, _)| *name == "/search-config")
+        .expect("the command is discoverable");
+    assert!(description.contains("search"), "{description}");
 }

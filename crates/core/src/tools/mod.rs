@@ -256,7 +256,7 @@ pub fn get_tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             summary: Some("Read a web page and answer a prompt from it with the session model".into()),
             name: "WebFetch".to_string(),
-            description: "Read a web page and answer prompt from it with the session's model. The result is that answer, not the page markup or the raw response body. http(s) only; public http is upgraded to https. Local and private addresses need the user's approval unless the session is in bypass mode. Same-host redirects are followed; a cross-host redirect is returned for you to fetch. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page; a successful download is reused for fifteen minutes. When you need the exact response body, such as from a local JSON endpoint, run curl or a similar command through Bash instead.".to_string(),
+            description: "Read a web page and answer prompt from it with the session's model. The result is that answer, not the page markup or the raw response body. http(s) only; public http is upgraded to https. Local and private addresses need the user's approval unless the session is in bypass mode. Public redirects are followed automatically, but a public page is never allowed to redirect to a local or private address. HTML becomes readable text, and text, JSON, XML and JavaScript are read as-is. Cleaned text of 20,000 characters or fewer is returned directly; only longer text is summarized by the model from prompt, and a summary that exceeds its output limit falls back to the first 20,000 characters of the page text. A failed direct fetch or a JavaScript-only shell page falls back to the Jina Reader automatically. Downloads stop at 2 MiB, answers cover up to 50,000 characters from offset, and next_offset continues a truncated page; a successful download is reused for fifteen minutes. When you need the exact response body, such as from a local JSON endpoint, run curl or a similar command through Bash instead.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -1803,6 +1803,13 @@ fn tool_web_fetch_blocking(input: serde_json::Value) -> Result<serde_json::Value
 }
 async fn tool_web_fetch_async(input: serde_json::Value) -> Result<serde_json::Value> {
     web::fetch(model_fetch_input(input)?).await
+}
+/// WebFetch with the configured transport proxy, after the same URL policy.
+pub(crate) async fn execute_web_fetch_async(
+    input: serde_json::Value,
+    proxy: Option<&str>,
+) -> Result<serde_json::Value> {
+    web::fetch_with_proxy(model_fetch_input(input)?, proxy).await
 }
 fn tool_web_search_blocking(_input: serde_json::Value) -> Result<serde_json::Value> {
     Err(anyhow!("WebSearch requires a conversation provider and its search settings. Start search from a conversation."))

@@ -7,7 +7,7 @@ use crate::{args::Cli, config, session::Session};
 use anyhow::{bail, ensure, Context, Result};
 use clap::Parser;
 use deepseek_code_core::{
-    config::{ConfigManager, ProviderConfig},
+    config::{ConfigManager, DeepSeekSearchConfig, ProviderConfig, WebFetchConfig},
     runtime::RuntimePaths,
 };
 use serde_json::{json, Value};
@@ -16,6 +16,17 @@ async fn ask(input: &mut TerminalInput, prompt: &str) -> Result<String> {
     let prompt = format!("{prompt}: ");
     let line = tokio::select! {
         line = input.read_answer(&prompt) => line?.context("Input closed")?,
+        _ = crate::signals::interrupted() => bail!("Cancelled"),
+    };
+    ensure!(line.trim() != "/cancel", "Cancelled");
+    Ok(line.trim().into())
+}
+
+/// Like [`ask`], but the typed text is hidden, for credentials.
+async fn ask_secret(input: &mut TerminalInput, prompt: &str) -> Result<String> {
+    let prompt = format!("{prompt}: ");
+    let line = tokio::select! {
+        line = input.read_secret(&prompt) => line?.context("Input closed")?,
         _ = crate::signals::interrupted() => bail!("Cancelled"),
     };
     ensure!(line.trim() != "/cancel", "Cancelled");
@@ -35,7 +46,11 @@ async fn ask_valid<T>(
     };
     for _ in 0..3 {
         let answer = ask(input, &label).await?;
-        let answer = if answer.is_empty() { default.unwrap_or_default().to_owned() } else { answer };
+        let answer = if answer.is_empty() {
+            default.unwrap_or_default().to_owned()
+        } else {
+            answer
+        };
         match check(&answer) {
             Ok(value) => return Ok(value),
             Err(reason) => command_eprintln!("  {reason}"),
@@ -55,8 +70,12 @@ pub(crate) enum Credential {
 
 fn looks_like_secret(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    ["sk-", "sk_", "key-", "bearer "].iter().any(|prefix| lower.starts_with(prefix))
-        || (value.len() >= 32 && value.chars().any(|c| c.is_ascii_lowercase()) && value.chars().any(|c| c.is_ascii_digit()))
+    ["sk-", "sk_", "key-", "bearer "]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || (value.len() >= 32
+            && value.chars().any(|c| c.is_ascii_lowercase())
+            && value.chars().any(|c| c.is_ascii_digit()))
 }
 
 fn strip_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -76,14 +95,17 @@ fn is_env_name(value: &str) -> bool {
 /// a key the user pasted. `set` covers lower-case names already exported.
 fn looks_like_env_name(value: &str) -> bool {
     is_env_name(value)
-        && (value.chars().all(|c| !c.is_ascii_lowercase())
-            || std::env::var_os(value).is_some())
+        && (value.chars().all(|c| !c.is_ascii_lowercase()) || std::env::var_os(value).is_some())
 }
 
 fn key_credential(value: &str) -> std::result::Result<Credential, String> {
-    let value = strip_prefix_ignore_case(value, "bearer ").unwrap_or(value).trim();
+    let value = strip_prefix_ignore_case(value, "bearer ")
+        .unwrap_or(value)
+        .trim();
     if value.is_empty() {
-        return Err("Enter an API key, or an environment variable NAME such as DEEPSEEK_API_KEY.".into());
+        return Err(
+            "Enter an API key, or an environment variable NAME such as DEEPSEEK_API_KEY.".into(),
+        );
     }
     if value.chars().any(char::is_whitespace) || value.chars().any(char::is_control) {
         return Err("An API key has no spaces or control characters; paste just the key, or enter an environment variable NAME (e.g. DEEPSEEK_API_KEY).".into());
@@ -133,7 +155,11 @@ pub(crate) fn is_opencode_url(url: &str) -> bool {
         return false;
     };
     let authority = rest.split('/').next().unwrap_or_default();
-    let host = authority.split(':').next().unwrap_or_default().to_ascii_lowercase();
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     host == "opencode.ai" || host.ends_with(".opencode.ai")
 }
 
@@ -145,10 +171,7 @@ pub(crate) fn opencode_base_url(protocol: &str, url: &str) -> Option<String> {
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let host = authority.split(':').next()?.to_ascii_lowercase();
     let path = format!("/{path}");
-    if host != "opencode.ai"
-        || path.starts_with("/inference/go/")
-        || path.starts_with("/zen")
-    {
+    if host != "opencode.ai" || path.starts_with("/inference/go/") || path.starts_with("/zen") {
         return None;
     }
     let suffix = match protocol {
@@ -179,7 +202,11 @@ fn parse_protocol(value: &str) -> std::result::Result<String, String> {
 }
 
 fn validate_model_ids(value: &str) -> std::result::Result<Vec<String>, String> {
-    let models: Vec<_> = value.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let models: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if models.is_empty() {
         Err("Enter at least one model ID (e.g. deepseek-flash).".into())
     } else if models
@@ -203,7 +230,11 @@ fn parse_model_selection(
     value: &str,
     listed: &[String],
 ) -> std::result::Result<Vec<String>, String> {
-    let tokens: Vec<_> = value.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    let tokens: Vec<_> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     if tokens.is_empty() {
         return Ok(vec![listed[0].clone()]);
     }
@@ -217,10 +248,17 @@ fn parse_model_selection(
             let model = number
                 .checked_sub(1)
                 .and_then(|index| listed.get(index))
-                .ok_or_else(|| format!("Enter a number from 1 to {}, a model ID, or all.", listed.len()))?;
+                .ok_or_else(|| {
+                    format!(
+                        "Enter a number from 1 to {}, a model ID, or all.",
+                        listed.len()
+                    )
+                })?;
             push_unique(&mut chosen, model.clone());
         } else if token.contains("::") || token.contains(char::is_whitespace) {
-            return Err("Model IDs cannot contain spaces or ::; separate several with commas.".into());
+            return Err(
+                "Model IDs cannot contain spaces or ::; separate several with commas.".into(),
+            );
         } else {
             push_unique(&mut chosen, token.to_owned());
         }
@@ -317,7 +355,11 @@ pub async fn wizard(
         Some(id) => id.to_owned(),
         None => {
             ask_valid(input, "Provider ID", None, |id| {
-                if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                if !id.is_empty()
+                    && id
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                {
                     Ok(id.to_owned())
                 } else {
                     Err("Use letters, digits, - or _ for the ID (e.g. deepseek).".into())
@@ -349,7 +391,9 @@ pub async fn wizard(
     .await?;
     let url = match deepseek_base_url(&protocol, &url) {
         Some(corrected) => {
-            command_eprintln!("  DeepSeek serves the Anthropic protocol at {corrected}; using that URL.");
+            command_eprintln!(
+                "  DeepSeek serves the Anthropic protocol at {corrected}; using that URL."
+            );
             corrected
         }
         None => url,
@@ -452,7 +496,10 @@ pub async fn wizard(
             models.len()
         ),
         (None, Some(name)) if std::env::var_os(name).is_some() => {
-            command_eprintln!("Saved {id} ({} models); the API key is read from {name}.", models.len());
+            command_eprintln!(
+                "Saved {id} ({} models); the API key is read from {name}.",
+                models.len()
+            );
         }
         (None, Some(name)) => command_eprintln!(
             "Saved {id} ({} models). Set {name} in the launching shell before selecting it.",
@@ -495,7 +542,10 @@ pub(crate) fn select_saved(
     paths: &RuntimePaths,
     provider: &str,
     model: &str,
-    startup: Option<(&config::StartupProvider, &deepseek_code_core::native_engine::provider_manager::Provider)>,
+    startup: Option<(
+        &config::StartupProvider,
+        &deepseek_code_core::native_engine::provider_manager::Provider,
+    )>,
 ) -> Result<config::Selection> {
     let mut cli = Cli::parse_from(["dcl"]);
     cli.provider = Some(provider.into());
@@ -572,7 +622,10 @@ fn refresh_endpoint(provider: &ProviderConfig) -> Result<(String, &'static str)>
         provider.id,
         protocols.iter().copied().collect::<Vec<_>>().join(", ")
     );
-    Ok((provider.base_url.trim().to_owned(), *protocols.iter().next().unwrap()))
+    Ok((
+        provider.base_url.trim().to_owned(),
+        *protocols.iter().next().unwrap(),
+    ))
 }
 
 /// The credential the saved provider already uses, in the same order as
@@ -590,7 +643,11 @@ fn provider_api_key(provider: &ProviderConfig) -> Result<String> {
         .get("builtinId")
         .and_then(Value::as_str)
         .map(deepseek_code_core::native_engine::provider_runtime::credential_env);
-    let first_model = provider.models.first().map(|model| model.id.as_str()).unwrap_or_default();
+    let first_model = provider
+        .models
+        .first()
+        .map(|model| model.id.as_str())
+        .unwrap_or_default();
     let model_default = if first_model.starts_with("deepseek") {
         "DEEPSEEK_API_KEY".to_owned()
     } else {
@@ -598,7 +655,10 @@ fn provider_api_key(provider: &ProviderConfig) -> Result<String> {
             .map(|metadata| metadata.auth_env.to_owned())
             .unwrap_or_else(|| "OPENAI_API_KEY".to_owned())
     };
-    let name = configured.map(str::to_owned).or(builtin).unwrap_or(model_default);
+    let name = configured
+        .map(str::to_owned)
+        .or(builtin)
+        .unwrap_or(model_default);
     let env_key = std::env::var(&name)
         .ok()
         .map(|key| key.trim().to_owned())
@@ -640,7 +700,10 @@ async fn choose_replacement(
         use crate::terminal::picker::{Entry, Picker};
         let entries: Vec<Entry> = available
             .iter()
-            .map(|model| Entry { title: model.clone(), detail: String::new() })
+            .map(|model| Entry {
+                title: model.clone(),
+                detail: String::new(),
+            })
             .collect();
         let subtitle = format!("{provider} no longer offers {gone}; conversation history is kept");
         let picker = Picker {
@@ -678,7 +741,10 @@ async fn choose_replacement(
         if available.contains(&answer) {
             return Ok(answer);
         }
-        command_eprintln!("  Enter a number from 1 to {} or a listed model ID.", available.len());
+        command_eprintln!(
+            "  Enter a number from 1 to {} or a listed model ID.",
+            available.len()
+        );
     }
     bail!("No replacement model chosen; nothing was changed")
 }
@@ -712,7 +778,11 @@ fn restore_provider(
         return Ok(());
     }
     manager.update_config(|config| {
-        if let Some(slot) = config.providers.iter_mut().find(|provider| provider.id == target) {
+        if let Some(slot) = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == target)
+        {
             *slot = original.clone();
         }
     })
@@ -743,7 +813,9 @@ async fn refresh_provider(
 ) -> Result<()> {
     // A malformed configuration is never overwritten; the save reloads it too.
     let config = paths.read_config()?;
-    let target = id.unwrap_or(&session.binding_state().provider_id).to_owned();
+    let target = id
+        .unwrap_or(&session.binding_state().provider_id)
+        .to_owned();
     let provider = config
         .providers
         .iter()
@@ -790,7 +862,10 @@ async fn refresh_provider(
             )
         ),
     };
-    ensure!(!listed.is_empty(), "The endpoint returned no models; nothing was changed");
+    ensure!(
+        !listed.is_empty(),
+        "The endpoint returned no models; nothing was changed"
+    );
 
     let api = provider
         .models
@@ -814,14 +889,15 @@ async fn refresh_provider(
         .map(|model| model.id.as_str())
         .collect();
     let previous_model = session.binding_state().model.clone();
-    let current_invalid = target == session.binding_state().provider_id && !enabled.contains(previous_model.as_str());
+    let current_invalid =
+        target == session.binding_state().provider_id && !enabled.contains(previous_model.as_str());
     let saved_default = config::default_model(paths);
     // Valid means the endpoint still offers the model and it is enabled
     // locally; comparing against the removed set alone would miss a default
     // that was already invalid before this refresh.
-    let default_invalid = saved_default.as_ref().is_some_and(|(provider, model)| {
-        provider == &target && !enabled.contains(model.as_str())
-    });
+    let default_invalid = saved_default
+        .as_ref()
+        .is_some_and(|(provider, model)| provider == &target && !enabled.contains(model.as_str()));
     let mut gone: Vec<String> = Vec::new();
     if current_invalid {
         gone.push(previous_model.clone());
@@ -869,10 +945,9 @@ async fn refresh_provider(
     );
     let mut manager = ConfigManager::new(paths.data_dir.clone());
     manager.reload()?;
-    let latest = manager
-        .get_provider(&target)
-        .cloned()
-        .context("The provider was removed while its models were being refreshed; nothing was changed")?;
+    let latest = manager.get_provider(&target).cloned().context(
+        "The provider was removed while its models were being refreshed; nothing was changed",
+    )?;
     ensure!(
         serde_json::to_value(&latest)? == serde_json::to_value(&provider)?,
         "Provider {target} changed while its models were being refreshed; run the refresh again. Other configuration changes were preserved."
@@ -883,7 +958,11 @@ async fn refresh_provider(
     updated.models = models;
     let written = updated.clone();
     manager.update_config(|config| {
-        if let Some(slot) = config.providers.iter_mut().find(|provider| provider.id == target) {
+        if let Some(slot) = config
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == target)
+        {
             *slot = written;
         }
     })?;
@@ -932,15 +1011,27 @@ async fn refresh_provider(
     );
     command_eprintln!(
         "Added: {}",
-        if sync.added.is_empty() { "none".to_owned() } else { sync.added.join(", ") }
+        if sync.added.is_empty() {
+            "none".to_owned()
+        } else {
+            sync.added.join(", ")
+        }
     );
     command_eprintln!(
         "Removed: {}",
-        if sync.removed.is_empty() { "none".to_owned() } else { sync.removed.join(", ") }
+        if sync.removed.is_empty() {
+            "none".to_owned()
+        } else {
+            sync.removed.join(", ")
+        }
     );
     command_eprintln!(
         "Unchanged: {}",
-        if sync.kept.is_empty() { "none".to_owned() } else { sync.kept.join(", ") }
+        if sync.kept.is_empty() {
+            "none".to_owned()
+        } else {
+            sync.kept.join(", ")
+        }
     );
     Ok(())
 }
@@ -964,18 +1055,88 @@ const OPENCODE_RESPONSES_BASE_URL: &str = "https://opencode.ai/inference/go/open
 
 const PRESETS: &[Preset] = &[
     // Default OpenCode preset: uses OpenAI Responses protocol out of the box.
-    Preset { id: "opencode", name: "OpenCode (recommended)", builtin: Some("opencode-go"), models: &["deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "kimi-k3"], key_url: "https://opencode.ai/auth" },
-    Preset { id: "deepseek", name: "DeepSeek", builtin: None, models: &["deepseek-flash", "deepseek-v4-pro"], key_url: "https://platform.deepseek.com/api_keys" },
-    Preset { id: "anthropic", name: "Anthropic Claude", builtin: Some("anthropic"), models: &["claude-sonnet-4-5", "claude-opus-4-6", "claude-haiku-4-5"], key_url: "https://console.anthropic.com/settings/keys" },
-    Preset { id: "openai", name: "OpenAI", builtin: Some("openai"), models: &["gpt-5.1", "gpt-5-mini", "gpt-4.1"], key_url: "https://platform.openai.com/api-keys" },
-    Preset { id: "moonshotai-cn", name: "Moonshot Kimi (China)", builtin: Some("moonshotai-cn"), models: &["kimi-k2.7-code", "kimi-k2-thinking"], key_url: "https://platform.moonshot.cn/console/api-keys" },
-    Preset { id: "zai-coding-cn", name: "Zhipu GLM Coding Plan (China)", builtin: Some("zai-coding-cn"), models: &["glm-5.1", "glm-4.7"], key_url: "https://open.bigmodel.cn/usercenter/apikeys" },
-    Preset { id: "minimax-cn", name: "MiniMax (China)", builtin: Some("minimax-cn"), models: &["MiniMax-M3", "MiniMax-M2.7"], key_url: "https://platform.minimaxi.com/user-center/basic-information/interface-key" },
-    Preset { id: "qwen-token-plan-cn", name: "Alibaba Qwen Token Plan (China)", builtin: Some("qwen-token-plan-cn"), models: &["qwen3.6-flash", "deepseek-v4-flash", "glm-5.1"], key_url: "https://bailian.console.aliyun.com/" },
+    Preset {
+        id: "opencode",
+        name: "OpenCode (recommended)",
+        builtin: Some("opencode-go"),
+        models: &[
+            "deepseek-v4.1-flash",
+            "deepseek-v4-pro",
+            "glm-5.3",
+            "kimi-k3",
+        ],
+        key_url: "https://opencode.ai/auth",
+    },
+    Preset {
+        id: "deepseek",
+        name: "DeepSeek",
+        builtin: None,
+        models: &["deepseek-flash", "deepseek-v4-pro"],
+        key_url: "https://platform.deepseek.com/api_keys",
+    },
+    Preset {
+        id: "anthropic",
+        name: "Anthropic Claude",
+        builtin: Some("anthropic"),
+        models: &["claude-sonnet-4-5", "claude-opus-4-6", "claude-haiku-4-5"],
+        key_url: "https://console.anthropic.com/settings/keys",
+    },
+    Preset {
+        id: "openai",
+        name: "OpenAI",
+        builtin: Some("openai"),
+        models: &["gpt-5.1", "gpt-5-mini", "gpt-4.1"],
+        key_url: "https://platform.openai.com/api-keys",
+    },
+    Preset {
+        id: "moonshotai-cn",
+        name: "Moonshot Kimi (China)",
+        builtin: Some("moonshotai-cn"),
+        models: &["kimi-k2.7-code", "kimi-k2-thinking"],
+        key_url: "https://platform.moonshot.cn/console/api-keys",
+    },
+    Preset {
+        id: "zai-coding-cn",
+        name: "Zhipu GLM Coding Plan (China)",
+        builtin: Some("zai-coding-cn"),
+        models: &["glm-5.1", "glm-4.7"],
+        key_url: "https://open.bigmodel.cn/usercenter/apikeys",
+    },
+    Preset {
+        id: "minimax-cn",
+        name: "MiniMax (China)",
+        builtin: Some("minimax-cn"),
+        models: &["MiniMax-M3", "MiniMax-M2.7"],
+        key_url: "https://platform.minimaxi.com/user-center/basic-information/interface-key",
+    },
+    Preset {
+        id: "qwen-token-plan-cn",
+        name: "Alibaba Qwen Token Plan (China)",
+        builtin: Some("qwen-token-plan-cn"),
+        models: &["qwen3.6-flash", "deepseek-v4-flash", "glm-5.1"],
+        key_url: "https://bailian.console.aliyun.com/",
+    },
     // Saves every catalog model over four protocols, not just these four; the
     // first entry seeds the template and becomes the default model.
-    Preset { id: "opencode-go", name: "OpenCode Go", builtin: Some("opencode-go"), models: &["deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "kimi-k3"], key_url: "https://opencode.ai/auth" },
-    Preset { id: "openrouter", name: "OpenRouter", builtin: Some("openrouter"), models: &["anthropic/claude-sonnet-4.5", "anthropic/claude-opus-4.6"], key_url: "https://openrouter.ai/keys" },
+    Preset {
+        id: "opencode-go",
+        name: "OpenCode Go",
+        builtin: Some("opencode-go"),
+        models: &[
+            "deepseek-v4.1-flash",
+            "deepseek-v4-pro",
+            "glm-5.3",
+            "kimi-k3",
+        ],
+        key_url: "https://opencode.ai/auth",
+    },
+    Preset {
+        id: "openrouter",
+        name: "OpenRouter",
+        builtin: Some("openrouter"),
+        models: &["anthropic/claude-sonnet-4.5", "anthropic/claude-opus-4.6"],
+        key_url: "https://openrouter.ai/keys",
+    },
 ];
 
 fn preset_by_id(id: &str) -> Option<&'static Preset> {
@@ -1001,13 +1162,18 @@ fn preset_key_env(preset: &Preset) -> String {
 }
 
 /// The saved provider for a preset, with models taken from the catalog.
-fn preset_provider(preset: &Preset, api_key: Option<String>) -> Result<deepseek_code_core::config::ProviderConfig> {
+fn preset_provider(
+    preset: &Preset,
+    api_key: Option<String>,
+) -> Result<deepseek_code_core::config::ProviderConfig> {
     let mut provider = config::provider_template(preset.models[0]);
     provider.id = preset.id.into();
     provider.name = preset.name.trim_end_matches(" (recommended)").into();
     // A pasted key is stored; otherwise the key is read from the environment.
     if api_key.is_none() {
-        provider.settings.insert("apiKeyEnv".into(), json!(preset_key_env(preset)));
+        provider
+            .settings
+            .insert("apiKeyEnv".into(), json!(preset_key_env(preset)));
     }
     provider.api_key = api_key;
     provider.enabled = true;
@@ -1070,8 +1236,11 @@ fn preset_provider(preset: &Preset, api_key: Option<String>) -> Result<deepseek_
                     } else {
                         model["api"].as_str().map(String::from)
                     };
-                    config.context_window = model["contextWindow"].as_u64().map(|value| value as u32);
-                    config.max_tokens = model["maxTokens"].as_u64().map(|value| (value as u32).min(32_000));
+                    config.context_window =
+                        model["contextWindow"].as_u64().map(|value| value as u32);
+                    config.max_tokens = model["maxTokens"]
+                        .as_u64()
+                        .map(|value| (value as u32).min(32_000));
                     config.supports_vision = model["inputTypes"]
                         .as_array()
                         .map(|items| {
@@ -1084,7 +1253,10 @@ fn preset_provider(preset: &Preset, api_key: Option<String>) -> Result<deepseek_
                     config
                 })
                 .collect();
-            ensure!(!provider.models.is_empty(), "No preset model is in the built-in catalog");
+            ensure!(
+                !provider.models.is_empty(),
+                "No preset model is in the built-in catalog"
+            );
         }
     }
     Ok(provider)
@@ -1102,14 +1274,22 @@ pub(crate) async fn verify(paths: &RuntimePaths, provider: &str, model: &str) ->
         .context("The saved provider could not be resolved")?;
     tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        deepseek_code_core::native_engine::generation::generate(resolved, "Reply OK.", "This is a connection test. Reply only OK."),
+        deepseek_code_core::native_engine::generation::generate(
+            resolved,
+            "Reply OK.",
+            "This is a connection test. Reply only OK.",
+        ),
     )
     .await
     .context("The connection test timed out")??;
     Ok(())
 }
 
-async fn configure_preset(paths: &RuntimePaths, input: &mut TerminalInput, preset: &Preset) -> Result<Option<config::Selection>> {
+async fn configure_preset(
+    paths: &RuntimePaths,
+    input: &mut TerminalInput,
+    preset: &Preset,
+) -> Result<Option<config::Selection>> {
     let key_env = preset_key_env(preset);
     // Keep the chosen model across a retry with another key.
     let mut chosen: Option<String> = None;
@@ -1126,15 +1306,26 @@ async fn configure_preset(paths: &RuntimePaths, input: &mut TerminalInput, prese
             } else {
                 command_eprintln!("Get an API key at {}", preset.key_url);
             }
-            let prompt = format!("Paste the API key (hidden), or press Enter to set {key_env} yourself: ");
-            let key = input.read_secret(&prompt).await?.context("Input closed")?.trim().to_owned();
+            let prompt =
+                format!("Paste the API key (hidden), or press Enter to set {key_env} yourself: ");
+            let key = input
+                .read_secret(&prompt)
+                .await?
+                .context("Input closed")?
+                .trim()
+                .to_owned();
             if key.is_empty() {
                 command_eprintln!("Set it in your shell, then start dcl again:");
                 command_eprintln!("  bash/zsh:   export {key_env}=<your key>");
-                command_eprintln!("  PowerShell: setx {key_env} \"<your key>\"   (then open a new terminal)");
+                command_eprintln!(
+                    "  PowerShell: setx {key_env} \"<your key>\"   (then open a new terminal)"
+                );
                 return Ok(None);
             }
-            anyhow::ensure!(!key.contains(char::is_whitespace), "An API key has no spaces; paste it again");
+            anyhow::ensure!(
+                !key.contains(char::is_whitespace),
+                "An API key has no spaces; paste it again"
+            );
             Some(key)
         };
         let provider = preset_provider(preset, api_key.clone())?;
@@ -1162,7 +1353,11 @@ async fn configure_preset(paths: &RuntimePaths, input: &mut TerminalInput, prese
                 command_eprintln!(
                     "Connected. {} is saved as the default provider{}.",
                     preset.name.trim_end_matches(" (recommended)"),
-                    if api_key.is_some() { " (key stored in config.json, readable only by you)" } else { "" }
+                    if api_key.is_some() {
+                        " (key stored in config.json, readable only by you)"
+                    } else {
+                        ""
+                    }
                 );
                 crate::config::save_default_model(paths, preset.id, &model)?;
                 return Ok(Some(select(paths, preset.id, &model)?));
@@ -1170,7 +1365,9 @@ async fn configure_preset(paths: &RuntimePaths, input: &mut TerminalInput, prese
             Err(error) => {
                 command_eprintln!("The connection test failed: {error:#}");
                 if api_key.is_none() {
-                    command_eprintln!("Check the value of {key_env}, or unset it to paste a key here.");
+                    command_eprintln!(
+                        "Check the value of {key_env}, or unset it to paste a key here."
+                    );
                     return Ok(None);
                 }
                 let again = ask(input, "Paste a different key? [Y/n]").await?;
@@ -1187,8 +1384,15 @@ async fn choose_default_model(
     input: &mut TerminalInput,
     provider: &deepseek_code_core::config::ProviderConfig,
 ) -> Result<String> {
-    let models: Vec<_> = provider.models.iter().filter(|model| model.enabled).collect();
-    ensure!(!models.is_empty(), "This provider has no models to choose from");
+    let models: Vec<_> = provider
+        .models
+        .iter()
+        .filter(|model| model.enabled)
+        .collect();
+    ensure!(
+        !models.is_empty(),
+        "This provider has no models to choose from"
+    );
     if models.len() < 2 {
         return Ok(models[0].id.clone());
     }
@@ -1198,7 +1402,11 @@ async fn choose_default_model(
             .iter()
             .map(|model| Entry {
                 title: model.id.clone(),
-                detail: if model.name == model.id { String::new() } else { model.name.clone() },
+                detail: if model.name == model.id {
+                    String::new()
+                } else {
+                    model.name.clone()
+                },
             })
             .collect();
         let picker = Picker {
@@ -1218,7 +1426,11 @@ async fn choose_default_model(
             "  {:>2}. {}{}",
             index + 1,
             model.id,
-            model.api.as_deref().map(|api| format!(" ({api})")).unwrap_or_default()
+            model
+                .api
+                .as_deref()
+                .map(|api| format!(" ({api})"))
+                .unwrap_or_default()
         );
     }
     let choice = ask(input, "Number [1]").await?;
@@ -1233,7 +1445,12 @@ async fn choose_default_model(
 /// First-run setup: pick a built-in provider (OpenCode by default), a saved
 /// one, or a custom endpoint; the key is checked before the session starts.
 pub async fn setup(paths: &RuntimePaths, input: &mut TerminalInput) -> Result<config::Selection> {
-    let saved: Vec<_> = paths.read_config()?.providers.into_iter().filter(|p| p.enabled).collect();
+    let saved: Vec<_> = paths
+        .read_config()?
+        .providers
+        .into_iter()
+        .filter(|p| p.enabled)
+        .collect();
     if saved.is_empty() {
         command_eprintln!("Welcome to DeepSeek Code! Connect a model provider to get started.");
     }
@@ -1245,14 +1462,25 @@ pub async fn setup(paths: &RuntimePaths, input: &mut TerminalInput) -> Result<co
         let custom = PRESETS.len() + 1;
         command_eprintln!("  {custom:>2}. Another OpenAI- or Anthropic-compatible endpoint");
         for provider in &saved {
-            let models: Vec<_> = provider.models.iter().filter(|m| m.enabled).map(|m| m.id.as_str()).collect();
+            let models: Vec<_> = provider
+                .models
+                .iter()
+                .filter(|m| m.enabled)
+                .map(|m| m.id.as_str())
+                .collect();
             command_eprintln!("      saved: {} ({})", provider.id, models.join(", "));
         }
         let choice = ask(input, "Number or saved provider ID [1]").await?;
-        let choice = if choice.is_empty() { "1".to_owned() } else { choice };
+        let choice = if choice.is_empty() {
+            "1".to_owned()
+        } else {
+            choice
+        };
         let result: Result<Option<config::Selection>> = async {
             match choice.parse::<usize>() {
-                Ok(number) if (1..=PRESETS.len()).contains(&number) => configure_preset(paths, input, &PRESETS[number - 1]).await,
+                Ok(number) if (1..=PRESETS.len()).contains(&number) => {
+                    configure_preset(paths, input, &PRESETS[number - 1]).await
+                }
                 Ok(number) if number == custom => {
                     let id = wizard(paths, input, None).await?;
                     let config = paths.read_config()?;
@@ -1267,8 +1495,16 @@ pub async fn setup(paths: &RuntimePaths, input: &mut TerminalInput) -> Result<co
                 }
                 Ok(_) => anyhow::bail!("Choose a number from the list"),
                 Err(_) => {
-                    let provider = saved.iter().find(|provider| provider.id == choice).context("No saved provider has that ID")?;
-                    let model = provider.models.iter().find(|m| m.enabled).map(|m| m.id.clone()).context("That provider has no enabled models")?;
+                    let provider = saved
+                        .iter()
+                        .find(|provider| provider.id == choice)
+                        .context("No saved provider has that ID")?;
+                    let model = provider
+                        .models
+                        .iter()
+                        .find(|m| m.enabled)
+                        .map(|m| m.id.clone())
+                        .context("That provider has no enabled models")?;
                     Ok(Some(select(paths, &choice, &model)?))
                 }
             }
@@ -1282,6 +1518,204 @@ pub async fn setup(paths: &RuntimePaths, input: &mut TerminalInput) -> Result<co
     }
 }
 
+/// One-line DeepSeek search state; the API key is never printed.
+pub(crate) fn search_summary(search: &DeepSeekSearchConfig) -> String {
+    format!(
+        "DeepSeek search: base URL {} | model {} | API key {}",
+        search.base_url.trim(),
+        search.model.trim(),
+        if search.api_key.trim().is_empty() {
+            "[not set]"
+        } else {
+            "[set]"
+        }
+    )
+}
+
+/// The short value shown for the search row in settings menus.
+pub(crate) fn search_status(search: &DeepSeekSearchConfig) -> String {
+    if search.api_key.trim().is_empty() {
+        "not configured".into()
+    } else {
+        format!("configured ({})", search.model.trim())
+    }
+}
+
+/// The saved WebFetch proxy, or `none`.
+pub(crate) fn fetch_proxy_status(web_fetch: &WebFetchConfig) -> String {
+    web_fetch.normalized_proxy().unwrap_or("none").to_owned()
+}
+
+fn search_base_url(value: &str) -> std::result::Result<String, String> {
+    let mut candidate = DeepSeekSearchConfig::default();
+    candidate.base_url = value.into();
+    candidate
+        .validate()
+        .map(|()| value.to_owned())
+        .map_err(|error| error.to_string())
+}
+
+fn search_model(value: &str) -> std::result::Result<String, String> {
+    let mut candidate = DeepSeekSearchConfig::default();
+    candidate.model = value.into();
+    candidate
+        .validate()
+        .map(|()| value.to_owned())
+        .map_err(|error| error.to_string())
+}
+
+/// A pasted API key stays on one line and within a reasonable size, so a
+/// whitespace or control character means the paste went wrong.
+fn validate_search_api_key(value: &str) -> std::result::Result<(), String> {
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("An API key has no spaces or control characters; paste it again".into());
+    }
+    if value.chars().count() > 8_192 {
+        return Err("An API key is at most 8192 characters; paste it again".into());
+    }
+    Ok(())
+}
+
+/// `/search-config` and `/config search`: a summary plus an optional wizard or
+/// one quick field. Values apply to the next search without restarting.
+pub(crate) async fn search_config(
+    argument: &str,
+    paths: &RuntimePaths,
+    input: &mut TerminalInput,
+) -> Result<()> {
+    let mut manager = ConfigManager::new(paths.data_dir.clone());
+    let mut search = manager.get_config().deepseek_search.clone();
+    let argument = argument.trim();
+    if !argument.is_empty() {
+        let (field, value) = argument
+            .split_once(char::is_whitespace)
+            .unwrap_or((argument, ""));
+        let value = value.trim();
+        match field {
+            "api_key" => {
+                ensure!(!value.is_empty(), "Usage: /config search api_key KEY");
+                if let Err(reason) = validate_search_api_key(value) {
+                    bail!("{reason}");
+                }
+                search.api_key = value.into();
+            }
+            "base_url" => {
+                ensure!(!value.is_empty(), "Usage: /config search base_url URL");
+                search.base_url = value.into();
+            }
+            "model" => {
+                ensure!(!value.is_empty(), "Usage: /config search model MODEL");
+                search.model = value.into();
+            }
+            "clear" => {
+                ensure!(value.is_empty(), "Usage: /config search clear");
+                search.api_key.clear();
+            }
+            _ => bail!("Usage: /config search [api_key KEY|base_url URL|model MODEL|clear]"),
+        }
+        search.validate()?;
+        let summary = search_summary(&search);
+        manager.update_config(|c| c.deepseek_search = search)?;
+        command_eprintln!("Updated {summary}");
+        return Ok(());
+    }
+    command_eprintln!("{}", search_summary(&search));
+    let mut accepted = false;
+    for _ in 0..3 {
+        let key = ask_secret(
+            input,
+            "DeepSeek Search API key (hidden; blank keeps current, 'clear' removes)",
+        )
+        .await?;
+        if key.is_empty() {
+            accepted = true;
+            break;
+        }
+        if key.eq_ignore_ascii_case("clear") {
+            search.api_key.clear();
+            accepted = true;
+            break;
+        }
+        match validate_search_api_key(&key) {
+            Ok(()) => {
+                search.api_key = key;
+                accepted = true;
+                break;
+            }
+            Err(reason) => command_eprintln!("  {reason}"),
+        }
+    }
+    ensure!(
+        accepted,
+        "Search API key setup cancelled after three invalid answers; nothing was saved"
+    );
+    let current_base_url = search.base_url.clone();
+    search.base_url = ask_valid(
+        input,
+        "Search API base URL",
+        Some(&current_base_url),
+        search_base_url,
+    )
+    .await?;
+    let current_model = search.model.clone();
+    search.model = ask_valid(input, "Search model", Some(&current_model), search_model).await?;
+    search.validate()?;
+    let summary = search_summary(&search);
+    manager.update_config(|c| c.deepseek_search = search)?;
+    command_eprintln!("Saved {summary}");
+    Ok(())
+}
+
+/// `/config fetch-proxy`: set or clear the WebFetch proxy, or ask for it.
+pub(crate) async fn fetch_proxy(
+    argument: &str,
+    paths: &RuntimePaths,
+    input: &mut TerminalInput,
+) -> Result<()> {
+    let mut manager = ConfigManager::new(paths.data_dir.clone());
+    let mut web_fetch = manager.get_config().web_fetch.clone();
+    let argument = argument.trim();
+    if !argument.is_empty() {
+        web_fetch.set_proxy(argument)?;
+        let status = fetch_proxy_status(&web_fetch);
+        manager.update_config(|c| c.web_fetch = web_fetch)?;
+        command_eprintln!("WebFetch proxy: {status}");
+        return Ok(());
+    }
+    command_eprintln!(
+        "WebFetch proxy: {} (use an HTTP proxy such as http://127.0.0.1:10808)",
+        fetch_proxy_status(&web_fetch)
+    );
+    for _ in 0..3 {
+        let answer = ask(
+            input,
+            "HTTP proxy URL (blank keeps current, clear/none/off removes)",
+        )
+        .await?;
+        if answer.is_empty() {
+            command_eprintln!(
+                "WebFetch proxy unchanged: {}",
+                fetch_proxy_status(&web_fetch)
+            );
+            return Ok(());
+        }
+        let mut candidate = web_fetch.clone();
+        match candidate.set_proxy(&answer) {
+            Ok(()) => {
+                let status = fetch_proxy_status(&candidate);
+                manager.update_config(|c| c.web_fetch = candidate)?;
+                command_eprintln!("Saved WebFetch proxy: {status}");
+                return Ok(());
+            }
+            Err(error) => command_eprintln!("  {error:#}"),
+        }
+    }
+    bail!("WebFetch proxy setup cancelled after three invalid answers; nothing was saved")
+}
+
 pub async fn handle(
     line: &str,
     paths: &RuntimePaths,
@@ -1292,9 +1726,7 @@ pub async fn handle(
     let command = words.next().unwrap_or_default();
     // Status uses the same scrollable report as a running turn. Config and
     // usage retain their settings tabs; arguments keep the text forms.
-    if words.clone().next().is_none()
-        && !input.is_fixture()
-        && crate::terminal::picker::available()
+    if words.clone().next().is_none() && !input.is_fixture() && crate::terminal::picker::available()
     {
         if command == "/status" {
             let text = crate::status_commands::text(session, "").await?;
@@ -1312,7 +1744,12 @@ pub async fn handle(
         }
     }
     if command == "/statusline" {
-        crate::statusline_commands::handle(line.strip_prefix("/statusline").unwrap().trim(), session, input).await?;
+        crate::statusline_commands::handle(
+            line.strip_prefix("/statusline").unwrap().trim(),
+            session,
+            input,
+        )
+        .await?;
         return Ok(true);
     }
     if command == "/config" {
@@ -1324,6 +1761,15 @@ pub async fn handle(
         )
         .await
         .map(|()| true);
+    }
+    if command == "/search-config" {
+        search_config(
+            line.trim().strip_prefix("/search-config").unwrap().trim(),
+            paths,
+            input,
+        )
+        .await?;
+        return Ok(true);
     }
     if !["/provider", "/model", "/test"].contains(&command) {
         return Ok(false);
@@ -1352,7 +1798,11 @@ pub async fn handle(
         (command, argument),
         ("/provider", Some("refresh")) | ("/model", Some("refresh"))
     ) {
-        let id = if command == "/provider" { words.next() } else { None };
+        let id = if command == "/provider" {
+            words.next()
+        } else {
+            None
+        };
         ensure!(
             words.next().is_none(),
             if command == "/provider" {
@@ -1375,7 +1825,11 @@ pub async fn handle(
                 ensure!(words.next().is_none(), "Unexpected argument");
                 if let Some(selection) = configure_preset(paths, input, preset).await? {
                     session.switch(paths, selection).await?;
-                    config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
+                    config::save_default_model(
+                        paths,
+                        &session.binding_state().provider_id,
+                        &session.binding_state().model,
+                    )?;
                     status(session);
                 }
                 return Ok(true);
@@ -1399,7 +1853,11 @@ pub async fn handle(
                 .map(|model| model.id.clone())
                 .context("The saved provider has no enabled models")?;
             session.switch(paths, select(paths, &id, &model)?).await?;
-            config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
+            config::save_default_model(
+                paths,
+                &session.binding_state().provider_id,
+                &session.binding_state().model,
+            )?;
             status(session);
         }
         return Ok(true);
@@ -1472,20 +1930,48 @@ pub async fn handle(
             use crate::terminal::picker::{Entry, Key, Picked, Picker};
             let efforts = crate::session_commands::EFFORTS;
             let current_effort = crate::session_commands::session_effort(session)?;
-            let mut effort = efforts.iter().position(|level| Some(*level) == current_effort.as_deref()).unwrap_or(0);
-            let mut selected = models.iter().position(|m| m.id == session.binding_state().model).unwrap_or(0);
+            let mut effort = efforts
+                .iter()
+                .position(|level| Some(*level) == current_effort.as_deref())
+                .unwrap_or(0);
+            let mut selected = models
+                .iter()
+                .position(|m| m.id == session.binding_state().model)
+                .unwrap_or(0);
             loop {
                 let entries: Vec<Entry> = models
                     .iter()
                     .map(|m| Entry {
-                        title: if m.id == session.binding_state().model { format!("{} \u{2714}", m.id) } else { m.id.clone() },
-                        detail: if m.name.is_empty() || m.name == m.id { String::new() } else { m.name.clone() },
+                        title: if m.id == session.binding_state().model {
+                            format!("{} \u{2714}", m.id)
+                        } else {
+                            m.id.clone()
+                        },
+                        detail: if m.name.is_empty() || m.name == m.id {
+                            String::new()
+                        } else {
+                            m.name.clone()
+                        },
                     })
                     .collect();
                 let level = efforts[effort];
-                let level_label = if level == "default" { "Default effort (model default)".to_owned() } else { format!("{}{} effort", level[..1].to_uppercase(), &level[1..]) };
-                let subtitle = format!("Switch between {} models. \u{25cf} {level_label} \u{2190}/\u{2192} to adjust", provider.name);
-                let picker = Picker { heading: "Select model", subtitle: Some(&subtitle), entries: &entries, search: false, hint: "Enter to switch \u{b7} Esc to cancel", selected };
+                let level_label = if level == "default" {
+                    "Default effort (model default)".to_owned()
+                } else {
+                    format!("{}{} effort", level[..1].to_uppercase(), &level[1..])
+                };
+                let subtitle = format!(
+                    "Switch between {} models. \u{25cf} {level_label} \u{2190}/\u{2192} to adjust",
+                    provider.name
+                );
+                let picker = Picker {
+                    heading: "Select model",
+                    subtitle: Some(&subtitle),
+                    entries: &entries,
+                    search: false,
+                    hint: "Enter to switch \u{b7} Esc to cancel",
+                    selected,
+                };
                 match picker.run_keys(&[Key::Left, Key::Right])? {
                     Picked::Key(Key::Left, index) => {
                         selected = index.unwrap_or(selected);
@@ -1496,20 +1982,31 @@ pub async fn handle(
                         effort = (effort + 1) % efforts.len();
                     }
                     Picked::Entry(index) => {
-                        let chosen = (efforts[effort] != "default").then(|| efforts[effort].to_owned());
+                        let chosen =
+                            (efforts[effort] != "default").then(|| efforts[effort].to_owned());
                         let effort_change = (chosen != current_effort).then_some(chosen.as_deref());
                         let change_model = models[index].id != session.binding_state().model;
                         if change_model || effort_change.is_some() {
-                            let selection = change_model.then(|| select(paths, &provider.id, &models[index].id)).transpose()?;
-                            session.switch_with_effort(paths, selection, effort_change).await?;
+                            let selection = change_model
+                                .then(|| select(paths, &provider.id, &models[index].id))
+                                .transpose()?;
+                            session
+                                .switch_with_effort(paths, selection, effort_change)
+                                .await?;
                         }
                         if let Some(level) = effort_change {
                             command_eprintln!("Session effort: {}", level.unwrap_or("default"));
                         }
                         if change_model {
-                            config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
+                            config::save_default_model(
+                                paths,
+                                &session.binding_state().provider_id,
+                                &session.binding_state().model,
+                            )?;
                             status(session);
-                            command_eprintln!("Conversation history preserved. Use /test to verify connectivity.");
+                            command_eprintln!(
+                                "Conversation history preserved. Use /test to verify connectivity."
+                            );
                         }
                         return Ok(true);
                     }
@@ -1546,7 +2043,11 @@ pub async fn handle(
     };
     let selection = select(paths, &provider, &model)?;
     session.switch(paths, selection).await?;
-    config::save_default_model(paths, &session.binding_state().provider_id, &session.binding_state().model)?;
+    config::save_default_model(
+        paths,
+        &session.binding_state().provider_id,
+        &session.binding_state().model,
+    )?;
     status(session);
     command_eprintln!("Conversation history preserved. Use /test to verify connectivity.");
     Ok(true)
@@ -1569,7 +2070,10 @@ mod tests {
         assert_eq!(PRESETS[0].id, "opencode");
         assert!(PRESETS[0].name.contains("recommended"));
         let opencode = preset_provider(&PRESETS[0], Some("oc-test".into())).unwrap();
-        assert_eq!(opencode.base_url, "https://opencode.ai/inference/go/openai/v1");
+        assert_eq!(
+            opencode.base_url,
+            "https://opencode.ai/inference/go/openai/v1"
+        );
         assert_eq!(opencode.settings["builtinId"], "opencode-go");
         assert_eq!(opencode.api_key.as_deref(), Some("oc-test"));
         assert_eq!(preset_key_env(&PRESETS[0]), "OPENCODE_API_KEY");
@@ -1578,14 +2082,21 @@ mod tests {
             .iter()
             .all(|model| model.api.as_deref() == Some("openai-responses")));
 
-        let deepseek = preset_provider(preset_by_id("deepseek").unwrap(), Some("sk-test".into())).unwrap();
+        let deepseek =
+            preset_provider(preset_by_id("deepseek").unwrap(), Some("sk-test".into())).unwrap();
         assert_eq!(deepseek.base_url, "https://api.deepseek.com");
         assert_eq!(deepseek.models[0].id, "deepseek-flash");
         assert_eq!(deepseek.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(preset_key_env(preset_by_id("moonshotai-cn").unwrap()), "MOONSHOT_API_KEY");
+        assert_eq!(
+            preset_key_env(preset_by_id("moonshotai-cn").unwrap()),
+            "MOONSHOT_API_KEY"
+        );
         let anthropic = preset_provider(preset_by_id("anthropic").unwrap(), None).unwrap();
         assert_eq!(anthropic.settings["builtinId"], "anthropic");
-        assert_eq!(anthropic.models[0].api.as_deref(), Some("anthropic-messages"));
+        assert_eq!(
+            anthropic.models[0].api.as_deref(),
+            Some("anthropic-messages")
+        );
     }
 
     #[test]
@@ -1597,13 +2108,12 @@ mod tests {
         assert_eq!(provider.settings["apiKeyEnv"], "OPENCODE_API_KEY");
         assert_eq!(preset_key_env(preset), "OPENCODE_API_KEY");
         // The preset lists every catalog model, so /provider add can offer them.
-        let catalog = deepseek_code_core::native_engine::provider_runtime::catalog_entry(
-            "opencode-go",
-        )
-        .unwrap()["models"]
-            .as_array()
-            .unwrap()
-            .len();
+        let catalog =
+            deepseek_code_core::native_engine::provider_runtime::catalog_entry("opencode-go")
+                .unwrap()["models"]
+                .as_array()
+                .unwrap()
+                .len();
         assert_eq!(provider.models.len(), catalog);
         assert!(provider
             .models
@@ -1684,14 +2194,28 @@ mod tests {
         assert_eq!(parse_protocol("4").unwrap(), "responses");
         assert_eq!(parse_protocol("OpenAI-Responses").unwrap(), "responses");
         assert!(parse_protocol("5").is_err());
-        let listed = vec!["model-a".to_owned(), "model-b".to_owned(), "model-c".to_owned()];
+        let listed = vec![
+            "model-a".to_owned(),
+            "model-b".to_owned(),
+            "model-c".to_owned(),
+        ];
         assert_eq!(parse_model_selection("", &listed).unwrap(), ["model-a"]);
-        assert_eq!(parse_model_selection("2,3", &listed).unwrap(), ["model-b", "model-c"]);
+        assert_eq!(
+            parse_model_selection("2,3", &listed).unwrap(),
+            ["model-b", "model-c"]
+        );
         assert_eq!(parse_model_selection("2,2", &listed).unwrap(), ["model-b"]);
         assert_eq!(parse_model_selection("all", &listed).unwrap(), listed);
-        assert_eq!(parse_model_selection("typed-model", &listed).unwrap(), ["typed-model"]);
-        assert!(parse_model_selection("9", &listed).unwrap_err().contains("1 to 3"));
-        assert!(parse_model_selection("two words", &listed).unwrap_err().contains("cannot contain spaces"));
+        assert_eq!(
+            parse_model_selection("typed-model", &listed).unwrap(),
+            ["typed-model"]
+        );
+        assert!(parse_model_selection("9", &listed)
+            .unwrap_err()
+            .contains("1 to 3"));
+        assert!(parse_model_selection("two words", &listed)
+            .unwrap_err()
+            .contains("cannot contain spaces"));
     }
 
     #[test]
@@ -1706,17 +2230,35 @@ mod tests {
             Ok(Credential::Env(name)) => assert_eq!(name, "DEEPSEEK_API_KEY"),
             other => panic!("an environment name was not recognised: {other:?}"),
         }
-        assert!(matches!(parse_credential("env:DEEPSEEK_API_KEY"), Ok(Credential::Env(_))));
-        assert!(matches!(parse_credential("key:DEEPSEEK_API_KEY"), Ok(Credential::Key(_))));
-        assert!(parse_credential("two words").unwrap_err().contains("no spaces"));
-        assert!(parse_credential("env:1KEY").unwrap_err().contains("letters, digits"));
-        assert!(parse_credential("").unwrap_err().contains("Enter an API key"));
+        assert!(matches!(
+            parse_credential("env:DEEPSEEK_API_KEY"),
+            Ok(Credential::Env(_))
+        ));
+        assert!(matches!(
+            parse_credential("key:DEEPSEEK_API_KEY"),
+            Ok(Credential::Key(_))
+        ));
+        assert!(parse_credential("two words")
+            .unwrap_err()
+            .contains("no spaces"));
+        assert!(parse_credential("env:1KEY")
+            .unwrap_err()
+            .contains("letters, digits"));
+        assert!(parse_credential("")
+            .unwrap_err()
+            .contains("Enter an API key"));
         assert_eq!(
             deepseek_base_url("anthropic", "https://api.deepseek.com/").as_deref(),
             Some("https://api.deepseek.com/anthropic")
         );
-        assert_eq!(deepseek_base_url("anthropic", "https://api.deepseek.com/anthropic"), None);
-        assert_eq!(deepseek_base_url("openai", "https://api.deepseek.com"), None);
+        assert_eq!(
+            deepseek_base_url("anthropic", "https://api.deepseek.com/anthropic"),
+            None
+        );
+        assert_eq!(
+            deepseek_base_url("openai", "https://api.deepseek.com"),
+            None
+        );
     }
 
     fn answers(lines: &[&str]) -> TerminalInput {
@@ -1784,18 +2326,49 @@ mod tests {
     async fn wizard_saves_responses_transport_and_edit_clears_it() {
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
-        wizard(&paths, &mut answers(&["responses-test", "4", "http://localhost:8317/v1", "UNSET_RESPONSES_TEST_KEY", "custom-model"]), None).await.unwrap();
+        wizard(
+            &paths,
+            &mut answers(&[
+                "responses-test",
+                "4",
+                "http://localhost:8317/v1",
+                "UNSET_RESPONSES_TEST_KEY",
+                "custom-model",
+            ]),
+            None,
+        )
+        .await
+        .unwrap();
         let saved = paths.read_config().unwrap();
-        let provider = saved.providers.iter().find(|p| p.id == "responses-test").unwrap();
+        let provider = saved
+            .providers
+            .iter()
+            .find(|p| p.id == "responses-test")
+            .unwrap();
         assert_eq!(provider.provider_type, "openai");
         assert_eq!(provider.settings["builtinId"], "openai");
         assert_eq!(provider.models[0].api.as_deref(), Some("openai-responses"));
         let runtime = deepseek_code_core::runtime::provider_from_config(provider);
         assert_eq!(runtime.builtin_id.as_deref(), Some("openai"));
         assert_eq!(runtime.models[0].api.as_deref(), Some("openai-responses"));
-        wizard(&paths, &mut answers(&["1", "http://localhost:8317/v1", "UNSET_RESPONSES_TEST_KEY", "custom-model"]), Some("responses-test")).await.unwrap();
+        wizard(
+            &paths,
+            &mut answers(&[
+                "1",
+                "http://localhost:8317/v1",
+                "UNSET_RESPONSES_TEST_KEY",
+                "custom-model",
+            ]),
+            Some("responses-test"),
+        )
+        .await
+        .unwrap();
         let saved = paths.read_config().unwrap();
-        let provider = saved.providers.iter().find(|p| p.id == "responses-test").unwrap();
+        let provider = saved
+            .providers
+            .iter()
+            .find(|p| p.id == "responses-test")
+            .unwrap();
         assert!(!provider.settings.contains_key("builtinId"));
         assert!(provider.models[0].api.is_none());
     }
@@ -1831,7 +2404,10 @@ mod tests {
 
     #[tokio::test]
     async fn wizard_accepts_a_pasted_key_and_can_switch_back_to_a_variable() {
-        use axum::{routing::{get, post}, Json, Router};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let app = Router::new()
@@ -1887,7 +2463,10 @@ mod tests {
 
     #[tokio::test]
     async fn wizard_keeps_a_provider_saved_when_the_connection_test_fails() {
-        use axum::{routing::{get, post}, Json, Router};
+        use axum::{
+            routing::{get, post},
+            Json, Router,
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         let app = Router::new()
@@ -2054,9 +2633,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn listing_fixture(
-        models: serde_json::Value,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+    async fn listing_fixture(models: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
         listing_fixture_with(models, || {}).await
     }
 
@@ -2090,7 +2667,8 @@ mod tests {
     async fn refresh_adds_and_removes_models_and_keeps_same_id_settings() {
         let (base, server) = listing_fixture(json!({
             "data": [{"id": "keep"}, {"id": "new"}],
-        })).await;
+        }))
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
         let mut provider = refresh_provider_config(
@@ -2111,14 +2689,22 @@ mod tests {
         let saved = paths.read_config().unwrap();
         let provider = saved.providers.iter().find(|p| p.id == "one").unwrap();
         assert_eq!(
-            provider.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            provider
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             ["keep", "new"]
         );
         assert_eq!(provider.models[0].name, "Local keep");
         assert_eq!(provider.models[0].context_window, Some(1234));
         assert!(provider.models[1].enabled, "a new model starts enabled");
         assert_eq!(session.binding_state().provider_id, "one");
-        assert_eq!(session.binding_state().model, "keep", "the current model still exists");
+        assert_eq!(
+            session.binding_state().model,
+            "keep",
+            "the current model still exists"
+        );
         session.close().await.unwrap();
         server.abort();
     }
@@ -2152,7 +2738,8 @@ mod tests {
     async fn refresh_switches_a_removed_current_model_and_preserves_history() {
         let (base, server) = listing_fixture(json!({
             "data": [{"id": "keep"}, {"id": "new"}],
-        })).await;
+        }))
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
         let provider = refresh_provider_config(
@@ -2170,18 +2757,30 @@ mod tests {
             .unwrap();
         let before = serde_json::to_value(session.store.history(&session.id).unwrap()).unwrap();
 
-        handle("/provider refresh one", &paths, &mut session, &mut answers(&["2"]))
-            .await
-            .unwrap();
+        handle(
+            "/provider refresh one",
+            &paths,
+            &mut session,
+            &mut answers(&["2"]),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(session.binding_state().provider_id, "one");
-        assert_eq!(session.binding_state().model, "new", "the replacement is selected");
+        assert_eq!(
+            session.binding_state().model,
+            "new",
+            "the replacement is selected"
+        );
         assert_eq!(
             before,
             serde_json::to_value(session.store.history(&session.id).unwrap()).unwrap(),
             "conversation history is preserved"
         );
-        assert_eq!(config::default_model(&paths), Some(("one".into(), "new".into())));
+        assert_eq!(
+            config::default_model(&paths),
+            Some(("one".into(), "new".into()))
+        );
         session.close().await.unwrap();
         server.abort();
     }
@@ -2218,15 +2817,18 @@ mod tests {
             .unwrap();
         config::save_default_model(&paths, "two", "other").unwrap();
         let before = paths.read_config().unwrap();
-        let two_before = serde_json::to_value(
-            before.providers.iter().find(|p| p.id == "two").unwrap(),
-        )
-        .unwrap();
+        let two_before =
+            serde_json::to_value(before.providers.iter().find(|p| p.id == "two").unwrap()).unwrap();
         let mut session = open_refresh_session(&paths, "one", "keep").await;
 
-        let error = handle("/provider refresh one", &paths, &mut session, &mut answers(&[]))
-            .await
-            .unwrap_err();
+        let error = handle(
+            "/provider refresh one",
+            &paths,
+            &mut session,
+            &mut answers(&[]),
+        )
+        .await
+        .unwrap_err();
 
         let message = format!("{error:#}");
         assert!(
@@ -2238,13 +2840,15 @@ mod tests {
             saved.providers.iter().all(|provider| provider.id != "one"),
             "the concurrent removal stands"
         );
-        let two_after = serde_json::to_value(
-            saved.providers.iter().find(|p| p.id == "two").unwrap(),
-        )
-        .unwrap();
+        let two_after =
+            serde_json::to_value(saved.providers.iter().find(|p| p.id == "two").unwrap()).unwrap();
         assert_eq!(two_after, two_before, "the other provider is unchanged");
         assert_eq!(session.binding_state().provider_id, "one");
-        assert_eq!(session.binding_state().model, "keep", "the session is unchanged");
+        assert_eq!(
+            session.binding_state().model,
+            "keep",
+            "the session is unchanged"
+        );
         assert_eq!(
             config::default_model(&paths),
             Some(("two".into(), "other".into())),
@@ -2291,15 +2895,18 @@ mod tests {
             ))
             .unwrap();
         let before = paths.read_config().unwrap();
-        let two_before = serde_json::to_value(
-            before.providers.iter().find(|p| p.id == "two").unwrap(),
-        )
-        .unwrap();
+        let two_before =
+            serde_json::to_value(before.providers.iter().find(|p| p.id == "two").unwrap()).unwrap();
         let mut session = open_refresh_session(&paths, "one", "keep").await;
 
-        let error = handle("/provider refresh one", &paths, &mut session, &mut answers(&[]))
-            .await
-            .unwrap_err();
+        let error = handle(
+            "/provider refresh one",
+            &paths,
+            &mut session,
+            &mut answers(&[]),
+        )
+        .await
+        .unwrap_err();
 
         let message = format!("{error:#}");
         assert!(
@@ -2318,13 +2925,15 @@ mod tests {
             Some(999_999),
             "the concurrent edit stands"
         );
-        let two_after = serde_json::to_value(
-            saved.providers.iter().find(|p| p.id == "two").unwrap(),
-        )
-        .unwrap();
+        let two_after =
+            serde_json::to_value(saved.providers.iter().find(|p| p.id == "two").unwrap()).unwrap();
         assert_eq!(two_after, two_before, "the other provider is unchanged");
         assert_eq!(session.binding_state().provider_id, "one");
-        assert_eq!(session.binding_state().model, "keep", "the session is unchanged");
+        assert_eq!(
+            session.binding_state().model,
+            "keep",
+            "the session is unchanged"
+        );
         session.close().await.unwrap();
         server.abort();
     }
@@ -2368,9 +2977,14 @@ mod tests {
         // The current model survives the refresh, so no prompt appears.
         let mut session = open_refresh_session(&paths, "one", "keep").await;
 
-        handle("/provider refresh one", &paths, &mut session, &mut answers(&[]))
-            .await
-            .unwrap();
+        handle(
+            "/provider refresh one",
+            &paths,
+            &mut session,
+            &mut answers(&[]),
+        )
+        .await
+        .unwrap();
 
         let saved = paths.read_config().unwrap();
         let one = saved.providers.iter().find(|p| p.id == "one").unwrap();
@@ -2489,7 +3103,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(session.binding_state().model, "keep", "the current model is unchanged");
+        assert_eq!(
+            session.binding_state().model,
+            "keep",
+            "the current model is unchanged"
+        );
         assert_eq!(
             config::default_model(&paths),
             Some(("one".into(), "new".into())),
@@ -2584,7 +3202,10 @@ mod tests {
             .await
             .unwrap_err();
         let message = format!("{error:#}");
-        assert!(message.contains("previous model list was restored"), "{message}");
+        assert!(
+            message.contains("previous model list was restored"),
+            "{message}"
+        );
         assert_eq!(
             paths.read_config().unwrap().providers[0]
                 .models
@@ -2594,7 +3215,11 @@ mod tests {
             ["keep", "gone"],
             "the saved list is restored"
         );
-        assert_eq!(session.binding_state().model, "gone", "the session is unchanged");
+        assert_eq!(
+            session.binding_state().model,
+            "gone",
+            "the session is unchanged"
+        );
         session
             .store
             .db
@@ -2648,7 +3273,11 @@ mod tests {
             ["keep", "gone"],
             "the saved list is restored"
         );
-        assert_eq!(session.binding_state().model, "gone", "the session is restored");
+        assert_eq!(
+            session.binding_state().model,
+            "gone",
+            "the session is restored"
+        );
         assert_eq!(
             std::fs::read(&cli_path).unwrap(),
             before,
@@ -2700,15 +3329,26 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(session.binding_state().provider_id, "one", "another provider stays unselected");
+        assert_eq!(
+            session.binding_state().provider_id,
+            "one",
+            "another provider stays unselected"
+        );
         assert_eq!(session.binding_state().model, "current");
         let saved = paths.read_config().unwrap();
         let provider = saved.providers.iter().find(|p| p.id == "two").unwrap();
         assert_eq!(
-            provider.models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            provider
+                .models
+                .iter()
+                .map(|m| m.id.as_str())
+                .collect::<Vec<_>>(),
             ["fresh"]
         );
-        assert_eq!(config::default_model(&paths), Some(("two".into(), "fresh".into())));
+        assert_eq!(
+            config::default_model(&paths),
+            Some(("two".into(), "fresh".into()))
+        );
         session.close().await.unwrap();
         server.abort();
     }
@@ -2736,14 +3376,25 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains("Usage: /provider refresh [ID]"), "{error:#}");
+        assert!(
+            error.to_string().contains("Usage: /provider refresh [ID]"),
+            "{error:#}"
+        );
         let error = handle("/model refresh extra", &paths, &mut session, &mut input)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("Usage: /model refresh"), "{error:#}");
-        let error = handle("/provider refresh missing", &paths, &mut session, &mut input)
-            .await
-            .unwrap_err();
+        assert!(
+            error.to_string().contains("Usage: /model refresh"),
+            "{error:#}"
+        );
+        let error = handle(
+            "/provider refresh missing",
+            &paths,
+            &mut session,
+            &mut input,
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("is not saved"), "{error:#}");
         assert_eq!(
             paths
@@ -2773,7 +3424,9 @@ mod tests {
         );
         provider.models[0].api = Some("anthropic-messages".into());
         assert_eq!(refresh_endpoint(&provider).unwrap().1, "anthropic");
-        provider.models.insert(0, config::provider_template("model-b").models.remove(0));
+        provider
+            .models
+            .insert(0, config::provider_template("model-b").models.remove(0));
         let error = refresh_endpoint(&provider).unwrap_err();
         assert!(error.to_string().contains("several protocols"), "{error:#}");
 
@@ -2793,7 +3446,10 @@ mod tests {
         assert_eq!(provider_api_key(&provider).unwrap(), "from-environment");
         std::env::remove_var(env);
         let error = provider_api_key(&provider).unwrap_err().to_string();
-        assert!(error.contains(env), "the variable name is reported: {error}");
+        assert!(
+            error.contains(env),
+            "the variable name is reported: {error}"
+        );
         assert!(!error.contains("from-environment"), "{error}");
         assert!(!error.contains("from-config"), "{error}");
 
@@ -2808,6 +3464,211 @@ mod tests {
         provider.api_key = None;
         let error = provider_api_key(&provider).unwrap_err().to_string();
         assert!(error.contains(&builtin_env), "{error}");
+    }
+
+    async fn config_test_session(paths: &RuntimePaths) -> Session {
+        let mut provider = config::provider_template("model-a");
+        provider.id = "one".into();
+        provider.api_key = Some("fixture-only".into());
+        ConfigManager::new(paths.data_dir.clone())
+            .add_provider(provider)
+            .unwrap();
+        let cli = Cli::parse_from(["dcl"]);
+        Session::open(&cli, paths, select(paths, "one", "model-a").unwrap(), None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn search_config_interactive_and_quick_forms_save_masked_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+
+        let mut input = answers(&["sk-search-fixture", "", "deepseek-pro"]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.api_key, "sk-search-fixture");
+        assert_eq!(saved.base_url, "https://api.deepseek.com/anthropic/v1");
+        assert_eq!(saved.model, "deepseek-pro");
+        let summary = search_summary(&saved);
+        assert!(summary.contains("[set]"), "{summary}");
+        assert!(!summary.contains("sk-search-fixture"), "{summary}");
+
+        let mut empty = answers(&[]);
+        handle(
+            "/config search api_key quick-key",
+            &paths,
+            &mut session,
+            &mut empty,
+        )
+        .await
+        .unwrap();
+        let mut interactive = answers(&["", "https://search.example/v1", ""]);
+        handle("/config search", &paths, &mut session, &mut interactive)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.api_key, "quick-key");
+        assert_eq!(saved.base_url, "https://search.example/v1");
+        assert_eq!(saved.model, "deepseek-pro", "blank keeps the current model");
+
+        assert!(handle(
+            "/config search base_url ftp://example.com",
+            &paths,
+            &mut session,
+            &mut empty
+        )
+        .await
+        .is_err());
+        assert_eq!(
+            paths.read_config().unwrap().deepseek_search.base_url,
+            "https://search.example/v1",
+            "a rejected base URL keeps the saved value"
+        );
+
+        handle("/config search clear", &paths, &mut session, &mut empty)
+            .await
+            .unwrap();
+        assert!(paths
+            .read_config()
+            .unwrap()
+            .deepseek_search
+            .api_key
+            .is_empty());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_config_rejects_whitespace_keys_and_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+
+        let mut input = answers(&["sk-bad key", "sk-good-key", "", ""]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        assert_eq!(
+            paths.read_config().unwrap().deepseek_search.api_key,
+            "sk-good-key",
+            "a key with whitespace is rejected and the next answer is used"
+        );
+
+        let mut invalid = answers(&["a b", "c\td", "e f"]);
+        assert!(handle("/search-config", &paths, &mut session, &mut invalid)
+            .await
+            .is_err());
+        assert_eq!(
+            paths.read_config().unwrap().deepseek_search.api_key,
+            "sk-good-key",
+            "three invalid keys save nothing"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_config_quick_form_rejects_whitespace_keys_without_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+        let mut input = answers(&[]);
+
+        handle(
+            "/config search api_key sk-good-key",
+            &paths,
+            &mut session,
+            &mut input,
+        )
+        .await
+        .unwrap();
+        for invalid in [
+            "/config search api_key \"bad key\"",
+            "/config search api_key bad\tkey",
+        ] {
+            assert!(handle(invalid, &paths, &mut session, &mut input)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            paths.read_config().unwrap().deepseek_search.api_key,
+            "sk-good-key",
+            "a rejected quick key keeps the saved value"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fetch_proxy_quick_and_interactive_forms_save_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+        let proxy = || paths.read_config().unwrap().web_fetch.proxy;
+        let mut input = answers(&[]);
+
+        handle(
+            "/config fetch-proxy http://127.0.0.1:10808",
+            &paths,
+            &mut session,
+            &mut input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(proxy().as_deref(), Some("http://127.0.0.1:10808"));
+        handle(
+            "/config fetch-proxy clear",
+            &paths,
+            &mut session,
+            &mut input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(proxy(), None);
+
+        let mut prompt = answers(&["http://127.0.0.1:10809"]);
+        handle("/config fetch-proxy", &paths, &mut session, &mut prompt)
+            .await
+            .unwrap();
+        assert_eq!(proxy().as_deref(), Some("http://127.0.0.1:10809"));
+
+        let mut prompt = answers(&["off"]);
+        handle("/config fetch-proxy", &paths, &mut session, &mut prompt)
+            .await
+            .unwrap();
+        assert_eq!(proxy(), None);
+
+        handle(
+            "/config fetch-proxy http://127.0.0.1:10810",
+            &paths,
+            &mut session,
+            &mut input,
+        )
+        .await
+        .unwrap();
+        let mut prompt = answers(&["socks5://127.0.0.1:1080", "http://127.0.0.1:10811"]);
+        handle("/config fetch-proxy", &paths, &mut session, &mut prompt)
+            .await
+            .unwrap();
+        assert_eq!(
+            proxy().as_deref(),
+            Some("http://127.0.0.1:10811"),
+            "a retry replaces the rejected answer"
+        );
+
+        let mut invalid = answers(&["socks5://a", "socks5://b", "socks5://c"]);
+        assert!(
+            handle("/config fetch-proxy", &paths, &mut session, &mut invalid)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            proxy().as_deref(),
+            Some("http://127.0.0.1:10811"),
+            "three invalid answers save nothing"
+        );
+        session.close().await.unwrap();
     }
 }
 
@@ -2828,7 +3689,8 @@ async fn settings_menu(
             argument
         } else {
             let display = crate::display_commands::load(session)?;
-            command_eprintln!("Settings | {}\nProvider: {} | Model: {}\nPermissions: {} | Theme: {} | Color: {} | Focus: {} | Renderer: {}\nprovider | model | permissions | theme | color | focus | output-style | statusline | tui | effort | autocompact\nChoose a setting, or enter done to return.", paths.data_dir.display(), session.binding_state().provider_id, session.binding_state().model, session.permission_mode(), display.theme, display.color, display.focus, display.tui);
+            let saved = paths.read_config()?;
+            command_eprintln!("Settings | {}\nProvider: {} | Model: {}\nSearch: {} | WebFetch proxy: {}\nPermissions: {} | Theme: {} | Color: {} | Focus: {} | Renderer: {}\nprovider | model | permissions | theme | color | focus | output-style | statusline | tui | effort | autocompact | search | fetch-proxy\nChoose a setting, or enter done to return.", paths.data_dir.display(), session.binding_state().provider_id, session.binding_state().model, search_status(&saved.deepseek_search), fetch_proxy_status(&saved.web_fetch), session.permission_mode(), display.theme, display.color, display.focus, display.tui);
             ask(input, "Setting").await?
         };
         if matches!(choice.as_str(), "" | "done" | "exit") {
@@ -2849,12 +3711,16 @@ async fn settings_menu(
                 "statusline",
                 "tui",
                 "effort",
-                "autocompact"
+                "autocompact",
+                "search",
+                "fetch-proxy"
             ]
             .contains(&setting),
             "Unknown setting"
         );
-        let value = if value.trim().is_empty() && !matches!(setting, "provider" | "model") {
+        let value = if value.trim().is_empty()
+            && !matches!(setting, "provider" | "model" | "search" | "fetch-proxy")
+        {
             ask(
                 input,
                 &format!("{setting} value (blank uses command default)"),
@@ -2871,6 +3737,10 @@ async fn settings_menu(
                 input,
             ))
             .await?;
+        } else if setting == "search" {
+            search_config(&value, paths, input).await?;
+        } else if setting == "fetch-proxy" {
+            fetch_proxy(&value, paths, input).await?;
         } else if setting == "statusline" {
             crate::statusline_commands::handle(&value, session, input).await?;
         } else if setting == "permissions" {
