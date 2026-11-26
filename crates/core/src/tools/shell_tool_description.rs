@@ -9,9 +9,11 @@ use super::background_shell;
 use crate::services::shell_settings::{self, ResolvedShell, ShellSettings};
 use std::sync::Mutex;
 
-const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call runs in a new process. Explicit background tasks start in the workspace.
+const BASH_DESCRIPTION: &str = "Run a command and read its output. Each call spawns a new process, while foreground calls keep the previous foreground directory across calls. Explicit background tasks start in the workspace.
 
-A foreground timeout in a managed session returns recent output and a task_id while the process continues. Without a managed session, the timeout stops the process tree. Read the task with TaskGet, use block:true to wait for completion, or end it with TaskStop.
+Combine related steps into one call with `&&` (dependent) or `;` (independent checks) instead of issuing one short command per turn.
+
+A foreground timeout in a managed session returns recent output and a task_id while the process continues. Without a managed session, the timeout stops the process tree. Read the task with TaskGet, use block:true to wait for completion, or end it with TaskStop. Do not poll background tasks with `sleep` loops: wait for completion notifications, run a command you must wait on in the foreground with an explicit `timeout`, or use TaskGet (`block: true`) / Monitor.
 
 When a call ends, every process it started is stopped, including background children. A server, daemon or other service that must keep running after the call has to be started with `detach: true`, which returns its PID and log files; stop it yourself when it is no longer needed.
 
@@ -146,7 +148,7 @@ fn append_execution_note(note: &mut String, shell: &ResolvedShell, host_os: &str
     note.push_str(if name == "fish" {
         " Foreground commands start in the workspace."
     } else {
-        " A foreground call starts in the previous foreground call's directory; the first foreground call of a new session reports its starting directory in `cwd`, and later calls report `cwd` only when they change it. Add a leading `cd` only to change it; use `(cd ... && ...)` or `git -C` for a temporary switch. Other tools still resolve relative paths against the primary working directory."
+        " A foreground call starts in the previous foreground call's directory and always reports its resulting directory in `cwd`. Do not repeat `cd` to a directory you are already in; add a leading `cd` only to change directories, or use `(cd ... && ...)` or `git -C` for a temporary switch. Other tools still resolve relative paths against the primary working directory."
     });
     if super::pipeline_failure_flag(shell.command_flag, name, shell.wsl.is_some()) {
         note.push_str(" With pipefail enabled, a failing pipeline stage can surface even when the last stage succeeds.");
@@ -530,7 +532,7 @@ mod tests {
             assert_eq!(text.contains("PowerShell 5.1"), name == "powershell");
             assert_eq!(text.contains("PowerShell 7"), name == "pwsh");
             assert_eq!(
-                text.contains("first foreground call of a new session reports"),
+                text.contains("always reports its resulting directory in `cwd`"),
                 name != "fish"
             );
             assert_eq!(
