@@ -310,6 +310,26 @@ cargo test --locked -p deepseek-code-core --lib current_rejects_a_worker_record
 
 第 1、2、4 条及 banner 的终端渲染需要真实 pty。2026-11-26 已在 macOS 用 tmux + 本地 mock SSE 跑通：owner 为 `dcl --resume ID --print`，observer 在 40×140 tmux 面板中 `dcl --resume ID`；banner、已发布文本、未提交提示、owner 结束后的输入恢复均通过，且观察期间没有模型请求。脚本和日志见 `dev-support/deepseek-code/session-occupancy-20261126/`（`dcl_occupancy_tmux.py`、`pty-run.log`）。Windows ConPTY 尚未运行。第 5 条由 `worker_frontend::failure_tests::losing_the_goal_proposal_frontend_keeps_the_task_view_and_its_output` 覆盖：running job 的 proposal presence 被另一 live frontend 接管后，观察只记录失败、禁用提案 UI，任务完成且无 cancel/detach。banner 去重由 `observe::tests::a_caller_banner_suppresses_the_first_running_notice` 覆盖；`/loop stop-*` 边界由 `turn_command_tests` 覆盖。`read_prompt` 期间被另一进程接管的 tick 门禁尚未用真实 pty 重跑。
 
+#### D10. 已删除目录的只读恢复
+
+保存的工程目录或绑定的会话 worktree 被删除后，历史仍在 `global.db` 与 `data/sessions/<id>/session.db`。交互式 REPL 必须能只读打开，严格执行路径仍必须失败。
+
+1. **严格路径不变**：`dcl --print --resume <id> …`、`--input-format stream-json`、`--fork-session`、`--init-only`、SDK、worker、Desktop 和 `--continue` 仍返回缺失目录错误（工程目录为 `Folder must be an existing absolute directory` / `Project folder is unavailable`，绑定 worktree 为 `Conversation worktree is unavailable; restore it before continuing`）。不得把这些入口降级为只读。
+2. **交互式 `dcl --resume <id>`**：不改变启动 cwd，不写目标会话库，不设置权限模式，不运行 SessionStart/Setup hooks，不注册协调行；显示 banner、完整历史与 `✻ Read-only mode: directory no longer exists (<path>).`。普通提示、多行提示、skill 提示、remote 提示、`!命令` 与 `# 记忆` 都提示未提交；`Shift+Tab` 与 effort 键提示只读；`/history`、`/export`、`/copy`、`/context`、`/cost`、`/status`、`/stats`、`/sessions`、`/tasks list|show|sessions|records`、主题/颜色/输出样式的无参数查看、`/help`、`/exit` 可用；`/clear`、`/branch`、`/compact`、`/model`、`/effort`、`/permissions`、`/rename`、`/config`、`/tasks cancel|answer|stop-session|attach` 等起始回合或修改会话/工作区的命令被拒绝。
+3. **切换**：在有效会话中输入 `/resume <缺失会话>` 进入只读；缺失目录不得显示为可写。`/resume` 选择器按 `Ctrl+A` 显示所有项目时，缺失目录的详情行带 ` · [missing]`。再次 `/resume <有效会话>` 恢复可写、权限模式和宿主 lifecycle hooks；重建缺失目录后 `/resume <原会话>` 也恢复可写。
+4. **保存的 provider/model 已从 `config.json` 删除**：仍以 observation-only 的显示绑定打开，状态行和 `/status` 显示保存的 provider/model 与 `read-only (directory missing)`，`/status` 不探测 worker、工具或语言服务器，状态行外部脚本不执行。
+5. **数据安全**：只读打开前后目标会话的 `updated_at`、`message_count` 与权限模式行不变；`turn()`、`clear()`、`branch_saved()`、`set_permission_mode()`、`cycle_permission_mode()` 均被门禁拒绝；`sync_workspace()` 无操作。信任、归档、非 Code、现有目录 canonical 路径变化等错误仍与严格 resume 一致，缺失目录不是信任绕过。
+
+自动回归：
+
+```bash
+cargo test --locked -p deepseek-code-core --lib inspection_tests
+cargo test --locked -p deepseek-code-cli --bin dcl missing_workspace_tests
+cargo test --locked -p deepseek-code-cli --bin dcl resume_tests
+```
+
+`inspection_tests` 覆盖缺失工程目录、缺失绑定 worktree、未信任、现有目录路径漂移、归档会话/工程、非 Code 会话与 projectless 私有目录；`missing_workspace_tests` 覆盖有效→缺失→有效、重建目录、缺失 provider、状态/模型标签、命令白名单与只读 footer；`resume_tests` 覆盖 `[missing]` 标记。macOS 默认 soft fd limit（256）会让 core 全量测试出现 `Too many open files`，先 `ulimit -n 8192`；该全量套件另有与本次改动无关的并行 cwd/超时失败，单独重跑通过。真实交互需要隔离数据目录与 PTY：先创建一个有历史的会话并删除其目录，再在另一目录运行 `dcl --resume <id>` 或 `/resume <id>`，确认只读 banner、历史、拒绝输入、`/history`/`/status`、`/resume <有效>` 恢复；在 `--resume` 选择器中按 `Ctrl+A` 选择带 `[missing]` 的条目。Windows ConPTY、Desktop WebView 和真实 provider 未在本轮验证。
+
 ### F. /tasks
 
 有两个后台命令时输入 `/tasks`：

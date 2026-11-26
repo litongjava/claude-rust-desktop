@@ -50,6 +50,80 @@ fn settle_abandoned_turns(
 
 }
 
+/// A saved session whose recorded working directory is gone. History stays
+/// readable, but every execution or mutation path stays closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MissingWorkspace {
+    pub path: std::path::PathBuf,
+    pub reason: String,
+}
+
+/// Whether a slash command only inspects the saved conversation.
+///
+/// Kept as one explicit boundary so a missing-directory session cannot mutate
+/// the session, start hooks, run tools or open a mutating picker.
+pub(crate) fn allowed_in_missing_workspace_readonly(command: &str, argument: &str) -> bool {
+    let command = crate::command_catalog::canonical(command.trim());
+    let argument = argument.trim();
+    match command {
+        "/resume" | "/history" | "/export" | "/copy" | "/copy-session-id" | "/context"
+        | "/cost" | "/usage" | "/status" | "/stats" | "/sessions" | "/help" | "/vim"
+        | "/scroll-speed" => true,
+        "/exit" | "/quit" => argument.is_empty(),
+        "/theme" | "/color" | "/output-style" => argument.is_empty(),
+        "/tasks" => {
+            let mut parts = argument.split_whitespace();
+            match parts.next() {
+                None => true,
+                Some(
+                    "list" | "running" | "completed" | "failed" | "sessions",
+                ) => parts.next().is_none(),
+                Some("records") => parts.next().is_none_or(|legacy| legacy == "legacy" && parts.next().is_none()),
+                Some("show") => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Keep filesystem text from injecting terminal control sequences.
+pub(crate) fn terminal_safe(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
+/// The read-only action a REPL line would perform, or `None` when it is safe.
+pub(crate) fn missing_workspace_rejected_action(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.starts_with('!') {
+        return Some("shell commands".into());
+    }
+    if line.starts_with("# ") {
+        return Some("memory notes".into());
+    }
+    let (command, argument) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let canonical = crate::command_catalog::canonical(command);
+    if canonical.starts_with('/') {
+        if allowed_in_missing_workspace_readonly(canonical, argument) {
+            return None;
+        }
+        return Some(format!("`{canonical}`"));
+    }
+    if argument.trim().is_empty()
+        && matches!(
+            canonical,
+            "exit" | "quit" | ".exit" | ":q" | "help" | ".help" | ":h" | "status"
+                | ".status" | "history" | ".history"
+        )
+    {
+        return None;
+    }
+    Some("the prompt".into())
+}
+
 pub struct Session {
     pub(crate) binding_requester: String,
     launch_binding_rejected: bool,
@@ -88,7 +162,12 @@ pub struct Session {
     pub(crate) full_access: bool,
     providers: Arc<Mutex<ProviderManager>>,
     pub(crate) workspace: std::path::PathBuf,
+    /// Display-only reason the saved directory cannot be written.
+    missing_workspace: Option<MissingWorkspace>,
     lifecycle_owned: bool,
+    /// Whether this host owned lifecycle hooks before a missing-directory
+    /// session temporarily suspended them.
+    host_lifecycle_owned: bool,
     remote_relay: std::sync::Mutex<Option<deepseek_code_core::services::remote_control::Relay>>,
     /// Registry incarnation owned by this session; closed on resume or teardown.
     pub(crate) coordination:
@@ -752,10 +831,50 @@ impl Session {
     pub(crate) async fn open_with_registration(
         cli: &Cli,
         paths: &RuntimePaths,
+        selection: Selection,
+        resumed_id: Option<&str>,
+        mode: crate::local_coordination::RegistrationMode,
+        host_binding: Option<&deepseek_code_core::native_engine::session_binding::SessionBinding>,
+    ) -> Result<Self> {
+        Self::open_with_registration_inner(
+            cli,
+            paths,
+            selection,
+            resumed_id,
+            mode,
+            host_binding,
+            false,
+        )
+        .await
+    }
+
+    /// Interactive startup may open a saved session whose directory is gone.
+    pub(crate) async fn open_interactive(
+        cli: &Cli,
+        paths: &RuntimePaths,
+        selection: Selection,
+        resumed_id: Option<&str>,
+    ) -> Result<Self> {
+        Self::open_with_registration_inner(
+            cli,
+            paths,
+            selection,
+            resumed_id,
+            crate::local_coordination::RegistrationMode::Automatic,
+            None,
+            true,
+        )
+        .await
+    }
+
+    async fn open_with_registration_inner(
+        cli: &Cli,
+        paths: &RuntimePaths,
         mut selection: Selection,
         resumed_id: Option<&str>,
         mode: crate::local_coordination::RegistrationMode,
         host_binding: Option<&deepseek_code_core::native_engine::session_binding::SessionBinding>,
+        allow_missing_workspace: bool,
     ) -> Result<Self> {
         anyhow::ensure!(
             !cli.fork_session || resumed_id.is_some(),
@@ -766,10 +885,31 @@ impl Session {
         deepseek_code_core::config::OrchestrationConfig::init_global()?;
         let db = paths.open_database()?;
         let store = SessionStore::new(db.clone());
+        let mut missing_workspace = None;
+        let mut resumed_row = None;
         let id = if let Some(id) = resumed_id {
-            store
-                .resume(id)
-                .map_err(|error| crate::session_trust::diagnose(&store.db, paths, id, error))?;
+            if allow_missing_workspace {
+                let (_, row, workspace) = store
+                    .db
+                    .resume_code_for_inspection(id)
+                    .map_err(|error| crate::session_trust::diagnose(&store.db, paths, id, error))?;
+                if let deepseek_code_core::db::session_store::ResumedWorkspace::Missing {
+                    path,
+                    reason,
+                } = workspace
+                {
+                    anyhow::ensure!(
+                        !cli.fork_session,
+                        "--fork-session requires an existing workspace directory"
+                    );
+                    missing_workspace = Some(MissingWorkspace { path, reason });
+                }
+                resumed_row = Some(row);
+            } else {
+                store
+                    .resume(id)
+                    .map_err(|error| crate::session_trust::diagnose(&store.db, paths, id, error))?;
+            }
             id.to_owned()
         } else {
             store
@@ -788,15 +928,19 @@ impl Session {
         } else {
             id
         };
-        store
-            .db
-            .set_request_recording_policy(&id, cli.record_requests, cli.full_access)?;
+        if missing_workspace.is_none() {
+            store
+                .db
+                .set_request_recording_policy(&id, cli.record_requests, cli.full_access)?;
+        }
         let internal_worker = deepseek_code_core::services::background_sessions::worker_directory(
             &paths.data_dir,
             &id,
         )?
         .is_some();
-        let auto_route = if internal_worker {
+        let auto_route = if missing_workspace.is_some() {
+            false
+        } else if internal_worker {
             std::env::var("DEEPSEEK_CODE_WORKER_AUTO_ROUTE").as_deref() == Ok("true")
         } else {
             cli.auto_route
@@ -811,21 +955,31 @@ impl Session {
             selection.apply_worker_model_snapshot(workflow_snapshot)?;
         }
         // The role is durable per session; an explicit --role on a resume
-        // updates it, otherwise the stored role is kept.
+        // updates it, otherwise the stored role is kept. A missing directory
+        // is read-only, so its session row is never changed.
         if let Some(role) = cli.role {
-            deepseek_code_core::super_agent::role::set(&store.db, &id, role.into())?;
+            if missing_workspace.is_none() {
+                deepseek_code_core::super_agent::role::set(&store.db, &id, role.into())?;
+            }
         }
-        let workspace = store
-            .workspace(&id, &paths.data_dir.join("data/workspaces"))
-            .map_err(|error| crate::session_trust::diagnose(&store.db, paths, &id, error))?;
+        let workspace = match missing_workspace.as_ref() {
+            Some(missing) => missing.path.clone(),
+            None => store
+                .workspace(&id, &paths.data_dir.join("data/workspaces"))
+                .map_err(|error| crate::session_trust::diagnose(&store.db, paths, &id, error))?,
+        };
         let permissions = runtime::default_permissions();
         permissions
             .set_plan_launch_permissions(cli.allow_dangerously_skip_permissions, cli.full_access);
-        let loaded = deepseek_code_core::services::permission_updates::load_settings(
-            &paths.data_dir,
-            &workspace,
-            true,
-        )?;
+        let loaded = if missing_workspace.is_some() {
+            deepseek_code_core::services::permission_updates::LoadedPermissions::default()
+        } else {
+            deepseek_code_core::services::permission_updates::load_settings(
+                &paths.data_dir,
+                &workspace,
+                true,
+            )?
+        };
         let mut merged = launch_rules;
         for (rule, action) in loaded.rules {
             match merged.get(&rule) {
@@ -837,12 +991,14 @@ impl Session {
         }
         permissions.set_launch_rules(&id, merged)?;
         permissions.set_session_directories(&id, loaded.directories);
-        if let Some(crate::args::Commands::Agent { agent_type, .. }) = &cli.command {
-            let definition = deepseek_code_core::services::agents::resolve(
-                &crate::services::context(paths)?,
-                agent_type,
-            )?;
-            deepseek_code_core::services::agents::bind(&store.db, &id, &definition)?;
+        if missing_workspace.is_none() {
+            if let Some(crate::args::Commands::Agent { agent_type, .. }) = &cli.command {
+                let definition = deepseek_code_core::services::agents::resolve(
+                    &crate::services::context(paths)?,
+                    agent_type,
+                )?;
+                deepseek_code_core::services::agents::bind(&store.db, &id, &definition)?;
+            }
         }
         let selected_mode = match cli.permission_mode {
             PermissionModeArg::Ask => PermissionMode::AskPermissions,
@@ -858,14 +1014,14 @@ impl Session {
             || cli.dangerously_skip_permissions
             || cli.full_access;
         // Clear what exited processes left behind, so a crash cannot block this resume.
-        let settled = if internal_worker {
+        let settled = if internal_worker || missing_workspace.is_some() {
             None
         } else {
             deepseek_code_core::services::session_worker::settle_session(&paths.data_dir, &id).ok()
         };
         // A direct print/json run leaves no worker job; settle its abandoned turn
         // so the resumed screen reports an interruption instead of a live turn.
-        if resumed_id.is_some() && !internal_worker {
+        if resumed_id.is_some() && !internal_worker && missing_workspace.is_none() {
             let interrupted = settle_abandoned_turns(paths, &store, &id);
             if !interrupted.is_empty() {
                 eprintln!(
@@ -873,7 +1029,7 @@ impl Session {
                 );
             }
         }
-        let active_job = if internal_worker {
+        let active_job = if internal_worker || missing_workspace.is_some() {
             None
         } else if let Some(settled) = settled {
             settled.active
@@ -889,14 +1045,16 @@ impl Session {
             anyhow::ensure!(cli.allowed_tools.is_empty() && cli.disallowed_tools.is_empty(), "This session has active background work; attach without launch tool rules, or stop the worker before changing them");
             anyhow::ensure!(!explicit_mode, "This session has active background work; resume without an explicit permission mode and use /tasks attach {} to change its mode", job.id);
         }
-        let selected_mode = if explicit_mode {
+        let selected_mode = if missing_workspace.is_some() {
+            PermissionMode::AskPermissions
+        } else if explicit_mode {
             selected_mode
         } else {
             deepseek_code_core::services::session_permission_mode::load(&store.db, &id)?
                 .filter(|mode| *mode != PermissionMode::BypassPermissions)
                 .unwrap_or(selected_mode)
         };
-        if selected_mode == PermissionMode::Auto {
+        if missing_workspace.is_none() && selected_mode == PermissionMode::Auto {
             let provider = selection
                 .providers
                 .iter()
@@ -924,78 +1082,103 @@ impl Session {
                 );
             }
         }
-        if active_job.is_some() {
-            permissions.set_mode(selected_mode);
-        } else {
-            deepseek_code_core::services::session_permission_mode::set(
-                &store.db,
-                &id,
-                &permissions,
-                selected_mode,
-            )?;
+        if missing_workspace.is_none() {
+            if active_job.is_some() {
+                permissions.set_mode(selected_mode);
+            } else {
+                deepseek_code_core::services::session_permission_mode::set(
+                    &store.db,
+                    &id,
+                    &permissions,
+                    selected_mode,
+                )?;
+            }
         }
         let binding_requester = uuid::Uuid::new_v4().to_string();
         let mut launch_binding_rejected = false;
         let mut took_launch_selection = false;
-        let binding = match host_binding {
-            Some(binding) => binding.clone(),
-            None => {
-                let mut snapshot = crate::worker_binding::snapshot(paths, selection, true)?;
-                let admitted = internal_worker
-                    .then(|| {
-                        std::env::var(
-                            deepseek_code_core::services::background_sessions::WORKER_GENERATION_ENV,
-                        )
-                        .ok()
-                    })
-                    .flatten();
-                if let Some(admitted) = admitted {
-                    // This foreground execution is part of its submitting session.
-                    // Starting the single-turn process must not change its binding.
-                    let (owner, version) = admitted
-                        .split_once(':')
-                        .context("Invalid worker generation")?;
-                    anyhow::ensure!(owner == id, "Worker generation belongs to another session");
-                    snapshot.generation = version.parse()?;
-                    let admitted = store.db.observed_binding(&id)?;
-                    anyhow::ensure!(
-                        admitted.generation == snapshot.generation
-                            && admitted.pending.is_none()
-                            && admitted.provider == snapshot.provider_id
-                            && admitted.model == snapshot.model,
-                        "One-shot admission no longer owns this binding"
-                    );
-                } else if internal_worker || mode == crate::local_coordination::RegistrationMode::HostOwned {
-                    snapshot = crate::worker_binding::observe_worker(paths, &store.db, &id, None, || Ok(snapshot)).await?;
-                } else {
-                    if cli.observes_binding(resumed_id.is_some()) {
-                        snapshot = crate::worker_binding::observe(paths, &store.db, &id, snapshot).await?;
-                        if cli.binding_generation.is_some_and(|generation| generation != snapshot.generation) {
-                            eprintln!("Session binding changed before admission; using the current binding.");
-                        }
+        let display_only = missing_workspace.as_ref().map(|_| {
+            let saved = resumed_row.as_ref();
+            let provider_id = saved
+                .and_then(|row| row.provider.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| selection.provider_id.clone());
+            let model = saved
+                .and_then(|row| row.model.clone())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| selection.model.clone());
+            crate::worker_binding::display_snapshot(
+                selection.providers.clone(),
+                &provider_id,
+                &model,
+            )
+        });
+        let binding = if let Some(state) = display_only {
+            let binding =
+                deepseek_code_core::native_engine::session_binding::SessionBinding::default();
+            binding.install(state)?;
+            binding
+        } else {
+            match host_binding {
+                Some(binding) => binding.clone(),
+                None => {
+                    let mut snapshot = crate::worker_binding::snapshot(paths, selection, true)?;
+                    let admitted = internal_worker
+                        .then(|| {
+                            std::env::var(
+                                deepseek_code_core::services::background_sessions::WORKER_GENERATION_ENV,
+                            )
+                            .ok()
+                        })
+                        .flatten();
+                    if let Some(admitted) = admitted {
+                        // This foreground execution is part of its submitting session.
+                        // Starting the single-turn process must not change its binding.
+                        let (owner, version) = admitted
+                            .split_once(':')
+                            .context("Invalid worker generation")?;
+                        anyhow::ensure!(owner == id, "Worker generation belongs to another session");
+                        snapshot.generation = version.parse()?;
+                        let admitted = store.db.observed_binding(&id)?;
+                        anyhow::ensure!(
+                            admitted.generation == snapshot.generation
+                                && admitted.pending.is_none()
+                                && admitted.provider == snapshot.provider_id
+                                && admitted.model == snapshot.model,
+                            "One-shot admission no longer owns this binding"
+                        );
+                    } else if internal_worker || mode == crate::local_coordination::RegistrationMode::HostOwned {
+                        snapshot = crate::worker_binding::observe_worker(paths, &store.db, &id, None, || Ok(snapshot)).await?;
                     } else {
-                        let expected = if resumed_id.is_some() && !cli.fork_session {
-                            cli.observed_generation.unwrap_or(0)
+                        if cli.observes_binding(resumed_id.is_some()) {
+                            snapshot = crate::worker_binding::observe(paths, &store.db, &id, snapshot).await?;
+                            if cli.binding_generation.is_some_and(|generation| generation != snapshot.generation) {
+                                eprintln!("Session binding changed before admission; using the current binding.");
+                            }
                         } else {
-                            0
-                        };
-                        took_launch_selection = crate::worker_binding::commit(
-                            &paths.data_dir,
-                            &store.db,
-                            &id,
-                            expected,
-                            &mut snapshot,
-                            &binding_requester,
-                            None,
-                        )
-                        .await?;
-                        launch_binding_rejected = !took_launch_selection;
+                            let expected = if resumed_id.is_some() && !cli.fork_session {
+                                cli.observed_generation.unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            took_launch_selection = crate::worker_binding::commit(
+                                &paths.data_dir,
+                                &store.db,
+                                &id,
+                                expected,
+                                &mut snapshot,
+                                &binding_requester,
+                                None,
+                            )
+                            .await?;
+                            launch_binding_rejected = !took_launch_selection;
+                        }
                     }
+                    let binding =
+                        deepseek_code_core::native_engine::session_binding::SessionBinding::default();
+                    binding.install(snapshot)?;
+                    binding
                 }
-                let binding =
-                    deepseek_code_core::native_engine::session_binding::SessionBinding::default();
-                binding.install(snapshot)?;
-                binding
             }
         };
         let selected = store.db.open_session(&id)?;
@@ -1058,6 +1241,7 @@ impl Session {
                 || paths.layout().config_file("providers.json").is_file(),
             providers,
             workspace,
+            missing_workspace,
             auto_route,
             bypass_available: cli.allow_dangerously_skip_permissions,
             full_access: cli.full_access,
@@ -1070,6 +1254,7 @@ impl Session {
             sdk_mcp,
             sdk_mcp_transport: None,
             lifecycle_owned: false,
+            host_lifecycle_owned: false,
             remote_relay: Default::default(),
             coordination: None,
             coordination_context: None,
@@ -1078,11 +1263,13 @@ impl Session {
     }
 
     pub async fn switch(&mut self, paths: &RuntimePaths, selection: Selection) -> Result<()> {
+        self.ensure_writable_workspace("switching providers")?;
         self.switch_with_effort(paths, Some(selection), None).await
     }
 
     pub(crate) async fn switch_with_effort(&mut self, paths: &RuntimePaths, selection: Option<Selection>,
         effort: Option<Option<&str>>) -> Result<()> {
+        self.ensure_writable_workspace("switching providers")?;
         let Some(selection) = selection else {
             return self.publish_selection((*self.binding_state()).clone(), effort).await;
         };
@@ -1102,6 +1289,7 @@ impl Session {
     }
 
     pub async fn start_hooks(&mut self, source: &str) -> Result<()> {
+        self.ensure_writable_workspace("SessionStart hooks")?;
         if self.lifecycle_owned {
             return Ok(());
         }
@@ -1138,6 +1326,7 @@ impl Session {
     async fn start_prepared_hooks(&mut self, source: &str) -> Result<()> {
         use deepseek_code_core::services::session_hooks;
         self.lifecycle_owned = true;
+        self.host_lifecycle_owned = true;
         let context = self.hook_service_context();
         let state = self.binding_state();
         let outcome = tokio::select! {
@@ -1199,6 +1388,7 @@ impl Session {
     }
 
     pub async fn clear(&mut self) -> Result<String> {
+        self.ensure_writable_workspace("/clear")?;
         self.refresh_binding().await?;
         let id = uuid::Uuid::new_v4().to_string();
         // Everything fallible runs before the commit: the target hooks are
@@ -1252,13 +1442,31 @@ impl Session {
 
     /// Validate the project and provider before replacing the current session.
     pub async fn resume_saved(&mut self, paths: &RuntimePaths, id: &str) -> Result<()> {
-        let (shard, saved) =
-            self.store.db.resume_code(id).map_err(|error| {
-                crate::session_trust::diagnose(&self.store.db, paths, id, error)
-            })?;
-        let workspace = shard
-            .workspace()
+        let (shard, saved, inspection) = self
+            .store
+            .db
+            .resume_code_for_inspection(id)
             .map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
+        match inspection {
+            deepseek_code_core::db::session_store::ResumedWorkspace::Available(workspace) => {
+                self.resume_saved_available(paths, id, shard, saved, workspace)
+                    .await
+            }
+            deepseek_code_core::db::session_store::ResumedWorkspace::Missing { path, reason } => {
+                self.resume_saved_missing(paths, id, shard, saved, path, reason)
+                    .await
+            }
+        }
+    }
+
+    async fn resume_saved_available(
+        &mut self,
+        paths: &RuntimePaths,
+        id: &str,
+        shard: deepseek_code_core::db::session_store::SessionDb,
+        saved: deepseek_code_core::db::conversation_repo::ConversationRow,
+        workspace: std::path::PathBuf,
+    ) -> Result<()> {
         let model = saved.model.context("Saved session has no model")?;
         let provider_id = saved.provider.context("Saved session has no provider")?;
         let row = shard.observe_provider()?;
@@ -1277,7 +1485,7 @@ impl Session {
             };
             crate::worker_binding::snapshot(paths, selected, self.owns_startup_transport() && !changing_provider)?
         };
-        let lifecycle_owned = self.lifecycle_owned;
+        let lifecycle_owned = self.host_lifecycle_owned || self.lifecycle_owned;
         // As in the reference CLI, the resumed conversation keeps the mode in use.
         let mode = self.permissions.get_mode();
         // Everything fallible runs before the commit. The target's permission
@@ -1316,7 +1524,9 @@ impl Session {
         let (target, guard, workspace, prepared) = match admission {
             Ok(admitted) => admitted,
             Err(error) => {
-                if lifecycle_owned { self.finish_committed_start_hooks("resume").await; }
+                if lifecycle_owned && !self.is_missing_workspace() {
+                    self.finish_committed_start_hooks("resume").await;
+                }
                 return Err(error.context("Resume did not apply; current session retained"));
             }
         };
@@ -1332,6 +1542,7 @@ impl Session {
             monitor.update_workspace(self.workspace.clone());
         }
         self.auto_route = false;
+        self.missing_workspace = None;
         if let Some(policy) = policy {
             shard.set_recording_policy(policy);
         }
@@ -1344,6 +1555,80 @@ impl Session {
         if prepared == Some(true) {
             self.finish_committed_start_hooks("resume").await;
         }
+        Ok(())
+    }
+
+    /// Open a saved conversation for inspection without touching its directory,
+    /// hooks, permission mode or database.
+    async fn resume_saved_missing(
+        &mut self,
+        paths: &RuntimePaths,
+        id: &str,
+        shard: deepseek_code_core::db::session_store::SessionDb,
+        saved: deepseek_code_core::db::conversation_repo::ConversationRow,
+        path: std::path::PathBuf,
+        reason: String,
+    ) -> Result<()> {
+        let provider_id = saved
+            .provider
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| self.binding_state().provider_id.clone());
+        let model = saved
+            .model
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| self.binding_state().model.clone());
+        let providers = crate::interactive_config::select_saved(paths, &provider_id, &model, None)
+            .map(|selection| selection.providers)
+            .unwrap_or_else(|_| self.binding_state().providers.clone());
+        let state = crate::worker_binding::display_snapshot(providers, &provider_id, &model);
+        // No SessionEnd runs against the missing folder. The lifecycle host
+        // decision is retained for the next available resume.
+        self.host_lifecycle_owned |= self.lifecycle_owned;
+        let lifecycle_owned = self.host_lifecycle_owned;
+        self.end_hooks("other").await;
+        let admission = async {
+            let guard = shard.hold_incarnation()?;
+            let (_, admitted) = shard
+                .code_selection_for_inspection()
+                .map_err(|error| crate::session_trust::diagnose(&self.store.db, paths, id, error))?;
+            if matches!(
+                admitted,
+                deepseek_code_core::db::session_store::ResumedWorkspace::Available(_)
+            ) {
+                anyhow::bail!("The saved directory is available again; retry /resume");
+            }
+            let target =
+                deepseek_code_core::native_engine::session_binding::SessionBinding::default();
+            target.track_session(shard.clone());
+            target.install(state)?;
+            Ok::<_, anyhow::Error>((target.initialized()?, guard))
+        }
+        .await;
+        let (target, guard) = match admission {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                // The current conversation is still valid; restore hooks only
+                // when its own workspace is usable.
+                if lifecycle_owned && !self.is_missing_workspace() {
+                    self.finish_committed_start_hooks("resume").await;
+                }
+                return Err(error.context("Resume did not apply; current session retained"));
+            }
+        };
+        self.providers.lock().await.binding = (*target).clone();
+        self.binding = target;
+        self.workspace = path.clone();
+        self.missing_workspace = Some(MissingWorkspace { path, reason });
+        self.auto_route = false;
+        self.startup_provider = None;
+        self.store = SessionStore::new(Arc::new(shard.scoped_stores()));
+        self.id = id.to_owned();
+        drop(guard);
+        self.waiting_for_continue
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Close the previous incarnation, but never register the missing folder.
+        // The launch context stays for the next writable resume.
+        self.close_coordination().await;
         Ok(())
     }
 
@@ -1360,6 +1645,7 @@ impl Session {
     }
 
     pub async fn branch_saved(&mut self, paths: &RuntimePaths, title: &str) -> Result<String> {
+        self.ensure_writable_workspace("/branch")?;
         anyhow::ensure!(
             title.chars().count() <= 200,
             "Session titles must be at most 200 characters"
@@ -1373,7 +1659,47 @@ impl Session {
         Ok(id)
     }
 
+    pub(crate) fn is_missing_workspace(&self) -> bool {
+        self.missing_workspace.is_some()
+    }
+
+    pub(crate) fn missing_workspace(&self) -> Option<&MissingWorkspace> {
+        self.missing_workspace.as_ref()
+    }
+
+    /// The full read-only banner shown after opening or switching to a session
+    /// whose saved directory no longer exists.
+    pub(crate) fn missing_workspace_banner_notice(&self) -> Option<String> {
+        let missing = self.missing_workspace()?;
+        Some(format!(
+            "\u{273b} Read-only mode: directory no longer exists ({}).\n  {}\n  History is available to inspect (Ctrl+O, /history, /export, /copy). Sending prompts and running tools are disabled; use /resume to switch sessions or restore the directory to continue.",
+            terminal_safe(&missing.path.to_string_lossy()),
+            terminal_safe(&missing.reason)
+        ))
+    }
+
+    pub(crate) fn missing_workspace_notice(&self, action: &str) -> String {
+        match self.missing_workspace() {
+            Some(missing) => format!(
+                "This session is in read-only mode because {} no longer exists; {action} was not submitted. Inspect history with Ctrl+O, /history, /export, or /copy, or switch sessions with /resume.",
+                terminal_safe(&missing.path.to_string_lossy())
+            ),
+            None => format!("This session is read-only; {action} was not submitted."),
+        }
+    }
+
+    /// Defense in depth for every execution or mutation entry point.
+    pub(crate) fn ensure_writable_workspace(&self, action: &str) -> Result<()> {
+        if self.is_missing_workspace() {
+            anyhow::bail!("{}", self.missing_workspace_notice(action));
+        }
+        Ok(())
+    }
+
     pub fn permission_mode(&self) -> &'static str {
+        if self.is_missing_workspace() {
+            return "read-only";
+        }
         match self.permissions.get_mode() {
             PermissionMode::AskPermissions => "ask",
             PermissionMode::AcceptEdits => "accept-edits",
@@ -1391,6 +1717,7 @@ impl Session {
     }
 
     pub async fn cycle_permission_mode(&self) -> Result<&'static str> {
+        self.ensure_writable_workspace("permission mode changes")?;
         // Auto mode needs its classifier; without one the cycle goes on to ask.
         if self
             .set_permission_mode(self.next_permission_mode())
@@ -1486,6 +1813,7 @@ impl Session {
     }
 
     pub async fn set_permission_mode(&self, value: &str) -> Result<()> {
+        self.ensure_writable_workspace("permission mode changes")?;
         if deepseek_code_core::services::background_sessions::worker_directory(
             &self.paths.data_dir,
             &self.id,
@@ -1592,6 +1920,13 @@ impl Session {
         if self.coordination_mode != crate::local_coordination::RegistrationMode::Automatic {
             return;
         }
+        if self.is_missing_workspace() {
+            // Keep the launch decision, but publish no incarnation for a
+            // directory that cannot be the session's working root.
+            self.coordination_context = Some(prepared.context);
+            self.coordination = None;
+            return;
+        }
         self.publish_coordination(&prepared).await;
     }
 
@@ -1601,7 +1936,7 @@ impl Session {
         prepared: &crate::local_coordination::PreparedCoordination,
     ) {
         self.coordination_context = Some(prepared.context.clone());
-        self.coordination = if prepared.enabled {
+        self.coordination = if prepared.enabled && !self.is_missing_workspace() {
             crate::local_coordination::register_with_context(
                 &prepared.context,
                 self.paths.data_dir.clone(),
@@ -1634,6 +1969,12 @@ impl Session {
         let Some(context) = self.coordination_context.clone() else {
             return;
         };
+        if self.is_missing_workspace() {
+            if let Some(mut previous) = self.coordination.take() {
+                let _ = previous.close().await;
+            }
+            return;
+        }
         let prepared = crate::local_coordination::prepare_next_incarnation(
             context,
             self.paths.data_dir.clone(),
@@ -1650,6 +1991,9 @@ impl Session {
     /// Follows EnterWorktree/ExitWorktree from the last turn: the bound
     /// worktree, or the recorded source folder once a worktree is left.
     pub fn sync_workspace(&mut self) -> Result<()> {
+        if self.is_missing_workspace() {
+            return Ok(());
+        }
         let target = match deepseek_code_core::worktree::hooks::status(&self.store.db, &self.id)? {
             Some(state) => state["path"].as_str().map(std::path::PathBuf::from),
             // A worktree checkout has a .git file; the main checkout a directory.
@@ -1709,6 +2053,7 @@ impl Session {
         input: &mut Option<TerminalInput>,
         mut origin: TurnOrigin<'_>,
     ) -> Result<()> {
+        self.ensure_writable_workspace("the prompt")?;
         use std::io::IsTerminal;
         self.apply_settings_permissions(cli)?;
         // Idle callers must check the resume gate before submitting a turn.
@@ -1904,6 +2249,7 @@ impl Session {
     }
 
     pub async fn wake_hooks(&self, cli: &Cli, input: &mut Option<TerminalInput>) -> Result<()> {
+        self.ensure_writable_workspace("hook wakes")?;
         Box::pin(self.run_turn_origin(cli, "", input, TurnOrigin::HookWake, true)).await
     }
 
@@ -1925,6 +2271,7 @@ impl Session {
         input: &mut Option<TerminalInput>,
         publish: bool,
     ) -> Result<()> {
+        self.ensure_writable_workspace("the initial hook turn")?;
         self.apply_settings_permissions(cli)?;
         self.run_turn_origin(cli, prompt, input, TurnOrigin::InitialHook, publish)
             .await
@@ -2009,6 +2356,7 @@ impl Session {
         publish: bool,
         completion: &mut TurnCompletion<'_>,
     ) -> Result<()> {
+        self.ensure_writable_workspace("the prompt")?;
         // Own the session before the turn becomes visible, and keep that
         // ownership until the turn is persisted. The engine only borrows a clone
         // while it runs, so a terminal that resumes during compaction, hooks or
@@ -5514,6 +5862,402 @@ mod event_tests {
             "no row for the cleared conversation"
         );
         assert_eq!(lc_owner_files(&clear_root), clear_owners);
+    }
+}
+
+#[cfg(test)]
+mod missing_workspace_tests {
+    use super::*;
+
+    fn fixture_selection() -> Selection {
+        Selection {
+            providers: vec![serde_json::from_value(json!({
+                "id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1",
+                "api_key":"unused","api_format":"openai","enabled":true,
+                "models":[{"id":"fixture","name":"Fixture","enabled":true,
+                    "supports_vision":false,"supports_web_search":false}]
+            }))
+            .unwrap()],
+            provider_id: "fixture".into(),
+            model: "fixture".into(),
+        }
+    }
+
+    fn fixture_cli() -> Cli {
+        Cli::try_parse_with_mode_source(["dcl", "--permission-mode", "ask"]).unwrap()
+    }
+
+    struct Fixture {
+        root: tempfile::TempDir,
+        paths: RuntimePaths,
+        first: String,
+        second: String,
+        session: Session,
+    }
+
+    async fn fixture() -> Fixture {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let first_id = store.create(&first, "fixture", "fixture").unwrap();
+        let second_id = store.create(&second, "fixture", "fixture").unwrap();
+        store.append(&second_id, "user", "history that must survive").unwrap();
+        let session = Session::open(&fixture_cli(), &paths, fixture_selection(), Some(&first_id))
+            .await
+            .unwrap();
+        Fixture {
+            root,
+            paths,
+            first: first_id,
+            second: second_id,
+            session,
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_directory_resumes_read_only_then_restores_writable_mode() {
+        let mut fixture = fixture().await;
+        // The first valid session owns lifecycle hooks. Missing-directory
+        // admission must suspend them without forgetting that ownership.
+        fixture.session.host_lifecycle_owned = true;
+        fixture.session.lifecycle_owned = true;
+        let second_path = fixture.root.path().join("second");
+        std::fs::remove_dir_all(&second_path).unwrap();
+        let before = fixture
+            .session
+            .store
+            .db
+            .conversation_metadata(&fixture.second)
+            .unwrap()
+            .unwrap();
+
+        fixture
+            .session
+            .resume_saved(&fixture.paths, &fixture.second)
+            .await
+            .unwrap();
+        assert!(fixture.session.is_missing_workspace());
+        assert!(!fixture.session.lifecycle_owned);
+        assert!(fixture.session.host_lifecycle_owned);
+        let missing = fixture.session.missing_workspace().unwrap();
+        assert!(missing.path.ends_with("second"));
+        assert!(missing.reason.contains("Directory no longer exists"));
+        assert_eq!(fixture.session.permission_mode(), "read-only");
+        assert_eq!(fixture.session.workspace, missing.path);
+        assert_eq!(
+            fixture.session.store.history(&fixture.second).unwrap()[0]["content"],
+            "history that must survive"
+        );
+        assert!(fixture
+            .session
+            .ensure_writable_workspace("test mutation")
+            .is_err());
+        assert!(fixture.session.clear().await.is_err());
+        assert!(fixture
+            .session
+            .branch_saved(&fixture.paths, "branch")
+            .await
+            .is_err());
+        assert!(fixture.session.set_permission_mode("ask").await.is_err());
+        assert!(fixture.session.cycle_permission_mode().await.is_err());
+        assert!(fixture.session.start_hooks("resume").await.is_err());
+        assert!(fixture
+            .session
+            .wake_hooks(&fixture_cli(), &mut None)
+            .await
+            .is_err());
+        assert!(fixture
+            .session
+            .turn_initial_hook(&fixture_cli(), "hook", &mut None, false)
+            .await
+            .is_err());
+        assert!(fixture.session.sync_workspace().is_ok());
+        assert!(fixture
+            .session
+            .store
+            .db
+            .resume_code(&fixture.second)
+            .is_err());
+        // Read-only admission never writes the target's permission mode.
+        assert_eq!(
+            deepseek_code_core::services::session_permission_mode::load(
+                &fixture.session.store.db,
+                &fixture.second
+            )
+            .unwrap(),
+            None
+        );
+        let after = fixture
+            .session
+            .store
+            .db
+            .conversation_metadata(&fixture.second)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_eq!(after.message_count, before.message_count);
+
+        // Recreating the directory makes the same resume writable again.
+        std::fs::create_dir_all(&second_path).unwrap();
+        fixture
+            .session
+            .resume_saved(&fixture.paths, &fixture.second)
+            .await
+            .unwrap();
+        assert!(!fixture.session.is_missing_workspace());
+        assert_eq!(fixture.session.id, fixture.second);
+        assert_eq!(
+            fixture.session.workspace.canonicalize().unwrap(),
+            second_path.canonicalize().unwrap()
+        );
+        assert_ne!(fixture.session.permission_mode(), "read-only");
+        assert!(fixture.session.lifecycle_owned);
+        assert!(fixture.session.set_permission_mode("ask").await.is_ok());
+
+        // A later switch back to the first session stays writable too.
+        fixture
+            .session
+            .resume_saved(&fixture.paths, &fixture.first)
+            .await
+            .unwrap();
+        assert!(!fixture.session.is_missing_workspace());
+        assert_eq!(fixture.session.id, fixture.first);
+        fixture.session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn interactive_startup_opens_a_missing_directory_while_strict_open_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let project = root.path().join("gone");
+        std::fs::create_dir(&project).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(&project, "fixture", "fixture").unwrap();
+        store.append(&id, "user", "saved history").unwrap();
+        std::fs::remove_dir_all(&project).unwrap();
+
+        assert!(Session::open(
+            &fixture_cli(),
+            &paths,
+            fixture_selection(),
+            Some(&id)
+        )
+        .await
+        .is_err());
+        let session = Session::open_interactive(
+            &fixture_cli(),
+            &paths,
+            fixture_selection(),
+            Some(&id),
+        )
+        .await
+        .unwrap();
+        assert!(session.is_missing_workspace());
+        assert_eq!(session.id, id);
+        assert_eq!(
+            session.store.history(&id).unwrap()[0]["content"],
+            "saved history"
+        );
+        assert_eq!(session.permission_mode(), "read-only");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_directory_opens_when_its_saved_provider_is_gone() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let first_id = store.create(&first, "fixture", "fixture").unwrap();
+        let second_id = store.create(&second, "deleted", "deleted").unwrap();
+        store.append(&second_id, "user", "keep me").unwrap();
+        let mut session = Session::open(
+            &fixture_cli(),
+            &paths,
+            fixture_selection(),
+            Some(&first_id),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&second).unwrap();
+
+        session.resume_saved(&paths, &second_id).await.unwrap();
+        assert!(session.is_missing_workspace());
+        let state = session.binding_state();
+        assert_eq!(state.provider_id, "deleted");
+        assert_eq!(state.model, "deleted");
+        assert!(state.observation_only);
+        assert!(session.ensure_writable_workspace("turn").is_err());
+        assert!(session.turn(
+            &fixture_cli(),
+            "hello",
+            &mut None,
+            TurnOrigin::User("hello")
+        )
+        .await
+        .is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_and_model_labels_render_missing_directories() {
+        let mut fixture = fixture().await;
+        std::fs::remove_dir_all(fixture.root.path().join("second")).unwrap();
+        fixture
+            .session
+            .resume_saved(&fixture.paths, &fixture.second)
+            .await
+            .unwrap();
+        let label = crate::session_commands::model_label(&fixture.session).await;
+        assert!(label.contains("read-only (directory missing)"), "{label}");
+        let status = crate::status_commands::text(&fixture.session, "")
+            .await
+            .unwrap();
+        assert!(status.contains("missing"), "{status}");
+        assert!(status.contains("read-only"), "{status}");
+        assert!(!status.contains("Language servers"), "{status}");
+        let payload = crate::statusline_commands::payload(&fixture.session)
+            .await
+            .unwrap();
+        assert_eq!(payload["model"]["id"], "fixture");
+        assert_eq!(
+            payload["cwd"],
+            fixture.session.workspace.to_string_lossy().as_ref()
+        );
+        assert!(crate::repl::transcript(&fixture.session).is_ok());
+        fixture.session.close().await.unwrap();
+    }
+
+    #[test]
+    fn read_only_command_allowlist_blocks_mutation_and_turns() {
+        for (command, argument) in [
+            ("/resume", ""),
+            ("/resume", "id"),
+            ("/history", ""),
+            ("/export", "file.txt"),
+            ("/copy", ""),
+            ("/copy-session-id", ""),
+            ("/context", ""),
+            ("/cost", ""),
+            ("/status", ""),
+            ("/stats", ""),
+            ("/sessions", ""),
+            ("/help", ""),
+            ("/vim", ""),
+            ("/scroll-speed", "5"),
+            ("/exit", ""),
+            ("/quit", ""),
+            ("/theme", ""),
+            ("/color", ""),
+            ("/output-style", ""),
+            ("/tasks", ""),
+            ("/tasks", "list"),
+            ("/tasks", "running"),
+            ("/tasks", "show task-1"),
+            ("/tasks", "sessions"),
+            ("/tasks", "records legacy"),
+        ] {
+            assert!(
+                allowed_in_missing_workspace_readonly(command, argument),
+                "{command} {argument}"
+            );
+        }
+        for (command, argument) in [
+            ("/clear", ""),
+            ("/branch", "x"),
+            ("/fork", ""),
+            ("/continue", ""),
+            ("/btw", "hi"),
+            ("/compact", ""),
+            ("/plan", ""),
+            ("/goal", "do work"),
+            ("/loop", "5m hi"),
+            ("/model", "other"),
+            ("/effort", "high"),
+            ("/role", "router"),
+            ("/rename", "x"),
+            ("/permissions", ""),
+            ("/remote-control", "listen"),
+            ("/restart", ""),
+            ("/add-dir", "/tmp"),
+            ("/memory", ""),
+            ("/lsp", ""),
+            ("/mcp", ""),
+            ("/agents", ""),
+            ("/skills", ""),
+            ("/plugins", ""),
+            ("/tools", ""),
+            ("/design", ""),
+            ("/worktree", ""),
+            ("/batch", ""),
+            ("/workflows", ""),
+            ("/rewind", ""),
+            ("/subtask", ""),
+            ("/background", ""),
+            ("/config", ""),
+            ("/settings", ""),
+            ("/theme", "dark"),
+            ("/color", "red"),
+            ("/output-style", "learning"),
+            ("/tasks", "cancel task-1"),
+            ("/tasks", "answer task-1 req yes"),
+            ("/tasks", "stop-session id"),
+            ("/tasks", "attach task-1"),
+            ("/mcp__server__tool", ""),
+            ("/not-a-command", ""),
+            ("/exit", "now"),
+            ("/quit", "now"),
+        ] {
+            assert!(
+                !allowed_in_missing_workspace_readonly(command, argument),
+                "{command} {argument}"
+            );
+        }
+        assert_eq!(
+            missing_workspace_rejected_action("/history"),
+            None
+        );
+        assert_eq!(
+            missing_workspace_rejected_action("/clear"),
+            Some("`/clear`".into())
+        );
+        assert_eq!(
+            missing_workspace_rejected_action("hello there"),
+            Some("the prompt".into())
+        );
+        assert_eq!(
+            missing_workspace_rejected_action("!ls"),
+            Some("shell commands".into())
+        );
+        assert_eq!(
+            missing_workspace_rejected_action("# remember this"),
+            Some("memory notes".into())
+        );
+        assert_eq!(missing_workspace_rejected_action("exit"), None);
+        assert_eq!(missing_workspace_rejected_action("status"), None);
+        assert_eq!(
+            missing_workspace_rejected_action("exit now"),
+            Some("the prompt".into())
+        );
+    }
+
+    #[test]
+    fn read_only_footer_label_is_clean() {
+        let (label, _) = crate::terminal::style::mode_indicator("read-only").unwrap();
+        assert!(label.contains("read-only"), "{label}");
+        assert!(label.contains("directory missing"), "{label}");
+        assert!(!label.contains("shift+tab"), "{label}");
+        assert_eq!(
+            crate::terminal::style::status_mode("read-only"),
+            "read-only \u{b7} directory missing"
+        );
     }
 }
 
