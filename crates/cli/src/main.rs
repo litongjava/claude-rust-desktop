@@ -70,6 +70,7 @@ mod plugins;
 mod plugins_panel;
 mod powerup;
 mod prompt_suggestion;
+mod provider_panel;
 mod remote_client;
 mod remote_commands;
 mod remote_host;
@@ -1683,7 +1684,12 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 Ok(false) => {},
             }
             match interactive_config::handle(line.trim(), &paths, &mut session, input.as_mut().unwrap()).await {
-                Ok(true) => continue,
+                Ok(true) => {
+                    if let Some(input) = &input {
+                        input.set_provider_ids(interactive_config::provider_ids(&paths));
+                    }
+                    continue;
+                }
                 Err(error) => { command_eprintln!("Error: {error:#}"); continue; },
                 Ok(false) => {},
             }
