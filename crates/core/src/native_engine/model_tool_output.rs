@@ -517,9 +517,8 @@ fn render_with_spans(
             parts.push("Command failed".into());
         }
         fields.remove("success");
-        // Foreground shells always report their resulting directory above stdout;
-        // `cwd_changed` is UI-only metadata and never shown to the model.
-        fields.remove("cwd_changed");
+        // A foreground shell reports its directory on first call, change, reset,
+        // or after resume/compaction, above stdout.
         if let Some(cwd) = fields
             .remove("cwd")
             .and_then(|cwd| cwd.as_str().map(str::to_owned))
@@ -1300,13 +1299,11 @@ mod tests {
             "stdout": "a\n",
             "stderr": "",
             "cwd": "/repo/deepseek-code-data-layout",
-            "cwd_changed": false,
             "exit_code": 0
         })
         .to_string();
         let rendered = render("Bash", &raw, None);
         assert!(rendered.contains("cwd: /repo/deepseek-code-data-layout"), "{rendered}");
-        assert!(!rendered.contains("cwd_changed"), "{rendered}");
         assert!(
             rendered.find("cwd: /repo/deepseek-code-data-layout")
                 < rendered.find("Output:\na\n"),

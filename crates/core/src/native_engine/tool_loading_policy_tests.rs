@@ -567,7 +567,7 @@ fn defaults_carry_exactly_the_core_tools() {
     assert_eq!(actual, expected, "defaults must be exactly the core tools");
     assert_eq!(names.len(), actual.len(), "no tool may be sent twice");
     // Everything else waits to be discovered.
-    for name in ["ListDir", "WebFetch", "WebSearch", "MultiEdit", "Agent"] {
+    for name in ["ListDir", "Monitor", "NotebookEdit", "Agent"] {
         assert!(
             !has(&names, name),
             "{name} must not be sent by default: {names:?}"

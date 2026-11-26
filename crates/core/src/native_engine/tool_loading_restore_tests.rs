@@ -78,7 +78,7 @@ fn a_resumed_session_keeps_the_loaded_tool_order() {
     let session = store.create(dir.path(), "fixture", "fixture").unwrap();
 
     store.append(&session, "user", "Load both").unwrap();
-    for (name, suffix) in [("WebFetch", "web"), ("ListDir", "dir")] {
+    for (name, suffix) in [("Monitor", "mon"), ("ListDir", "dir")] {
         let assistant = uuid::Uuid::new_v4().to_string();
         record_call(
             &store,
@@ -96,7 +96,7 @@ fn a_resumed_session_keeps_the_loaded_tool_order() {
     );
     from_messages.restore_loaded_tools();
     let sent = request_names(&from_messages);
-    assert_eq!(&sent[sent.len() - 2..], ["WebFetch", "ListDir"], "{sent:?}");
+    assert_eq!(&sent[sent.len() - 2..], ["Monitor", "ListDir"], "{sent:?}");
 
     // The durable rows restore the same order even when the submitted display
     // history is empty.
@@ -106,7 +106,7 @@ fn a_resumed_session_keeps_the_loaded_tool_order() {
         .unwrap();
     from_rows.restore_persisted_loaded_tools().unwrap();
     let sent = request_names(&from_rows);
-    assert_eq!(&sent[sent.len() - 2..], ["WebFetch", "ListDir"], "{sent:?}");
+    assert_eq!(&sent[sent.len() - 2..], ["Monitor", "ListDir"], "{sent:?}");
 }
 
 #[test]

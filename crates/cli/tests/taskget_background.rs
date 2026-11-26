@@ -92,20 +92,11 @@ async fn respond(
         !tools.contains(&"TaskOutput".to_owned()),
         "TaskOutput is still advertised: {tools:?}"
     );
-    // TaskGet is deferred: absent from the default request, loaded by the
-    // ToolLoad call at step 1, and carried from step 2 on.
-    if index == 0 {
-        assert!(
-            !tools.contains(&"TaskGet".to_owned()),
-            "TaskGet must start on demand: {tools:?}"
-        );
-    }
-    if index >= 2 && !fixture.foreground {
-        assert!(
-            tools.contains(&"TaskGet".to_owned()),
-            "TaskGet missing after ToolLoad: {tools:?}"
-        );
-    }
+    // TaskGet is resident by default and available on every request.
+    assert!(
+        tools.contains(&"TaskGet".to_owned()),
+        "TaskGet must be resident by default: {tools:?}"
+    );
     let frames = match index {
         0 => tool_call_frame(
             "call-bash",
@@ -136,10 +127,10 @@ async fn respond(
             tool_call_frame("call-search", "ToolLoad", &json!({"names":["TaskGet"]}))
         }
         2 => {
-            // The model sees one text line; the TaskGet schema travels in `tools`.
+            // TaskGet is resident by default; ToolLoad confirms it is already available.
             assert_eq!(
                 last_tool_content(&body),
-                Some("Loaded TaskGet. Available from the next request."),
+                Some("Already available: TaskGet."),
                 "{body}"
             );
             let started = fixture

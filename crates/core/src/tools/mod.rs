@@ -743,22 +743,25 @@ async fn bash_keeps_its_directory_and_resets_outside_the_project() {
         project.join("sub").to_str().unwrap()
     );
     let out = tool_bash_async(run("pwd -P"), cwd).await.unwrap();
-    assert_eq!(
-        out["cwd"].as_str().unwrap(),
-        project.join("sub").to_str().unwrap()
-    );
-    assert_eq!(out["cwd_changed"], serde_json::json!(false));
+    assert!(out.get("cwd").is_none(), "{out}");
     assert_eq!(
         out["stdout"].as_str().unwrap().trim(),
         project.join("sub").to_str().unwrap()
     );
-    // Exiting early keeps the previous directory and still reports it.
-    let early = tool_bash_async(run("cd /; exit 3"), cwd).await.unwrap();
+    // Resume/compaction forces a single cwd reminder even when unchanged.
+    let reminded = tool_bash_async(
+        serde_json::json!({"command":"pwd -P","__cwd_state":state.to_string_lossy(),"__report_cwd":true}),
+        cwd,
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        early["cwd"].as_str().unwrap(),
+        reminded["cwd"].as_str().unwrap(),
         project.join("sub").to_str().unwrap()
     );
-    assert_eq!(early["cwd_changed"], serde_json::json!(false));
+    // Exiting early keeps the previous directory.
+    let early = tool_bash_async(run("cd /; exit 3"), cwd).await.unwrap();
+    assert!(early.get("cwd").is_none(), "{early}");
     assert!(tool_bash_async(run("pwd -P"), cwd).await.unwrap()["stdout"]
         .as_str()
         .unwrap()
@@ -766,7 +769,6 @@ async fn bash_keeps_its_directory_and_resets_outside_the_project() {
     let reset = tool_bash_async(run("cd /"), cwd).await.unwrap();
     assert_eq!(reset["note"], format!("Shell cwd was reset to {cwd}"));
     assert_eq!(reset["cwd"], serde_json::json!(cwd));
-    assert_eq!(reset["cwd_changed"], serde_json::json!(true));
     assert_eq!(
         tool_bash_async(run("pwd -P"), cwd).await.unwrap()["stdout"]
             .as_str()
@@ -803,14 +805,12 @@ async fn concurrent_foreground_bash_calls_preserve_saved_cwd() {
     let run = |command: &str| serde_json::json!({"command":command,"__cwd_state":state.to_string_lossy()});
     let moved = tool_bash_async(run("cd sub"), cwd).await.unwrap();
     assert_eq!(moved["cwd"], serde_json::json!(sub.to_str().unwrap()));
-    assert_eq!(moved["cwd_changed"], serde_json::json!(true));
 
     let handles: Vec<_> = (0..8)
         .map(|_| tool_bash_async(run("pwd -P"), cwd))
         .collect();
     for result in futures::future::try_join_all(handles).await.unwrap() {
-        assert_eq!(result["cwd"], serde_json::json!(sub.to_str().unwrap()));
-        assert_eq!(result["cwd_changed"], serde_json::json!(false));
+        assert!(result.get("cwd").is_none(), "{result}");
         assert_eq!(
             result["stdout"].as_str().unwrap().trim(),
             sub.to_str().unwrap()
@@ -1560,6 +1560,7 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                 object.insert("sandbox_network".into(), serde_json::json!(format!("The sandbox blocked network access to {}: not in sandbox.network.allowedDomains (or listed in deniedDomains) in settings.json. Ask the user to allow the domain; do not retry with other hosts.", hosts.join(", "))));
             }
         }
+        let force_report_cwd = input["__report_cwd"].as_bool().unwrap_or(false);
         if let (Some(state), Some(capture)) = (&cwd_state, &cwd_capture) {
             let moved = saved_cwd(&capture.0).filter(|dir| !dir.is_empty());
             let reset = moved
@@ -1573,7 +1574,6 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                         serde_json::json!(format!("Shell cwd was reset to {cwd}")),
                     );
                     object.insert("cwd".into(), serde_json::json!(cwd));
-                    object.insert("cwd_changed".into(), serde_json::json!(true));
                 }
             } else if let Some(moved) = moved {
                 let changed = report_initial || !same_directory(&moved, &safe_cwd);
@@ -1584,15 +1584,17 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                         let _ = fs::write(state, format!("{moved}\n"));
                     }
                 }
-                if let Some(object) = result.as_object_mut() {
-                    object.insert("cwd".into(), serde_json::json!(moved));
-                    object.insert("cwd_changed".into(), serde_json::json!(changed));
+                if changed || force_report_cwd {
+                    if let Some(object) = result.as_object_mut() {
+                        object.insert("cwd".into(), serde_json::json!(moved));
+                    }
                 }
-            } else if let Some(object) = result.as_object_mut() {
-                // Early exit kept the previous working directory; still surface
-                // it so the model knows where subsequent foreground calls start.
-                object.insert("cwd".into(), serde_json::json!(safe_cwd));
-                object.insert("cwd_changed".into(), serde_json::json!(report_initial));
+            } else if (report_initial || force_report_cwd)
+                && result.as_object().is_some()
+            {
+                if let Some(object) = result.as_object_mut() {
+                    object.insert("cwd".into(), serde_json::json!(safe_cwd));
+                }
             }
         }
         Ok(result)

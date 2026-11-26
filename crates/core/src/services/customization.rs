@@ -60,6 +60,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "Read",
     "Write",
     "Edit",
+    "MultiEdit",
     "Grep",
     "Glob",
     "Skill",
@@ -67,7 +68,10 @@ pub const CORE_TOOLS: &[&str] = &[
     "AskUserQuestion",
     "EnterPlanMode",
     "ExitPlanMode",
+    "TaskGet",
     "TaskStop",
+    "WebFetch",
+    "WebSearch",
 ];
 
 /// Whether the name belongs to the default core set. The list only decides the
@@ -391,6 +395,7 @@ mod tests {
                 "Read",
                 "Write",
                 "Edit",
+                "MultiEdit",
                 "Grep",
                 "Glob",
                 "Skill",
@@ -398,13 +403,16 @@ mod tests {
                 "AskUserQuestion",
                 "EnterPlanMode",
                 "ExitPlanMode",
+                "TaskGet",
                 "TaskStop",
+                "WebFetch",
+                "WebSearch",
             ]
         );
         for name in CORE_TOOLS {
             assert_eq!(default_loading(name), ToolLoading { enabled: true, on_demand: true }, "{name}");
         }
-        for name in ["ListDir", "MultiEdit", "WebFetch", "Agent", "Workflow", "computer_use", "ProposeGoal"] {
+        for name in ["ListDir", "Monitor", "NotebookEdit", "Agent", "Workflow", "computer_use", "ProposeGoal"] {
             assert!(!is_core_tool(name), "{name}");
             assert_eq!(default_loading(name), ToolLoading { enabled: false, on_demand: true }, "{name}");
         }
@@ -417,7 +425,7 @@ mod tests {
         let mut customization = Customization::default();
         let none = BTreeSet::new();
         assert!(customization.exposes("Grep", &none));
-        assert!(!customization.exposes("WebFetch", &none));
+        assert!(!customization.exposes("ListDir", &none));
         // Legacy "disabled" no longer blocks discovery.
         customization.disabled_tools.push("Grep".into());
         assert_eq!(customization.loading("Grep"), ToolLoading { enabled: false, on_demand: true });
@@ -428,9 +436,9 @@ mod tests {
         customization.tool_loading.insert("Grep".into(), ToolLoading { enabled: false, on_demand: false });
         assert!(!customization.exposes("Grep", &loaded));
         // Turning discovery off leaves a loaded tool in place.
-        customization.tool_loading.insert("WebFetch".into(), ToolLoading { enabled: true, on_demand: false });
-        assert_eq!(customization.loading("WebFetch"), ToolLoading { enabled: true, on_demand: false });
-        assert!(customization.exposes("WebFetch", &none));
+        customization.tool_loading.insert("ListDir".into(), ToolLoading { enabled: true, on_demand: false });
+        assert_eq!(customization.loading("ListDir"), ToolLoading { enabled: true, on_demand: false });
+        assert!(customization.exposes("ListDir", &none));
     }
 
     #[test]
