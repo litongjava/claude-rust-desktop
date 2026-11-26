@@ -54,6 +54,13 @@ port = 30085
 # fixed 300-second total deadline of their own.
 request_timeout_secs = 300
 
+# How long an idle keep-alive connection stays in the process-wide shared model
+# client pools (in seconds). Must be positive. Reuse only happens for the same
+# scheme + host + port while the connection is still idle; servers may close it
+# earlier. Read when each shared client is first built (restart required for
+# changes to take effect).
+pool_idle_timeout_secs = 300
+
 # Maximum retries for transient HTTP errors (429, 5xx).
 max_retries = 7
 
