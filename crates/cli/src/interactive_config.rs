@@ -1753,7 +1753,7 @@ pub(crate) async fn search_config(
                 accepted = true;
                 break;
             }
-            _ if answer.starts_with("http://") || answer.starts_with("https://") => {
+            _ if choice.starts_with("http://") || choice.starts_with("https://") => {
                 match search_base_url(&answer) {
                     Ok(base_url) => {
                         let current = search.effective_provider().to_owned();
@@ -3926,6 +3926,25 @@ mod tests {
         assert_eq!(saved.provider.as_deref(), Some("anthropic"));
         assert_eq!(saved.base_url, "https://gateway.example/messages");
         assert_eq!(saved.model, "claude-opus-4-6");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn search_config_direct_url_accepts_uppercase_scheme() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(dir.path().to_path_buf()).unwrap();
+        let mut session = config_test_session(&paths).await;
+
+        // A pasted URL counts as a direct URL even when its scheme is
+        // uppercase, and the saved value keeps the original casing.
+        let mut input = answers(&["HTTPS://api.openai.com/v1", "", ""]);
+        handle("/search-config", &paths, &mut session, &mut input)
+            .await
+            .unwrap();
+        let saved = paths.read_config().unwrap().deepseek_search;
+        assert_eq!(saved.base_url, "HTTPS://api.openai.com/v1");
+        assert_eq!(saved.provider.as_deref(), Some("openai"));
+        assert_eq!(saved.model, "gpt-5-mini");
         session.close().await.unwrap();
     }
 
