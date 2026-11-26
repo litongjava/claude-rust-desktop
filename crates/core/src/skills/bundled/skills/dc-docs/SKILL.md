@@ -255,7 +255,7 @@ cargo build --release --locked -p deepseek-code-cli --bin dcl
 **安装路径约定**：
 
 - **临时编译安装（开发/灰度验证）**：复制到 `~/bin/dcl{N}`，`N` 从 `1` 开始取当前已有最大编号 + 1 递增（例如已有 `~/bin/dcl7` 时安装为 `~/bin/dcl8`），不覆盖正在运行的旧版本。
-- **正式安装**：安装到 `/usr/bin/dcl`。
+- **正式安装**：安装到 `/usr/local/bin/dcl`。
 
 | 要证明的结论 | 运行 |
 | --- | --- |
