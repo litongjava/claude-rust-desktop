@@ -46,7 +46,7 @@ async fn ask_valid<T>(
 
 /// Where the wizard keeps the credential for the provider it saves.
 #[derive(Debug)]
-enum Credential {
+pub(crate) enum Credential {
     /// Written to `api_key` in config.json.
     Key(String),
     /// The name of an environment variable read at launch.
@@ -101,7 +101,7 @@ fn env_credential(value: &str) -> std::result::Result<Credential, String> {
 
 /// Accepts either an inline API key or the name of an environment variable.
 /// `key:` and `env:` force one meaning when the value is ambiguous.
-fn parse_credential(value: &str) -> std::result::Result<Credential, String> {
+pub(crate) fn parse_credential(value: &str) -> std::result::Result<Credential, String> {
     let value = value.trim();
     if let Some(key) = strip_prefix_ignore_case(value, "key:") {
         return key_credential(key);
@@ -119,7 +119,7 @@ fn parse_credential(value: &str) -> std::result::Result<Credential, String> {
 }
 
 /// DeepSeek serves the Anthropic protocol under `/anthropic`.
-fn deepseek_base_url(protocol: &str, url: &str) -> Option<String> {
+pub(crate) fn deepseek_base_url(protocol: &str, url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
     let rest = trimmed.split_once("://")?.1;
     let host = rest.split(['/', ':']).next()?.to_ascii_lowercase();
@@ -127,9 +127,19 @@ fn deepseek_base_url(protocol: &str, url: &str) -> Option<String> {
         .then(|| format!("{trimmed}/anthropic"))
 }
 
+pub(crate) fn is_opencode_url(url: &str) -> bool {
+    let trimmed = url.trim().trim_end_matches('/');
+    let Some((_, rest)) = trimmed.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = authority.split(':').next().unwrap_or_default().to_ascii_lowercase();
+    host == "opencode.ai" || host.ends_with(".opencode.ai")
+}
+
 /// OpenCode Go serves each protocol under `/inference/go/...`; the bare host
 /// is a web page. Returns the URL to use when the entered one is not an API base.
-fn opencode_base_url(protocol: &str, url: &str) -> Option<String> {
+pub(crate) fn opencode_base_url(protocol: &str, url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/');
     let rest = trimmed.split_once("://")?.1;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
@@ -420,7 +430,12 @@ pub async fn wizard(
         })
         .collect();
     if protocol == "responses" {
-        provider.settings.insert("builtinId".into(), json!("openai"));
+        let builtin = if is_opencode_url(&provider.base_url) {
+            "opencode-go"
+        } else {
+            "openai"
+        };
+        provider.settings.insert("builtinId".into(), json!(builtin));
     }
     if protocol == "gemini" {
         provider
@@ -945,8 +960,12 @@ struct Preset {
     key_url: &'static str,
 }
 
+const OPENCODE_RESPONSES_BASE_URL: &str = "https://opencode.ai/inference/go/openai/v1";
+
 const PRESETS: &[Preset] = &[
-    Preset { id: "deepseek", name: "DeepSeek (recommended)", builtin: None, models: &["deepseek-flash", "deepseek-v4-pro"], key_url: "https://platform.deepseek.com/api_keys" },
+    // Default OpenCode preset: uses OpenAI Responses protocol out of the box.
+    Preset { id: "opencode", name: "OpenCode (recommended)", builtin: Some("opencode-go"), models: &["deepseek-v4.1-flash", "deepseek-v4-pro", "glm-5.3", "kimi-k3"], key_url: "https://opencode.ai/auth" },
+    Preset { id: "deepseek", name: "DeepSeek", builtin: None, models: &["deepseek-flash", "deepseek-v4-pro"], key_url: "https://platform.deepseek.com/api_keys" },
     Preset { id: "anthropic", name: "Anthropic Claude", builtin: Some("anthropic"), models: &["claude-sonnet-4-5", "claude-opus-4-6", "claude-haiku-4-5"], key_url: "https://console.anthropic.com/settings/keys" },
     Preset { id: "openai", name: "OpenAI", builtin: Some("openai"), models: &["gpt-5.1", "gpt-5-mini", "gpt-4.1"], key_url: "https://platform.openai.com/api-keys" },
     Preset { id: "moonshotai-cn", name: "Moonshot Kimi (China)", builtin: Some("moonshotai-cn"), models: &["kimi-k2.7-code", "kimi-k2-thinking"], key_url: "https://platform.moonshot.cn/console/api-keys" },
@@ -963,10 +982,15 @@ fn preset_by_id(id: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|preset| preset.id == id)
 }
 
-/// OpenCode Go advertises models over four protocols, so its preset keeps the
-/// whole catalog instead of a hand-picked subset.
+/// OpenCode and OpenCode Go advertise dozens of models, so their presets keep
+/// the whole catalog instead of a hand-picked subset.
 fn preset_uses_entire_catalog(preset: &Preset) -> bool {
-    preset.id == "opencode-go"
+    matches!(preset.id, "opencode" | "opencode-go")
+}
+
+/// The default OpenCode preset routes models over OpenAI Responses.
+fn preset_uses_responses(preset: &Preset) -> bool {
+    preset.id == "opencode"
 }
 
 fn preset_key_env(preset: &Preset) -> String {
@@ -1007,7 +1031,11 @@ fn preset_provider(preset: &Preset, api_key: Option<String>) -> Result<deepseek_
             let entry = deepseek_code_core::native_engine::provider_runtime::catalog_entry(builtin)
                 .with_context(|| format!("The built-in catalog has no {builtin} entry"))?;
             provider.provider_type = "openai".into();
-            provider.base_url = entry["baseUrl"].as_str().unwrap_or_default().into();
+            provider.base_url = if preset_uses_responses(preset) {
+                OPENCODE_RESPONSES_BASE_URL.into()
+            } else {
+                entry["baseUrl"].as_str().unwrap_or_default().into()
+            };
             provider.settings.insert("builtinId".into(), json!(builtin));
             let catalog = entry["models"].as_array().cloned().unwrap_or_default();
             let wanted: Vec<&str> = if preset_uses_entire_catalog(preset) {
@@ -1037,10 +1065,22 @@ fn preset_provider(preset: &Preset, api_key: Option<String>) -> Result<deepseek_
                     let mut config = config::provider_template(id).models.remove(0);
                     config.id = id.into();
                     config.name = model["name"].as_str().unwrap_or(id).into();
-                    config.api = model["api"].as_str().map(String::from);
+                    config.api = if preset_uses_responses(preset) {
+                        Some("openai-responses".into())
+                    } else {
+                        model["api"].as_str().map(String::from)
+                    };
                     config.context_window = model["contextWindow"].as_u64().map(|value| value as u32);
                     config.max_tokens = model["maxTokens"].as_u64().map(|value| (value as u32).min(32_000));
-                    config.supports_vision = true;
+                    config.supports_vision = model["inputTypes"]
+                        .as_array()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .any(|item| item.eq_ignore_ascii_case("image"))
+                        })
+                        .unwrap_or(true);
                     config
                 })
                 .collect();
@@ -1051,7 +1091,7 @@ fn preset_provider(preset: &Preset, api_key: Option<String>) -> Result<deepseek_
 }
 
 /// Sends a tiny request with the saved provider so a bad key shows up now.
-async fn verify(paths: &RuntimePaths, provider: &str, model: &str) -> Result<()> {
+pub(crate) async fn verify(paths: &RuntimePaths, provider: &str, model: &str) -> Result<()> {
     let selection = select(paths, provider, model)?;
     let manager = deepseek_code_core::native_engine::provider_manager::ProviderManager::in_memory(
         selection.providers,
@@ -1078,7 +1118,14 @@ async fn configure_preset(paths: &RuntimePaths, input: &mut TerminalInput, prese
             command_eprintln!("Using the API key from {key_env}.");
             None
         } else {
-            command_eprintln!("Get an API key at {}", preset.key_url);
+            if preset.id == "opencode" {
+                command_eprintln!(
+                    "Create an OpenAI API key for OpenCode at {} (defaults to OpenAI Responses protocol)",
+                    preset.key_url
+                );
+            } else {
+                command_eprintln!("Get an API key at {}", preset.key_url);
+            }
             let prompt = format!("Paste the API key (hidden), or press Enter to set {key_env} yourself: ");
             let key = input.read_secret(&prompt).await?.context("Input closed")?.trim().to_owned();
             if key.is_empty() {
@@ -1183,7 +1230,7 @@ async fn choose_default_model(
     Ok(models[index - 1].id.clone())
 }
 
-/// First-run setup: pick a built-in provider (DeepSeek by default), a saved
+/// First-run setup: pick a built-in provider (OpenCode by default), a saved
 /// one, or a custom endpoint; the key is checked before the session starts.
 pub async fn setup(paths: &RuntimePaths, input: &mut TerminalInput) -> Result<config::Selection> {
     let saved: Vec<_> = paths.read_config()?.providers.into_iter().filter(|p| p.enabled).collect();
@@ -1364,6 +1411,10 @@ pub async fn handle(
     let config = paths.read_config()?;
     let providers: Vec<_> = config.providers.iter().filter(|p| p.enabled).collect();
     let (provider, model) = if command == "/provider" {
+        if argument.is_none() && !input.is_fixture() && crate::terminal::picker::available() {
+            crate::provider_panel::run(paths, session).await?;
+            return Ok(true);
+        }
         for (i, p) in providers.iter().enumerate() {
             command_eprintln!("{}. {} — {} ({})", i + 1, p.id, p.name, p.provider_type);
         }
@@ -1515,12 +1566,24 @@ mod tests {
                 assert!(provider.base_url.starts_with("https://"), "{}", preset.id);
             }
         }
-        let deepseek = preset_provider(&PRESETS[0], Some("sk-test".into())).unwrap();
+        assert_eq!(PRESETS[0].id, "opencode");
+        assert!(PRESETS[0].name.contains("recommended"));
+        let opencode = preset_provider(&PRESETS[0], Some("oc-test".into())).unwrap();
+        assert_eq!(opencode.base_url, "https://opencode.ai/inference/go/openai/v1");
+        assert_eq!(opencode.settings["builtinId"], "opencode-go");
+        assert_eq!(opencode.api_key.as_deref(), Some("oc-test"));
+        assert_eq!(preset_key_env(&PRESETS[0]), "OPENCODE_API_KEY");
+        assert!(opencode
+            .models
+            .iter()
+            .all(|model| model.api.as_deref() == Some("openai-responses")));
+
+        let deepseek = preset_provider(preset_by_id("deepseek").unwrap(), Some("sk-test".into())).unwrap();
         assert_eq!(deepseek.base_url, "https://api.deepseek.com");
         assert_eq!(deepseek.models[0].id, "deepseek-flash");
         assert_eq!(deepseek.api_key.as_deref(), Some("sk-test"));
-        assert_eq!(preset_key_env(&PRESETS[3]), "MOONSHOT_API_KEY");
-        let anthropic = preset_provider(&PRESETS[1], None).unwrap();
+        assert_eq!(preset_key_env(preset_by_id("moonshotai-cn").unwrap()), "MOONSHOT_API_KEY");
+        let anthropic = preset_provider(preset_by_id("anthropic").unwrap(), None).unwrap();
         assert_eq!(anthropic.settings["builtinId"], "anthropic");
         assert_eq!(anthropic.models[0].api.as_deref(), Some("anthropic-messages"));
     }
