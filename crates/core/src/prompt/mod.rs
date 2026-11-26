@@ -1,6 +1,6 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -176,6 +176,59 @@ pub fn skills_for_session(root: &Path, session: &str, lines: &[String]) -> Optio
     reminder
 }
 
+/// The full body of a skill, injected directly into the first-turn context so
+/// the model has its complete instructions without spending a turn calling
+/// `Skill`. None when there is no block.
+pub fn inline_skills_reminder(blocks: &[(String, String)]) -> Option<String> {
+    let mut text = String::new();
+    for (name, body) in blocks {
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!("# Skill: {name}\n{body}"));
+    }
+    (!text.is_empty()).then(|| format!("<system-reminder>\n{text}\n</system-reminder>"))
+}
+
+/// The inline skill bodies frozen on the session's first request, for the same
+/// prefix-stability reason as the environment.
+pub fn inline_skills_for_session(
+    root: &Path,
+    session: &str,
+    blocks: &[(String, String)],
+) -> Option<String> {
+    let path = crate::session_files::environment_file(root, session, ".inline-skills.json");
+    if let Some(saved) = frozen_reminder(&path) {
+        return saved;
+    }
+    let reminder = inline_skills_reminder(blocks);
+    store_frozen_reminder(&path, &reminder);
+    reminder
+}
+
+/// Full skill bodies for the first-turn context from every skill whose
+/// effective state is `SkillState::Always` (marked `always_inline`) and that is
+/// model-invocable. Empty when no skill is in `Always`, so users pay zero extra
+/// tokens. A `$ARGUMENTS` placeholder is stripped because injected text has no
+/// invocation arguments.
+pub fn inline_skill_blocks(
+    skills: &BTreeMap<String, crate::skills::discovery::SkillCommand>,
+) -> Vec<(String, String)> {
+    skills
+        .values()
+        .filter(|skill| skill.always_inline && skill.model_invocable())
+        .filter_map(|skill| {
+            let body = skill.content.replace("$ARGUMENTS", "");
+            let body = body.trim();
+            (!body.is_empty()).then(|| (skill.name.clone(), body.to_owned()))
+        })
+        .collect()
+}
+
 /// The experience index plus its runtime instruction. Always a block when the
 /// feature applies; an empty index still tells the model where to write.
 pub fn experience_reminder(lines: &[String]) -> String {
@@ -305,6 +358,8 @@ pub struct SessionReminders {
     pub loadable_tools: Option<String>,
     /// The model-invocable skills, frozen on the first request.
     pub available_skills: Option<String>,
+    /// Full skill bodies injected on the first request, such as `codegraph`.
+    pub inline_skills: Option<String>,
     pub environment: Option<String>,
     pub date: Option<String>,
     pub git: Option<String>,
@@ -328,6 +383,7 @@ pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     blocks.extend(parts.experience);
     blocks.extend(parts.loadable_tools);
     blocks.extend(parts.available_skills);
+    blocks.extend(parts.inline_skills);
     blocks.extend(parts.environment);
     blocks.extend(parts.date);
     blocks.extend(parts.git);
@@ -1257,12 +1313,15 @@ mod tests {
             available_skills: Some(
                 "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
             ),
+            inline_skills: Some(
+                "<system-reminder>\n# Skill: codegraph\ncodegraph explore marker\n</system-reminder>".into(),
+            ),
             environment: Some(environment),
             date: Some(date_reminder("2026-11-19")),
             git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
             skills: Some("<system-reminder>\ninvoked skills\n</system-reminder>".into()),
         });
-        assert_eq!(blocks.len(), 11);
+        assert_eq!(blocks.len(), 12);
         assert!(blocks[0].contains("user rules"));
         assert_eq!(blocks[1], standalone_frontend_reminder());
         assert!(blocks[1].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
@@ -1271,13 +1330,14 @@ mod tests {
         assert!(blocks[4].contains("experience marker"));
         assert!(blocks[5].contains("Tools you can load with ToolLoad"));
         assert!(blocks[6].contains("Available skills"));
-        assert!(blocks[7].starts_with("<system-reminder>\n# Working environment\n"));
-        assert!(blocks[7].contains(" - Project: Demo\n - Primary working directory: "));
-        assert!(blocks[7].contains(" - Platform: "));
-        assert!(!blocks[7].contains("Today's date"));
-        assert_eq!(blocks[8], date_reminder("2026-11-19"));
-        assert_eq!(blocks[9], "<system-reminder>\n# gitStatus\n</system-reminder>");
-        assert_eq!(blocks[10], "<system-reminder>\ninvoked skills\n</system-reminder>");
+        assert!(blocks[7].contains("codegraph explore marker"));
+        assert!(blocks[8].starts_with("<system-reminder>\n# Working environment\n"));
+        assert!(blocks[8].contains(" - Project: Demo\n - Primary working directory: "));
+        assert!(blocks[8].contains(" - Platform: "));
+        assert!(!blocks[8].contains("Today's date"));
+        assert_eq!(blocks[9], date_reminder("2026-11-19"));
+        assert_eq!(blocks[10], "<system-reminder>\n# gitStatus\n</system-reminder>");
+        assert_eq!(blocks[11], "<system-reminder>\ninvoked skills\n</system-reminder>");
         // The terminal facts are a first-message reminder, never system text.
         let system = compose_system_prompt_in(None, PromptProfile::Code);
         assert!(!system.contains(STANDALONE_FRONTEND));
@@ -1299,6 +1359,93 @@ mod tests {
         }
         let end: String = system.chars().skip(system.chars().count().saturating_sub(160)).collect();
         println!("system prompt end:\n{end}");
+    }
+
+    #[test]
+    fn always_skills_are_inlined_and_frozen_while_other_states_cost_zero_tokens() {
+        let skill = |name: &str, content: &str, always_inline: bool, disable_model_invocation: bool| {
+            crate::skills::discovery::SkillCommand {
+                name: name.to_owned(),
+                description: format!("{name} description"),
+                path: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
+                content: content.to_owned(),
+                user_invocable: true,
+                disable_model_invocation,
+                listing_name_only: false,
+                always_inline,
+                context: None,
+                shell: None,
+                agent: None,
+            }
+        };
+        let mut skills = BTreeMap::new();
+        skills.insert(
+            "codegraph".to_owned(),
+            skill(
+                "codegraph",
+                "Use CodeGraph.\n\n1. Run `codegraph status` or `codegraph init`.\n2. Run `codegraph explore`, `codegraph node`, `codegraph callers`, `codegraph impact`.\n3. Run `codegraph sync` after a large edit.\n\n$ARGUMENTS",
+                true,
+                false,
+            ),
+        );
+        skills.insert(
+            "style-guide".to_owned(),
+            skill("style-guide", "Follow the repository style guide.", true, false),
+        );
+        skills.insert(
+            "regular-user".to_owned(),
+            skill("regular-user", "Should not be inlined.", false, false),
+        );
+        skills.insert(
+            "hidden-always".to_owned(),
+            skill("hidden-always", "Hidden from model.", true, true),
+        );
+
+        let blocks = inline_skill_blocks(&skills);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "codegraph");
+        assert_eq!(blocks[1].0, "style-guide");
+        assert_eq!(blocks[1].1, "Follow the repository style guide.");
+        for command in [
+            "codegraph status",
+            "codegraph init",
+            "codegraph explore",
+            "codegraph node",
+            "codegraph callers",
+            "codegraph impact",
+            "codegraph sync",
+        ] {
+            assert!(blocks[0].1.contains(command), "missing {command}: {}", blocks[0].1);
+        }
+        assert!(!blocks[0].1.contains("$ARGUMENTS"));
+
+        // No `always_inline` skills -> zero extra text.
+        let non_always = BTreeMap::from([(
+            "regular-user".to_owned(),
+            skill("regular-user", "Should not be inlined.", false, false),
+        )]);
+        assert!(inline_skill_blocks(&non_always).is_empty());
+        assert!(inline_skill_blocks(&BTreeMap::new()).is_empty());
+
+        let root = tempfile::tempdir().unwrap();
+        let frozen = inline_skills_for_session(root.path(), "s", &blocks).unwrap();
+        assert!(frozen.starts_with("<system-reminder>\n# Skill: codegraph\n"));
+        assert!(frozen.contains("# Skill: style-guide\nFollow the repository style guide."));
+        assert!(!frozen.contains("regular-user"));
+        assert!(!frozen.contains("hidden-always"));
+        assert_eq!(frozen.matches("<system-reminder>").count(), 1);
+        // Later requests and resumes replay the frozen block.
+        assert_eq!(
+            inline_skills_for_session(root.path(), "s", &[]).as_deref(),
+            Some(frozen.as_str())
+        );
+        assert!(inline_skills_for_session(root.path(), "other", &[]).is_none());
+        assert!(inline_skills_reminder(&[]).is_none());
+        assert!(first_message_reminders(SessionReminders {
+            inline_skills: Some(frozen.clone()),
+            ..Default::default()
+        })
+        .contains(&frozen));
     }
 
     #[test]
@@ -1637,6 +1784,11 @@ mod tests {
             &[],
         );
         skills_for_session(root, session, &["- deploy: Ship it".to_owned()]);
+        inline_skills_for_session(
+            root,
+            session,
+            &[("codegraph".to_owned(), "codegraph explore".to_owned())],
+        );
         experience_for_session(root, session, Some(root), true, &[]);
         set_changes(root, session, "loadable-tools", &["ListDir".to_owned()]);
         set_changes(root, session, "skills", &["deploy".to_owned()]);

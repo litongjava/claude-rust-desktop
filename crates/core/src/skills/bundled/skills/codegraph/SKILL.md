@@ -4,17 +4,14 @@ description: "Use CodeGraph code intelligence to inspect symbols, call paths, an
 user-invocable: true
 disable-model-invocation: false
 ---
-Use CodeGraph for this code question or change: $ARGUMENTS
+Use CodeGraph to answer this code question or plan this change before editing files.
 
 1. Check for a `.codegraph/` index at or above the project root with
    `codegraph status` to see whether the index exists, how current it is and
    which project it describes. If no index exists yet, run `codegraph init`
    (or `codegraph index` to rebuild) to build the local index before querying.
-2. Use the `codegraph` CLI directly (concise and works even when MCP is
-   unavailable): `codegraph explore "<symbols or question>"`,
+2. Use the `codegraph` CLI directly: `codegraph explore "<symbols or question>"`,
    `codegraph node <name>`, or `codegraph callers|callees|impact <symbol>`.
-   If the `codegraph_explore` MCP tool is configured and working, you may
-   also load it with ToolLoad and query it.
 3. Treat the result as verbatim source with line numbers plus the call path
    among the shown symbols. Consider those spans already read; open a file
    separately only for lines outside the returned view or to confirm an edit.
@@ -24,6 +21,6 @@ Use CodeGraph for this code question or change: $ARGUMENTS
    `codegraph` is unavailable or indexing fails, fall back to Grep, Glob and
    Read.
 
-Report which command or tool answered the question, the symbols and file:line
+Report which command answered the question, the symbols and file:line
 references that matter, and any part of the answer that comes from reasoning
 rather than the index.
