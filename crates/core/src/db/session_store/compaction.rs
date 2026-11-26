@@ -208,6 +208,26 @@ impl SessionRead<'_> {
             fingerprint: compaction::fingerprint(self.0, &id)?.0,
         })
     }
+    pub(crate) fn mid_turn_compaction_fence(
+        &self,
+    ) -> Result<(Option<String>, Option<String>, usize)> {
+        let last_message: Option<String> = self
+            .0
+            .query_row(
+                "SELECT id FROM messages ORDER BY sort_order DESC, rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let boundary = self.boundary_id()?;
+        let count: i64 = self.0.query_row(
+            "WITH cut AS (SELECT sort_order, rowid AS seq FROM messages WHERE is_compact_boundary=1 ORDER BY sort_order DESC, rowid DESC LIMIT 1)
+             SELECT COUNT(*) FROM messages WHERE NOT EXISTS(SELECT 1 FROM cut) OR (sort_order, rowid) >= (SELECT sort_order, seq FROM cut)",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((last_message, boundary, count.max(0) as usize))
+    }
 }
 
 impl SessionDb {
@@ -224,6 +244,32 @@ impl SessionDb {
                 "Session changed during compaction"
             );
             w.commit_summary(summary, &memory, cut.before.as_deref())
+        })
+    }
+
+    pub(crate) fn commit_mid_turn_compaction(
+        &self,
+        expected_last_message: Option<&str>,
+        expected_boundary: Option<&str>,
+        summary: &compaction::GeneratedSummary,
+    ) -> Result<String> {
+        ensure!(
+            !summary.text.trim().is_empty() && summary.text.chars().count() <= 32_000,
+            "Empty or oversized compaction summary"
+        );
+        let _guard = self.hold_incarnation()?;
+        let _locks = self.stores.key_lock(&self.key, false, false)?;
+        let memory = crate::services::memory_files::prompt::Admission::session(self)?;
+        self.require_active_compaction()?;
+        self.write_locked("commit mid-turn compaction", |w| {
+            let (current_last, current_boundary, _) = SessionRead(w.0).mid_turn_compaction_fence()?;
+            ensure!(
+                current_last.as_deref() == expected_last_message
+                    && current_boundary.as_deref() == expected_boundary,
+                "Session changed during compaction"
+            );
+            w.0.execute("DELETE FROM compaction_request", [])?;
+            w.commit_summary(summary, &memory, None)
         })
     }
 }

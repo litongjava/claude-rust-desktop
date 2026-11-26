@@ -118,6 +118,12 @@ pub struct CliGoal {
     pub last_check: Option<String>,
 }
 
+/// Compacts at 80% of the window by default, leaving a fifth for the next
+/// response and for summarization, e.g. 160k of a 200k window.
+pub fn default_autocompact_tokens(window: u64) -> Option<u64> {
+    Some(window * 4 / 5).filter(|tokens| *tokens > 0)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
@@ -125,6 +131,20 @@ pub struct Preferences {
     pub autocompact_percent: Option<CompactPercent>,
     pub autocompact_off: bool,
     pub goal: Option<CliGoal>,
+}
+
+impl Preferences {
+    /// Estimated history tokens at which the conversation is automatically compacted.
+    pub fn autocompact_tokens(&self, window: u64) -> Option<u64> {
+        if window == 0 {
+            return None;
+        }
+        match self.autocompact_percent {
+            Some(percent) => Some(window * u64::from(u8::from(percent)) / 100),
+            None if self.autocompact_off => None,
+            None => default_autocompact_tokens(window),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,7 +183,19 @@ pub struct Editor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Microcompact {
     pub through: usize,
+    #[serde(default)]
+    pub cleared_results: usize,
     pub boundary: String,
+}
+
+impl Microcompact {
+    pub fn for_boundary(boundary: impl Into<String>) -> Self {
+        Self {
+            through: 0,
+            cleared_results: 0,
+            boundary: boundary.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

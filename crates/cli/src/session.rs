@@ -2732,7 +2732,10 @@ impl Session {
                         else { progress.thinking(); }
                     },
                     EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
-                    EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved } if session_id == self.id => {
+                    EngineEvent::CompactionNotice(message) => {
+                        progress.notice(&message);
+                    },
+                    EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved, reason } if session_id == self.id => {
                         transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
                             tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
@@ -2741,8 +2744,15 @@ impl Session {
                         assistant_id = turn.resume_reset_segment(reserved)?;
                         text.clear(); thinking_text.clear(); tools.clear(); snapshots.clear();
                         if background_transcript { live_transcript = BackgroundTranscript::default(); separate_text = false; }
-                        observed_plan_boundary = Some(boundary_id);
-                        progress.notice("Planning context cleared. The approved plan starts a fresh context in this session; prior messages remain archived.");
+                        match reason {
+                            deepseek_code_core::native_engine::tool_loop::ContextResetReason::PlanApproval => {
+                                observed_plan_boundary = Some(boundary_id);
+                                progress.notice("Planning context cleared. The approved plan starts a fresh context in this session; prior messages remain archived.");
+                            }
+                            deepseek_code_core::native_engine::tool_loop::ContextResetReason::AutoCompact { notice } => {
+                                progress.notice(&notice);
+                            }
+                        }
                     },
                     EngineEvent::AgentProgress { session_id, address, agent_type, status, tool_name } => progress.agent_progress(address, &session_id, &agent_type, &status, tool_name.as_deref()),
                     EngineEvent::Usage(value) => { progress.reported_usage(&value); },
@@ -3108,6 +3118,7 @@ impl Session {
                         session_id,
                         boundary_id,
                         assistant_id: reserved,
+                        reason,
                     } if session_id == self.id => {
                         transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
@@ -3121,7 +3132,12 @@ impl Session {
                         snapshots.clear();
                         live_transcript = BackgroundTranscript::default();
                         separate_text = false;
-                        observed_plan_boundary = Some(boundary_id);
+                        if matches!(
+                            reason,
+                            deepseek_code_core::native_engine::tool_loop::ContextResetReason::PlanApproval
+                        ) {
+                            observed_plan_boundary = Some(boundary_id);
+                        }
                     }
                     EngineEvent::RequestSnapshot(snapshot) => {
                         request_usage.observe(&snapshot);
@@ -3992,8 +4008,22 @@ pub(crate) fn event_json_with(event: &EngineEvent, summaries: bool) -> Option<Va
         EngineEvent::ContextReset {
             session_id,
             boundary_id,
+            reason,
             ..
-        } => json!({"type":"context_reset","session_id":session_id,"boundary_id":boundary_id}),
+        } => {
+            let kind = match reason {
+                deepseek_code_core::native_engine::tool_loop::ContextResetReason::PlanApproval => {
+                    "plan_approval"
+                }
+                deepseek_code_core::native_engine::tool_loop::ContextResetReason::AutoCompact {
+                    ..
+                } => "auto_compact",
+            };
+            json!({"type":"context_reset","session_id":session_id,"boundary_id":boundary_id,"reason":kind})
+        }
+        EngineEvent::CompactionNotice(message) => {
+            json!({"type":"compaction_notice","message":message})
+        }
         EngineEvent::Text(delta) => json!({"type":"text","delta":delta}),
         EngineEvent::QueuedInput(input) => {
             json!({"type":"queued_input","text":input.text,"content":input.content,"origin":input.origin})
@@ -5456,6 +5486,39 @@ mod compaction_cancellation_tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn context_reset_and_compaction_notice_serialize_distinct_reasons() {
+        use deepseek_code_core::native_engine::tool_loop::{ContextResetReason, EngineEvent};
+        let plan = super::event_json(&EngineEvent::ContextReset {
+            session_id: "s1".into(),
+            boundary_id: "b1".into(),
+            assistant_id: Some("a2".into()),
+            reason: ContextResetReason::PlanApproval,
+        })
+        .unwrap();
+        assert_eq!(plan["type"], "context_reset");
+        assert_eq!(plan["reason"], "plan_approval");
+
+        let auto = super::event_json(&EngineEvent::ContextReset {
+            session_id: "s1".into(),
+            boundary_id: "b2".into(),
+            assistant_id: Some("a3".into()),
+            reason: ContextResetReason::AutoCompact {
+                notice: "Compacted in 1s".into(),
+            },
+        })
+        .unwrap();
+        assert_eq!(auto["type"], "context_reset");
+        assert_eq!(auto["reason"], "auto_compact");
+
+        let notice = super::event_json(&EngineEvent::CompactionNotice(
+            "Auto-compacting conversation…".into(),
+        ))
+        .unwrap();
+        assert_eq!(notice["type"], "compaction_notice");
+        assert_eq!(notice["message"], "Auto-compacting conversation…");
     }
 }
 

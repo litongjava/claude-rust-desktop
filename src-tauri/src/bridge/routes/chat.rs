@@ -385,7 +385,10 @@ pub(super) async fn start_authorized_chat(
                 }
             }
             let event_data = match event {
-                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved } => {
+                crate::native_engine::tool_loop::EngineEvent::CompactionNotice(message) => {
+                    Some(serde_json::json!({"type":"compaction_notice","message":message}))
+                }
+                crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved, reason } => {
                     if session_id == conv_id {
                         if let Err(error) = history.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&full_text), thinking: Some(""),
@@ -404,10 +407,16 @@ pub(super) async fn start_authorized_chat(
                         full_text.clear(); tools.clear(); origins.clear(); arguments.clear(); request_snapshots.clear();
                         run.reset_progress();
                         run.set_turn(turn.record(), &assistant_id);
-                        observed_plan_boundary = Some(boundary_id.clone());
+                        if matches!(reason, crate::native_engine::tool_loop::ContextResetReason::PlanApproval) {
+                            observed_plan_boundary = Some(boundary_id.clone());
+                        }
                     }
                     let content = history.message_text(&boundary_id).ok().flatten().unwrap_or_default();
-                    Some(serde_json::json!({"type":"context_reset","boundary_id":boundary_id,"content":content,"assistant_id":assistant_id,"turn":turn.record()}))
+                    let kind = match reason {
+                        crate::native_engine::tool_loop::ContextResetReason::PlanApproval => "plan_approval",
+                        crate::native_engine::tool_loop::ContextResetReason::AutoCompact { .. } => "auto_compact",
+                    };
+                    Some(serde_json::json!({"type":"context_reset","boundary_id":boundary_id,"content":content,"assistant_id":assistant_id,"turn":turn.record(),"reason":kind}))
                 }
                 crate::native_engine::tool_loop::EngineEvent::RequestSnapshot(mut snapshot) => {
                     if let Some(existing) = request_snapshots.iter_mut().find(|entry| entry["id"] == snapshot["id"]) {

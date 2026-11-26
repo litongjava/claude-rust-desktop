@@ -603,10 +603,7 @@ impl QueryEngine {
                 .repository()
                 .preference(MICROCOMPACT)?
                 .filter(|state| state.boundary == boundary)
-                .unwrap_or(Microcompact {
-                    through: 0,
-                    boundary: boundary.into(),
-                });
+                .unwrap_or_else(|| Microcompact::for_boundary(boundary));
             crate::services::compaction::microcompact::replay(
                 &mut history,
                 &mut state,

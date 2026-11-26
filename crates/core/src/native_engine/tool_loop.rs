@@ -131,17 +131,27 @@ mod provider_transcript;
 #[path = "multimodal_tests.rs"]
 mod multimodal_tests;
 
+/// Why a durable context boundary reset was emitted mid-turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextResetReason {
+    PlanApproval,
+    AutoCompact { notice: String },
+}
+
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     /// A message the user sent while the turn ran, now given to the model
     /// after the last tool results.
     QueuedInput(crate::services::input_queue::DeliveredInput),
-    /// A durable plan boundary; hosts must finish the old assistant segment before it.
+    /// A durable context boundary; hosts must finish the old assistant segment before it.
     ContextReset {
         session_id: String,
         boundary_id: String,
         assistant_id: Option<String>,
+        reason: ContextResetReason,
     },
+    /// Progress or status notice emitted during automatic context compaction.
+    CompactionNotice(String),
     /// Delegated task state without exposing the child's private model output.
     AgentProgress {
         address: Option<crate::db::session_store::HistoryAddress>,
@@ -400,6 +410,18 @@ pub struct ToolLoopExecutor {
     turn_scope: String,
     /// Monotonic per distinct execution within this turn.
     invocation_counter: u64,
+    /// Total input tokens reported by the previous model response in this turn.
+    last_reported_input_tokens: Option<u64>,
+    /// Estimated message-history tokens sent in the previous model request.
+    last_request_message_tokens: Option<u64>,
+    /// Non-history request overhead (system prompt + tools + schema) observed in the previous request.
+    last_request_overhead_tokens: u64,
+    /// Number of durable mid-turn auto-compactions committed during this turn.
+    mid_turn_compactions: usize,
+    /// Iteration index before which mid-turn auto-compaction is paused (failure or low-reduction cooldown).
+    mid_turn_compact_cooldown_until: usize,
+    /// Transient cue appended once when rendering a freshly compacted mid-turn boundary.
+    mid_turn_continuation_cue: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1716,6 +1738,12 @@ impl ToolLoopExecutor {
             super_agent: None,
             turn_scope: uuid::Uuid::new_v4().to_string(),
             invocation_counter: 0,
+            last_reported_input_tokens: None,
+            last_request_message_tokens: None,
+            last_request_overhead_tokens: 0,
+            mid_turn_compactions: 0,
+            mid_turn_compact_cooldown_until: 0,
+            mid_turn_continuation_cue: false,
         }
     }
 
@@ -3285,7 +3313,7 @@ impl ToolLoopExecutor {
                     .position(|msg| msg.get("role").and_then(Value::as_str) == Some("user"))
             })
             .flatten();
-        let additions: Vec<_> =
+        let mut additions: Vec<_> =
             crate::services::turn_context::resolve(&self.turn_context, &self.messages)
                 .into_iter()
                 .enumerate()
@@ -3300,6 +3328,18 @@ impl ToolLoopExecutor {
                     )
                 })
                 .collect();
+        if self.mid_turn_continuation_cue {
+            if let Some(first) = self.messages.first() {
+                let is_native = first
+                    .get("provider_content")
+                    .is_some_and(|v| v["compaction"] == true);
+                if !is_native && first.get("role").and_then(Value::as_str) == Some("user") {
+                    if let Some((_, after)) = additions.first_mut() {
+                        after.push("<system-reminder>\nContext was automatically compacted mid-turn. Continue executing the current task immediately from where you left off without waiting for a new user prompt.\n</system-reminder>".into());
+                    }
+                }
+            }
+        }
 
         additions
     }
@@ -3650,18 +3690,61 @@ impl ToolLoopExecutor {
         Ok(Some(id))
     }
 
-    async fn publish_context_reset(&mut self, boundary_id: String) -> Result<()> {
+    pub(super) async fn publish_context_reset(
+        &mut self,
+        boundary_id: String,
+        reason: ContextResetReason,
+    ) -> Result<()> {
         let sender = self.event_tx.clone();
-        let event = sender.reserve().await.map_err(|_| anyhow!("Planning event receiver closed"))?;
+        let event = sender
+            .reserve()
+            .await
+            .map_err(|_| anyhow!("Context reset event receiver closed"))?;
         let next = match (self.session_search_storage(), self.parent_message_id.as_deref()) {
             (Some(history), Some(previous)) => Some(history.rollover_segment(previous, &boundary_id)?),
             _ => None,
         };
         self.parent_message_id = next.clone();
         event.send(EngineEvent::ContextReset {
-            session_id: self.conv_id.clone().unwrap_or_default(), boundary_id, assistant_id: next,
+            session_id: self.conv_id.clone().unwrap_or_default(),
+            boundary_id,
+            assistant_id: next,
+            reason,
         });
         Ok(())
+    }
+
+    fn record_request_usage(&mut self, snapshot: &Value) {
+        let input = snapshot["inputTokens"].as_u64();
+        let cache_read = snapshot["cacheReadTokens"].as_u64().unwrap_or(0);
+        let cache_write = snapshot["cacheWriteTokens"].as_u64().unwrap_or(0);
+        // Anthropic `input_tokens` excludes cached input; OpenAI `prompt_tokens` includes it.
+        let reported = input.map(|tokens| {
+            if self.provider.provider.api_format == ApiFormat::Anthropic
+                && snapshot["usage"].get("input_tokens").is_some()
+            {
+                tokens
+                    .saturating_add(cache_read)
+                    .saturating_add(cache_write)
+            } else {
+                tokens
+            }
+        });
+        if let Some(cu) = snapshot.get("contextUsage").filter(|v| v.is_object()) {
+            let overhead = cu["instructions"]["estimated_tokens"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(cu["tools"]["estimated_tokens"].as_u64().unwrap_or(0))
+                .saturating_add(cu["output_schema"]["estimated_tokens"].as_u64().unwrap_or(0));
+            self.last_request_overhead_tokens = overhead;
+            if let Some(tokens) = reported {
+                self.last_reported_input_tokens = Some(tokens);
+                self.last_request_message_tokens =
+                    cu["history"]["estimated_tokens"].as_u64();
+            }
+        } else if let Some(tokens) = reported {
+            self.last_reported_input_tokens = Some(tokens);
+        }
     }
 
     fn session_search_storage(&self) -> Option<ExecutorHistory> {
@@ -3985,7 +4068,8 @@ impl ToolLoopExecutor {
             .unwrap_or_else(|error| error.into_inner()) = None;
         self.approved_call = None;
         if let Some(boundary_id) = self.restore_plan_boundary()? {
-            self.publish_context_reset(boundary_id).await?;
+            self.publish_context_reset(boundary_id, ContextResetReason::PlanApproval)
+                .await?;
         }
         // The OS lock is scoped to this future: cancellation/crash releases it.
         let (_turn_wal, turn_delivery) =
@@ -4254,7 +4338,8 @@ impl ToolLoopExecutor {
             ApiFormat::Anthropic => {
                 let mut messages = self.build_anthropic_messages()?;
                 self.apply_reasoning_prompt();
-                self.replay_window(&mut messages, None, Self::render_anthropic_messages)
+                let _ = self
+                    .replay_window(&mut messages, None, false, Self::render_anthropic_messages)
                     .await?;
                 let prepared = self.prepare_request()?;
                 let body = self.anthropic_client.request_body(
@@ -4274,7 +4359,8 @@ impl ToolLoopExecutor {
             ApiFormat::OpenAI => {
                 let mut messages = self.build_openai_messages()?;
                 self.apply_reasoning_prompt();
-                self.replay_window(&mut messages, None, Self::render_openai_messages)
+                let _ = self
+                    .replay_window(&mut messages, None, false, Self::render_openai_messages)
                     .await?;
                 let prepared = self.prepare_request()?;
                 self.openai_client.request_body(
@@ -5480,12 +5566,48 @@ impl ToolLoopExecutor {
             tracing::info!(module = "AnthropicLoop", "API key length={}", api_key_len);
 
             let mut request_messages = conversation_messages.clone();
-            self.replay_window(
+            let mut active_durable_len = durable_len;
+            let mut mid_turn_managed = false;
+            if iteration > 0 {
+                match Box::pin(self.maybe_mid_turn_auto_compact(
+                    iteration,
+                    &full_text,
+                    &mut request_messages,
+                    active_durable_len,
+                    Self::render_anthropic_messages,
+                ))
+                .await?
+                {
+                    history_replay::MidTurnCompact::Cancelled => {
+                        return Ok((full_text, Some("interrupted".to_string())));
+                    }
+                    history_replay::MidTurnCompact::Compacted => {
+                        conversation_messages = request_messages.clone();
+                        active_durable_len = request_messages.len();
+                        full_text.clear();
+                        mid_turn_managed = true;
+                    }
+                    history_replay::MidTurnCompact::Synced => {
+                        conversation_messages = request_messages.clone();
+                        active_durable_len = request_messages.len();
+                        mid_turn_managed = true;
+                    }
+                    history_replay::MidTurnCompact::Managed => {
+                        mid_turn_managed = true;
+                    }
+                    history_replay::MidTurnCompact::Unmanaged => {}
+                }
+            }
+            if Box::pin(self.replay_window(
                 &mut request_messages,
-                Some(durable_len),
+                Some(active_durable_len),
+                mid_turn_managed,
                 Self::render_anthropic_messages,
-            )
-            .await?;
+            ))
+            .await?
+            {
+                conversation_messages = request_messages.clone();
+            }
 
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
@@ -5900,6 +6022,9 @@ impl ToolLoopExecutor {
                 .as_str()
                 .unwrap_or("Model response ended before completion")
                 .to_string();
+            if response_status == "completed" {
+                self.record_request_usage(&snapshot);
+            }
             let _ = self
                 .event_tx
                 .send(EngineEvent::RequestSnapshot(snapshot))
@@ -6030,7 +6155,8 @@ impl ToolLoopExecutor {
                     after_tool_results = false;
                     conversation_messages = self.build_anthropic_messages()?;
                     full_text.clear();
-                    self.publish_context_reset(boundary_id).await?;
+                    self.publish_context_reset(boundary_id, ContextResetReason::PlanApproval)
+                        .await?;
                 }
             } else {
                 let can_continue = self
@@ -6194,12 +6320,48 @@ impl ToolLoopExecutor {
             tracing::info!(module = "OpenAILoop", "API key length={}", api_key_len);
 
             let mut request_messages = conversation_messages.clone();
-            self.replay_window(
+            let mut active_durable_len = durable_len;
+            let mut mid_turn_managed = false;
+            if iteration > 0 {
+                match Box::pin(self.maybe_mid_turn_auto_compact(
+                    iteration,
+                    &full_text,
+                    &mut request_messages,
+                    active_durable_len,
+                    Self::render_openai_messages,
+                ))
+                .await?
+                {
+                    history_replay::MidTurnCompact::Cancelled => {
+                        return Ok((full_text, Some("interrupted".to_string())));
+                    }
+                    history_replay::MidTurnCompact::Compacted => {
+                        conversation_messages = request_messages.clone();
+                        active_durable_len = request_messages.len();
+                        full_text.clear();
+                        mid_turn_managed = true;
+                    }
+                    history_replay::MidTurnCompact::Synced => {
+                        conversation_messages = request_messages.clone();
+                        active_durable_len = request_messages.len();
+                        mid_turn_managed = true;
+                    }
+                    history_replay::MidTurnCompact::Managed => {
+                        mid_turn_managed = true;
+                    }
+                    history_replay::MidTurnCompact::Unmanaged => {}
+                }
+            }
+            if Box::pin(self.replay_window(
                 &mut request_messages,
-                Some(durable_len),
+                Some(active_durable_len),
+                mid_turn_managed,
                 Self::render_openai_messages,
-            )
-            .await?;
+            ))
+            .await?
+            {
+                conversation_messages = request_messages.clone();
+            }
 
             // One snapshot per request: the definitions, the request snapshot
             // and the tool directory all come from the same settings and
@@ -6703,6 +6865,9 @@ impl ToolLoopExecutor {
                     .as_str()
                     .unwrap_or("Model response ended before completion")
                     .to_string();
+                if response_status == "completed" {
+                    self.record_request_usage(&snapshot);
+                }
                 let _ = self
                     .event_tx
                     .send(EngineEvent::RequestSnapshot(snapshot))
@@ -6906,7 +7071,8 @@ impl ToolLoopExecutor {
                     after_tool_results = false;
                     conversation_messages = self.build_openai_messages()?;
                     full_text.clear();
-                    self.publish_context_reset(boundary_id).await?;
+                    self.publish_context_reset(boundary_id, ContextResetReason::PlanApproval)
+                        .await?;
                 }
             } else {
                 let can_continue = self
