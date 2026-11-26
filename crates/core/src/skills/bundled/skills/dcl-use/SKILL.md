@@ -1,12 +1,12 @@
 ---
-name: test-dcl
-description: "Test the DeepSeek Code dcl CLI: pure logic, binary behavior, process-level mock runs, and real-terminal REPL panels."
-whenToUse: "Use when verifying a dcl change, reproducing a CLI bug, or adding regression coverage for crates/cli or shared core behavior."
+name: dcl-use
+description: "Use the DeepSeek Code CLI (dcl): build and run the binary, drive REPL panels, inspect sessions and requests, and verify changes at the right test layer."
+whenToUse: "Use when working with the dcl CLI: running it against a data directory, inspecting sessions or requests, driving REPL panels, or verifying a CLI/core change."
 user-invocable: true
 disable-model-invocation: false
 ---
 
-# Test dcl
+# Use dcl (DeepSeek Code CLI)
 
 Pick the cheapest layer that can falsify the claim. A unit test cannot prove the REPL renders, and a PTY run cannot pin parsing logic.
 
