@@ -339,7 +339,7 @@ fn starts_turn_command(command: &str, argument: &str) -> bool {
             let argument = argument.trim();
             !argument.is_empty()
                 && argument != "list"
-                && !argument.starts_with("stop")
+                && argument.split_whitespace().next() != Some("stop")
         }
         "/goal" => !argument.trim().is_empty() && !session_commands::is_goal_clear(argument),
         _ => command.starts_with("/mcp__"),
@@ -1259,6 +1259,9 @@ async fn run(cli: &mut Cli) -> Result<()> {
                         "{}",
                         worker_frontend::observation_banner(&session, occupancy)
                     );
+                    if let Err(error) = execution_observer.preannounce(&session) {
+                        command_eprintln!("Observation: {error:#}");
+                    }
                 }
             }
             if !observing && observe_announced {
@@ -1424,6 +1427,51 @@ async fn run(cli: &mut Cli) -> Result<()> {
                             input.as_ref().expect("interactive reader").set_suggestion(ghost);
                         }
                     }
+                    // Another process can take over while this prompt waits:
+                    // stop every automatic source here, then enter the same
+                    // read-only view the top of the REPL would show.
+                    let occupancy = match worker_frontend::occupancy(&session) {
+                        Ok(occupancy) => {
+                            last_occupancy_error.clear();
+                            occupancy
+                        }
+                        Err(error) => {
+                            let text = format!("{error:#}");
+                            if text != last_occupancy_error {
+                                command_eprintln!("Session occupancy: {text}");
+                                last_occupancy_error = text;
+                            }
+                            None
+                        }
+                    };
+                    let observing = occupancy.is_some()
+                        || (observe_announced && observe_state == observe::State::Running);
+                    if observing {
+                        // No hook wake, cron, loop, wakeup, agent question or
+                        // desktop input may start a turn while another owner
+                        // holds the session.
+                        session.hold_automatic_wake();
+                    }
+                    if observing && !observe_announced {
+                        observe_announced = true;
+                        if let Some(occupancy) = occupancy.as_ref() {
+                            command_eprintln!(
+                                "{}",
+                                worker_frontend::observation_banner(&session, occupancy)
+                            );
+                            if let Err(error) = execution_observer.preannounce(&session) {
+                                command_eprintln!("Observation: {error:#}");
+                            }
+                        }
+                        if input
+                            .as_mut()
+                            .expect("interactive reader")
+                            .yield_prompt()
+                            .await?
+                        {
+                            continue 'repl;
+                        }
+                    }
                     // While a resumed session is owned elsewhere, show the public
                     // text/tool progress that owner publishes. The observer never
                     // takes the lease, submits input or runs a tool.
@@ -1443,6 +1491,16 @@ async fn run(cli: &mut Cli) -> Result<()> {
                                         observe_state = observe::State::Idle;
                                         if let Some(reader) = input.as_ref() {
                                             reader.notice("✻ The other turn finished; input is enabled. Nothing queued while observing was submitted.".into());
+                                        }
+                                        // The current prompt still shows the
+                                        // read-only marker; redraw it as idle.
+                                        if input
+                                            .as_mut()
+                                            .expect("interactive reader")
+                                            .yield_prompt()
+                                            .await?
+                                        {
+                                            continue 'repl;
                                         }
                                     }
                                 }
@@ -1835,8 +1893,12 @@ async fn run(cli: &mut Cli) -> Result<()> {
             }
             match repl::handle(&line, &paths, &mut session, input.as_mut()).await {
                 Ok(true) => {
-                    if let Some(draft) = terminal::NEXT_DRAFT.lock().unwrap_or_else(|error| error.into_inner()).take() {
-                        if let Some(input) = &input { input.restore_draft(draft); }
+                    // A command that switched sessions must let the next 'repl
+                    // iteration discard the previous session's draft first.
+                    if active_session == session.id {
+                        if let Some(draft) = terminal::NEXT_DRAFT.lock().unwrap_or_else(|error| error.into_inner()).take() {
+                            if let Some(input) = &input { input.restore_draft(draft); }
+                        }
                     }
                     continue;
                 },
@@ -2116,6 +2178,60 @@ fn read_piped_stdin<R: Read + Send + 'static>(
     }
     let bytes = done_rx.recv().context("stdin reader exited")??;
     String::from_utf8(bytes).context("stdin is not valid UTF-8")
+}
+
+#[cfg(test)]
+mod turn_command_tests {
+    use super::starts_turn_command;
+
+    #[test]
+    fn loop_stop_is_recognized_only_as_its_own_first_word() {
+        for argument in ["stop", "stop 2", "  stop   now  "] {
+            assert!(
+                !starts_turn_command("/loop", argument),
+                "/loop {argument} does not start a turn"
+            );
+        }
+        for argument in ["", "list"] {
+            assert!(
+                !starts_turn_command("/loop", argument),
+                "/loop {argument} does not start a turn"
+            );
+        }
+        for argument in [
+            "stop-watching-build",
+            "stopwatch",
+            "5m check",
+            "watch the build",
+            "list extra",
+        ] {
+            assert!(
+                starts_turn_command("/loop", argument),
+                "/loop {argument} starts a turn"
+            );
+        }
+    }
+
+    #[test]
+    fn only_turn_commands_are_gated_while_occupied() {
+        for (command, argument) in [
+            ("/plan", ""),
+            ("/btw", "question"),
+            ("/compact", ""),
+            ("/goal", "ship it"),
+            ("/mcp__fixture__search", ""),
+        ] {
+            assert!(starts_turn_command(command, argument), "{command}");
+        }
+        for (command, argument) in [
+            ("/status", ""),
+            ("/goal", "clear"),
+            ("/loop", "list"),
+            ("/clear", ""),
+        ] {
+            assert!(!starts_turn_command(command, argument), "{command}");
+        }
+    }
 }
 
 #[cfg(test)]
