@@ -9,7 +9,7 @@
 - An HTTP proxy can be configured as `web_fetch.proxy` in `config.json` (for example `http://127.0.0.1:10808`); only `http://` and `https://` proxy addresses are accepted. Without a configured proxy, the standard `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment is used. The model's tool input cannot choose a proxy.
 - Long pages are read in parts: a result with `next_offset` is continued by calling again with it as `offset`.
 - A new host asks for approval unless it is on the reference CLI's list of documentation sites; `WebFetch(domain:...)` rules allow or deny hosts. `/deep-research` children may fetch any page, subject to deny rules.
-- Downloads stop at 2 MiB and have a 12-second request deadline (4-second connection timeout). Text, HTML, JSON and XML are supported; HTTP failures and unsupported binary formats fail the tool.
+- Downloads stop at 2 MiB and have a 30-second request deadline (10-second connection timeout). Text, HTML, JSON and XML are supported; HTTP failures and unsupported binary formats fail the tool.
 
 `WebSearch` defaults to provider-hosted search. OpenAI uses the Responses API `web_search` tool; Anthropic uses the Messages API `web_search_20250305` tool. The adapter returns up to eight structured source URLs, titles and available citation snippets. It does not extract invented links from generated prose. The selected model/endpoint must support native search; failures are reported without silently switching to public search engines. Requests have a 45-second deadline and a 2 MiB response limit.
 
