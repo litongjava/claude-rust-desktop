@@ -17,6 +17,7 @@ use deepseek_code_core::{
     },
     permissions::PermissionMode,
     runtime::{self, RuntimePaths, SessionStore},
+    services::resource_monitor::{ResourceMonitor, ResourceMonitorConfig},
 };
 use serde_json::{json, Value};
 use std::{
@@ -1024,7 +1025,14 @@ impl Session {
         ))
         .with_skills_manager(Arc::new(Mutex::new(
             deepseek_code_core::skills::SkillsManager::with_path(paths.data_dir.join("skills")),
-        )));
+        )))
+        // One in-process monitor per executing session. Utility subcommands
+        // never open a Session and therefore never sample.
+        .with_resource_monitor(ResourceMonitor::start(
+            ResourceMonitorConfig::load(&paths.data_dir),
+            workspace.clone(),
+            paths.data_dir.clone(),
+        ));
         // Registration is a separate step: it waits until startup options chose
         // the final workspace, so a failed startup publishes no incarnation.
         let binding = binding.initialized()?;
@@ -1320,6 +1328,9 @@ impl Session {
             if changing_provider || self.id != id { self.startup_provider = None; }
         }
         self.workspace = workspace;
+        if let Some(monitor) = self.engine.resource_monitor() {
+            monitor.update_workspace(self.workspace.clone());
+        }
         self.auto_route = false;
         if let Some(policy) = policy {
             shard.set_recording_policy(policy);
@@ -1648,6 +1659,9 @@ impl Session {
         if let Some(target) = target.filter(|path| path.is_dir() && *path != self.workspace) {
             std::env::set_current_dir(&target)?;
             self.workspace = target;
+            if let Some(monitor) = self.engine.resource_monitor() {
+                monitor.update_workspace(self.workspace.clone());
+            }
             // Only an actual change asks the registry worker for a new
             // observation; the fenced write stays on that worker.
             if let Some(guard) = self.coordination.as_ref() {
@@ -2765,6 +2779,9 @@ impl Session {
                     EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
                     EngineEvent::CompactionNotice(message) => {
                         progress.notice(&message);
+                    },
+                    EngineEvent::ResourceAlert(alert) => {
+                        progress.notice(&format!("● System resource warning: {}", alert.summary()));
                     },
                     EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved, reason } if session_id == self.id => {
                         transcript.save_segment(&assistant_id, SegmentUpdate {
@@ -4055,6 +4072,12 @@ pub(crate) fn event_json_with(event: &EngineEvent, summaries: bool) -> Option<Va
         EngineEvent::CompactionNotice(message) => {
             json!({"type":"compaction_notice","message":message})
         }
+        EngineEvent::ResourceAlert(alert) => json!({
+            "type":"resource_alert",
+            "kind":alert.kind.as_str(),
+            "summary":alert.summary(),
+            "details":alert.details
+        }),
         EngineEvent::Text(delta) => json!({"type":"text","delta":delta}),
         EngineEvent::QueuedInput(input) => {
             json!({"type":"queued_input","text":input.text,"content":input.content,"origin":input.origin})
@@ -5556,6 +5579,35 @@ mod compaction_cancellation_tests {
         .unwrap();
         assert_eq!(notice["type"], "compaction_notice");
         assert_eq!(notice["message"], "Auto-compacting conversation…");
+    }
+
+    #[test]
+    fn resource_alerts_serialize_kind_summary_and_details() {
+        use deepseek_code_core::native_engine::tool_loop::EngineEvent;
+        use deepseek_code_core::services::resource_monitor::{
+            ResourceAlert, ResourceKey, ResourceKind,
+        };
+        for (key, kind, name) in [
+            (ResourceKey::Cpu, ResourceKind::Cpu, "cpu"),
+            (ResourceKey::Memory, ResourceKind::Memory, "memory"),
+            (
+                ResourceKey::Disk("workspace, data".into()),
+                ResourceKind::Disk,
+                "disk",
+            ),
+        ] {
+            let alert = ResourceAlert {
+                key,
+                kind,
+                summary: "Low memory: 1.0 GiB available".into(),
+                details: "Reduce parallel jobs.".into(),
+            };
+            let value = super::event_json(&EngineEvent::ResourceAlert(alert)).unwrap();
+            assert_eq!(value["type"], "resource_alert");
+            assert_eq!(value["kind"], name);
+            assert_eq!(value["summary"], "Low memory: 1.0 GiB available");
+            assert_eq!(value["details"], "Reduce parallel jobs.");
+        }
     }
 }
 

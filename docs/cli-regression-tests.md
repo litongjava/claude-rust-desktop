@@ -1001,6 +1001,7 @@ SDK 用例通过真实 CLI、本地 OpenAI mock、ToolLoad 与私有 worker 验�
 - `native_engine/tool_call_ids.rs`（发给模型的请求体）：E1、E6；确认只改写超长调用 ID，未提供 `tool_calls`、`content` 等字段的消息不会被补成 `null`
 - `extended_commands.rs` 的复制（`/copy`、`/copy-session-id`、鼠标选择；右击复制后会取消选中并提示结果）：在没有 `xclip`、`wl-copy` 的 tmux 中执行 `/copy-session-id`，显示 `Copied session ID to clipboard`，`tmux show-buffer` 内容为会话 ID；在有 `xclip` 的桌面终端中复制后能粘贴。再跑 E
 - `skills/discovery.rs`、`native_engine/skill_tool.rs`、`native_engine/engine_core.rs` 的技能发现与模型列表、`cli/skill_commands.rs`：N
+- `services/resource_monitor.rs`、`native_engine/{engine_core,tool_loop}.rs` 的资源告警注入、`crates/cli/src/session.rs` 的监控启动与工作区同步：I43
 - 其他范围：至少跑 E
 
 ## 长命令输出摘要
@@ -1760,3 +1761,24 @@ cargo test --locked -p deepseek-code-cli --bin dcl shell_configuration_is_shared
 - 手工终端：在含 `.agents/experience/` 的临时工作区连本地 mock，确认首条消息顺序、`/config` 开关、恢复同一会话和压缩后只有一份块。Windows 与 Desktop WebView 未在本机验证。
 
 已知平台问题：macOS 上 `cargo check -p deepseek-code-cli --all-targets` 会在 `local_coordination_registry` 失败（`private_root` 使用 `#[cfg(unix)]`，CoordinationPaths 导入使用 `#[cfg(target_os = "linux")]`）。这是既有问题，与本次改动无关；本次用 `--bin dcl --test experience --test peripheral` 检查。
+
+### I43. 内置资源监控（CLI 与 Desktop 接入）
+
+改动范围：`services/resource_monitor.rs`、`native_engine/engine_core.rs` 与 `native_engine/tool_loop.rs` 的告警注入、`crates/cli/src/session.rs` 的监控启动与工作区同步、`src-tauri/src/lib.rs`、`src-tauri/src/bridge/mod.rs`、`src-tauri/src/bridge/routes/chat.rs`、`src-tauri/src/commands/mod.rs` 的 Desktop 接入。
+
+自动回归：
+
+```bash
+cargo test --locked -p deepseek-code-core --lib services::resource_monitor
+cargo test --locked -p deepseek-code-core --lib native_engine::engine_core::resource_monitor_tests
+cargo test --locked -p deepseek-code-cli --bin dcl resource_alert
+cargo check --locked -p deepseek-code-desktop --all-targets
+```
+
+手工终端（必须人为压低阈值；真实主机负载触发无法在自动用例中稳定复现）：
+
+1. 在隔离数据目录的 `<data>/config/settings.json` 写入 `{"resourceMonitor":{"enabled":true,"intervalSecs":2,"memoryAvailablePercentThreshold":99.9,"memoryAvailableMinBytes":1099511627776,"memoryConsecutive":1,"cooldownSecs":0}}`，启动 `dcl --data-dir <data>` 并发送普通消息。下一轮请求必须包含 `<kind>system_resource</kind>`、实际摘要和可执行的 `details`，终端显示 `● System resource warning: ...`；冷却期内同一资源只注入一次。
+2. 同一场景加 `--print` 或 `--output-format stream-json`：出现 `{"type":"resource_alert","kind":"memory","summary":...,"details":...}`，其他事件顺序不变。
+3. 空闲 REPL 等待数个采样周期：不得发起请求、不得显示提示；随后发送消息，告警只在该回合注入。两个同时空闲的 `dcl` 进程都不能被资源告警唤醒。
+4. 将 `enabled` 设为 false 或设置 `DEEPSEEK_CODE_RESOURCE_MONITOR=0` 后不再采样。恢复会话（resume）和 EnterWorktree/ExitWorktree 后，监控的磁盘目标应跟随新的工作区。
+5. Desktop 用同一配置对话时，Bridge SSE 应出现 `resource_alert`。本次未运行真实 Desktop 窗口，Windows 亦未验证。

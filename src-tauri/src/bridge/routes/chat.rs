@@ -388,6 +388,14 @@ pub(super) async fn start_authorized_chat(
                 crate::native_engine::tool_loop::EngineEvent::CompactionNotice(message) => {
                     Some(serde_json::json!({"type":"compaction_notice","message":message}))
                 }
+                crate::native_engine::tool_loop::EngineEvent::ResourceAlert(alert) => {
+                    Some(serde_json::json!({
+                        "type":"resource_alert",
+                        "kind":alert.kind.as_str(),
+                        "summary":alert.summary(),
+                        "details":alert.details,
+                    }))
+                }
                 crate::native_engine::tool_loop::EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved, reason } => {
                     if session_id == conv_id {
                         if let Err(error) = history.save_segment(&assistant_id, SegmentUpdate {

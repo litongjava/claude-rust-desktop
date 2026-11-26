@@ -364,6 +364,9 @@ pub struct QueryEngine {
     skills_manager: Option<Arc<Mutex<SkillsManager>>>,
     file_cache: Arc<FileCache>,
     cost_tracker: Option<Arc<CostTracker>>,
+    /// Host load monitor. Hosts attach it to their main engine; the default
+    /// keeps core unit and integration tests independent of host load.
+    resource_monitor: Option<crate::services::resource_monitor::ResourceMonitor>,
 }
 
 // The shared child launcher prefixes its bound role to the CLI system prompt.
@@ -760,6 +763,7 @@ impl QueryEngine {
             skills_manager: None,
             file_cache,
             cost_tracker: None,
+            resource_monitor: None,
         }
     }
 
@@ -776,6 +780,18 @@ impl QueryEngine {
     pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
         self.cost_tracker = Some(tracker);
         self
+    }
+
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::services::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
+    pub fn resource_monitor(&self) -> Option<&crate::services::resource_monitor::ResourceMonitor> {
+        self.resource_monitor.as_ref()
     }
 
     pub fn set_permission_host_available(&self, available: bool) {
@@ -1814,7 +1830,12 @@ impl QueryEngine {
         .with_prefetch_engine(Arc::new(PrefetchEngine::new(
             self.file_cache.clone(),
             workspace_path.clone(),
-        )));
+        )))
+        .with_resource_monitor(if replay {
+            None
+        } else {
+            self.resource_monitor.clone()
+        });
 
         if let Some(memory) = file_memory {
             executor = executor.with_file_memory(memory);
@@ -2684,5 +2705,41 @@ mod provider_input_tests {
             &[serde_json::json!({"role":"user","content":"hello"})]
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod resource_monitor_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn monitor_is_opt_in_and_exposed_by_accessor() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = crate::services::session_messages::context(temp.path()).unwrap();
+        let engine = QueryEngine::new(
+            Arc::new(Mutex::new(
+                crate::native_engine::provider_manager::ProviderManager::in_memory(
+                    vec![],
+                    temp.path().join("config.json"),
+                ),
+            )),
+            context.db,
+            temp.path().to_path_buf(),
+            crate::runtime::default_permissions(),
+            Arc::new(FileCache::new()),
+        );
+        assert!(engine.resource_monitor().is_none());
+
+        // Disabled so the test never samples host load or spawns a task.
+        let mut config = crate::services::resource_monitor::ResourceMonitorConfig::default();
+        config.enabled = false;
+        let monitor = crate::services::resource_monitor::ResourceMonitor::start(
+            config,
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+        );
+        let engine = engine.with_resource_monitor(monitor);
+        assert!(engine.resource_monitor().is_some());
+        assert!(!engine.resource_monitor().unwrap().is_enabled());
     }
 }

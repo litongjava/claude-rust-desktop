@@ -152,6 +152,9 @@ pub enum EngineEvent {
     },
     /// Progress or status notice emitted during automatic context compaction.
     CompactionNotice(String),
+    /// A host resource warning drained by the active turn. Idle hosts never
+    /// receive it, so an unattended session cannot be woken by host load.
+    ResourceAlert(crate::services::resource_monitor::ResourceAlert),
     /// Delegated task state without exposing the child's private model output.
     AgentProgress {
         address: Option<crate::db::session_store::HistoryAddress>,
@@ -372,6 +375,8 @@ pub struct ToolLoopExecutor {
     delegation_parent: Option<(String, Arc<PermissionManager>)>,
     observed_parent_mode: std::sync::Mutex<Option<crate::permissions::PermissionMode>>,
     hooks: Option<Arc<crate::services::tool_hooks::HookRunner>>,
+    /// Host load monitor. Attached only to main turns, never to summary turns.
+    resource_monitor: Option<crate::services::resource_monitor::ResourceMonitor>,
     stop_hook_active: bool,
     stop_hook_blocks: u64,
     goal_db: Option<Arc<crate::db::session_store::Stores>>,
@@ -1719,6 +1724,7 @@ impl ToolLoopExecutor {
             delegation_parent: None,
             observed_parent_mode: std::sync::Mutex::new(None),
             hooks: None,
+            resource_monitor: None,
             stop_hook_active: false,
             stop_hook_blocks: 0,
             goal_db: None,
@@ -1789,6 +1795,14 @@ impl ToolLoopExecutor {
         self.goal_db = Some(db);
         // Session-backed tools enter the catalog once storage is bound.
         self.builtin_names.take();
+        self
+    }
+
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: Option<crate::services::resource_monitor::ResourceMonitor>,
+    ) -> Self {
+        self.resource_monitor = monitor;
         self
     }
 
@@ -4200,6 +4214,23 @@ impl ToolLoopExecutor {
         messages
     }
 
+    /// Takes the warnings the monitor queued while this turn ran. It runs only
+    /// inside active turn iterations and never feeds the idle input queue, so an
+    /// unattended session cannot be woken by host load.
+    async fn drain_resource_alerts(&self) -> Vec<crate::services::resource_monitor::ResourceAlert> {
+        let Some(monitor) = &self.resource_monitor else {
+            return Vec::new();
+        };
+        let alerts = monitor.drain_alerts();
+        for alert in &alerts {
+            let _ = self
+                .event_tx
+                .send(EngineEvent::ResourceAlert(alert.clone()))
+                .await;
+        }
+        alerts
+    }
+
     async fn refresh_mcp_tools(&mut self) -> Result<()> {
         // Read once per turn next to the discovery, so a saved change applies
         // to this request without another lookup per tool.
@@ -5564,6 +5595,12 @@ impl ToolLoopExecutor {
                     )),
                 });
             }
+            for alert in self.drain_resource_alerts().await {
+                conversation_messages.push(AnthropicMessage {
+                    role: "user".into(),
+                    content: AnthropicContent::Text(alert.notification()),
+                });
+            }
             for content in self.drain_approval_notes().into_iter().map(Value::String) {
                 let content = multimodal::anthropic_content(&content)?;
                 conversation_messages.push(AnthropicMessage {
@@ -6308,6 +6345,16 @@ impl ToolLoopExecutor {
                     content: OpenAIContent::Text(format!(
                         "<system-reminder>\nAsync hook context:\n{context}\n</system-reminder>"
                     )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                    provider_content: None,
+                });
+            }
+            for alert in self.drain_resource_alerts().await {
+                conversation_messages.push(OpenAIMessage {
+                    role: "user".into(),
+                    content: OpenAIContent::Text(alert.notification()),
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning_content: None,
