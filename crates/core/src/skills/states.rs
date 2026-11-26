@@ -113,7 +113,7 @@ pub fn default_state(name: &str) -> SkillState {
 pub fn bundled_default_state(name: &str) -> SkillState {
     match name {
         "skill-creator"
-        | "dcl-use"
+        | "dc-docs"
         | "llm-proxy-data-troubleshooting"
         | "project-docs" => SkillState::User,
         "codegraph" if codegraph_installed() => SkillState::User,
@@ -415,7 +415,7 @@ mod tests {
 
         for name in [
             "skill-creator",
-            "dcl-use",
+            "dc-docs",
             "llm-proxy-data-troubleshooting",
             "project-docs",
         ] {
