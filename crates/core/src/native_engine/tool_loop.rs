@@ -318,6 +318,12 @@ pub struct ToolLoopExecutor {
     /// so the single call that claims the coaching-hint slot attaches the
     /// multi-Bash batching hint.
     shell_batch_bash_hint: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of consecutive turns that emitted only a single foreground `Bash`
+    /// call. Reset on compaction or any other turn shape.
+    shell_consecutive_single_bash: Arc<std::sync::atomic::AtomicUsize>,
+    /// True while executing the 2nd+ consecutive single-`Bash` turn so the
+    /// coaching hint asks the model to chain related shell commands.
+    shell_serial_bash_hint: Arc<std::sync::atomic::AtomicBool>,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_tool_iterations: Option<usize>,
@@ -1841,6 +1847,8 @@ impl ToolLoopExecutor {
             shell_cwd_needs_report: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             shell_redundant_cd_cooldown: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell_batch_bash_hint: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shell_consecutive_single_bash: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            shell_serial_bash_hint: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             system_prompt,
             max_tokens,
             max_tool_iterations: crate::config::OrchestrationConfig::max_tool_iterations(),
@@ -1970,6 +1978,8 @@ impl ToolLoopExecutor {
             self.shell_cwd_needs_report
                 .store(true, std::sync::atomic::Ordering::Release);
             self.shell_redundant_cd_cooldown
+                .store(0, std::sync::atomic::Ordering::Release);
+            self.shell_consecutive_single_bash
                 .store(0, std::sync::atomic::Ordering::Release);
         }
         self
@@ -3386,6 +3396,11 @@ impl ToolLoopExecutor {
                 .load(std::sync::atomic::Ordering::Acquire)
             {
                 input["__hint_batch_bash"] = json!(true);
+            } else if self
+                .shell_serial_bash_hint
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                input["__hint_serial_bash"] = json!(true);
             }
         }
         let asker = input
@@ -6399,6 +6414,13 @@ impl ToolLoopExecutor {
                     &self.shell_batch_bash_hint,
                     count_foreground_bash_calls(&pending_tool_calls) >= 2,
                 );
+                let _serial_bash_guard = BatchBashHintGuard::set(
+                    &self.shell_serial_bash_hint,
+                    update_consecutive_single_bash_turns(
+                        &self.shell_consecutive_single_bash,
+                        &pending_tool_calls,
+                    ),
+                );
                 for batch in tool_batches(&pending_tool_calls) {
                     let results = self.execute_tool_batch(batch).await;
                     for (tc, (actual_input, output_str, is_error)) in batch.iter().zip(results) {
@@ -7322,6 +7344,13 @@ impl ToolLoopExecutor {
                     &self.shell_batch_bash_hint,
                     count_foreground_bash_calls(&pending_tool_calls) >= 2,
                 );
+                let _serial_bash_guard = BatchBashHintGuard::set(
+                    &self.shell_serial_bash_hint,
+                    update_consecutive_single_bash_turns(
+                        &self.shell_consecutive_single_bash,
+                        &pending_tool_calls,
+                    ),
+                );
                 for batch in tool_batches(&pending_tool_calls) {
                     let results = self.execute_tool_batch(batch).await;
                     for (tc, (actual_input, output_str, is_error)) in batch.iter().zip(results) {
@@ -8163,6 +8192,27 @@ fn is_bash_coaching_note(note: &str) -> bool {
     note.contains(crate::tools::REDUNDANT_CD_NOTE_PREFIX)
         || note.contains(crate::tools::SHELL_READ_SEARCH_NOTE_PREFIX)
         || note.contains(crate::tools::BASH_BATCH_NOTE_PREFIX)
+        || note.contains(crate::tools::SERIAL_BASH_NOTE_PREFIX)
+}
+
+/// Tracks consecutive turns that emitted only a single foreground `Bash` call.
+/// Returns `true` starting on the 2nd consecutive single-`Bash` turn and resets
+/// to 0 on any turn with 0 calls, multiple calls, or a non-foreground-`Bash` call.
+fn update_consecutive_single_bash_turns(
+    counter: &std::sync::atomic::AtomicUsize,
+    calls: &[PendingToolCall],
+) -> bool {
+    let single_fg_bash =
+        calls.len() == 1 && is_foreground_bash_call(&calls[0].name, &calls[0].input);
+    if single_fg_bash {
+        let next = counter
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .saturating_add(1);
+        next >= 2
+    } else {
+        counter.store(0, std::sync::atomic::Ordering::Release);
+        false
+    }
 }
 
 fn try_claim_bash_hint(cooldown: &std::sync::atomic::AtomicUsize) -> bool {
@@ -8278,8 +8328,8 @@ pub(crate) mod toolscript_approval;
 mod shell_state_input_tests {
     use super::{
         count_foreground_bash_calls, is_bash_coaching_note, shell_state_input,
-        try_claim_bash_hint, update_redundant_cd_cooldown, BashHintClaim, PendingToolCall,
-        BASH_HINT_CLAIMED, REDUNDANT_CD_HINT_COOLDOWN_CALLS,
+        try_claim_bash_hint, update_consecutive_single_bash_turns, update_redundant_cd_cooldown,
+        BashHintClaim, PendingToolCall, BASH_HINT_CLAIMED, REDUNDANT_CD_HINT_COOLDOWN_CALLS,
     };
     use crate::permissions::PermissionMode;
     use serde_json::json;
@@ -8399,6 +8449,44 @@ mod shell_state_input_tests {
         ];
         assert_eq!(count_foreground_bash_calls(&calls), 2);
         assert_eq!(count_foreground_bash_calls(&calls[..2]), 1);
+    }
+
+    #[test]
+    fn consecutive_single_bash_turns_arm_serial_hint_and_reset_on_other_turns() {
+        let call = |name: &str, input: serde_json::Value| PendingToolCall {
+            provider_id: "p".into(),
+            id: "i".into(),
+            name: name.into(),
+            input,
+            concurrent: true,
+        };
+        let counter = AtomicUsize::new(0);
+        let one_bash = vec![call("Bash", json!({"command": "cargo test"}))];
+        let one_read = vec![call("Read", json!({"file_path": "a.rs"}))];
+        let one_bg = vec![call(
+            "Bash",
+            json!({"command": "sleep 5", "run_in_background": true}),
+        )];
+        let two_tools = vec![
+            call("Bash", json!({"command": "git status"})),
+            call("Read", json!({"file_path": "a.rs"})),
+        ];
+
+        assert!(!update_consecutive_single_bash_turns(&counter, &one_bash));
+        assert!(update_consecutive_single_bash_turns(&counter, &one_bash));
+        assert!(update_consecutive_single_bash_turns(&counter, &one_bash));
+
+        // Any batched turn or non-foreground-Bash turn resets the streak.
+        assert!(!update_consecutive_single_bash_turns(&counter, &two_tools));
+        assert!(!update_consecutive_single_bash_turns(&counter, &one_bash));
+        assert!(!update_consecutive_single_bash_turns(&counter, &one_read));
+        assert!(!update_consecutive_single_bash_turns(&counter, &one_bash));
+        assert!(!update_consecutive_single_bash_turns(&counter, &one_bg));
+        assert!(!update_consecutive_single_bash_turns(&counter, &one_bash));
+        assert!(update_consecutive_single_bash_turns(&counter, &one_bash));
+        assert!(is_bash_coaching_note(
+            "Avoid serial single-Bash turns; chain related shell commands."
+        ));
     }
 
     #[test]

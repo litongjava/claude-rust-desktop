@@ -219,9 +219,11 @@ pub enum CodeGraphIndexStatus {
     /// Current workspace is a git worktree without `.codegraph/codegraph.db`,
     /// while the main git repository has a non-empty `.codegraph/codegraph.db`.
     WorktreeUninitialized { main_repo: PathBuf },
-    /// Neither the workspace (up to its git root) nor a worktree's main repo
-    /// has a populated `.codegraph/codegraph.db`.
-    NotInitialized,
+    /// Current workspace is inside a git repository (or worktree) without a
+    /// populated `.codegraph/codegraph.db`.
+    GitUninitialized(PathBuf),
+    /// Workspace is not inside a git repository and has no `.codegraph/codegraph.db`.
+    NotGitRepo,
 }
 
 fn has_non_empty_codegraph_db(dir: &Path) -> bool {
@@ -277,13 +279,13 @@ pub fn codegraph_workspace_status(workspace: &Path) -> CodeGraphIndexStatus {
                     return CodeGraphIndexStatus::WorktreeUninitialized { main_repo };
                 }
             }
-            break;
+            return CodeGraphIndexStatus::GitUninitialized(dir.to_path_buf());
         }
         if meta.is_dir() {
-            break;
+            return CodeGraphIndexStatus::GitUninitialized(dir.to_path_buf());
         }
     }
-    CodeGraphIndexStatus::NotInitialized
+    CodeGraphIndexStatus::NotGitRepo
 }
 
 fn codegraph_status_note(workspace: &Path) -> &'static str {
@@ -294,8 +296,11 @@ fn codegraph_status_note(workspace: &Path) -> &'static str {
         CodeGraphIndexStatus::WorktreeUninitialized { .. } => {
             "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git worktree (`.codegraph/codegraph.db` is missing; git worktrees do not inherit the main repo's index). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
         }
-        CodeGraphIndexStatus::NotInitialized => {
-            "\n\nWorkspace CodeGraph index: NOT INITIALIZED (`.codegraph/codegraph.db` is missing). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
+        CodeGraphIndexStatus::GitUninitialized(_) => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git repository (`.codegraph/codegraph.db` is missing). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
+        }
+        CodeGraphIndexStatus::NotGitRepo => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED (not a git repository; skip `codegraph init` and use parallel `Read`/`Grep`/`Glob`)."
         }
     }
 }
@@ -1575,14 +1580,14 @@ mod tests {
             CodeGraphIndexStatus::Ready(ready.path().to_path_buf())
         );
 
-        // Zero-byte `.codegraph/codegraph.db` is not considered Ready.
+        // Zero-byte `.codegraph/codegraph.db` inside a git repo is GitUninitialized.
         let empty_db = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(empty_db.path().join(".git")).unwrap();
         std::fs::create_dir_all(empty_db.path().join(".codegraph")).unwrap();
         std::fs::write(empty_db.path().join(".codegraph/codegraph.db"), b"").unwrap();
         assert_eq!(
             codegraph_workspace_status(empty_db.path()),
-            CodeGraphIndexStatus::NotInitialized
+            CodeGraphIndexStatus::GitUninitialized(empty_db.path().to_path_buf())
         );
 
         // 2. Git worktree `.git` file pointing to main repo with `.codegraph/codegraph.db`,
@@ -1607,11 +1612,11 @@ mod tests {
             }
         );
 
-        // 3. Empty workspace -> NotInitialized.
+        // 3. Non-git empty workspace -> NotGitRepo.
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
             codegraph_workspace_status(empty.path()),
-            CodeGraphIndexStatus::NotInitialized
+            CodeGraphIndexStatus::NotGitRepo
         );
     }
 
@@ -1670,13 +1675,23 @@ mod tests {
         assert!(wt_blocks[0].1.contains("codegraph init -y"));
         assert_eq!(wt_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
 
-        // Empty workspace.
+        // Uninitialized regular git repository -> prompts `codegraph init -y`.
+        let git_only = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(git_only.path().join(".git")).unwrap();
+        let git_blocks = inline_skill_blocks_for_workspace(&skills, Some(git_only.path()));
+        assert!(git_blocks[0]
+            .1
+            .contains("NOT INITIALIZED in this git repository"));
+        assert!(git_blocks[0].1.contains("codegraph init -y"));
+        assert_eq!(git_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
+
+        // Non-git empty workspace -> skips `codegraph init`.
         let empty = tempfile::tempdir().unwrap();
         let empty_blocks = inline_skill_blocks_for_workspace(&skills, Some(empty.path()));
         assert!(empty_blocks[0]
             .1
-            .contains("Workspace CodeGraph index: NOT INITIALIZED (`.codegraph/codegraph.db` is missing)."));
-        assert!(empty_blocks[0].1.contains("codegraph init -y"));
+            .contains("not a git repository; skip `codegraph init`"));
+        assert!(!empty_blocks[0].1.contains("codegraph init -y"));
         assert_eq!(empty_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
     }
 

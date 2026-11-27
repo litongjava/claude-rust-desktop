@@ -738,6 +738,10 @@ pub(crate) const SHELL_READ_SEARCH_NOTE_PREFIX: &str = "Use dedicated Read/Grep/
 /// when a single turn splits work across multiple foreground `Bash` tool calls.
 pub(crate) const BASH_BATCH_NOTE_PREFIX: &str = "Avoid splitting multiple Bash calls in one turn";
 
+/// Prefix of the one-line coaching note added to a foreground `Bash` result
+/// when consecutive turns emit one foreground `Bash` call at a time.
+pub(crate) const SERIAL_BASH_NOTE_PREFIX: &str = "Avoid serial single-Bash turns";
+
 /// Returns true when `command` only uses shell read/search utilities (`cat`,
 /// `sed -n`, `head`, `tail`, `grep`, `rg`, `find`, `ls`, `wc`) — optionally
 /// separated by `echo`, `;`, `&&`, or a leading `cd` — with no file writes or
@@ -1089,6 +1093,40 @@ async fn bash_adds_redundant_cd_batch_hint_note() {
         combined_note.contains(REDUNDANT_CD_NOTE_PREFIX)
             && combined_note.contains(BASH_BATCH_NOTE_PREFIX),
         "expected combined redundant-cd + batch-bash note, got: {combined}"
+    );
+
+    let serial = tool_bash_async(
+        serde_json::json!({
+            "command": "pwd -P",
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_serial_bash": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    let serial_note = serial["note"].as_str().unwrap_or_default();
+    assert!(
+        serial_note.starts_with(SERIAL_BASH_NOTE_PREFIX),
+        "expected serial-bash note, got: {serial}"
+    );
+
+    let combined_serial = tool_bash_async(
+        serde_json::json!({
+            "command": format!("cd {cwd} && pwd -P"),
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_redundant_cd": true,
+            "__hint_serial_bash": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    let combined_serial_note = combined_serial["note"].as_str().unwrap_or_default();
+    assert!(
+        combined_serial_note.contains(REDUNDANT_CD_NOTE_PREFIX)
+            && combined_serial_note.contains(SERIAL_BASH_NOTE_PREFIX),
+        "expected combined redundant-cd + serial-bash note, got: {combined_serial}"
     );
 }
 
@@ -1967,7 +2005,8 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
         }
         let hint_redundant_cd = input["__hint_redundant_cd"].as_bool().unwrap_or(false);
         let hint_batch_bash = input["__hint_batch_bash"].as_bool().unwrap_or(false);
-        if hint_redundant_cd || hint_batch_bash {
+        let hint_serial_bash = input["__hint_serial_bash"].as_bool().unwrap_or(false);
+        if hint_redundant_cd || hint_batch_bash || hint_serial_bash {
             let mut notes = Vec::new();
             if hint_redundant_cd {
                 if has_redundant_leading_cd(&raw_command, &safe_cwd) {
@@ -1984,6 +2023,10 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
             if hint_batch_bash {
                 notes.push(format!(
                     "{BASH_BATCH_NOTE_PREFIX}; chain related shell commands with && or ; in one Bash call, or use parallel Read/Grep/Glob."
+                ));
+            } else if hint_serial_bash {
+                notes.push(format!(
+                    "{SERIAL_BASH_NOTE_PREFIX}; chain related shell commands in one Bash call with && or ; (or use parallel Read/Grep/Glob)."
                 ));
             }
             if !notes.is_empty() {
