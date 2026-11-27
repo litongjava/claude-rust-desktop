@@ -317,6 +317,9 @@ pub struct ToolLoopExecutor {
     /// Cooldown (in foreground `Bash` calls) before emitting another redundant
     /// leading-`cd` coaching note. Resets to 0 on compaction.
     shell_redundant_cd_cooldown: Arc<std::sync::atomic::AtomicUsize>,
+    /// Per-category turn cooldowns for ephemeral `<system-reminder>` Bash
+    /// coaching messages injected after tool results. Resets on compaction.
+    bash_coaching: BashCoachingState,
     /// True while executing a turn/batch containing 2+ foreground `Bash` calls
     /// so the single call that claims the coaching-hint slot attaches the
     /// multi-Bash batching hint.
@@ -1855,6 +1858,7 @@ impl ToolLoopExecutor {
             applied_compaction: false,
             shell_cwd_needs_report: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             shell_redundant_cd_cooldown: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            bash_coaching: BashCoachingState::default(),
             shell_batch_bash_hint: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shell_consecutive_single_bash: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell_serial_bash_hint: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1998,6 +2002,7 @@ impl ToolLoopExecutor {
                 .store(true, std::sync::atomic::Ordering::Release);
             self.shell_redundant_cd_cooldown
                 .store(0, std::sync::atomic::Ordering::Release);
+            self.bash_coaching.reset();
             self.shell_consecutive_single_bash
                 .store(0, std::sync::atomic::Ordering::Release);
         }
@@ -3798,6 +3803,19 @@ impl ToolLoopExecutor {
                 .map(|tool| tool.name)
                 .collect()
         })
+    }
+
+    /// Whether the dedicated `Python` tool is currently enabled or loadable
+    /// via `ToolLoad` in this executor.
+    fn python_tool_available_or_loadable(&self) -> bool {
+        if !self.builtin_names().contains("Python") || !self.tool_is_allowed("Python") {
+            return false;
+        }
+        let Ok(customization) = self.customization() else {
+            return false;
+        };
+        let loading = customization.loading("Python");
+        loading.enabled || loading.on_demand
     }
 
     /// Whether a restricted agent can reach its granted tools without a
@@ -6508,6 +6526,9 @@ impl ToolLoopExecutor {
             }
             if has_tool_use && !pending_tool_calls.is_empty() {
                 let mut tool_results: Vec<ContentBlock> = Vec::new();
+                let mut redundant_cd_cwd: Option<String> = None;
+                let mut foreground_sleep_detected = false;
+                let mut inline_python_calls = 0usize;
                 if pending_tool_calls
                     .iter()
                     .any(|t| t.name.as_str() == "ExitPlanMode")
@@ -6562,6 +6583,19 @@ impl ToolLoopExecutor {
                                 is_error
                             )?),
                         };
+                        if is_foreground_bash_call(&tc.name, &actual_input) {
+                            if let Some(cwd) = extract_redundant_cd_cwd(&output_str) {
+                                redundant_cd_cwd = Some(cwd);
+                            }
+                            if let Some(command) = actual_input["command"].as_str() {
+                                if has_foreground_sleep_command(command) {
+                                    foreground_sleep_detected = true;
+                                }
+                                if is_standalone_inline_python_command(command) {
+                                    inline_python_calls += 1;
+                                }
+                            }
+                        }
                         let _ = self
                             .event_tx
                             .send(EngineEvent::ToolUseDone {
@@ -6588,6 +6622,17 @@ impl ToolLoopExecutor {
                     role: "assistant".to_string(),
                     content: AnthropicContent::Blocks(assistant_blocks),
                 });
+
+                let python_available =
+                    inline_python_calls > 0 && self.python_tool_available_or_loadable();
+                if let Some(reminder) = self.bash_coaching.build_turn_reminder(
+                    redundant_cd_cwd.as_deref(),
+                    foreground_sleep_detected,
+                    inline_python_calls,
+                    python_available,
+                ) {
+                    tool_results.push(ContentBlock::Text { text: reminder });
+                }
 
                 // All results for one assistant turn belong in a single user message.
                 conversation_messages.push(AnthropicMessage {
@@ -7452,6 +7497,9 @@ impl ToolLoopExecutor {
 
                 let mut tool_results: Vec<OpenAIMessage> = Vec::new();
                 let mut tool_images = Vec::new();
+                let mut redundant_cd_cwd: Option<String> = None;
+                let mut foreground_sleep_detected = false;
+                let mut inline_python_calls = 0usize;
                 if pending_tool_calls
                     .iter()
                     .any(|t| t.name.as_str() == "ExitPlanMode")
@@ -7503,6 +7551,19 @@ impl ToolLoopExecutor {
                                 self.completed_model_text(tc, &actual_input, &output_str, is_error)?
                             }
                         };
+                        if is_foreground_bash_call(&tc.name, &actual_input) {
+                            if let Some(cwd) = extract_redundant_cd_cwd(&output_str) {
+                                redundant_cd_cwd = Some(cwd);
+                            }
+                            if let Some(command) = actual_input["command"].as_str() {
+                                if has_foreground_sleep_command(command) {
+                                    foreground_sleep_detected = true;
+                                }
+                                if is_standalone_inline_python_command(command) {
+                                    inline_python_calls += 1;
+                                }
+                            }
+                        }
                         let _ = self
                             .event_tx
                             .send(EngineEvent::ToolUseDone {
@@ -7544,6 +7605,23 @@ impl ToolLoopExecutor {
                     conversation_messages.push(OpenAIMessage {
                         role: "user".into(),
                         content: serde_json::from_value(json!(tool_images))?,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                        provider_content: None,
+                    });
+                }
+                let python_available =
+                    inline_python_calls > 0 && self.python_tool_available_or_loadable();
+                if let Some(reminder) = self.bash_coaching.build_turn_reminder(
+                    redundant_cd_cwd.as_deref(),
+                    foreground_sleep_detected,
+                    inline_python_calls,
+                    python_available,
+                ) {
+                    conversation_messages.push(OpenAIMessage {
+                        role: "user".into(),
+                        content: OpenAIContent::Text(reminder),
                         tool_calls: None,
                         tool_call_id: None,
                         reasoning_content: None,
@@ -8611,6 +8689,581 @@ fn update_redundant_cd_cooldown(cooldown: &std::sync::atomic::AtomicUsize, hinte
     }
 }
 
+/// Number of subsequent tool-using turns to skip after emitting an ephemeral
+/// `<system-reminder>` Bash coaching message for a given category.
+const BASH_COACHING_COOLDOWN_TURNS: usize = 4;
+
+const FOREGROUND_SLEEP_COACHING_TEXT: &str = "\
+Do NOT poll with foreground `sleep` or `for`/`while` wait loops.\n\
+- Start long-running services that must survive across calls (dev server, backend, browser/local daemon) with `Bash` `detach: true`.\n\
+- For finite long commands, use `Bash` `run_in_background: true` (it notifies you automatically on completion) or `TaskGet` with `block: true` — never `sleep` in the foreground.";
+
+const INLINE_PYTHON_COACHING_TEXT: &str = "\
+Prefer the dedicated `Python` tool over `Bash` heredocs (`python - <<'EOF'`) or `python -c` for inline Python snippets and data inspection. If `Python` is on-demand, load it first with `ToolLoad({\"names\":[\"Python\"]})`.";
+
+#[derive(Debug, Default)]
+struct BashCoachingState {
+    redundant_cd_cooldown: usize,
+    foreground_sleep_cooldown: usize,
+    inline_python_count: usize,
+    inline_python_cooldown: usize,
+}
+
+impl BashCoachingState {
+    fn reset(&mut self) {
+        self.redundant_cd_cooldown = 0;
+        self.foreground_sleep_cooldown = 0;
+        self.inline_python_count = 0;
+        self.inline_python_cooldown = 0;
+    }
+
+    fn build_turn_reminder(
+        &mut self,
+        redundant_cd_cwd: Option<&str>,
+        foreground_sleep_detected: bool,
+        inline_python_calls: usize,
+        python_tool_available: bool,
+    ) -> Option<String> {
+        let mut notices = Vec::new();
+
+        if self.redundant_cd_cooldown > 0 {
+            self.redundant_cd_cooldown -= 1;
+        } else if let Some(cwd) = redundant_cd_cwd.filter(|cwd| !cwd.is_empty()) {
+            notices.push(format_redundant_cd_coaching(cwd));
+            self.redundant_cd_cooldown = BASH_COACHING_COOLDOWN_TURNS;
+        }
+
+        if self.foreground_sleep_cooldown > 0 {
+            self.foreground_sleep_cooldown -= 1;
+        } else if foreground_sleep_detected {
+            notices.push(FOREGROUND_SLEEP_COACHING_TEXT.to_owned());
+            self.foreground_sleep_cooldown = BASH_COACHING_COOLDOWN_TURNS;
+        }
+
+        let effective_python_calls = if python_tool_available {
+            inline_python_calls
+        } else {
+            0
+        };
+        if effective_python_calls > 0 {
+            self.inline_python_count = self
+                .inline_python_count
+                .saturating_add(effective_python_calls);
+        }
+        if self.inline_python_cooldown > 0 {
+            self.inline_python_cooldown -= 1;
+        } else if effective_python_calls > 0 && self.inline_python_count >= 2 {
+            notices.push(INLINE_PYTHON_COACHING_TEXT.to_owned());
+            self.inline_python_cooldown = BASH_COACHING_COOLDOWN_TURNS;
+        }
+
+        if notices.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "<system-reminder>\n{}\n</system-reminder>",
+                notices.join("\n\n")
+            ))
+        }
+    }
+}
+
+fn format_redundant_cd_coaching(cwd: &str) -> String {
+    format!(
+        "Your foreground Bash shell is ALREADY in `{cwd}` (reported via `cwd` in the previous output). Do NOT prepend `cd {cwd} &&` on subsequent commands — run commands directly."
+    )
+}
+
+/// Extracts the working directory from a foreground `Bash` tool result's
+/// redundant-`cd` note (e.g. `"Bash already runs in <cwd>; omit redundant leading 'cd'."`).
+fn extract_redundant_cd_cwd(raw_output: &str) -> Option<String> {
+    let prefix = crate::tools::REDUNDANT_CD_NOTE_PREFIX;
+    let source = serde_json::from_str::<Value>(raw_output)
+        .ok()
+        .and_then(|value| value.get("note").and_then(Value::as_str).map(str::to_owned));
+    let haystack = source.as_deref().unwrap_or(raw_output);
+    let start = haystack.find(prefix)? + prefix.len();
+    let rest = &haystack[start..];
+    let end = rest
+        .find("; omit redundant leading 'cd'")
+        .or_else(|| rest.find(';'))
+        .or_else(|| rest.find('\n'))
+        .unwrap_or(rest.len());
+    let cwd = rest[..end].trim();
+    (!cwd.is_empty()).then(|| cwd.to_owned())
+}
+
+fn is_shell_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_sleep_duration_arg(arg: &str) -> bool {
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let numeric = trimmed
+        .strip_suffix(['s', 'm', 'h', 'd', 'S', 'M', 'H', 'D'])
+        .unwrap_or(trimmed);
+    if numeric.is_empty() {
+        return false;
+    }
+    let mut seen_digit = false;
+    let mut seen_dot = false;
+    for ch in numeric.chars() {
+        if ch.is_ascii_digit() {
+            seen_digit = true;
+        } else if ch == '.' && !seen_dot {
+            seen_dot = true;
+        } else {
+            return false;
+        }
+    }
+    seen_digit
+}
+
+fn split_shell_segments(command: &str) -> Vec<Vec<String>> {
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut current_segment: Vec<String> = Vec::new();
+    let mut current_word = String::new();
+    let mut in_word = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current_word.push(ch);
+            in_word = true;
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current_word.push(ch);
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '\\' {
+                if let Some(&next) = chars.peek() {
+                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        chars.next();
+                        current_word.push(next);
+                        continue;
+                    }
+                }
+                current_word.push(ch);
+            } else if ch == '"' {
+                in_double = false;
+            } else {
+                current_word.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                escaped = true;
+                in_word = true;
+            }
+            '\'' => {
+                in_single = true;
+                in_word = true;
+            }
+            '"' => {
+                in_double = true;
+                in_word = true;
+            }
+            '#' if !in_word => {
+                for next in chars.by_ref() {
+                    if next == '\n' {
+                        if !current_segment.is_empty() {
+                            segments.push(std::mem::take(&mut current_segment));
+                        }
+                        break;
+                    }
+                }
+            }
+            ';' | '\n' | '|' | '&' | '(' | ')' | '{' | '}' => {
+                if in_word {
+                    current_segment.push(std::mem::take(&mut current_word));
+                    in_word = false;
+                }
+                if !current_segment.is_empty() {
+                    segments.push(std::mem::take(&mut current_segment));
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    current_segment.push(std::mem::take(&mut current_word));
+                    in_word = false;
+                }
+            }
+            _ => {
+                current_word.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        current_segment.push(current_word);
+    }
+    if !current_segment.is_empty() {
+        segments.push(current_segment);
+    }
+    segments
+}
+
+/// Detects foreground `sleep` invocations (with a numeric/duration argument or
+/// inside a `for`/`while`/`until` wait loop) while ignoring quoted strings,
+/// comments, arguments to other commands (`echo sleep 5`, `grep sleep`), and
+/// unrelated identifiers (`asleep`, `sleeper`).
+fn has_foreground_sleep_command(command: &str) -> bool {
+    let mut saw_loop = false;
+    for segment in split_shell_segments(command) {
+        let mut idx = 0;
+        while idx < segment.len() {
+            let word = segment[idx].as_str();
+            if matches!(word, "for" | "while" | "until") {
+                saw_loop = true;
+                break;
+            }
+            if matches!(
+                word,
+                "do" | "then" | "else" | "elif" | "!" | "time" | "command" | "builtin" | "exec" | "env"
+            ) || is_shell_env_assignment(word)
+            {
+                idx += 1;
+                continue;
+            }
+            if word == "sleep" || word.ends_with("/sleep") {
+                let args = &segment[idx + 1..];
+                if args.iter().any(|arg| is_sleep_duration_arg(arg))
+                    || (saw_loop && !args.is_empty())
+                {
+                    return true;
+                }
+            }
+            break;
+        }
+    }
+    false
+}
+
+fn is_python_executable(word: &str) -> bool {
+    let base = word.rsplit(['/', '\\']).next().unwrap_or(word);
+    let lower = base.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    stem == "python"
+        || stem == "py"
+        || stem.strip_prefix("python").is_some_and(|rest| {
+            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
+}
+
+fn parse_heredoc_delimiter(raw: &str) -> Option<(String, bool)> {
+    let rest = raw.strip_prefix("<<")?;
+    if rest.starts_with('<') {
+        return None;
+    }
+    let (strip_tabs, rest) = match rest.strip_prefix('-') {
+        Some(stripped) => (true, stripped),
+        None => (false, rest),
+    };
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let unquoted = rest
+        .strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .or_else(|| rest.strip_prefix('"').and_then(|s| s.strip_suffix('"')))
+        .unwrap_or(rest)
+        .replace('\\', "");
+    (!unquoted.is_empty()).then_some((unquoted, strip_tabs))
+}
+
+/// Detects a **standalone** foreground inline Python invocation (`python`/`python3`/`py`
+/// with `-c` or a heredoc `<<`), optionally preceded by `cd ... &&`, with NO top-level
+/// pipe `|` and NOT chained with other non-`cd` shell commands.
+fn is_standalone_inline_python_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Parse the first top-level command line (respecting quotes/escapes) and track
+    // whether there is any top-level pipe/chaining or a heredoc body after the first newline.
+    let mut segments: Vec<Vec<String>> = Vec::new();
+    let mut current_segment: Vec<String> = Vec::new();
+    let mut current_word = String::new();
+    let mut in_word = false;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut heredoc: Option<(String, bool)> = None;
+    let mut expect_heredoc_delim: Option<bool> = None;
+    let mut after_first_newline: Option<&str> = None;
+
+    let mut chars = trimmed.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if escaped {
+            current_word.push(ch);
+            in_word = true;
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current_word.push(ch);
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '\\' {
+                if let Some(&(_, next)) = chars.peek() {
+                    if matches!(next, '"' | '\\' | '$' | '`' | '\n') {
+                        chars.next();
+                        current_word.push(next);
+                        continue;
+                    }
+                }
+                current_word.push(ch);
+            } else if ch == '"' {
+                in_double = false;
+            } else {
+                current_word.push(ch);
+            }
+            continue;
+        }
+
+        match ch {
+            '\\' => {
+                escaped = true;
+                in_word = true;
+            }
+            '\'' => {
+                in_single = true;
+                in_word = true;
+            }
+            '"' => {
+                in_double = true;
+                in_word = true;
+            }
+            '#' if !in_word => {
+                for (next_idx, next_ch) in chars.by_ref() {
+                    if next_ch == '\n' {
+                        after_first_newline = Some(&trimmed[next_idx + 1..]);
+                        break;
+                    }
+                }
+                break;
+            }
+            '\n' => {
+                after_first_newline = Some(&trimmed[idx + 1..]);
+                break;
+            }
+            '|' => {
+                // Any top-level pipe `|` or `||` disqualifies standalone inline python.
+                return false;
+            }
+            ';' => {
+                if in_word {
+                    let word = std::mem::take(&mut current_word);
+                    if let Some(strip_tabs) = expect_heredoc_delim.take() {
+                        heredoc = Some((word.clone(), strip_tabs));
+                    }
+                    current_segment.push(word);
+                    in_word = false;
+                }
+                if !current_segment.is_empty() {
+                    segments.push(std::mem::take(&mut current_segment));
+                }
+            }
+            '&' => {
+                if chars.peek().is_some_and(|&(_, next)| next == '&') {
+                    chars.next();
+                    if in_word {
+                        let word = std::mem::take(&mut current_word);
+                        if let Some(strip_tabs) = expect_heredoc_delim.take() {
+                            heredoc = Some((word.clone(), strip_tabs));
+                        }
+                        current_segment.push(word);
+                        in_word = false;
+                    }
+                    if !current_segment.is_empty() {
+                        segments.push(std::mem::take(&mut current_segment));
+                    }
+                } else if current_word.ends_with('>') {
+                    // Redirection like `2>&1` or `>&2`.
+                    current_word.push(ch);
+                    in_word = true;
+                } else {
+                    return false;
+                }
+            }
+            '<' if !in_word && chars.peek().is_some_and(|&(_, next)| next == '<') => {
+                chars.next();
+                if chars.peek().is_some_and(|&(_, next)| next == '<') {
+                    // `<<<` here-string, keep as ordinary word.
+                    chars.next();
+                    current_word.push_str("<<<");
+                    in_word = true;
+                } else {
+                    let strip_tabs = if chars.peek().is_some_and(|&(_, next)| next == '-') {
+                        chars.next();
+                        true
+                    } else {
+                        false
+                    };
+                    // Capture raw delimiter (may be immediately attached or after whitespace).
+                    let mut raw_delim = String::new();
+                    while let Some(&(_, next)) = chars.peek() {
+                        if next.is_whitespace() || matches!(next, ';' | '|' | '&' | '\n') {
+                            break;
+                        }
+                        raw_delim.push(next);
+                        chars.next();
+                    }
+                    if raw_delim.is_empty() {
+                        expect_heredoc_delim = Some(strip_tabs);
+                    } else {
+                        let candidate = if strip_tabs {
+                            format!("<<-{raw_delim}")
+                        } else {
+                            format!("<<{raw_delim}")
+                        };
+                        if let Some(parsed) = parse_heredoc_delimiter(&candidate) {
+                            heredoc = Some(parsed);
+                        }
+                        current_segment.push(candidate);
+                    }
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    let word = std::mem::take(&mut current_word);
+                    if let Some(strip_tabs) = expect_heredoc_delim.take() {
+                        heredoc = Some((word.clone(), strip_tabs));
+                    }
+                    current_segment.push(word);
+                    in_word = false;
+                }
+            }
+            _ => {
+                current_word.push(ch);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        let word = std::mem::take(&mut current_word);
+        if let Some(strip_tabs) = expect_heredoc_delim.take() {
+            heredoc = Some((word.clone(), strip_tabs));
+        }
+        current_segment.push(word);
+    }
+    if !current_segment.is_empty() {
+        segments.push(current_segment);
+    }
+
+    // Validate anything after the first unquoted newline.
+    if let Some(rest) = after_first_newline {
+        if let Some((ref delim, strip_tabs)) = heredoc {
+            let mut closed = false;
+            for line in rest.lines() {
+                let candidate = line.trim_end_matches('\r');
+                if !closed {
+                    let matched = if strip_tabs {
+                        candidate.trim_start_matches('\t') == delim
+                    } else {
+                        candidate == delim
+                    };
+                    if matched {
+                        closed = true;
+                    }
+                } else {
+                    let after_trim = candidate.trim();
+                    if !after_trim.is_empty() && !after_trim.starts_with('#') {
+                        // Another shell command follows the heredoc.
+                        return false;
+                    }
+                }
+            }
+        } else {
+            // No heredoc: any non-empty, non-comment line after newline is another command.
+            if rest.lines().any(|line| {
+                let t = line.trim();
+                !t.is_empty() && !t.starts_with('#')
+            }) {
+                return false;
+            }
+        }
+    }
+
+    // Strip any leading `cd ...` segments.
+    let mut non_cd = segments.iter().skip_while(|seg| {
+        seg.iter()
+            .find(|word| !is_shell_env_assignment(word))
+            .is_some_and(|cmd| cmd == "cd")
+    });
+    let Some(py_seg) = non_cd.next() else {
+        return false;
+    };
+    // Must NOT be chained with any other non-`cd` shell commands.
+    if non_cd.next().is_some() {
+        return false;
+    }
+
+    let mut idx = 0;
+    while idx < py_seg.len() {
+        let word = py_seg[idx].as_str();
+        if matches!(word, "env" | "command" | "exec") || is_shell_env_assignment(word) {
+            idx += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(cmd) = py_seg.get(idx) else {
+        return false;
+    };
+    if !is_python_executable(cmd) {
+        return false;
+    }
+
+    if heredoc.is_some() {
+        return true;
+    }
+
+    let args = &py_seg[idx + 1..];
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "-m" {
+            return false;
+        }
+        if arg == "-c" {
+            return i + 1 < args.len();
+        }
+        if arg.starts_with("-c") && arg.len() > 2 {
+            return true;
+        }
+    }
+    false
+}
+
 #[path = "toolscript_approval.rs"]
 pub(crate) mod toolscript_approval;
 
@@ -8969,6 +9622,211 @@ mod shell_state_input_tests {
             assert!(value["__sandbox"].is_object(), "{name}");
         }
         assert!(input("Read").get("__sandbox").is_none());
+    }
+}
+
+#[cfg(test)]
+mod bash_coaching_tests {
+    use super::{
+        extract_redundant_cd_cwd, format_redundant_cd_coaching, has_foreground_sleep_command,
+        is_foreground_bash_call, is_standalone_inline_python_command, BashCoachingState,
+        BASH_COACHING_COOLDOWN_TURNS, FOREGROUND_SLEEP_COACHING_TEXT, INLINE_PYTHON_COACHING_TEXT,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn redundant_cd_coaching_extracts_cwd_and_formats_exact_reminder() {
+        let raw_json = json!({
+            "stdout": "ok\n",
+            "stderr": "",
+            "exit_code": 0,
+            "cwd": "D:/code/project/HuLa",
+            "note": "Bash already runs in D:/code/project/HuLa; omit redundant leading 'cd'."
+        })
+        .to_string();
+        assert_eq!(
+            extract_redundant_cd_cwd(&raw_json).as_deref(),
+            Some("D:/code/project/HuLa")
+        );
+
+        let combined_note_json = json!({
+            "note": "Bash already runs in /workspace/app; omit redundant leading 'cd'. Prefer Read/Grep/Glob tools in parallel."
+        })
+        .to_string();
+        assert_eq!(
+            extract_redundant_cd_cwd(&combined_note_json).as_deref(),
+            Some("/workspace/app")
+        );
+
+        let plain_note = "Bash already runs in /tmp/demo; omit redundant leading 'cd'.";
+        assert_eq!(
+            extract_redundant_cd_cwd(plain_note).as_deref(),
+            Some("/tmp/demo")
+        );
+
+        let unrelated = json!({"stdout": "ok", "note": "Shell cwd was reset to /repo"}).to_string();
+        assert_eq!(extract_redundant_cd_cwd(&unrelated), None);
+
+        let mut state = BashCoachingState::default();
+        let reminder = state
+            .build_turn_reminder(Some("/workspace/app"), false, 0, false)
+            .expect("redundant cd reminder");
+        assert_eq!(
+            reminder,
+            "<system-reminder>\nYour foreground Bash shell is ALREADY in `/workspace/app` (reported via `cwd` in the previous output). Do NOT prepend `cd /workspace/app &&` on subsequent commands — run commands directly.\n</system-reminder>"
+        );
+        assert_eq!(
+            format_redundant_cd_coaching("/workspace/app"),
+            "Your foreground Bash shell is ALREADY in `/workspace/app` (reported via `cwd` in the previous output). Do NOT prepend `cd /workspace/app &&` on subsequent commands — run commands directly."
+        );
+    }
+
+    #[test]
+    fn foreground_sleep_coaching_detects_wait_loops_without_false_positives() {
+        let should_trigger = |input: serde_json::Value| {
+            is_foreground_bash_call("Bash", &input)
+                && input["command"]
+                    .as_str()
+                    .is_some_and(has_foreground_sleep_command)
+        };
+
+        // True positives
+        assert!(should_trigger(json!({"command": "sleep 5"})));
+        assert!(should_trigger(
+            json!({"command": "sleep 25 && tail -n 50 server.log"})
+        ));
+        assert!(should_trigger(
+            json!({"command": "for i in $(seq 1 10); do sleep 1; done"})
+        ));
+        assert!(should_trigger(
+            json!({"command": "while ! curl -sf http://localhost:3000; do sleep $INTERVAL; done"})
+        ));
+        assert!(should_trigger(
+            json!({"command": "FOO=1 /bin/sleep 0.5 && echo done"})
+        ));
+
+        // False positives: quoted text, other commands, comments, substrings, background/detach
+        assert!(!should_trigger(json!({"command": "echo \"sleep 5\""})));
+        assert!(!should_trigger(json!({"command": "echo 'sleep 5'"})));
+        assert!(!should_trigger(json!({"command": "echo sleep 5"})));
+        assert!(!should_trigger(json!({"command": "grep sleep file.rs"})));
+        assert!(!should_trigger(json!({"command": "asleep 5 && sleeper 10"})));
+        assert!(!should_trigger(json!({"command": "# sleep 5\necho ok # sleep 10"})));
+        assert!(!should_trigger(json!({"command": "sleep --help"})));
+        assert!(!should_trigger(
+            json!({"command": "sleep 25 && tail -n 50 server.log", "run_in_background": true})
+        ));
+        assert!(!should_trigger(
+            json!({"command": "for i in $(seq 1 10); do sleep 1; done", "detach": true})
+        ));
+    }
+
+    #[test]
+    fn inline_python_coaching_triggers_on_second_standalone_call_when_python_available() {
+        // Standalone inline python invocations (with optional leading `cd ... &&`)
+        assert!(is_standalone_inline_python_command(
+            "python -c \"import json; print(1 | 2)\""
+        ));
+        assert!(is_standalone_inline_python_command(
+            "cd /repo && python3 -c 'print(42)'"
+        ));
+        assert!(is_standalone_inline_python_command("py -3 -c \"print(1)\""));
+        assert!(is_standalone_inline_python_command(
+            "cd /repo && python - <<'EOF'\nimport json\nprint(1 | 2)\nEOF"
+        ));
+
+        // Non-standalone / non-inline commands must not match
+        assert!(!is_standalone_inline_python_command(
+            "curl -s http://localhost:8080/api | python -c \"import sys; print(sys.stdin.read())\""
+        ));
+        assert!(!is_standalone_inline_python_command(
+            "python -c \"print(1)\" | grep 1"
+        ));
+        assert!(!is_standalone_inline_python_command(
+            "python -c \"print(1)\" && echo done"
+        ));
+        assert!(!is_standalone_inline_python_command(
+            "python - <<'EOF'\nprint(1)\nEOF\necho done"
+        ));
+        assert!(!is_standalone_inline_python_command("python3 script.py"));
+        assert!(!is_standalone_inline_python_command("python3 -m pytest"));
+        assert!(!is_standalone_inline_python_command(
+            "echo \"python -c 'print(1)'\""
+        ));
+
+        // Unavailable Python tool never triggers (even across repeated calls)
+        let mut unavailable_state = BashCoachingState::default();
+        assert_eq!(
+            unavailable_state.build_turn_reminder(None, false, 1, false),
+            None
+        );
+        assert_eq!(
+            unavailable_state.build_turn_reminder(None, false, 1, false),
+            None
+        );
+
+        // Available Python tool: 1st occurrence does not trigger; 2nd triggers; then 4-turn cooldown
+        let mut state = BashCoachingState::default();
+        assert_eq!(state.build_turn_reminder(None, false, 1, true), None);
+        let second = state
+            .build_turn_reminder(None, false, 1, true)
+            .expect("inline python reminder on 2nd occurrence");
+        assert_eq!(
+            second,
+            format!("<system-reminder>\n{INLINE_PYTHON_COACHING_TEXT}\n</system-reminder>")
+        );
+        for _ in 0..BASH_COACHING_COOLDOWN_TURNS {
+            assert_eq!(state.build_turn_reminder(None, false, 1, true), None);
+        }
+        assert!(state.build_turn_reminder(None, false, 1, true).is_some());
+    }
+
+    #[test]
+    fn bash_coaching_combines_notices_and_enforces_per_category_cooldown() {
+        assert_eq!(BASH_COACHING_COOLDOWN_TURNS, 4);
+        let mut state = BashCoachingState::default();
+
+        // Both triggers in the same turn merge into one <system-reminder>.
+        let combined = state
+            .build_turn_reminder(Some("/repo"), true, 0, false)
+            .expect("combined reminder");
+        let expected = format!(
+            "<system-reminder>\n{}\n\n{}\n</system-reminder>",
+            format_redundant_cd_coaching("/repo"),
+            FOREGROUND_SLEEP_COACHING_TEXT
+        );
+        assert_eq!(combined, expected);
+        assert_eq!(combined.matches("<system-reminder>").count(), 1);
+        assert_eq!(combined.matches("</system-reminder>").count(), 1);
+
+        // Next 4 turns are cooled down for both categories.
+        for _ in 0..BASH_COACHING_COOLDOWN_TURNS {
+            assert_eq!(state.build_turn_reminder(Some("/repo"), true, 0, false), None);
+        }
+
+        // Turn 5: only redundant_cd triggers -> arms only redundant_cd cooldown.
+        let cd_only = state
+            .build_turn_reminder(Some("/repo"), false, 0, false)
+            .expect("cd reminder after cooldown");
+        assert!(cd_only.contains("ALREADY in `/repo`"));
+        assert!(!cd_only.contains("Do NOT poll with foreground `sleep`"));
+
+        // Next turn: redundant_cd is suppressed, but foreground_sleep fires independently.
+        let sleep_only = state
+            .build_turn_reminder(Some("/repo"), true, 0, false)
+            .expect("independent sleep reminder");
+        assert!(!sleep_only.contains("ALREADY in `/repo`"));
+        assert!(sleep_only.contains(FOREGROUND_SLEEP_COACHING_TEXT));
+
+        // Reset (e.g. on compaction) clears all cooldowns immediately.
+        state.reset();
+        let all_three = state
+            .build_turn_reminder(Some("/repo"), true, 2, true)
+            .expect("all three notices merged");
+        assert!(all_three.contains("ALREADY in `/repo`"));
+        assert!(all_three.contains(FOREGROUND_SLEEP_COACHING_TEXT));
+        assert!(all_three.contains(INLINE_PYTHON_COACHING_TEXT));
+        assert_eq!(all_three.matches("<system-reminder>").count(), 1);
     }
 }
 

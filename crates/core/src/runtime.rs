@@ -249,6 +249,180 @@ pub(crate) fn replay_history_with_ids(
     )
 }
 
+struct ModelRequestStep {
+    thinking: Option<String>,
+    text: String,
+    call_ids: Vec<String>,
+}
+
+fn load_model_request_steps(
+    conn: &rusqlite::Connection,
+    message_id: &str,
+) -> Result<Vec<ModelRequestStep>> {
+    let mut stmt = match conn.prepare(
+        "SELECT response_blocks_json FROM model_requests \
+         WHERE message_id = ?1 \
+         ORDER BY request_number ASC, started_at_ms ASC, rowid ASC",
+    ) {
+        Ok(stmt) => stmt,
+        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+            if msg.contains("no such table") || msg.contains("no such column") =>
+        {
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let rows = stmt.query_map([message_id], |row| row.get::<_, String>(0))?;
+    let mut steps = Vec::new();
+    for raw in rows {
+        let raw = raw?;
+        let Ok(blocks) = serde_json::from_str::<Vec<Value>>(&raw) else {
+            continue;
+        };
+        let mut thinking_parts = Vec::new();
+        let mut text_parts = Vec::new();
+        let mut call_ids = Vec::new();
+        for block in &blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("thinking") => {
+                    if let Some(text) = block
+                        .get("thinking")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        thinking_parts.push(text);
+                    }
+                }
+                Some("text") => {
+                    if let Some(text) = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                    {
+                        text_parts.push(text);
+                    }
+                }
+                Some("tool_call" | "tool_use") => {
+                    if let Some(id) = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    {
+                        call_ids.push(id.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        steps.push(ModelRequestStep {
+            thinking: (!thinking_parts.is_empty()).then(|| thinking_parts.join("\n\n")),
+            text: text_parts.concat(),
+            call_ids,
+        });
+    }
+    Ok(steps)
+}
+
+fn emit_tool_step(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    format: &ApiFormat,
+    step_calls: &[crate::db::model_results::ModelCall],
+    step_thinking: Option<&str>,
+    step_text: &str,
+    history: &mut Vec<Value>,
+) -> Result<bool> {
+    let mut thinking_replayed = false;
+    match format {
+        ApiFormat::OpenAI => {
+            let tool_calls: Vec<_> = step_calls
+                .iter()
+                .map(|t| {
+                    json!({
+                        "id": t.id,
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "arguments": t.input.as_deref().unwrap_or("{}")
+                        }
+                    })
+                })
+                .collect();
+            let mut assistant = json!({
+                "role": "assistant",
+                "content": step_text,
+                "tool_calls": tool_calls
+            });
+            if let Some(thinking) = step_thinking.filter(|text| !text.trim().is_empty()) {
+                assistant["reasoning_content"] = json!(thinking);
+                thinking_replayed = true;
+            }
+            history.push(assistant);
+            for tool in step_calls {
+                history.push(json!({
+                    "role": "tool",
+                    "tool_call_id": tool.id,
+                    "content": tool.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)
+                }));
+            }
+            for tool in step_calls {
+                if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? {
+                    history.push(
+                        json!({"role": "user", "content": note, "origin": "approval_note"}),
+                    );
+                }
+            }
+        }
+        ApiFormat::Anthropic => {
+            let mut blocks = Vec::new();
+            if !step_text.is_empty() {
+                blocks.push(json!({"type": "text", "text": step_text}));
+            }
+            blocks.extend(step_calls.iter().map(|t| {
+                json!({
+                    "type": "tool_use",
+                    "id": t.id,
+                    "name": t.name,
+                    "input": t.input
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                        .unwrap_or(json!({}))
+                })
+            }));
+            history.push(json!({"role": "assistant", "content": blocks}));
+            let mut results: Vec<_> = step_calls
+                .iter()
+                .map(|t| {
+                    json!({
+                        "type": "tool_result",
+                        "tool_use_id": t.id,
+                        "content": t.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),
+                        "is_error": t.is_error || t.text.is_none()
+                    })
+                })
+                .collect();
+            // Approval notes follow the results as the user's own text.
+            for tool in step_calls {
+                if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? {
+                    results.push(json!({"type": "text", "text": note}));
+                }
+            }
+            history.push(json!({"role": "user", "content": results, "origin": "tool_result"}));
+        }
+    }
+    for tool in step_calls {
+        for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
+            let mut message = input.model_message();
+            message["content"] = input.model_content(
+                crate::db::model_results::data_root(conn)?.as_deref(),
+                session_id,
+            );
+            history.push(message);
+        }
+    }
+    Ok(thinking_replayed)
+}
+
 pub(crate) fn replay_rows(
     conn: &rusqlite::Connection,
     id: &str,
@@ -294,50 +468,55 @@ pub(crate) fn replay_rows(
             crate::services::tool_history::nested_ids_for_message(conn, &message.id)?;
         calls.retain(|tool| !nested.contains(&tool.id));
         let mut thinking_replayed = false;
+        let mut any_step_matched = false;
+        let mut final_step_thinking: Option<String> = None;
         if message.role == "assistant" && !calls.is_empty() {
-            match format {
-                ApiFormat::OpenAI => {
-                    let tool_calls: Vec<_> = calls.iter().map(|t| json!({"id":t.id,"type":"function","function":{"name":t.name,"arguments":t.input.as_deref().unwrap_or("{}")}})).collect();
-                    let mut assistant = json!({"role":"assistant","content":"","tool_calls":tool_calls});
-                    if let Some(thinking) = message.thinking.as_deref().filter(|text| !text.trim().is_empty()) {
-                        assistant["reasoning_content"] = json!(thinking);
+            let steps = load_model_request_steps(conn, &message.id)?;
+            let mut remaining = calls;
+            for step in steps {
+                let mut step_calls = Vec::new();
+                for call_id in &step.call_ids {
+                    if let Some(pos) = remaining.iter().position(|c| c.id == *call_id) {
+                        step_calls.push(remaining.remove(pos));
+                    }
+                }
+                if !step_calls.is_empty() {
+                    any_step_matched = true;
+                    final_step_thinking = None;
+                    if emit_tool_step(
+                        conn,
+                        id,
+                        format,
+                        &step_calls,
+                        step.thinking.as_deref(),
+                        &step.text,
+                        &mut history,
+                    )? {
                         thinking_replayed = true;
                     }
-                    history.push(assistant);
-                    for tool in &calls {
-                        history.push(json!({
-                            "role":"tool",
-                            "tool_call_id":tool.id,
-                            "content":tool.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT)
-                        }));
-                    }
-                    for tool in &calls {
-                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? {
-                            history.push(
-                                json!({"role":"user","content":note,"origin":"approval_note"}),
-                            );
-                        }
-                    }
-                }
-                ApiFormat::Anthropic => {
-                    let blocks: Vec<_> = calls.iter().map(|t| json!({"type":"tool_use","id":t.id,"name":t.name,"input":t.input.as_deref().and_then(|s| serde_json::from_str::<Value>(s).ok()).unwrap_or(json!({}))})).collect();
-                    history.push(json!({"role":"assistant","content":blocks}));
-                    let mut results: Vec<_> = calls.iter().map(|t| json!({"type":"tool_result","tool_use_id":t.id,"content":t.text.as_deref().unwrap_or(message_repo::UNFINISHED_TOOL_RESULT),"is_error":t.is_error || t.text.is_none()})).collect();
-                    // Approval notes follow the results as the user's own text.
-                    for tool in &calls {
-                        if let Some(note) = message_repo::tool_call_note(conn, &tool.id)? { results.push(json!({"type":"text","text":note})); }
-                    }
-                    history.push(json!({"role":"user","content":results,"origin":"tool_result"}));
+                } else {
+                    final_step_thinking = step.thinking;
                 }
             }
-            for tool in &calls {
-                for input in crate::services::input_queue::load_delivered(conn, &tool.id)? {
-                    let mut message = input.model_message();
-                    message["content"] = input.model_content(
-                        crate::db::model_results::data_root(conn)?.as_deref(),
-                        id,
-                    );
-                    history.push(message);
+            if !remaining.is_empty() {
+                let fallback_thinking = if !any_step_matched {
+                    final_step_thinking = None;
+                    message.thinking.as_deref()
+                } else if !thinking_replayed && final_step_thinking.is_none() {
+                    message.thinking.as_deref()
+                } else {
+                    None
+                };
+                if emit_tool_step(
+                    conn,
+                    id,
+                    format,
+                    &remaining,
+                    fallback_thinking,
+                    "",
+                    &mut history,
+                )? {
+                    thinking_replayed = true;
                 }
             }
         }
@@ -366,8 +545,16 @@ pub(crate) fn replay_rows(
             continue;
         };
         let mut item = json!({"role":message.role,"content":content});
-        if message.role == "assistant" && !thinking_replayed {
-            if let Some(thinking) = message.thinking.as_deref().filter(|text| !text.trim().is_empty()) {
+        if message.role == "assistant" {
+            let final_thinking = final_step_thinking
+                .as_deref()
+                .or_else(|| {
+                    (!thinking_replayed && !any_step_matched)
+                        .then_some(message.thinking.as_deref())
+                        .flatten()
+                })
+                .filter(|text| !text.trim().is_empty());
+            if let Some(thinking) = final_thinking {
                 item["reasoning_content"] = json!(thinking);
             }
         }
@@ -785,5 +972,200 @@ mod database_cache_tests {
         drop(again);
         assert!(cached.upgrade().is_none());
         assert!(paths.open_database().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod model_history_step_replay_tests {
+    use super::*;
+
+    fn open_session_db(store: &SessionStore, id: &str) -> rusqlite::Connection {
+        let global = rusqlite::Connection::open(store.db.data_dir().join("global.db")).unwrap();
+        let key: String = global
+            .query_row(
+                "SELECT storage_key FROM conversations WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        rusqlite::Connection::open(
+            store
+                .db
+                .data_dir()
+                .join("data")
+                .join("sessions")
+                .join(key)
+                .join("session.db"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn openai_replays_per_step_reasoning_and_tool_calls_without_merging() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store.append(&id, "user", "Inspect the repo").unwrap();
+        let assistant_id = store.append(&id, "assistant", "Final answer").unwrap();
+
+        let conn = open_session_db(&store, &id);
+        conn.execute(
+            "UPDATE messages SET thinking = ?1 WHERE id = ?2",
+            rusqlite::params!["thinking1\n\nthinking2\n\nthinking3", assistant_id],
+        )
+        .unwrap();
+        message_repo::insert_tool_call(
+            &conn,
+            "call_1",
+            &assistant_id,
+            "Read",
+            Some(r#"{"file_path":"a.rs"}"#),
+            Some("content of a.rs"),
+            false,
+            0,
+        )
+        .unwrap();
+        message_repo::insert_tool_call(
+            &conn,
+            "call_2",
+            &assistant_id,
+            "Read",
+            Some(r#"{"file_path":"b.rs"}"#),
+            Some("content of b.rs"),
+            false,
+            1,
+        )
+        .unwrap();
+        crate::db::request_repo::save_request(
+            &conn,
+            &assistant_id,
+            &json!({
+                "id": "req-1",
+                "number": 1,
+                "startedAt": 1000,
+                "responseBlocks": [
+                    {"type": "thinking", "thinking": "thinking1"},
+                    {"type": "tool_call", "id": "call_1", "name": "Read"}
+                ]
+            }),
+        )
+        .unwrap();
+        crate::db::request_repo::save_request(
+            &conn,
+            &assistant_id,
+            &json!({
+                "id": "req-2",
+                "number": 2,
+                "startedAt": 2000,
+                "responseBlocks": [
+                    {"type": "thinking", "thinking": "thinking2"},
+                    {"type": "tool_call", "id": "call_2", "name": "Read"}
+                ]
+            }),
+        )
+        .unwrap();
+        crate::db::request_repo::save_request(
+            &conn,
+            &assistant_id,
+            &json!({
+                "id": "req-3",
+                "number": 3,
+                "startedAt": 3000,
+                "responseBlocks": [
+                    {"type": "thinking", "thinking": "thinking3"},
+                    {"type": "text", "text": "Final answer"}
+                ]
+            }),
+        )
+        .unwrap();
+        drop(conn);
+
+        let history = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+        assert_eq!(history.len(), 6, "user + 3 assistant steps + 2 tool results");
+
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "Inspect the repo");
+
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["reasoning_content"], "thinking1");
+        assert_eq!(history[1]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(history[1]["tool_calls"][0]["id"], "call_1");
+
+        assert_eq!(history[2]["role"], "tool");
+        assert_eq!(history[2]["tool_call_id"], "call_1");
+        assert_eq!(history[2]["content"], "content of a.rs");
+
+        assert_eq!(history[3]["role"], "assistant");
+        assert_eq!(history[3]["reasoning_content"], "thinking2");
+        assert_eq!(history[3]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(history[3]["tool_calls"][0]["id"], "call_2");
+
+        assert_eq!(history[4]["role"], "tool");
+        assert_eq!(history[4]["tool_call_id"], "call_2");
+        assert_eq!(history[4]["content"], "content of b.rs");
+
+        assert_eq!(history[5]["role"], "assistant");
+        assert_eq!(history[5]["reasoning_content"], "thinking3");
+        assert_eq!(history[5]["content"], "Final answer");
+        assert!(history[5].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn legacy_fallback_without_model_requests_replays_calls_and_thinking() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store.append(&id, "user", "Check legacy").unwrap();
+        let assistant_id = store.append(&id, "assistant", "Legacy answer").unwrap();
+
+        let conn = open_session_db(&store, &id);
+        conn.execute(
+            "UPDATE messages SET thinking = ?1 WHERE id = ?2",
+            rusqlite::params!["merged legacy thinking", assistant_id],
+        )
+        .unwrap();
+        message_repo::insert_tool_call(
+            &conn,
+            "legacy_call_1",
+            &assistant_id,
+            "Read",
+            Some(r#"{"file_path":"a.rs"}"#),
+            Some("a"),
+            false,
+            0,
+        )
+        .unwrap();
+        message_repo::insert_tool_call(
+            &conn,
+            "legacy_call_2",
+            &assistant_id,
+            "Read",
+            Some(r#"{"file_path":"b.rs"}"#),
+            Some("b"),
+            false,
+            1,
+        )
+        .unwrap();
+        drop(conn);
+
+        let history = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+        assert_eq!(history.len(), 5, "user + merged assistant + 2 tools + final assistant");
+
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["reasoning_content"], "merged legacy thinking");
+        assert_eq!(history[1]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(history[1]["tool_calls"][0]["id"], "legacy_call_1");
+        assert_eq!(history[1]["tool_calls"][1]["id"], "legacy_call_2");
+
+        assert_eq!(history[2]["role"], "tool");
+        assert_eq!(history[2]["tool_call_id"], "legacy_call_1");
+        assert_eq!(history[3]["role"], "tool");
+        assert_eq!(history[3]["tool_call_id"], "legacy_call_2");
+
+        assert_eq!(history[4]["role"], "assistant");
+        assert_eq!(history[4]["content"], "Legacy answer");
+        assert!(history[4].get("reasoning_content").is_none());
     }
 }
