@@ -67,10 +67,18 @@ pub fn standalone_frontend_reminder() -> String {
 /// block of the first user message. Static across requests so prompt caching
 /// stays intact.
 pub const SESSION_TIPS: &str = r#"Shell & tool-batching tips for this session:
-- Combine sequential shell steps into ONE `Bash` call using `&&` (dependent steps), `;` with `echo '---'` (independent checks), or a `for` loop with shell variables when inspecting multiple targets—instead of emitting multiple `Bash` calls across serial turns or in the same turn.
+- Combine sequential shell steps into ONE `Bash` call using `&&` (dependent steps), `;` with `echo '---'` (independent checks), `for` loops, or a self-contained multi-line script (~5–15 lines) when a workflow has variables, predictable fallbacks (missing dir, locked target), and final verification—instead of serial single-command turns. Use `set -euo pipefail` in Bash (or check `$LASTEXITCODE` and `try/catch` in PowerShell), and keep unrelated or high-risk irreversible actions separate.
   Examples (1 call instead of 5–10 separate turns):
   - Multi-target inspection: `for d in svc-a svc-b; do echo "== $d"; git -C "$d" branch --show-current; git -C "$d" status --short | head -20; done; echo '---'; node -v; pnpm -v`
-  - Build & verify: `pnpm typecheck && pnpm lint && pnpm test -- Login; echo '---'; git status --short; echo '---'; git diff --stat`
+  - Build, install & verify script:
+    ```bash
+    set -euo pipefail
+    src="target/release/app.exe"; dst="/d/bin/app.exe"
+    cargo build --release --locked --bin app
+    mkdir -p "$(dirname "$dst")"
+    cp -f "$src" "$dst" 2>/dev/null || { mv -f "$dst" "$dst.old" && cp -f "$src" "$dst"; }
+    ls -la "$src" "$dst" && "$dst" --version
+    ```
 - When `.codegraph/codegraph.db` is READY, reach for the `codegraph` CLI first (`codegraph explore "<symbols or question>"`, `codegraph node <name>`, `codegraph callers|callees|impact <symbol>`) for symbol lookup, call chains, and change impact instead of serial `Grep`/`Bash` hops.
 - Keep `Read`/`Grep`/`Glob` for reading and searching source files (batch them in parallel in one turn); do not use `Bash` with `cat`/`sed`/`head`/`tail`/`grep`/`find`/`ls` as a substitute for reading code (use `Bash` only for bulk log aggregation or shell-native pipelines).
 - Foreground `Bash` persists `cwd` across calls: once you `cd` into a directory, do not repeat `cd <dir> &&` on every command; use `(cd <dir> && ...)` or `git -C <dir>` for one-off directory switches.
