@@ -28,7 +28,7 @@ const FISH_NOTE: &str =
 const WSL_NOTE_PREFIX: &str = "The default is WSL";
 const WSL_NOTE_BODY: &str = ". Work with Linux paths inside the distribution. Drive C is normally mounted at /mnt/c, and launching Windows executables requires WSL interop.";
 const OTHER_SHELL_HINT: &str =
-    "If you override the default with shell, write the command for that interpreter.";
+    "To run a script for another interpreter listed in the `shell` parameter, pass `shell` directly instead of wrapping it inside the default shell, and write the command in that interpreter's syntax.";
 
 /// Shell-aware text for the Bash and Monitor tools.
 #[derive(Clone, Debug, PartialEq, Eq)]
