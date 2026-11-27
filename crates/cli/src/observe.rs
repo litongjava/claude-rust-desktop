@@ -241,10 +241,11 @@ impl Observer {
             });
         }
         // Drain whatever the owner published between the last active poll and
-        // its lease disappearing; those final lines are otherwise lost.
+        // its lease disappearing; those final lines are otherwise lost. The
+        // stream is not finished yet: within the settle window the owner may
+        // still publish the real tool result and the completed turn.
         if let Some(turn) = self.turn.clone() {
             self.render(&selected, &turn, workspace, &mut updates)?;
-            self.finish_segments(&mut updates);
         }
         let turn = self
             .turn
@@ -280,6 +281,11 @@ impl Observer {
         } else {
             finished_notice(turn.as_ref())
         };
+        // The turn is truly over. Only now close a partial line and account
+        // for calls that never recorded a result; doing this inside the grace
+        // period both preempts a result that is about to land and repeats the
+        // placeholder on every poll while the owner is gone.
+        self.finish_segments(&mut updates);
         self.announced = false;
         self.preannounced = false;
         self.turn = None;
@@ -349,7 +355,8 @@ impl Observer {
     fn finish_segments(&mut self, updates: &mut Vec<Update>) {
         for (segment, cursor) in self.segments.iter_mut() {
             cursor.flush_all(segment, updates);
-            for (_, (tool, number)) in std::mem::take(&mut cursor.running) {
+            for (id, (tool, number)) in std::mem::take(&mut cursor.running) {
+                cursor.tools.insert(id, true);
                 updates.push(Update::Tool(ToolUpdate {
                     segment: segment.clone(),
                     number,
@@ -909,6 +916,98 @@ mod tests {
             .unwrap();
         assert!(record.interrupted());
         assert_eq!(record.elapsed_ms, None, "duration stays unknown");
+    }
+
+    #[test]
+    fn the_settle_grace_never_preempts_a_result_that_lands_before_the_turn_closes() {
+        let (temp, db, session_id) = fixture();
+        let root = temp.path();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
+        let message = timer.ensure_segment().unwrap();
+        save_tool(&db, &session_id, &message, "read-1", "Read", "{\"file_path\":\"fixture.txt\"}", None);
+        let lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
+        let mut observer = Observer::default();
+        let result = observer.poll_at(root, &db, &session_id, Some(root)).unwrap();
+        assert_eq!(result.state, State::Running);
+        assert!(tools(&result.updates).is_empty());
+        assert!(result.activity.is_some());
+
+        // The owner released the lease but has not finished writing the turn:
+        // the call stays running instead of being settled as an orphan.
+        drop(lease);
+        for _ in 0..3 {
+            let result = observer.poll_at(root, &db, &session_id, Some(root)).unwrap();
+            assert_eq!(result.state, State::Running, "the grace period is respected");
+            assert!(
+                tools(&result.updates).is_empty(),
+                "an unfinished call was preempted: {:?}",
+                result.updates
+            );
+        }
+
+        // The finalization publishes the real result and completes the turn.
+        save_tool(
+            &db,
+            &session_id,
+            &message,
+            "read-1",
+            "Read",
+            "{\"file_path\":\"fixture.txt\"}",
+            Some("fixture contents\n"),
+        );
+        timer.finish(turn_repo::TurnStatus::Completed).unwrap();
+        let result = observer.poll_at(root, &db, &session_id, Some(root)).unwrap();
+        assert_eq!(result.state, State::Finished);
+        let tools = tools(&result.updates);
+        assert_eq!(tools.len(), 1, "the result must be published exactly once: {:?}", result.updates);
+        assert_eq!(tools[0].output, "fixture contents\n");
+        assert!(
+            !result.updates.iter().any(|update| matches!(
+                update,
+                Update::Tool(tool) if tool.output == "No result recorded"
+            )),
+            "an orphan placeholder contradicted the real result: {:?}",
+            result.updates
+        );
+    }
+
+    #[test]
+    fn an_interrupted_turn_records_an_unfinished_call_exactly_once() {
+        let (temp, db, session_id) = fixture();
+        let root = temp.path();
+        let mut timer = turn_repo::TurnTimer::in_session(db.open_session(&session_id).unwrap()).unwrap();
+        let message = timer.ensure_segment().unwrap();
+        save_tool(&db, &session_id, &message, "read-1", "Read", "{\"file_path\":\"fixture.txt\"}", None);
+        let lease = db.open_session(&session_id).unwrap().acquire_execution().unwrap();
+        let mut observer = Observer::default();
+        observer.poll_at(root, &db, &session_id, Some(root)).unwrap();
+
+        // The process is killed without settling its turn or its call.
+        drop(lease);
+        std::mem::forget(timer);
+        for _ in 0..3 {
+            let result = observer.poll_at(root, &db, &session_id, Some(root)).unwrap();
+            assert_eq!(result.state, State::Running);
+            assert!(
+                tools(&result.updates).is_empty(),
+                "the placeholder repeated inside the grace period: {:?}",
+                result.updates
+            );
+        }
+
+        observer.idle_since = Some(Instant::now() - SETTLE_GRACE - Duration::from_millis(1));
+        let result = observer.poll_at(root, &db, &session_id, Some(root)).unwrap();
+        assert_eq!(result.state, State::Finished);
+        let tools = tools(&result.updates);
+        assert_eq!(tools.len(), 1, "the orphan is reported exactly once: {:?}", result.updates);
+        assert_eq!(tools[0].output, "No result recorded");
+        assert!(notices(&result.updates)
+            .iter()
+            .any(|line| line.contains("interrupted · duration unknown")));
+
+        let result = observer.poll_at(root, &db, &session_id, Some(root)).unwrap();
+        assert_eq!(result.state, State::Idle);
+        assert!(result.updates.is_empty(), "never replays: {:?}", result.updates);
     }
 
     #[test]
