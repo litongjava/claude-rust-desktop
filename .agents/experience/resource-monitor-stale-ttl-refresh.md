@@ -21,4 +21,4 @@ A resource warning queued during a long tool call (for example a 90-second build
 
 ## Verification
 
-`cargo test --locked -p deepseek-code-core --lib services::resource_monitor` covers `sustained_breach_refreshes_undrained_alert_past_stale_ttl`: breach at `t=0`, breach again past `t + stale_ttl + 10s`, assert the pending alert survives with the latest summary and that draining it inside the cooldown does not re-enqueue. The CLI `resource_monitor` integration test (`cooldown_suppresses_alerts_across_iterations`) confirms delivery is still exactly once.
+`cargo test --locked -p deepseek-code-core --lib services::resource_monitor` covers `sustained_breach_refreshes_undrained_alert_past_stale_ttl`: breach at `t=0`, breach again past `t + stale_ttl + 10s`, assert the pending alert survives with the latest summary and that draining it inside the cooldown does not re-enqueue. The core integration test `crates/core/tests/resource_monitor.rs` (`cooldown_suppresses_alerts_across_iterations`) confirms delivery is still exactly once.

@@ -101,14 +101,18 @@ impl ResourceMonitorConfig {
 
     /// Keeps the interval in a range that is responsive without busy-waiting and
     /// replaces thresholds that would silently disable their comparison (`NaN`,
-    /// infinities and negatives). Values above 100 are preserved so tests can
-    /// force a deterministic breach.
+    /// infinities and negatives). A CPU threshold above 100 is also invalid
+    /// because the sampled percent is clamped to `0.0..=100.0`, so it could
+    /// never breach; memory and disk thresholds above 100 are preserved so
+    /// tests can force a deterministic breach.
     pub fn sanitized(mut self) -> Self {
         let defaults = Self::default();
         self.interval_secs = self
             .interval_secs
             .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
-        if !self.cpu_percent_threshold.is_finite() || self.cpu_percent_threshold < 0.0 {
+        if !self.cpu_percent_threshold.is_finite()
+            || !(0.0..=100.0).contains(&self.cpu_percent_threshold)
+        {
             self.cpu_percent_threshold = defaults.cpu_percent_threshold;
         }
         if !self.memory_available_percent_threshold.is_finite()
@@ -1457,17 +1461,25 @@ mod tests {
         assert_eq!(config.memory_consecutive, 1);
         assert_eq!(config.disk_consecutive, 1);
 
-        // Deterministic CLI tests rely on a threshold above 100 surviving.
-        let above = ResourceMonitorConfig {
-            cpu_percent_threshold: 100.1,
-            memory_available_percent_threshold: 100.1,
-            disk_available_percent_threshold: 100.1,
-            ..defaults
+        // The sampled CPU percent is clamped to 0..=100, so a higher threshold
+        // could never breach and must fall back to the default.
+        for invalid_cpu in [100.1, 105.0] {
+            let above = ResourceMonitorConfig {
+                cpu_percent_threshold: invalid_cpu,
+                memory_available_percent_threshold: 100.1,
+                disk_available_percent_threshold: 100.1,
+                ..defaults.clone()
+            }
+            .sanitized();
+            assert_eq!(
+                above.cpu_percent_threshold, defaults.cpu_percent_threshold,
+                "cpu threshold {invalid_cpu}"
+            );
+            // Deterministic core/CLI tests rely on these above-100 thresholds
+            // surviving, because memory and disk breach on a lower bound.
+            assert_eq!(above.memory_available_percent_threshold, 100.1);
+            assert_eq!(above.disk_available_percent_threshold, 100.1);
         }
-        .sanitized();
-        assert_eq!(above.cpu_percent_threshold, 100.1);
-        assert_eq!(above.memory_available_percent_threshold, 100.1);
-        assert_eq!(above.disk_available_percent_threshold, 100.1);
     }
 
     // ---- platform parsers ------------------------------------------------
