@@ -610,6 +610,8 @@ pub(super) async fn start_authorized_chat(
                     }))
                 }
                 crate::native_engine::tool_loop::EngineEvent::RequestAttempt(event) => Some(event),
+                // Consumed into request_links above; it is not a client event.
+                crate::native_engine::tool_loop::EngineEvent::ToolCallRequestLink { .. } => None,
                 crate::native_engine::tool_loop::EngineEvent::BudgetWarning { message, usage, limit } => {
                     Some(serde_json::json!({
                         "type": "budget_warning",
