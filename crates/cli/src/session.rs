@@ -3107,6 +3107,7 @@ impl Session {
         let mut text = String::new();
         // Set when a tool runs, so text from the next model round starts on its own paragraph.
         let mut separate_text = false;
+        let mut separate_thinking = false;
         let mut thinking_text = String::new();
         let mut request_usage = RequestUsage::default();
         let mut error = None;
@@ -3268,12 +3269,23 @@ impl Session {
                         }
                     },
                     EngineEvent::Thinking(delta) => {
-                        thinking_text.push_str(&delta);
+                        if !delta.is_empty() {
+                            if std::mem::take(&mut separate_thinking)
+                                && !thinking_text.is_empty()
+                                && !thinking_text.ends_with('\n')
+                            {
+                                thinking_text.push_str("\n\n");
+                            }
+                            thinking_text.push_str(&delta);
+                        }
                         progress.record_thinking(&delta);
                         if cli.verbose { progress.before_text(&delta); if !progress.is_live() { eprint!("{delta}"); } }
                         else { progress.thinking(); }
                     },
-                    EngineEvent::MessageStart { .. } => progress.set_activity("Composing"),
+                    EngineEvent::MessageStart { .. } => {
+                        separate_thinking = true;
+                        progress.set_activity("Composing");
+                    },
                     EngineEvent::CompactionNotice(message) => {
                         progress.notice(&message);
                     },
@@ -3283,11 +3295,14 @@ impl Session {
                     EngineEvent::ContextReset { session_id, boundary_id, assistant_id: reserved, reason } if session_id == self.id => {
                         transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
-                            tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
+                            tools: &tools, origins: Some(&live_transcript.origins), request_links: Some(&live_transcript.request_links),
+                            inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
                         })?;
                         assistant_id = turn.resume_reset_segment(reserved)?;
                         text.clear(); thinking_text.clear(); tools.clear(); snapshots.clear();
+                        live_transcript.request_links.clear();
+                        separate_thinking = false;
                         if background_transcript { live_transcript = BackgroundTranscript::default(); separate_text = false; }
                         match reason {
                             deepseek_code_core::native_engine::tool_loop::ContextResetReason::PlanApproval => {
@@ -3561,6 +3576,7 @@ impl Session {
                     EngineEvent::ToolUseStart { tool_use_id, tool_name, tool_input, display_title, .. } => {
                         tool_started.entry(tool_use_id.clone()).or_insert_with(std::time::Instant::now);
                         separate_text = true;
+                        separate_thinking = true;
                         progress.clear();
                         if cli.verbose && !progress.is_live() { eprintln!("\n[{tool_name}]"); }
                         progress.tool_started_named(&tool_use_id, &tool_name, &tool_input, display_title.as_deref());
@@ -3652,8 +3668,22 @@ impl Session {
                         }
                         text.push_str(&delta);
                     }
-                    EngineEvent::Thinking(delta) => thinking_text.push_str(&delta),
-                    EngineEvent::ToolUseStart { .. } => separate_text = true,
+                    EngineEvent::Thinking(delta) => {
+                        if !delta.is_empty() {
+                            if std::mem::take(&mut separate_thinking)
+                                && !thinking_text.is_empty()
+                                && !thinking_text.ends_with('\n')
+                            {
+                                thinking_text.push_str("\n\n");
+                            }
+                            thinking_text.push_str(&delta);
+                        }
+                    }
+                    EngineEvent::MessageStart { .. } => separate_thinking = true,
+                    EngineEvent::ToolUseStart { .. } => {
+                        separate_text = true;
+                        separate_thinking = true;
+                    }
                     EngineEvent::MessageStop { full_text, .. } => {
                         if structured_output || text.is_empty() {
                             text = full_text;
@@ -3667,7 +3697,8 @@ impl Session {
                     } if session_id == self.id => {
                         transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary_id), text: Some(&text), thinking: Some(&thinking_text),
-                            tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
+                            tools: &tools, origins: Some(&live_transcript.origins), request_links: Some(&live_transcript.request_links),
+                            inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
                         })?;
                         assistant_id = turn.resume_reset_segment(reserved)?;
@@ -3677,6 +3708,7 @@ impl Session {
                         snapshots.clear();
                         live_transcript = BackgroundTranscript::default();
                         separate_text = false;
+                        separate_thinking = false;
                         if matches!(
                             reason,
                             deepseek_code_core::native_engine::tool_loop::ContextResetReason::PlanApproval
@@ -3734,7 +3766,8 @@ impl Session {
             if let Some(boundary) = latest_boundary {
                 transcript.save_segment(&assistant_id, SegmentUpdate {
                             placement: SegmentPlacement::Before(&boundary), text: Some(&text), thinking: Some(&thinking_text),
-                            tools: &tools, origins: Some(&live_transcript.origins), inputs: Some(&queued_inputs_by_tool),
+                            tools: &tools, origins: Some(&live_transcript.origins), request_links: Some(&live_transcript.request_links),
+                            inputs: Some(&queued_inputs_by_tool),
                             snapshots: Some(&json!(snapshots)), ..Default::default()
                         })?;
                 assistant_id = turn.new_segment()?;
@@ -3777,6 +3810,7 @@ impl Session {
             text: Some(&text),
             thinking: (!thinking_text.is_empty()).then_some(thinking_text.as_str()),
             tools: &tools, origins: Some(&live_transcript.origins),
+            request_links: Some(&live_transcript.request_links),
             durations: Some(&tool_durations), inputs: Some(&queued_inputs_by_tool),
             notes: Some(&approval_notes), snapshots: Some(&json!(snapshots)),
             ..Default::default()
@@ -4127,10 +4161,25 @@ struct BackgroundTranscript {
     arguments: std::collections::HashMap<String, String>,
     /// Nested ToolScript calls observed in this turn, keyed by occurrence.
     origins: deepseek_code_core::services::tool_history::ToolOrigins,
+    /// `tool_use_id -> (model_request_id, provider_call_id)` observed in this turn.
+    request_links: deepseek_code_core::services::tool_history::ToolRequestLinks,
 }
 
 impl BackgroundTranscript {
     fn observe(&mut self, event: &EngineEvent, tools: &mut Vec<message_repo::ToolCallRow>) {
+        if let EngineEvent::ToolCallRequestLink {
+            tool_use_id,
+            request_id,
+            provider_call_id,
+        } = event
+        {
+            self.request_links.insert(
+                tool_use_id.clone(),
+                (request_id.clone(), Some(provider_call_id.clone())),
+            );
+            self.dirty = true;
+            return;
+        }
         if matches!(
             event,
             EngineEvent::Text(_) | EngineEvent::Thinking(_) | EngineEvent::MessageStop { .. }
@@ -4171,7 +4220,7 @@ impl BackgroundTranscript {
         if !self.dirty { return Ok(()); }
         history.save_live_segment(assistant_id, SegmentUpdate {
             text: Some(text), thinking: Some(thinking), tools,
-            origins: Some(&self.origins), ..Default::default()
+            origins: Some(&self.origins), request_links: Some(&self.request_links), ..Default::default()
         })?;
         self.dirty = false;
         Ok(())
