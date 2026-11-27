@@ -358,6 +358,36 @@ fn observing_session(
         || worker_frontend::occupancy(session)?.is_some())
 }
 
+/// Read-only sessions must not enter multiline composition: a pending
+/// composer would swallow `/exit` and `/resume`. Scheduled prompts are already
+/// complete and skip composition too.
+fn prompt_submission(
+    scheduled: bool,
+    read_only_missing: bool,
+    composer: &mut terminal::prompt::Composer,
+    line: String,
+) -> terminal::prompt::Input {
+    if scheduled || read_only_missing {
+        terminal::prompt::Input::Command(line)
+    } else {
+        composer.push(line)
+    }
+}
+
+/// A `-C`/`--path` launch must name the resumed project, not another cwd. A
+/// missing primary folder can never match the existing launch directory.
+fn launch_directory_matches(path: &std::path::Path, cwd: &std::path::Path) -> Result<()> {
+    if path.is_dir() {
+        ensure!(
+            std::fs::canonicalize(path)? == std::fs::canonicalize(cwd)?,
+            "--path differs from the resumed session's project"
+        );
+    } else {
+        anyhow::bail!("--path differs from the resumed session's project");
+    }
+    Ok(())
+}
+
 async fn run(cli: &mut Cli) -> Result<()> {
     if let Some(Commands::Help { topic, command }) = &cli.command {
         return help::show(topic.as_deref(), command);
@@ -902,10 +932,15 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 .map_err(|error| session_trust::diagnose(&store.db, &paths, id, error))?;
             if let deepseek_code_core::db::session_store::ResumedWorkspace::Missing {
                 path,
+                missing_path,
                 reason,
             } = workspace
             {
-                resumed_missing = Some(session::MissingWorkspace { path, reason });
+                resumed_missing = Some(session::MissingWorkspace {
+                    path,
+                    missing_path,
+                    reason,
+                });
             }
             Some(row)
         } else {
@@ -927,12 +962,11 @@ async fn run(cli: &mut Cli) -> Result<()> {
     if let Some(resumed) = &resumed {
         if let Some(missing) = &resumed_missing {
             // Keep the launch directory. A `-C` that points elsewhere must not
-            // silently attach a read-only session to another project.
+            // silently attach a read-only session to another project. A
+            // multi-folder project can leave its primary folder in place, so
+            // compare against it; an absent folder already differs from cwd.
             if cli.path.is_some() {
-                ensure!(
-                    std::env::current_dir()? == missing.path,
-                    "--path differs from the resumed session's project"
-                );
+                launch_directory_matches(&missing.path, &std::env::current_dir()?)?;
             }
         } else {
             let db = paths.open_database()?;
@@ -1171,6 +1205,11 @@ async fn run(cli: &mut Cli) -> Result<()> {
                 }?;
                 for warning in outcome { eprintln!("Setup hook: {warning}"); }
             }
+        } else if !sdk_stream {
+            // A non-SDK interactive host still owns the session lifecycle while
+            // it inspects a missing directory, so a later writable resume runs
+            // SessionStart. No hook runs against the missing folder itself.
+            session.remember_lifecycle_host();
         }
         // Startup succeeded and the final workspace is known: publish now, so a
         // failed startup never leaves a registry row or owner lease behind.
@@ -1759,7 +1798,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             fn input_origin(scheduled: bool, text: &str) -> TurnOrigin<'_> {
                 if scheduled { TurnOrigin::Scheduled } else { TurnOrigin::User(text) }
             }
-            let submission = if scheduled { terminal::prompt::Input::Command(line) } else { composer.push(line) };
+            let submission = prompt_submission(scheduled, read_only_missing, &mut composer, line);
             let line = match submission {
                 terminal::prompt::Input::Pending => continue,
                 terminal::prompt::Input::Cancelled => { command_eprintln!("Prompt discarded."); continue; },
@@ -1767,9 +1806,6 @@ async fn run(cli: &mut Cli) -> Result<()> {
                     if !prompt.trim().is_empty() {
                         if read_only_missing {
                             command_eprintln!("{}", session.missing_workspace_notice("the prompt"));
-                            if !scheduled {
-                                if let Some(input) = input.as_ref() { input.restore_draft(prompt); }
-                            }
                             continue;
                         }
                         match observing_session(&session, observe_announced, observe_state) {
@@ -2378,6 +2414,62 @@ mod turn_command_tests {
         ] {
             assert!(!starts_turn_command(command, argument), "{command}");
         }
+    }
+}
+
+#[cfg(test)]
+mod read_only_submission_tests {
+    use super::prompt_submission;
+    use crate::terminal::prompt::{Composer, Input};
+
+    #[test]
+    fn read_only_lines_bypass_multiline_composition() {
+        let mut composer = Composer::default();
+        for line in ["/multiline", "foo\\"] {
+            assert_eq!(
+                prompt_submission(false, true, &mut composer, line.into()),
+                Input::Command(line.into())
+            );
+            assert!(!composer.is_pending(), "{line} left the composer pending");
+        }
+        // A writable session still enters multiline mode.
+        assert_eq!(
+            prompt_submission(false, false, &mut composer, "/multiline".into()),
+            Input::Pending
+        );
+        assert!(composer.is_pending());
+        composer.cancel();
+    }
+}
+
+#[cfg(test)]
+mod launch_directory_tests {
+    use super::launch_directory_matches;
+
+    #[test]
+    fn missing_project_primary_must_match_the_launch_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let other = root.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+
+        assert!(launch_directory_matches(&project, &project).is_ok());
+        // A non-canonical spelling of the same existing folder still matches.
+        assert!(launch_directory_matches(&project.join("."), &project).is_ok());
+        let error = launch_directory_matches(&project, &other).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--path differs"),
+            "{error:#}"
+        );
+
+        // The primary folder is gone, so no existing launch directory can match.
+        let gone = root.path().join("gone");
+        let error = launch_directory_matches(&gone, &other).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--path differs"),
+            "{error:#}"
+        );
     }
 }
 

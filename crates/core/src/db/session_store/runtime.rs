@@ -208,7 +208,8 @@ fn inspection_workspace(
                     "Project source folder changed; start a new conversation for this folder"
                 );
                 return Ok(ResumedWorkspace::Missing {
-                    path,
+                    path: path.clone(),
+                    missing_path: path,
                     reason: "Conversation worktree directory no longer exists".into(),
                 });
             }
@@ -241,11 +242,22 @@ fn inspection_workspace(
         .or_else(|| project.workspace_path.clone())
         .or_else(|| row.workspace_path.clone());
     let missing = missing.remove(0);
+    let path = recorded
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&missing));
+    let missing_path = PathBuf::from(&missing);
+    // A single missing project keeps the plain directory wording. When another
+    // folder is still recorded as the display workspace, name the missing
+    // folder explicitly so the notice never blames the surviving folder.
+    let reason = if path == missing_path {
+        format!("Directory no longer exists: {}", missing_path.display())
+    } else {
+        format!("Project folder no longer exists: {}", missing_path.display())
+    };
     Ok(ResumedWorkspace::Missing {
-        path: recorded
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&missing)),
-        reason: format!("Directory no longer exists: {}", Path::new(&missing).display()),
+        path,
+        missing_path,
+        reason,
     })
 }
 
@@ -253,7 +265,14 @@ fn inspection_workspace(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumedWorkspace {
     Available(PathBuf),
-    Missing { path: PathBuf, reason: String },
+    Missing {
+        /// The recorded display workspace, which may still exist when another
+        /// folder of a multi-folder project is gone.
+        path: PathBuf,
+        /// The folder or worktree path that actually disappeared.
+        missing_path: PathBuf,
+        reason: String,
+    },
 }
 
 impl SessionWrite<'_> {
@@ -342,10 +361,16 @@ mod inspection_tests {
         let fixture = Fixture::new();
         fixture.delete_project();
         let workspace = fixture.missing();
-        let ResumedWorkspace::Missing { path, reason } = workspace else {
+        let ResumedWorkspace::Missing {
+            path,
+            missing_path,
+            reason,
+        } = workspace
+        else {
             panic!("expected a missing workspace: {workspace:?}");
         };
         assert_eq!(path, fixture.project);
+        assert_eq!(missing_path, fixture.project);
         assert!(reason.contains("Directory no longer exists"), "{reason}");
         let error = fixture.strict_error();
         assert!(
@@ -371,10 +396,16 @@ mod inspection_tests {
             })
             .unwrap()
             .unwrap();
-        let ResumedWorkspace::Missing { path: shown, reason } = fixture.missing() else {
+        let ResumedWorkspace::Missing {
+            path: shown,
+            missing_path,
+            reason,
+        } = fixture.missing()
+        else {
             panic!("expected a missing worktree");
         };
         assert_eq!(shown, path);
+        assert_eq!(missing_path, path);
         assert!(reason.contains("worktree"), "{reason}");
         assert!(fixture.strict_error().contains("worktree"), "{}", fixture.strict_error());
     }
@@ -509,6 +540,71 @@ mod inspection_tests {
                 .resume_code_for_inspection(&fixture.id)
                 .err()
                 .expect("changed canonical path")
+        );
+        assert!(error.contains("Project folders have changed"), "{error}");
+    }
+
+    #[test]
+    fn multi_folder_project_reports_the_deleted_folder_and_rejects_a_changed_primary() {
+        let fixture = Fixture::new();
+        let primary = fixture.project.clone();
+        let secondary = fixture.root.path().join("secondary");
+        std::fs::create_dir(&secondary).unwrap();
+        let secondary = secondary.canonicalize().unwrap();
+        fixture
+            .stores
+            .fixture_directory(|conn| -> Result<()> {
+                conn.execute(
+                    "INSERT INTO project_folders(project_id,path,trusted,sort_order)
+                     SELECT project_id,?2,1,1 FROM conversations WHERE id=?1",
+                    params![fixture.id, secondary.to_string_lossy()],
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&secondary).unwrap();
+
+        let ResumedWorkspace::Missing {
+            path,
+            missing_path,
+            reason,
+        } = fixture.missing()
+        else {
+            panic!("expected the deleted secondary folder");
+        };
+        assert_eq!(path, primary);
+        assert_eq!(missing_path, secondary);
+        assert!(
+            reason.contains(&secondary.display().to_string()),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains(&primary.display().to_string()),
+            "{reason}"
+        );
+
+        // A surviving folder still has to keep its recorded canonical path.
+        let altered = format!("{}/.", primary.display());
+        fixture
+            .stores
+            .fixture_directory(|conn| -> Result<()> {
+                conn.execute(
+                    "UPDATE project_folders SET path=?2 WHERE project_id=
+                     (SELECT project_id FROM conversations WHERE id=?1) AND sort_order=0",
+                    params![fixture.id, altered],
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        let error = format!(
+            "{:#}",
+            fixture
+                .stores
+                .resume_code_for_inspection(&fixture.id)
+                .err()
+                .expect("changed primary folder")
         );
         assert!(error.contains("Project folders have changed"), "{error}");
     }

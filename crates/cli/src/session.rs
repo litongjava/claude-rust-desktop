@@ -54,8 +54,41 @@ fn settle_abandoned_turns(
 /// readable, but every execution or mutation path stays closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissingWorkspace {
+    /// The recorded display workspace, which may still exist when another
+    /// folder of a multi-folder project is gone.
     pub path: std::path::PathBuf,
+    /// The folder or worktree path that actually disappeared.
+    pub missing_path: std::path::PathBuf,
     pub reason: String,
+}
+
+/// Build a writable selection only from a genuine provider catalog.
+///
+/// A missing-workspace display snapshot may contain a force-enabled disabled
+/// provider or a synthetic empty-URL placeholder; this rejects both so a
+/// display-only entry can never be promoted into an executing binding.
+fn writable_selection(
+    providers: Vec<deepseek_code_core::native_engine::provider_manager::Provider>,
+    provider_id: &str,
+    model: &str,
+) -> Result<Selection> {
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id == provider_id && provider.enabled)
+        .context("selected provider is not enabled")?;
+    anyhow::ensure!(
+        deepseek_code_core::native_engine::provider_manager::resolve_model_selection(
+            &provider.models,
+            model
+        )
+        .is_some(),
+        "selected model is not enabled"
+    );
+    Ok(Selection {
+        providers,
+        provider_id: provider_id.to_owned(),
+        model: model.to_owned(),
+    })
 }
 
 /// Whether a slash command only inspects the saved conversation.
@@ -155,6 +188,10 @@ pub struct Session {
     /// Provider whose entry in this manager was populated using startup options.
     pub(crate) startup_provider: Option<crate::config::StartupProvider>,
     has_saved_providers: bool,
+    /// The last provider catalog known to be genuinely writable. A read-only
+    /// display snapshot is never stored here, so recreating a directory cannot
+    /// promote a synthetic or force-enabled provider into a live binding.
+    real_providers: Option<Vec<deepseek_code_core::native_engine::provider_manager::Provider>>,
     pub(crate) auto_route: bool,
     /// Host authority to select ordinary bypass; enabled for normal CLI launches.
     pub(crate) bypass_available: bool,
@@ -652,6 +689,9 @@ impl Session {
     pub(crate) async fn use_worker_binding(&mut self, binding: &deepseek_code_core::native_engine::session_binding::SessionBinding) -> Result<()> {
         binding.track_session(self.selected_session()?);
         self.binding = binding.initialized()?;
+        if !self.binding_state().observation_only {
+            self.real_providers = Some(self.binding_state().providers.clone());
+        }
         self.providers.lock().await.binding = binding.clone();
         Ok(())
     }
@@ -895,6 +935,7 @@ impl Session {
                     .map_err(|error| crate::session_trust::diagnose(&store.db, paths, id, error))?;
                 if let deepseek_code_core::db::session_store::ResumedWorkspace::Missing {
                     path,
+                    missing_path,
                     reason,
                 } = workspace
                 {
@@ -902,7 +943,11 @@ impl Session {
                         !cli.fork_session,
                         "--fork-session requires an existing workspace directory"
                     );
-                    missing_workspace = Some(MissingWorkspace { path, reason });
+                    missing_workspace = Some(MissingWorkspace {
+                        path,
+                        missing_path,
+                        reason,
+                    });
                 }
                 resumed_row = Some(row);
             } else {
@@ -1097,6 +1142,9 @@ impl Session {
         let binding_requester = uuid::Uuid::new_v4().to_string();
         let mut launch_binding_rejected = false;
         let mut took_launch_selection = false;
+        // The launch selection is a real provider catalog even when the
+        // workspace is missing; the display snapshot below mutates only a clone.
+        let launch_providers = selection.providers.clone();
         let display_only = missing_workspace.as_ref().map(|_| {
             let saved = resumed_row.as_ref();
             let provider_id = saved
@@ -1219,6 +1267,11 @@ impl Session {
         // Registration is a separate step: it waits until startup options chose
         // the final workspace, so a failed startup publishes no incarnation.
         let binding = binding.initialized()?;
+        let real_providers = Some(if missing_workspace.is_some() {
+            launch_providers
+        } else {
+            binding.snapshot().providers.clone()
+        });
         let startup_provider=took_launch_selection.then(|| crate::config::StartupProvider::new(&binding.snapshot().provider_id,cli));
         Ok(Self {
             binding_requester,
@@ -1239,6 +1292,7 @@ impl Session {
             startup_provider,
             has_saved_providers: paths.layout().config_file("config.json").is_file()
                 || paths.layout().config_file("providers.json").is_file(),
+            real_providers,
             providers,
             workspace,
             missing_workspace,
@@ -1283,9 +1337,17 @@ impl Session {
         }
         self.has_saved_providers |= paths.layout().config_file("config.json").is_file()
             || paths.layout().config_file("providers.json").is_file();
+        self.real_providers = Some(self.binding_state().providers.clone());
         self.startup_provider = None;
         self.auto_route = false;
         Ok(())
+    }
+
+    /// A non-SDK interactive host owns lifecycle hooks even while it inspects a
+    /// missing directory. `lifecycle_owned` stays false so no hook runs against
+    /// that directory, but a later writable resume restores SessionStart.
+    pub(crate) fn remember_lifecycle_host(&mut self) {
+        self.host_lifecycle_owned = true;
     }
 
     pub async fn start_hooks(&mut self, source: &str) -> Result<()> {
@@ -1413,6 +1475,7 @@ impl Session {
         target.install(state)?;
         self.end_hooks("clear").await;
         self.binding = target.initialized()?;
+        self.real_providers = Some(self.binding_state().providers.clone());
         self.providers.lock().await.binding = target;
         self.store = next_store;
         self.id = id.clone();
@@ -1452,8 +1515,12 @@ impl Session {
                 self.resume_saved_available(paths, id, shard, saved, workspace)
                     .await
             }
-            deepseek_code_core::db::session_store::ResumedWorkspace::Missing { path, reason } => {
-                self.resume_saved_missing(paths, id, shard, saved, path, reason)
+            deepseek_code_core::db::session_store::ResumedWorkspace::Missing {
+                path,
+                missing_path,
+                reason,
+            } => {
+                self.resume_saved_missing(paths, id, shard, saved, path, missing_path, reason)
                     .await
             }
         }
@@ -1470,8 +1537,16 @@ impl Session {
         let model = saved.model.context("Saved session has no model")?;
         let provider_id = saved.provider.context("Saved session has no provider")?;
         let row = shard.observe_provider()?;
-        let changing_provider = provider_id != self.binding_state().provider_id;
-        let reload_catalog = changing_provider || (id != self.id && self.has_saved_providers);
+        let state = self.binding_state();
+        let display_only = self.is_missing_workspace() || state.observation_only;
+        let changing_provider = provider_id != state.provider_id;
+        // A display snapshot may contain a force-enabled provider or a synthetic
+        // empty-URL placeholder. It must never become a writable binding: reload
+        // the saved catalog, or resolve from providers that were genuinely
+        // writable, and validate the saved selection against that catalog.
+        let reload_catalog = changing_provider
+            || (id != self.id && self.has_saved_providers)
+            || (display_only && self.has_saved_providers);
         let candidate = if let Some(live) = crate::worker_binding::resident(paths, id, &row).await? {
             live
         } else {
@@ -1480,8 +1555,17 @@ impl Session {
                 crate::interactive_config::select_saved(paths, &provider_id, &model,
                     self.startup_provider.as_ref().map(|owner| (owner, &current.provider)))
                     .context("Saved provider/model is unavailable; current session retained")?
+            } else if display_only {
+                let providers = match self.real_providers.clone() {
+                    Some(providers) => providers,
+                    None => crate::interactive_config::select_saved(paths, &provider_id, &model, None)
+                        .context("Saved provider/model is unavailable; current session retained")?
+                        .providers,
+                };
+                writable_selection(providers, &provider_id, &model)
+                    .context("Saved provider/model is unavailable; current session retained")?
             } else {
-                Selection { providers: self.binding_state().providers.clone(), provider_id, model }
+                Selection { providers: state.providers.clone(), provider_id, model }
             };
             crate::worker_binding::snapshot(paths, selected, self.owns_startup_transport() && !changing_provider)?
         };
@@ -1543,6 +1627,7 @@ impl Session {
         }
         self.auto_route = false;
         self.missing_workspace = None;
+        self.real_providers = Some(self.binding_state().providers.clone());
         if let Some(policy) = policy {
             shard.set_recording_policy(policy);
         }
@@ -1567,6 +1652,7 @@ impl Session {
         shard: deepseek_code_core::db::session_store::SessionDb,
         saved: deepseek_code_core::db::conversation_repo::ConversationRow,
         path: std::path::PathBuf,
+        missing_path: std::path::PathBuf,
         reason: String,
     ) -> Result<()> {
         let provider_id = saved
@@ -1577,9 +1663,23 @@ impl Session {
             .model
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| self.binding_state().model.clone());
-        let providers = crate::interactive_config::select_saved(paths, &provider_id, &model, None)
-            .map(|selection| selection.providers)
-            .unwrap_or_else(|_| self.binding_state().providers.clone());
+        // Keep the last genuine writable catalog before entering display mode.
+        if !self.is_missing_workspace() && !self.binding_state().observation_only {
+            self.real_providers = Some(self.binding_state().providers.clone());
+        }
+        let saved_selection =
+            crate::interactive_config::select_saved(paths, &provider_id, &model, None);
+        let providers = match saved_selection {
+            Ok(selection) => {
+                // The catalog read from configuration is genuinely writable.
+                self.real_providers = Some(selection.providers.clone());
+                selection.providers
+            }
+            Err(_) => self
+                .real_providers
+                .clone()
+                .unwrap_or_else(|| self.binding_state().providers.clone()),
+        };
         let state = crate::worker_binding::display_snapshot(providers, &provider_id, &model);
         // No SessionEnd runs against the missing folder. The lifecycle host
         // decision is retained for the next available resume.
@@ -1618,7 +1718,11 @@ impl Session {
         self.providers.lock().await.binding = (*target).clone();
         self.binding = target;
         self.workspace = path.clone();
-        self.missing_workspace = Some(MissingWorkspace { path, reason });
+        self.missing_workspace = Some(MissingWorkspace {
+            path,
+            missing_path,
+            reason,
+        });
         self.auto_route = false;
         self.startup_provider = None;
         self.store = SessionStore::new(Arc::new(shard.scoped_stores()));
@@ -1671,18 +1775,34 @@ impl Session {
     /// whose saved directory no longer exists.
     pub(crate) fn missing_workspace_banner_notice(&self) -> Option<String> {
         let missing = self.missing_workspace()?;
-        Some(format!(
-            "\u{273b} Read-only mode: directory no longer exists ({}).\n  {}\n  History is available to inspect (Ctrl+O, /history, /export, /copy). Sending prompts and running tools are disabled; use /resume to switch sessions or restore the directory to continue.",
-            terminal_safe(&missing.path.to_string_lossy()),
-            terminal_safe(&missing.reason)
-        ))
+        // Multi-folder projects keep their surviving primary as `path`; the
+        // banner must name the folder that actually disappeared.
+        let shown = if missing.missing_path == missing.path {
+            &missing.path
+        } else {
+            &missing.missing_path
+        };
+        let plain_missing = missing.reason
+            == format!(
+                "Directory no longer exists: {}",
+                missing.missing_path.display()
+            );
+        let mut notice = format!(
+            "\u{273b} Read-only mode: directory no longer exists ({}).",
+            terminal_safe(&shown.to_string_lossy())
+        );
+        if !plain_missing {
+            notice.push_str(&format!("\n  {}", terminal_safe(&missing.reason)));
+        }
+        notice.push_str("\n  History is available to inspect (Ctrl+O, /history, /export, /copy). Sending prompts and running tools are disabled; use /resume to switch sessions or restore the directory to continue.");
+        Some(notice)
     }
 
     pub(crate) fn missing_workspace_notice(&self, action: &str) -> String {
         match self.missing_workspace() {
             Some(missing) => format!(
                 "This session is in read-only mode because {} no longer exists; {action} was not submitted. Inspect history with Ctrl+O, /history, /export, or /copy, or switch sessions with /resume.",
-                terminal_safe(&missing.path.to_string_lossy())
+                terminal_safe(&missing.missing_path.to_string_lossy())
             ),
             None => format!("This session is read-only; {action} was not submitted."),
         }
@@ -5945,6 +6065,7 @@ mod missing_workspace_tests {
         assert!(fixture.session.host_lifecycle_owned);
         let missing = fixture.session.missing_workspace().unwrap();
         assert!(missing.path.ends_with("second"));
+        assert!(missing.missing_path.ends_with("second"));
         assert!(missing.reason.contains("Directory no longer exists"));
         assert_eq!(fixture.session.permission_mode(), "read-only");
         assert_eq!(fixture.session.workspace, missing.path);
@@ -6221,6 +6342,14 @@ mod missing_workspace_tests {
             );
         }
         assert_eq!(
+            missing_workspace_rejected_action("/multiline"),
+            Some("`/multiline`".into())
+        );
+        assert_eq!(
+            missing_workspace_rejected_action("foo\\"),
+            Some("the prompt".into())
+        );
+        assert_eq!(
             missing_workspace_rejected_action("/history"),
             None
         );
@@ -6258,6 +6387,201 @@ mod missing_workspace_tests {
             crate::terminal::style::status_mode("read-only"),
             "read-only \u{b7} directory missing"
         );
+    }
+
+    fn write_providers(paths: &RuntimePaths, body: &str) {
+        let path = paths.layout().config_file("providers.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn fixture_providers(enabled: bool) -> String {
+        format!(
+            r#"[{{"id":"fixture","name":"Fixture","base_url":"http://127.0.0.1:1","api_key":"unused","api_format":"openai","enabled":{enabled},"models":[{{"id":"fixture","name":"Fixture","enabled":{enabled},"supports_vision":false,"supports_web_search":false}}]}}]"#
+        )
+    }
+
+    #[tokio::test]
+    async fn recreating_a_directory_never_promotes_a_deleted_display_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        write_providers(&paths, &fixture_providers(true));
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let first_id = store.create(&first, "fixture", "fixture").unwrap();
+        let second_id = store.create(&second, "deleted", "deleted").unwrap();
+        let mut session = Session::open(
+            &fixture_cli(),
+            &paths,
+            fixture_selection(),
+            Some(&first_id),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&second).unwrap();
+
+        session.resume_saved(&paths, &second_id).await.unwrap();
+        assert!(session.is_missing_workspace());
+        assert!(session.binding_state().observation_only);
+        let placeholder = session
+            .binding_state()
+            .providers
+            .iter()
+            .find(|provider| provider.id == "deleted")
+            .expect("display placeholder")
+            .clone();
+        assert!(placeholder.base_url.is_empty());
+        assert!(placeholder.api_key.is_empty());
+
+        // Recreating the folder must not promote the empty-URL placeholder.
+        std::fs::create_dir(&second).unwrap();
+        let error = session
+            .resume_saved(&paths, &second_id)
+            .await
+            .err()
+            .expect("deleted provider must stay unavailable");
+        assert!(
+            format!("{error:#}").contains("Saved provider/model is unavailable"),
+            "{error:#}"
+        );
+        assert!(session.is_missing_workspace());
+        assert_eq!(session.id, second_id);
+        assert!(session.binding_state().observation_only);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recreating_a_directory_never_promotes_a_force_enabled_display_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        write_providers(&paths, &fixture_providers(false));
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let first_id = store.create(&first, "fixture", "fixture").unwrap();
+        let second_id = store.create(&second, "fixture", "fixture").unwrap();
+        let mut session = Session::open(
+            &fixture_cli(),
+            &paths,
+            fixture_selection(),
+            Some(&first_id),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(&second).unwrap();
+
+        session.resume_saved(&paths, &second_id).await.unwrap();
+        assert!(session.is_missing_workspace());
+        let display = session.binding_state();
+        assert!(display.observation_only);
+        let provider = display
+            .providers
+            .iter()
+            .find(|provider| provider.id == "fixture")
+            .expect("display provider");
+        assert!(provider.enabled, "display mode force-enables the provider");
+        assert!(
+            provider.models.iter().any(|model| model.id == "fixture" && model.enabled),
+            "display mode force-enables the model"
+        );
+
+        std::fs::create_dir(&second).unwrap();
+        let error = session
+            .resume_saved(&paths, &second_id)
+            .await
+            .err()
+            .expect("disabled provider must stay unavailable");
+        assert!(
+            format!("{error:#}").contains("Saved provider/model is unavailable"),
+            "{error:#}"
+        );
+        assert!(session.is_missing_workspace());
+        assert_eq!(session.id, second_id);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_missing_start_remembers_lifecycle_for_a_later_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let project = root.path().join("gone");
+        std::fs::create_dir(&project).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(&project, "fixture", "fixture").unwrap();
+        std::fs::remove_dir_all(&project).unwrap();
+
+        let mut session = Session::open_interactive(
+            &fixture_cli(),
+            &paths,
+            fixture_selection(),
+            Some(&id),
+        )
+        .await
+        .unwrap();
+        assert!(session.is_missing_workspace());
+        assert!(!session.lifecycle_owned);
+        session.remember_lifecycle_host();
+        assert!(session.host_lifecycle_owned);
+        assert!(!session.lifecycle_owned, "no hook runs against a missing folder");
+
+        std::fs::create_dir(&project).unwrap();
+        session.resume_saved(&paths, &id).await.unwrap();
+        assert!(!session.is_missing_workspace());
+        assert!(session.lifecycle_owned);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_folder_notice_names_the_missing_path_without_duplicating_the_banner() {
+        let mut fixture = fixture().await;
+        let recorded = fixture.root.path().join("primary");
+        let gone = fixture.root.path().join("gone");
+        fixture.session.missing_workspace = Some(MissingWorkspace {
+            path: recorded.clone(),
+            missing_path: gone.clone(),
+            reason: format!("Project folder no longer exists: {}", gone.display()),
+        });
+        let notice = fixture.session.missing_workspace_notice("the prompt");
+        assert!(notice.contains(&gone.to_string_lossy().to_string()), "{notice}");
+        assert!(
+            !notice.contains(&recorded.to_string_lossy().to_string()),
+            "{notice}"
+        );
+        let banner = fixture
+            .session
+            .missing_workspace_banner_notice()
+            .expect("banner");
+        assert_eq!(
+            banner.to_lowercase().matches("directory no longer exists").count(),
+            1,
+            "{banner}"
+        );
+        assert!(banner.contains(&gone.to_string_lossy().to_string()), "{banner}");
+        assert!(banner.contains("Project folder no longer exists"), "{banner}");
+
+        // A plain missing directory keeps its single reason.
+        fixture.session.missing_workspace = Some(MissingWorkspace {
+            path: gone.clone(),
+            missing_path: gone.clone(),
+            reason: format!("Directory no longer exists: {}", gone.display()),
+        });
+        let banner = fixture
+            .session
+            .missing_workspace_banner_notice()
+            .expect("banner");
+        assert_eq!(
+            banner.to_lowercase().matches("directory no longer exists").count(),
+            1,
+            "{banner}"
+        );
+        assert!(!banner.contains("Project folder"), "{banner}");
+        fixture.session.missing_workspace = None;
+        fixture.session.close().await.unwrap();
     }
 }
 

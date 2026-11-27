@@ -381,9 +381,14 @@ fn read_only_text(session: &Session) -> Result<String> {
     let missing = session.missing_workspace();
     let mut output = String::from("Status\n\n");
     output.push_str(&format!("  Session:      {title} ({})\n", session.id));
+    // A multi-folder project can keep its primary workspace while another
+    // required folder is gone; report the folder that makes this read-only.
+    let workspace = missing
+        .map(|missing| missing.missing_path.as_path())
+        .unwrap_or(session.workspace.as_path());
     output.push_str(&format!(
         "  Workspace:    {} (missing \u{b7} read-only)\n",
-        crate::session::terminal_safe(&session.workspace.to_string_lossy())
+        crate::session::terminal_safe(&workspace.to_string_lossy())
     ));
     if let Some(missing) = missing {
         output.push_str(&format!(

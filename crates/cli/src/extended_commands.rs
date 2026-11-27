@@ -87,7 +87,9 @@ pub async fn handle(
                 // searchable picker, newest first; Ctrl+A shows every project,
                 // Space previews and Ctrl+R renames.
                 use crate::terminal::picker::{Entry, Key, Picked, Picker};
-                let mut all = false;
+                // Inside a read-only missing-directory session, show every
+                // project first so switching back to a valid session is one step.
+                let mut all = session.is_missing_workspace();
                 let mut this_branch = false;
                 let current_branch = git_branch(&session.workspace);
                 let mut selected = 0;
