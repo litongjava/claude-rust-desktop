@@ -521,11 +521,28 @@ pub fn run(paths: &RuntimePaths, action: &ConfigCommands) -> Result<()> {
                     "api_key" => search.api_key = value.trim().into(),
                     "base_url" => search.base_url = value.trim().into(),
                     "model" => search.model = value.trim().into(),
+                    "provider" => {
+                        let provider = value.trim().to_ascii_lowercase();
+                        search.provider = (!provider.is_empty()).then_some(provider);
+                    }
                     _ => bail!("Unsupported setting: {key}"),
                 }
                 search.validate()?;
                 manager.update_config(|c| c.deepseek_search = search)?;
                 eprintln!("Updated {key}");
+                return Ok(());
+            }
+            if let Some(field) = key
+                .strip_prefix("fetch.")
+                .or_else(|| key.strip_prefix("web_fetch."))
+            {
+                ensure!(field == "proxy", "Unsupported setting: {key}");
+                let mut manager = ConfigManager::new(paths.data_dir.clone());
+                let mut web_fetch = manager.get_config().web_fetch.clone();
+                web_fetch.set_proxy(value)?;
+                let cleared = web_fetch.proxy.is_none();
+                manager.update_config(|c| c.web_fetch = web_fetch)?;
+                eprintln!("{} {key}", if cleared { "Cleared" } else { "Updated" });
                 return Ok(());
             }
             ensure!(
@@ -823,17 +840,44 @@ mod search_tests {
         let set = |key: &str, value: &str| run(&paths, &ConfigCommands::Set { key: key.into(), value: value.into() });
         set("search.api_key", " search-key ").unwrap();
         set("search.model", "deepseek-pro").unwrap();
+        set("search.provider", "OpenAI").unwrap();
         assert!(set("search.base_url", "ftp://example.com").is_err());
         assert!(set("search.other", "x").is_err());
+        assert!(set("search.provider", "gemini").is_err());
         let saved: deepseek_code_core::config::AppConfig = serde_json::from_slice(
             &std::fs::read(paths.layout().config_file("config.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(saved.deepseek_search.api_key, "search-key");
         assert_eq!(saved.deepseek_search.model, "deepseek-pro");
+        assert_eq!(saved.deepseek_search.provider.as_deref(), Some("openai"));
         assert_eq!(saved.deepseek_search.base_url, "https://api.deepseek.com/anthropic/v1");
         let mut shown = json!({"config": saved});
         redact(&mut shown);
         assert!(!shown.to_string().contains("search-key"));
+    }
+
+    #[test]
+    fn web_fetch_proxy_settings_are_saved_cleared_and_kept_on_rejection() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let set = |key: &str, value: &str| run(&paths, &ConfigCommands::Set { key: key.into(), value: value.into() });
+        let saved = || paths.read_config().unwrap().web_fetch.proxy;
+        set("fetch.proxy", "http://127.0.0.1:10808").unwrap();
+        assert_eq!(saved().as_deref(), Some("http://127.0.0.1:10808"));
+        let error = set("fetch.proxy", "socks5://127.0.0.1:1080")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("http://127.0.0.1:10808"), "{error}");
+        assert_eq!(
+            saved().as_deref(),
+            Some("http://127.0.0.1:10808"),
+            "a rejected value must keep the saved proxy"
+        );
+        assert!(set("fetch.other", "x").is_err());
+        set("web_fetch.proxy", "off").unwrap();
+        assert_eq!(saved(), None);
+        set("fetch.proxy", "https://proxy.example:8443").unwrap();
+        assert_eq!(saved().as_deref(), Some("https://proxy.example:8443"));
     }
 }

@@ -27,6 +27,7 @@ const ENVIRONMENT_SUFFIXES: &[&str] = &[
     ".announced-date",
     ".loadable-tools.json",
     ".skills.json",
+    ".inline-skills.json",
     ".experience.json",
     SUGGESTION_SUFFIX,
 ];

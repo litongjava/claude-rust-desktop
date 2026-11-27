@@ -1,6 +1,6 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -176,6 +176,173 @@ pub fn skills_for_session(root: &Path, session: &str, lines: &[String]) -> Optio
     reminder
 }
 
+/// The full body of a skill, injected directly into the first-turn context so
+/// the model has its complete instructions without spending a turn calling
+/// `Skill`. None when there is no block.
+pub fn inline_skills_reminder(blocks: &[(String, String)]) -> Option<String> {
+    let mut text = String::new();
+    for (name, body) in blocks {
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!("# Skill: {name}\n{body}"));
+    }
+    (!text.is_empty()).then(|| format!("<system-reminder>\n{text}\n</system-reminder>"))
+}
+
+/// The inline skill bodies frozen on the session's first request, for the same
+/// prefix-stability reason as the environment.
+pub fn inline_skills_for_session(
+    root: &Path,
+    session: &str,
+    blocks: &[(String, String)],
+) -> Option<String> {
+    let path = crate::session_files::environment_file(root, session, ".inline-skills.json");
+    if let Some(saved) = frozen_reminder(&path) {
+        return saved;
+    }
+    let reminder = inline_skills_reminder(blocks);
+    store_frozen_reminder(&path, &reminder);
+    reminder
+}
+
+/// Workspace-local CodeGraph index state inferred purely from filesystem
+/// metadata (zero subprocesses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeGraphIndexStatus {
+    /// `<dir>/.codegraph/codegraph.db` exists as a non-empty regular file.
+    Ready(PathBuf),
+    /// Current workspace is a git worktree without `.codegraph/codegraph.db`,
+    /// while the main git repository has a non-empty `.codegraph/codegraph.db`.
+    WorktreeUninitialized { main_repo: PathBuf },
+    /// Current workspace is inside a git repository (or worktree) without a
+    /// populated `.codegraph/codegraph.db`.
+    GitUninitialized(PathBuf),
+    /// Workspace is not inside a git repository and has no `.codegraph/codegraph.db`.
+    NotGitRepo,
+}
+
+fn has_non_empty_codegraph_db(dir: &Path) -> bool {
+    fs::metadata(dir.join(".codegraph").join("codegraph.db"))
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+fn resolve_worktree_main_repo(worktree_root: &Path, git_file: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(git_file).ok()?;
+    let raw_gitdir = content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+        .trim();
+    if raw_gitdir.is_empty() {
+        return None;
+    }
+    let raw_path = Path::new(raw_gitdir);
+    let gitdir = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        worktree_root.join(raw_path)
+    };
+    let worktrees_dir = gitdir.parent()?;
+    if worktrees_dir.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
+        return None;
+    }
+    let common_git_dir = worktrees_dir.parent()?;
+    if common_git_dir.file_name().and_then(|n| n.to_str()) != Some(".git") {
+        return None;
+    }
+    let main_repo = common_git_dir.parent()?;
+    if raw_path.is_absolute() {
+        Some(main_repo.to_path_buf())
+    } else {
+        Some(fs::canonicalize(main_repo).unwrap_or_else(|_| main_repo.to_path_buf()))
+    }
+}
+
+/// Inspect `<workspace>` (and ancestors up to the enclosing git root) for a
+/// populated `.codegraph/codegraph.db` using filesystem metadata only.
+pub fn codegraph_workspace_status(workspace: &Path) -> CodeGraphIndexStatus {
+    for dir in workspace.ancestors() {
+        if has_non_empty_codegraph_db(dir) {
+            return CodeGraphIndexStatus::Ready(dir.to_path_buf());
+        }
+        let git_path = dir.join(".git");
+        let Ok(meta) = fs::metadata(&git_path) else {
+            continue;
+        };
+        if meta.is_file() {
+            if let Some(main_repo) = resolve_worktree_main_repo(dir, &git_path) {
+                if has_non_empty_codegraph_db(&main_repo) {
+                    return CodeGraphIndexStatus::WorktreeUninitialized { main_repo };
+                }
+            }
+            return CodeGraphIndexStatus::GitUninitialized(dir.to_path_buf());
+        }
+        if meta.is_dir() {
+            return CodeGraphIndexStatus::GitUninitialized(dir.to_path_buf());
+        }
+    }
+    CodeGraphIndexStatus::NotGitRepo
+}
+
+fn codegraph_status_note(workspace: &Path) -> &'static str {
+    match codegraph_workspace_status(workspace) {
+        CodeGraphIndexStatus::Ready(_) => {
+            "\n\nWorkspace CodeGraph index: READY (`.codegraph/codegraph.db` exists). Query directly with `codegraph explore|node|callers|callees|impact` — skip `codegraph status` / `codegraph init`."
+        }
+        CodeGraphIndexStatus::WorktreeUninitialized { .. } => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git worktree (`.codegraph/codegraph.db` is missing; git worktrees do not inherit the main repo's index). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
+        }
+        CodeGraphIndexStatus::GitUninitialized(_) => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git repository (`.codegraph/codegraph.db` is missing). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
+        }
+        CodeGraphIndexStatus::NotGitRepo => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED (not a git repository; skip `codegraph init` and use parallel `Read`/`Grep`/`Glob`)."
+        }
+    }
+}
+
+/// Full skill bodies for the first-turn context from every skill whose
+/// effective state is `SkillState::Always` (marked `always_inline`) and that is
+/// model-invocable. Empty when no skill is in `Always`, so users pay zero extra
+/// tokens. A `$ARGUMENTS` placeholder is stripped because injected text has no
+/// invocation arguments.
+pub fn inline_skill_blocks(
+    skills: &BTreeMap<String, crate::skills::discovery::SkillCommand>,
+) -> Vec<(String, String)> {
+    inline_skill_blocks_for_workspace(skills, None)
+}
+
+/// Like [`inline_skill_blocks`], additionally enriching the `codegraph` skill
+/// block with a one-line factual status of the workspace's `.codegraph` index
+/// when `workspace` is provided.
+pub fn inline_skill_blocks_for_workspace(
+    skills: &BTreeMap<String, crate::skills::discovery::SkillCommand>,
+    workspace: Option<&Path>,
+) -> Vec<(String, String)> {
+    skills
+        .values()
+        .filter(|skill| skill.always_inline && skill.model_invocable())
+        .filter_map(|skill| {
+            let body = skill.content.replace("$ARGUMENTS", "");
+            let body = body.trim();
+            if body.is_empty() {
+                return None;
+            }
+            let mut body = body.to_owned();
+            if skill.name == "codegraph" {
+                if let Some(ws) = workspace {
+                    body.push_str(codegraph_status_note(ws));
+                }
+            }
+            Some((skill.name.clone(), body))
+        })
+        .collect()
+}
+
 /// The experience index plus its runtime instruction. Always a block when the
 /// feature applies; an empty index still tells the model where to write.
 pub fn experience_reminder(lines: &[String]) -> String {
@@ -305,6 +472,8 @@ pub struct SessionReminders {
     pub loadable_tools: Option<String>,
     /// The model-invocable skills, frozen on the first request.
     pub available_skills: Option<String>,
+    /// Full skill bodies injected on the first request, such as `codegraph`.
+    pub inline_skills: Option<String>,
     pub environment: Option<String>,
     pub date: Option<String>,
     pub git: Option<String>,
@@ -328,6 +497,7 @@ pub fn first_message_reminders(parts: SessionReminders) -> Vec<String> {
     blocks.extend(parts.experience);
     blocks.extend(parts.loadable_tools);
     blocks.extend(parts.available_skills);
+    blocks.extend(parts.inline_skills);
     blocks.extend(parts.environment);
     blocks.extend(parts.date);
     blocks.extend(parts.git);
@@ -1027,7 +1197,21 @@ mod tests {
         assert_eq!(prompt.matches("# Execution and verification").count(), 1);
         assert!(prompt.contains("In a non-interactive run (no user to reply)"));
         assert!(prompt.contains("Do not duplicate work already assigned to a subagent."));
+        assert!(prompt.contains("isn't in the project or its dependency cache"));
+        assert!(prompt.contains("`~/code/<owner>/<repo>` (fetch if already cloned) and read it there."));
+        assert!(prompt.contains("Never clone into the project directory."));
         assert!(prompt.contains("prefer the Python tool over a Bash heredoc"));
+        assert_eq!(prompt.matches("# Working efficiently").count(), 1);
+        for required in [
+            "Stay strictly on task",
+            "Batch independent tool calls in one turn",
+            "Prefer dedicated read/search tools and omit redundant `cd`",
+            "Verify once with a compound command; do not re-run passing checks",
+            "Use `MultiEdit` for multiple edits in one file",
+            "Never poll with `sleep`",
+        ] {
+            assert!(prompt.contains(required), "missing efficiency rule: {required}");
+        }
         for removed in [
             "historical name of the shell tool",
             "Bash timeout is in milliseconds",
@@ -1246,12 +1430,15 @@ mod tests {
             available_skills: Some(
                 "<system-reminder>\nAvailable skills: invoke the Skill tool\n- deploy: Ship it\n</system-reminder>".into(),
             ),
+            inline_skills: Some(
+                "<system-reminder>\n# Skill: codegraph\ncodegraph explore marker\n</system-reminder>".into(),
+            ),
             environment: Some(environment),
             date: Some(date_reminder("2026-11-19")),
             git: Some("<system-reminder>\n# gitStatus\n</system-reminder>".into()),
             skills: Some("<system-reminder>\ninvoked skills\n</system-reminder>".into()),
         });
-        assert_eq!(blocks.len(), 11);
+        assert_eq!(blocks.len(), 12);
         assert!(blocks[0].contains("user rules"));
         assert_eq!(blocks[1], standalone_frontend_reminder());
         assert!(blocks[1].contains("! <command>"), "the CLI's command hint travels with its frontend facts");
@@ -1260,13 +1447,14 @@ mod tests {
         assert!(blocks[4].contains("experience marker"));
         assert!(blocks[5].contains("Tools you can load with ToolLoad"));
         assert!(blocks[6].contains("Available skills"));
-        assert!(blocks[7].starts_with("<system-reminder>\n# Working environment\n"));
-        assert!(blocks[7].contains(" - Project: Demo\n - Primary working directory: "));
-        assert!(blocks[7].contains(" - Platform: "));
-        assert!(!blocks[7].contains("Today's date"));
-        assert_eq!(blocks[8], date_reminder("2026-11-19"));
-        assert_eq!(blocks[9], "<system-reminder>\n# gitStatus\n</system-reminder>");
-        assert_eq!(blocks[10], "<system-reminder>\ninvoked skills\n</system-reminder>");
+        assert!(blocks[7].contains("codegraph explore marker"));
+        assert!(blocks[8].starts_with("<system-reminder>\n# Working environment\n"));
+        assert!(blocks[8].contains(" - Project: Demo\n - Primary working directory: "));
+        assert!(blocks[8].contains(" - Platform: "));
+        assert!(!blocks[8].contains("Today's date"));
+        assert_eq!(blocks[9], date_reminder("2026-11-19"));
+        assert_eq!(blocks[10], "<system-reminder>\n# gitStatus\n</system-reminder>");
+        assert_eq!(blocks[11], "<system-reminder>\ninvoked skills\n</system-reminder>");
         // The terminal facts are a first-message reminder, never system text.
         let system = compose_system_prompt_in(None, PromptProfile::Code);
         assert!(!system.contains(STANDALONE_FRONTEND));
@@ -1288,6 +1476,226 @@ mod tests {
         }
         let end: String = system.chars().skip(system.chars().count().saturating_sub(160)).collect();
         println!("system prompt end:\n{end}");
+    }
+
+    #[test]
+    fn always_skills_are_inlined_and_frozen_while_other_states_cost_zero_tokens() {
+        let skill = |name: &str, content: &str, always_inline: bool, disable_model_invocation: bool| {
+            crate::skills::discovery::SkillCommand {
+                name: name.to_owned(),
+                description: format!("{name} description"),
+                path: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
+                content: content.to_owned(),
+                user_invocable: true,
+                disable_model_invocation,
+                listing_name_only: false,
+                always_inline,
+                context: None,
+                shell: None,
+                agent: None,
+            }
+        };
+        let mut skills = BTreeMap::new();
+        skills.insert(
+            "codegraph".to_owned(),
+            skill(
+                "codegraph",
+                "Use CodeGraph.\n\n1. Run `codegraph status` or `codegraph init`.\n2. Run `codegraph explore`, `codegraph node`, `codegraph callers`, `codegraph impact`.\n3. Run `codegraph sync` after a large edit.\n\n$ARGUMENTS",
+                true,
+                false,
+            ),
+        );
+        skills.insert(
+            "style-guide".to_owned(),
+            skill("style-guide", "Follow the repository style guide.", true, false),
+        );
+        skills.insert(
+            "regular-user".to_owned(),
+            skill("regular-user", "Should not be inlined.", false, false),
+        );
+        skills.insert(
+            "hidden-always".to_owned(),
+            skill("hidden-always", "Hidden from model.", true, true),
+        );
+
+        let blocks = inline_skill_blocks(&skills);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "codegraph");
+        assert_eq!(blocks[1].0, "style-guide");
+        assert_eq!(blocks[1].1, "Follow the repository style guide.");
+        for command in [
+            "codegraph status",
+            "codegraph init",
+            "codegraph explore",
+            "codegraph node",
+            "codegraph callers",
+            "codegraph impact",
+            "codegraph sync",
+        ] {
+            assert!(blocks[0].1.contains(command), "missing {command}: {}", blocks[0].1);
+        }
+        assert!(!blocks[0].1.contains("$ARGUMENTS"));
+
+        // No `always_inline` skills -> zero extra text.
+        let non_always = BTreeMap::from([(
+            "regular-user".to_owned(),
+            skill("regular-user", "Should not be inlined.", false, false),
+        )]);
+        assert!(inline_skill_blocks(&non_always).is_empty());
+        assert!(inline_skill_blocks(&BTreeMap::new()).is_empty());
+
+        let root = tempfile::tempdir().unwrap();
+        let frozen = inline_skills_for_session(root.path(), "s", &blocks).unwrap();
+        assert!(frozen.starts_with("<system-reminder>\n# Skill: codegraph\n"));
+        assert!(frozen.contains("# Skill: style-guide\nFollow the repository style guide."));
+        assert!(!frozen.contains("regular-user"));
+        assert!(!frozen.contains("hidden-always"));
+        assert_eq!(frozen.matches("<system-reminder>").count(), 1);
+        // Later requests and resumes replay the frozen block.
+        assert_eq!(
+            inline_skills_for_session(root.path(), "s", &[]).as_deref(),
+            Some(frozen.as_str())
+        );
+        assert!(inline_skills_for_session(root.path(), "other", &[]).is_none());
+        assert!(inline_skills_reminder(&[]).is_none());
+        assert!(first_message_reminders(SessionReminders {
+            inline_skills: Some(frozen.clone()),
+            ..Default::default()
+        })
+        .contains(&frozen));
+    }
+
+    #[test]
+    fn codegraph_workspace_status_detects_ready_worktree_and_uninitialized() {
+        // 1. Direct `.codegraph/codegraph.db` present -> Ready (also from a nested subdir).
+        let ready = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ready.path().join(".git")).unwrap();
+        std::fs::create_dir_all(ready.path().join(".codegraph")).unwrap();
+        std::fs::write(ready.path().join(".codegraph/codegraph.db"), b"sqlite-bytes").unwrap();
+        let nested = ready.path().join("crates/core");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            codegraph_workspace_status(ready.path()),
+            CodeGraphIndexStatus::Ready(ready.path().to_path_buf())
+        );
+        assert_eq!(
+            codegraph_workspace_status(&nested),
+            CodeGraphIndexStatus::Ready(ready.path().to_path_buf())
+        );
+
+        // Zero-byte `.codegraph/codegraph.db` inside a git repo is GitUninitialized.
+        let empty_db = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(empty_db.path().join(".git")).unwrap();
+        std::fs::create_dir_all(empty_db.path().join(".codegraph")).unwrap();
+        std::fs::write(empty_db.path().join(".codegraph/codegraph.db"), b"").unwrap();
+        assert_eq!(
+            codegraph_workspace_status(empty_db.path()),
+            CodeGraphIndexStatus::GitUninitialized(empty_db.path().to_path_buf())
+        );
+
+        // 2. Git worktree `.git` file pointing to main repo with `.codegraph/codegraph.db`,
+        //    while worktree only has `.codegraph/.gitignore` -> WorktreeUninitialized.
+        let container = tempfile::tempdir().unwrap();
+        let main_repo = container.path().join("main");
+        let worktree = container.path().join("wt-feature");
+        std::fs::create_dir_all(main_repo.join(".git/worktrees/wt-feature")).unwrap();
+        std::fs::create_dir_all(main_repo.join(".codegraph")).unwrap();
+        std::fs::write(main_repo.join(".codegraph/codegraph.db"), b"sqlite-bytes").unwrap();
+        std::fs::create_dir_all(worktree.join(".codegraph")).unwrap();
+        std::fs::write(worktree.join(".codegraph/.gitignore"), b"codegraph.db\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main_repo.join(".git/worktrees/wt-feature").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            codegraph_workspace_status(&worktree),
+            CodeGraphIndexStatus::WorktreeUninitialized {
+                main_repo: main_repo.clone(),
+            }
+        );
+
+        // 3. Non-git empty workspace -> NotGitRepo.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            codegraph_workspace_status(empty.path()),
+            CodeGraphIndexStatus::NotGitRepo
+        );
+    }
+
+    #[test]
+    fn inline_skill_blocks_for_workspace_appends_status_only_to_codegraph() {
+        let skill = |name: &str, content: &str| crate::skills::discovery::SkillCommand {
+            name: name.to_owned(),
+            description: format!("{name} description"),
+            path: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            content: content.to_owned(),
+            user_invocable: true,
+            disable_model_invocation: false,
+            listing_name_only: false,
+            always_inline: true,
+            context: None,
+            shell: None,
+            agent: None,
+        };
+        let skills = BTreeMap::from([
+            ("codegraph".to_owned(), skill("codegraph", "Use CodeGraph.")),
+            (
+                "style-guide".to_owned(),
+                skill("style-guide", "Follow the style guide."),
+            ),
+        ]);
+
+        // Ready workspace.
+        let ready = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ready.path().join(".codegraph")).unwrap();
+        std::fs::write(ready.path().join(".codegraph/codegraph.db"), b"db").unwrap();
+        let ready_blocks = inline_skill_blocks_for_workspace(&skills, Some(ready.path()));
+        assert_eq!(ready_blocks.len(), 2);
+        assert_eq!(ready_blocks[0].0, "codegraph");
+        assert!(ready_blocks[0].1.starts_with("Use CodeGraph.\n\nWorkspace CodeGraph index: READY"));
+        assert!(ready_blocks[0].1.contains("skip `codegraph status` / `codegraph init`"));
+        assert_eq!(ready_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
+
+        // Worktree without its own index while main repo has one.
+        let container = tempfile::tempdir().unwrap();
+        let main_repo = container.path().join("main");
+        let worktree = container.path().join("wt");
+        std::fs::create_dir_all(main_repo.join(".git/worktrees/wt")).unwrap();
+        std::fs::create_dir_all(main_repo.join(".codegraph")).unwrap();
+        std::fs::write(main_repo.join(".codegraph/codegraph.db"), b"db").unwrap();
+        std::fs::create_dir_all(worktree.join(".codegraph")).unwrap();
+        std::fs::write(worktree.join(".codegraph/.gitignore"), b"*\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main_repo.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        let wt_blocks = inline_skill_blocks_for_workspace(&skills, Some(&worktree));
+        assert!(wt_blocks[0]
+            .1
+            .contains("NOT INITIALIZED in this git worktree"));
+        assert!(wt_blocks[0].1.contains("codegraph init -y"));
+        assert_eq!(wt_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
+
+        // Uninitialized regular git repository -> prompts `codegraph init -y`.
+        let git_only = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(git_only.path().join(".git")).unwrap();
+        let git_blocks = inline_skill_blocks_for_workspace(&skills, Some(git_only.path()));
+        assert!(git_blocks[0]
+            .1
+            .contains("NOT INITIALIZED in this git repository"));
+        assert!(git_blocks[0].1.contains("codegraph init -y"));
+        assert_eq!(git_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
+
+        // Non-git empty workspace -> skips `codegraph init`.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_blocks = inline_skill_blocks_for_workspace(&skills, Some(empty.path()));
+        assert!(empty_blocks[0]
+            .1
+            .contains("not a git repository; skip `codegraph init`"));
+        assert!(!empty_blocks[0].1.contains("codegraph init -y"));
+        assert_eq!(empty_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
     }
 
     #[test]
@@ -1626,6 +2034,11 @@ mod tests {
             &[],
         );
         skills_for_session(root, session, &["- deploy: Ship it".to_owned()]);
+        inline_skills_for_session(
+            root,
+            session,
+            &[("codegraph".to_owned(), "codegraph explore".to_owned())],
+        );
         experience_for_session(root, session, Some(root), true, &[]);
         set_changes(root, session, "loadable-tools", &["ListDir".to_owned()]);
         set_changes(root, session, "skills", &["deploy".to_owned()]);

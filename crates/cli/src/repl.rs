@@ -119,6 +119,10 @@ pub fn show_resumed(session: &Session, clear: bool) -> Result<()> {
         .lock()
         .unwrap_or_else(|error| error.into_inner()) =
         Some((session.id.clone(), view));
+    if let Some(notice) = session.missing_workspace_banner_notice() {
+        command_eprintln!("{notice}");
+        return Ok(());
+    }
     if session.waiting_for_continue() {
         if active.is_some() || leased {
             // The REPL prints a read-only observation banner and blocks

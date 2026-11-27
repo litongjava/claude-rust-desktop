@@ -14,7 +14,7 @@ pub fn definition() -> super::ToolDefinition {
     super::ToolDefinition {
         summary: Some("Read a workspace file and return its text with 1-based line numbers".into()),
         name: "Read".into(),
-        description: "Read a file and return its text with 1-based line numbers. Text reads 2000 lines from line 1 by default; offset and limit select another range, and rendered output over 256 KiB is refused unless allow_large is true. PNG, JPEG, GIF and WebP images up to 5 MiB return as image content when the model accepts it; PDFs return page text for the pages range; .ipynb files return cells with outputs. Long base64 runs in text are replaced with a short placeholder; pass raw=true to read them unchanged. A missing path or directory is an error, and an empty file returns only a warning.".into(),
+        description: "Read a file and return its text with 1-based line numbers. Text reads 2000 lines from line 1 by default; offset and limit select another range, and rendered output over 256 KiB is refused unless allow_large is true. Prefer Read over shell cat/sed/head/tail, batch independent Read calls in parallel in one turn, and read whole files or 200-400-line blocks at once instead of slicing 60-100-line chunks. PNG, JPEG, GIF and WebP images up to 5 MiB return as image content when the model accepts it; PDFs return page text for the pages range; .ipynb files return cells with outputs. Long base64 runs in text are replaced with a short placeholder; pass raw=true to read them unchanged. A missing path or directory is an error, and an empty file returns only a warning.".into(),
         input_schema: json!({
             "type": "object",
             "properties": {

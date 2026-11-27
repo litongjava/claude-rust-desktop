@@ -987,7 +987,7 @@ impl ToolLoopExecutor {
         skills.extend(crate::skills::discovery::discover(root, &workspace)?);
         let lines = skills
             .values()
-            .filter(|skill| skill.model_invocable())
+            .filter(|skill| skill.model_invocable() && !skill.always_inline)
             .map(|skill| {
                 crate::native_engine::engine_core::skill_listing_line(
                     &skill.name,
@@ -1023,6 +1023,11 @@ impl ToolLoopExecutor {
                 .map(crate::services::git_snapshot::reminder),
             loadable_tools: crate::prompt::loadable_tools_for_session(root, id, &builtin, &mcp),
             available_skills: crate::prompt::skills_for_session(root, id, &lines),
+            inline_skills: crate::prompt::inline_skills_for_session(
+                root,
+                id,
+                &crate::prompt::inline_skill_blocks_for_workspace(&skills, Some(&workspace)),
+            ),
             standalone_frontend: self.standalone_frontend,
             skills: crate::services::turn_context::invoked_skills_reminder(
                 &self.turn_context,

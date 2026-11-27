@@ -8,7 +8,7 @@ use crate::session::Session;
 use crate::tool_settings;
 use crate::terminal::input::editor::Screen;
 use crate::terminal::input::TerminalInput;
-use crate::terminal::picker::{details_from_top, Entry, Key, Picked, Picker};
+use crate::terminal::picker::{details_from_top_with, Entry, Key, Picked, Picker};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use deepseek_code_core::mcp::states::{self as mcp_states, McpState};
@@ -26,6 +26,9 @@ struct PanelScreen;
 
 impl PanelScreen {
     fn enter() -> std::io::Result<Self> {
+        // Drop the finished turn's input box before the alternate screen takes
+        // over; releasing it afterwards would jump the cursor on the new screen.
+        crate::terminal::release_handoff();
         crossterm::execute!(
             crate::terminal_output::stderr(),
             crossterm::terminal::EnterAlternateScreen,
@@ -211,10 +214,12 @@ pub(crate) async fn load(
                 |command| command.path.starts_with(&bundled),
             );
             let state = states::effective_in(&states, &name, is_bundled);
-            let listing_tokens = if state == SkillState::Off {
-                0
-            } else {
-                command.map_or(0, skill_usage::listing_tokens)
+            let listing_tokens = match state {
+                SkillState::Off => 0,
+                SkillState::Always => {
+                    command.map_or(0, |command| skill_usage::estimate_tokens(&command.content))
+                }
+                _ => command.map_or(0, skill_usage::listing_tokens),
             };
             let path = command.map_or_else(
                 || installed.get(&name).map_or(Path::new(""), |path| path.as_path()),
@@ -1013,6 +1018,10 @@ fn pick_skill_state(name: &str, current: SkillState) -> std::io::Result<Option<S
             SkillState::UserOnly,
             format!("Not listed to the model; only you can invoke it with /{name}"),
         ),
+        (
+            SkillState::Always,
+            "Full instructions injected on turn 1; you and the model can invoke it".to_owned(),
+        ),
     ];
     let entries: Vec<Entry> = choices
         .iter()
@@ -1038,7 +1047,12 @@ fn pick_skill_state(name: &str, current: SkillState) -> std::io::Result<Option<S
         hint: "Enter to set \u{b7} Esc to go back",
         selected,
     };
-    Ok(picker.run()?.map(|index| choices[index].0))
+    let mut screen = Screen::top_anchored();
+    let picked = picker.run_keys_with(&[], &mut screen)?;
+    Ok(match picked {
+        Picked::Entry(index) => Some(choices[index].0),
+        _ => None,
+    })
 }
 
 /// What the MCP state picker selected.
@@ -1100,12 +1114,17 @@ pub(crate) fn pick_mcp_state(
         hint: "Enter to set \u{b7} Esc to go back",
         selected,
     };
-    Ok(picker.run()?.map(|index| {
-        choices
-            .get(index)
-            .map(|(state, _)| McpStateChoice::State(*state))
-            .unwrap_or(McpStateChoice::Details)
-    }))
+    let mut screen = Screen::top_anchored();
+    let picked = picker.run_keys_with(&[], &mut screen)?;
+    Ok(match picked {
+        Picked::Entry(index) => Some(
+            choices
+                .get(index)
+                .map(|(state, _)| McpStateChoice::State(*state))
+                .unwrap_or(McpStateChoice::Details),
+        ),
+        _ => None,
+    })
 }
 
 fn plugin_details(plugin: &PluginRow, now: DateTime<Utc>) -> std::io::Result<()> {
@@ -1120,11 +1139,13 @@ fn plugin_details(plugin: &PluginRow, now: DateTime<Utc>) -> std::io::Result<()>
             skill_usage::relative_day(plugin.last_used, now)
         ),
     ];
-    details_from_top(
+    let mut screen = Screen::top_anchored();
+    details_from_top_with(
         &plugin.id,
         &rows,
         "\u{2190} to go back \u{b7} Esc to close",
         &[],
+        &mut screen,
     )?;
     Ok(())
 }
@@ -1152,11 +1173,13 @@ fn mcp_details(server: &McpRow, now: DateTime<Utc>) -> std::io::Result<()> {
     if let Some(failure) = &server.failure {
         rows.push(format!("failed:    {failure}"));
     }
-    details_from_top(
+    let mut screen = Screen::top_anchored();
+    details_from_top_with(
         &server.name,
         &rows,
         "\u{2190} to go back \u{b7} Esc to close",
         &[],
+        &mut screen,
     )?;
     Ok(())
 }
@@ -1221,7 +1244,7 @@ pub(crate) async fn run(
     let mut notice: Option<String> = None;
     // Reused across picker calls so a Space toggle repaints the changed row
     // instead of rebuilding and scrolling the whole view.
-    let mut frame = Screen::default();
+    let mut frame = Screen::top_anchored();
     loop {
         // Errors and Stats are read-only pages.
         if matches!(scope, Scope::Plugins | Scope::Skills) && tab > 0 {
@@ -1236,7 +1259,7 @@ pub(crate) async fn run(
                 )
             };
             let step =
-                match details_from_top(&tab_bar(scope.title(), tabs, tab), &rows, HINT, &[])? {
+                match details_from_top_with(&tab_bar(scope.title(), tabs, tab), &rows, HINT, &[], &mut frame)? {
                     Some('<') => -1,
                     Some('>') => 1,
                     _ => return Ok(changed),
@@ -1816,6 +1839,7 @@ mod tests {
         assert_eq!(space_state(SkillState::User), SkillState::Off);
         assert_eq!(space_state(SkillState::NameOnly), SkillState::Off);
         assert_eq!(space_state(SkillState::UserOnly), SkillState::Off);
+        assert_eq!(space_state(SkillState::Always), SkillState::Off);
         assert_eq!(space_mcp_state(McpState::Off), McpState::User);
         assert_eq!(space_mcp_state(McpState::User), McpState::Off);
         assert_eq!(space_mcp_state(McpState::OnDemand), McpState::Off);

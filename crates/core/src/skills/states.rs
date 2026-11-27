@@ -24,6 +24,7 @@ pub enum SkillState {
     User,
     NameOnly,
     UserOnly,
+    Always,
 }
 
 impl SkillState {
@@ -33,6 +34,7 @@ impl SkillState {
             SkillState::User => "user",
             SkillState::NameOnly => "name-only",
             SkillState::UserOnly => "user-only",
+            SkillState::Always => "always",
         }
     }
 }
@@ -46,8 +48,9 @@ impl std::str::FromStr for SkillState {
             "user" => Ok(SkillState::User),
             "name-only" => Ok(SkillState::NameOnly),
             "user-only" => Ok(SkillState::UserOnly),
+            "always" => Ok(SkillState::Always),
             other => Err(anyhow::anyhow!(
-                "Unknown skill state {other:?}; expected one of: off, user, name-only, user-only"
+                "Unknown skill state {other:?}; expected one of: off, user, name-only, user-only, always"
             )),
         }
     }
@@ -116,7 +119,7 @@ pub fn bundled_default_state(name: &str) -> SkillState {
         | "dc-docs"
         | "llm-proxy-data-troubleshooting"
         | "project-docs" => SkillState::User,
-        "codegraph" if codegraph_installed() => SkillState::User,
+        "codegraph" if codegraph_installed() => SkillState::Always,
         _ => SkillState::Off,
     }
 }
@@ -246,6 +249,11 @@ pub fn apply_in(
                     command.user_invocable = true;
                 }
             }
+            SkillState::Always => {
+                if let Some(command) = commands.get_mut(&name) {
+                    command.always_inline = true;
+                }
+            }
         }
     }
 }
@@ -267,6 +275,7 @@ mod tests {
             user_invocable: true,
             disable_model_invocation: false,
             listing_name_only: false,
+            always_inline: false,
             context: None,
             shell: None,
             agent: None,
@@ -370,12 +379,13 @@ mod tests {
     }
 
     #[test]
-    fn labels_and_parsing_cover_exactly_the_four_states() {
+    fn labels_and_parsing_cover_all_five_states() {
         let expected = [
             (SkillState::Off, "off"),
             (SkillState::User, "user"),
             (SkillState::NameOnly, "name-only"),
             (SkillState::UserOnly, "user-only"),
+            (SkillState::Always, "always"),
         ];
         for (state, label) in expected {
             assert_eq!(state.label(), label);
@@ -383,7 +393,7 @@ mod tests {
         }
         assert_eq!(SkillState::default(), SkillState::User);
         let error = "marketplace".parse::<SkillState>().unwrap_err().to_string();
-        for label in ["off", "user", "name-only", "user-only"] {
+        for label in ["off", "user", "name-only", "user-only", "always"] {
             assert!(error.contains(label), "{error}");
         }
     }
@@ -440,7 +450,28 @@ mod tests {
             assert_eq!(bundled_default_state("codegraph"), SkillState::Off);
             std::fs::set_permissions(&codegraph, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        assert_eq!(bundled_default_state("codegraph"), SkillState::User);
+        assert_eq!(bundled_default_state("codegraph"), SkillState::Always);
+    }
+
+    #[test]
+    fn always_state_round_trips_and_marks_command_for_inline_injection() {
+        assert_eq!("always".parse::<SkillState>().unwrap(), SkillState::Always);
+        assert_eq!(SkillState::Always.label(), "always");
+        let err = "bogus".parse::<SkillState>().unwrap_err().to_string();
+        assert!(err.contains("always"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        set(dir.path(), "style-guide", SkillState::Always).unwrap();
+        assert_eq!(load(dir.path()).get("style-guide"), Some(&SkillState::Always));
+
+        let mut commands = BTreeMap::from([
+            ("style-guide".to_owned(), command("style-guide")),
+            ("normal".to_owned(), command("normal")),
+        ]);
+        apply(&mut commands, &load(dir.path()));
+        assert!(commands["style-guide"].always_inline);
+        assert!(commands["style-guide"].model_invocable());
+        assert!(!commands["normal"].always_inline);
     }
 
     #[test]

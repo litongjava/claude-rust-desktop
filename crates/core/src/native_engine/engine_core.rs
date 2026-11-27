@@ -364,6 +364,9 @@ pub struct QueryEngine {
     skills_manager: Option<Arc<Mutex<SkillsManager>>>,
     file_cache: Arc<FileCache>,
     cost_tracker: Option<Arc<CostTracker>>,
+    /// Host load monitor. Hosts attach it to their main engine; the default
+    /// keeps core unit and integration tests independent of host load.
+    resource_monitor: Option<crate::services::resource_monitor::ResourceMonitor>,
 }
 
 // The shared child launcher prefixes its bound role to the CLI system prompt.
@@ -760,6 +763,7 @@ impl QueryEngine {
             skills_manager: None,
             file_cache,
             cost_tracker: None,
+            resource_monitor: None,
         }
     }
 
@@ -776,6 +780,18 @@ impl QueryEngine {
     pub fn with_cost_tracker(mut self, tracker: Arc<CostTracker>) -> Self {
         self.cost_tracker = Some(tracker);
         self
+    }
+
+    pub fn with_resource_monitor(
+        mut self,
+        monitor: crate::services::resource_monitor::ResourceMonitor,
+    ) -> Self {
+        self.resource_monitor = Some(monitor);
+        self
+    }
+
+    pub fn resource_monitor(&self) -> Option<&crate::services::resource_monitor::ResourceMonitor> {
+        self.resource_monitor.as_ref()
     }
 
     pub fn set_permission_host_available(&self, available: bool) {
@@ -1222,7 +1238,7 @@ impl QueryEngine {
         }
         let model_skills: Vec<_> = discovered_skills
             .values()
-            .filter(|skill| skill.model_invocable())
+            .filter(|skill| skill.model_invocable() && !skill.always_inline)
             .collect();
         let available_skills = model_skills
             .iter()
@@ -1239,6 +1255,11 @@ impl QueryEngine {
             .iter()
             .map(|skill| skill.name.clone())
             .collect::<Vec<_>>();
+        // Skills in `SkillState::Always` have their full body injected into the
+        // first user message, so the model has their complete instructions on
+        // turn 1 without spending a turn calling `Skill`.
+        let inline_blocks =
+            crate::prompt::inline_skill_blocks_for_workspace(&discovered_skills, Some(&workspace));
         // The set of tools ToolLoad can offer and the model-invocable skills
         // are frozen into the first user message. A later discovery only adds a
         // change reminder to the latest message, never an edit to that prefix.
@@ -1310,7 +1331,7 @@ impl QueryEngine {
             .messages
             .iter()
             .any(|message| message.get("role").and_then(Value::as_str) == Some("user"));
-        let (loadable_tools, available_skills_listing, experience, set_changes) =
+        let (loadable_tools, available_skills_listing, inline_skills, experience, set_changes) =
             tokio::task::spawn_blocking(move || {
                 let loadable_tools = crate::prompt::loadable_tools_for_session(
                     &first_message_root,
@@ -1322,6 +1343,11 @@ impl QueryEngine {
                     &first_message_root,
                     &first_message_session,
                     &available_skills,
+                );
+                let inline_skills = crate::prompt::inline_skills_for_session(
+                    &first_message_root,
+                    &first_message_session,
+                    &inline_blocks,
                 );
                 // One scan per turn feeds both the frozen block and the change
                 // reminder; the frozen file wins once the session has started.
@@ -1392,7 +1418,7 @@ impl QueryEngine {
                         )
                     })
                     .flatten();
-                (loadable_tools, available_skills, experience, changes)
+                (loadable_tools, available_skills, inline_skills, experience, changes)
             })
             .await?;
         if let Some(reminder) = set_changes {
@@ -1545,6 +1571,7 @@ impl QueryEngine {
             standalone_frontend,
             loadable_tools,
             available_skills: available_skills_listing,
+            inline_skills,
             date: Some(frozen_date),
             git: git_snapshot
                 .as_deref()
@@ -1746,6 +1773,13 @@ impl QueryEngine {
             None
         };
         let history = crate::db::session_store::ExecutorHistory::Session(selected);
+        // The monitor samples disk pressure for the turn's actual workspace, so
+        // a conversation on another mount is measured instead of the data dir.
+        if !replay {
+            if let Some(monitor) = &self.resource_monitor {
+                monitor.update_workspace(workspace_path.clone().into());
+            }
+        }
         let mut executor = ToolLoopExecutor::new(
             provider,
             request.messages,
@@ -1814,7 +1848,12 @@ impl QueryEngine {
         .with_prefetch_engine(Arc::new(PrefetchEngine::new(
             self.file_cache.clone(),
             workspace_path.clone(),
-        )));
+        )))
+        .with_resource_monitor(if replay {
+            None
+        } else {
+            self.resource_monitor.clone()
+        });
 
         if let Some(memory) = file_memory {
             executor = executor.with_file_memory(memory);
@@ -2684,5 +2723,123 @@ mod provider_input_tests {
             &[serde_json::json!({"role":"user","content":"hello"})]
         )
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod resource_monitor_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn monitor_is_opt_in_and_exposed_by_accessor() {
+        let temp = tempfile::tempdir().unwrap();
+        let context = crate::services::session_messages::context(temp.path()).unwrap();
+        let engine = QueryEngine::new(
+            Arc::new(Mutex::new(
+                crate::native_engine::provider_manager::ProviderManager::in_memory(
+                    vec![],
+                    temp.path().join("config.json"),
+                ),
+            )),
+            context.db,
+            temp.path().to_path_buf(),
+            crate::runtime::default_permissions(),
+            Arc::new(FileCache::new()),
+        );
+        assert!(engine.resource_monitor().is_none());
+
+        // Disabled so the test never samples host load or spawns a task.
+        let mut config = crate::services::resource_monitor::ResourceMonitorConfig::default();
+        config.enabled = false;
+        let monitor = crate::services::resource_monitor::ResourceMonitor::start(
+            config,
+            temp.path().to_path_buf(),
+            temp.path().to_path_buf(),
+        );
+        let engine = engine.with_resource_monitor(monitor);
+        assert!(engine.resource_monitor().is_some());
+        assert!(!engine.resource_monitor().unwrap().is_enabled());
+    }
+
+    #[tokio::test]
+    async fn preparing_a_turn_updates_the_monitor_workspace() {
+        crate::config::OrchestrationConfig::init_global().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let paths = crate::runtime::RuntimePaths::new(temp.path().join("data")).unwrap();
+        let store = crate::runtime::SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(&workspace, "fixture-model", "fixture").unwrap();
+        let mut turn = store.db.start_turn_timer(&id).unwrap();
+        let assistant_id = turn.ensure_segment().unwrap();
+
+        let provider: crate::native_engine::provider_manager::Provider =
+            serde_json::from_value(serde_json::json!({
+                "id": "fixture",
+                "name": "Fixture",
+                "api_format": "openai",
+                "base_url": "http://127.0.0.1:1/v1",
+                "api_key": "fixture-key",
+                "enabled": true,
+                "models": [{
+                    "id": "fixture-model",
+                    "name": "fixture-model",
+                    "enabled": true,
+                    "max_tokens": 1000,
+                    "context_window": 32000,
+                    "supports_web_search": false
+                }]
+            }))
+            .unwrap();
+
+        // Disabled so the test never samples host load or spawns a task.
+        let mut config = crate::services::resource_monitor::ResourceMonitorConfig::default();
+        config.enabled = false;
+        let previous = temp.path().join("previous-workspace");
+        let monitor = crate::services::resource_monitor::ResourceMonitor::start(
+            config,
+            previous.clone(),
+            paths.data_dir.clone(),
+        );
+        assert_eq!(monitor.tracked_workspace(), previous);
+
+        let engine = QueryEngine::new(
+            Arc::new(Mutex::new(
+                crate::native_engine::provider_manager::ProviderManager::in_memory(
+                    vec![provider],
+                    paths.data_dir.join("config/providers.json"),
+                ),
+            )),
+            store.db.clone(),
+            paths.layout().workspaces(),
+            crate::runtime::default_permissions(),
+            Arc::new(FileCache::new()),
+        )
+        .with_resource_monitor(monitor.clone());
+
+        let request: ChatRequest = serde_json::from_value(serde_json::json!({
+            "conversation_id": id,
+            "messages": store
+                .model_history(&id, &crate::native_engine::provider_manager::ApiFormat::OpenAI)
+                .unwrap(),
+            "assistant_message_id": assistant_id,
+            "standalone_frontend": true,
+            "model": "fixture-model",
+            "provider_id": "fixture",
+            "workspace_path": workspace.to_string_lossy(),
+            "max_tokens": 1000
+        }))
+        .unwrap();
+
+        let selected = store.db.open_session(&id).unwrap();
+        let flow = engine
+            .prepare_turn(selected, request, TurnPurpose::Submit)
+            .await
+            .unwrap();
+        assert!(matches!(flow, std::ops::ControlFlow::Continue(_)));
+        assert_eq!(
+            monitor.tracked_workspace(),
+            std::fs::canonicalize(&workspace).unwrap()
+        );
     }
 }
