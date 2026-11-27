@@ -291,7 +291,8 @@ fn agent_lifecycle_terminal_fixture() {
     let parent = fixture.job.parent_session_id.clone();
     let mut editor = crate::terminal::input::editor::PromptEditor::default();
     editor.set_agent_rows(Box::new(move || {
-        running_agents(&context.paths, &context.db, &parent)
+        let rows = running_agents(&context.paths, &context.db, &parent);
+        (rows.len(), rows)
     }));
     println!("LIVENESS_IDLE_READY");
     loop {

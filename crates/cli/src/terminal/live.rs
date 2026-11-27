@@ -3556,7 +3556,7 @@ mod tests {
         let mut editor = super::super::input::editor::PromptEditor::default();
         let agent =
             crate::background_commands::foreground_agent(&context, &context.db.open_session("child").unwrap().address(), "general").unwrap();
-        editor.set_agent_rows(Box::new(move || vec![agent.clone()]));
+        editor.set_agent_rows(Box::new(move || (0, vec![agent.clone()])));
         editor.set_subagents(context.clone(), "parent".into());
         editor.set_agent_details(Box::new(move |id| {
             crate::background_commands::agent_execution(&context, id)

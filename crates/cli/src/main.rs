@@ -1344,7 +1344,7 @@ async fn run(cli: &mut Cli) -> Result<()> {
             let agent_context = session.hook_service_context();
             let panel_context = agent_context.clone();
             let parent = session.selected_session()?;
-            input.as_ref().unwrap().set_agent_rows(Box::new(move || background_commands::panel_agents(&panel_context, &parent, &[]).1));
+            input.as_ref().unwrap().set_agent_rows(Box::new(move || background_commands::panel_agents(&panel_context, &parent, &[])));
             input.as_ref().unwrap().set_subagents(agent_context.clone(), session.id.clone());
             input.as_ref().unwrap().set_agent_details(Box::new(move |id| background_commands::agent_execution(&agent_context, id)));
             let (todo_paths, todo_session) = (paths.clone(), session.id.clone());
