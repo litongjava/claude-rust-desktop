@@ -327,6 +327,10 @@ pub struct ToolLoopExecutor {
     /// True while executing the 2nd+ consecutive single-`Bash` turn so the
     /// coaching hint asks the model to chain related shell commands.
     shell_serial_bash_hint: Arc<std::sync::atomic::AtomicBool>,
+    /// Frozen starting shell `cwd` and deferred commit outcomes for a turn
+    /// containing 2+ foreground `Bash` calls, preventing mid-turn `cd` writes
+    /// from leaking into sibling calls emitted in the same assistant turn.
+    shell_cwd_batch: Arc<std::sync::Mutex<Option<TurnShellCwdBatch>>>,
     system_prompt: Option<String>,
     max_tokens: u32,
     max_tool_iterations: Option<usize>,
@@ -1854,6 +1858,7 @@ impl ToolLoopExecutor {
             shell_batch_bash_hint: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shell_consecutive_single_bash: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             shell_serial_bash_hint: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shell_cwd_batch: Arc::new(std::sync::Mutex::new(None)),
             system_prompt,
             max_tokens,
             max_tool_iterations: crate::config::OrchestrationConfig::max_tool_iterations(),
@@ -2128,6 +2133,7 @@ impl ToolLoopExecutor {
     ) -> Vec<(Value, String, bool)> {
         let _batch_bash_guard = (count_foreground_bash_calls(calls) >= 2)
             .then(|| BatchBashHintGuard::set(&self.shell_batch_bash_hint, true));
+        let turn_cwd_guard = self.begin_turn_shell_cwd_batch(calls);
         if calls.len() < 2 {
             let mut results = Vec::new();
             for call in calls {
@@ -2140,6 +2146,9 @@ impl ToolLoopExecutor {
                     )
                     .await,
                 );
+            }
+            if let Some(guard) = turn_cwd_guard {
+                guard.commit();
             }
             return results;
         }
@@ -2189,6 +2198,9 @@ impl ToolLoopExecutor {
                 self.complete_tool_call_with(&call.name, &call.id, prepared.pre_contexts, ran)
                     .await,
             );
+        }
+        if let Some(guard) = turn_cwd_guard {
+            guard.commit();
         }
         results
     }
@@ -3335,6 +3347,26 @@ impl ToolLoopExecutor {
         self
     }
 
+    fn shell_cwd_state_path(&self) -> Option<std::path::PathBuf> {
+        let root = self
+            .search_config_path
+            .as_deref()
+            .and_then(crate::data_layout::data_root_of)?;
+        let session = self.conv_id.as_deref()?;
+        Some(root.join("state/shell-cwd").join(session))
+    }
+
+    fn begin_turn_shell_cwd_batch(&self, calls: &[PendingToolCall]) -> Option<TurnShellCwdGuard> {
+        if count_foreground_bash_calls(calls) < 2 {
+            return None;
+        }
+        let start_cwd = read_shell_cwd_snapshot(
+            self.shell_cwd_state_path().as_deref(),
+            self.get_workspace_cwd(),
+        );
+        TurnShellCwdGuard::begin(&self.shell_cwd_batch, start_cwd, calls)
+    }
+
     async fn run_builtin(
         &self,
         tool_name: &str,
@@ -3343,7 +3375,7 @@ impl ToolLoopExecutor {
         cwd: &str,
         approved: bool,
     ) -> Result<Value> {
-        let run = self.run_builtin_inner(tool_name, tool_input, cwd, approved);
+        let run = self.run_builtin_inner_with_id(tool_name, tool_input, Some(id), cwd, approved);
         self.retain_command_metadata(tool_name, id, run).await
     }
 
@@ -3382,6 +3414,18 @@ impl ToolLoopExecutor {
         cwd: &str,
         approved: bool,
     ) -> Result<Value> {
+        self.run_builtin_inner_with_id(tool_name, tool_input, None, cwd, approved)
+            .await
+    }
+
+    async fn run_builtin_inner_with_id(
+        &self,
+        tool_name: &str,
+        tool_input: &Value,
+        tool_use_id: Option<&str>,
+        cwd: &str,
+        approved: bool,
+    ) -> Result<Value> {
         let mut input = shell_state_input(
             tool_name,
             &self.tool_run_input(tool_name, tool_input),
@@ -3394,6 +3438,18 @@ impl ToolLoopExecutor {
                 .unwrap_or_default(),
         );
         let foreground_bash = is_foreground_bash_call(tool_name, &input);
+        let batch_cwd_start = foreground_bash
+            .then(|| {
+                self.shell_cwd_batch
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|batch| batch.start_cwd.clone()))
+            })
+            .flatten();
+        if let Some(start_cwd) = batch_cwd_start {
+            input["__cwd_start"] = json!(start_cwd);
+            input["__cwd_defer_persist"] = json!(true);
+        }
         if foreground_bash
             && self
                 .shell_cwd_needs_report
@@ -3448,7 +3504,7 @@ impl ToolLoopExecutor {
                 ),
             ),
         ));
-        let result = if let Some((_guard, mut questions)) = asker {
+        let mut result = if let Some((_guard, mut questions)) = asker {
             loop {
                 tokio::select! {
                     result = &mut run => break result,
@@ -3461,6 +3517,20 @@ impl ToolLoopExecutor {
         } else {
             run.await
         };
+        if let Ok(value) = result.as_mut() {
+            if let Some(commit) = value
+                .as_object_mut()
+                .and_then(|object| object.remove("__cwd_commit"))
+            {
+                if let Some(tool_use_id) = tool_use_id {
+                    if let Ok(mut guard) = self.shell_cwd_batch.lock() {
+                        if let Some(batch) = guard.as_mut() {
+                            batch.record_from_value(tool_use_id, &commit);
+                        }
+                    }
+                }
+            }
+        }
         if let Some(claim) = hint_claim {
             if result.is_ok() {
                 self.shell_cwd_needs_report
@@ -6458,6 +6528,7 @@ impl ToolLoopExecutor {
                         &pending_tool_calls,
                     ),
                 );
+                let turn_cwd_guard = self.begin_turn_shell_cwd_batch(&pending_tool_calls);
                 for batch in tool_batches(&pending_tool_calls) {
                     let results = self.execute_tool_batch(batch).await;
                     for (tc, (actual_input, output_str, is_error)) in batch.iter().zip(results) {
@@ -6507,6 +6578,9 @@ impl ToolLoopExecutor {
                             is_error: Some(is_error),
                         });
                     }
+                }
+                if let Some(guard) = turn_cwd_guard {
+                    guard.commit();
                 }
                 self.ensure_permission_continuation()?;
 
@@ -7398,6 +7472,7 @@ impl ToolLoopExecutor {
                         &pending_tool_calls,
                     ),
                 );
+                let turn_cwd_guard = self.begin_turn_shell_cwd_batch(&pending_tool_calls);
                 for batch in tool_batches(&pending_tool_calls) {
                     let results = self.execute_tool_batch(batch).await;
                     for (tc, (actual_input, output_str, is_error)) in batch.iter().zip(results) {
@@ -7447,6 +7522,9 @@ impl ToolLoopExecutor {
                             provider_content: None,
                         });
                     }
+                }
+                if let Some(guard) = turn_cwd_guard {
+                    guard.commit();
                 }
                 self.ensure_permission_continuation()?;
 
@@ -8304,6 +8382,171 @@ impl Drop for BatchBashHintGuard {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellCwdCommitOutcome {
+    state_path: std::path::PathBuf,
+    cwd: Option<String>,
+    reset: bool,
+    changed: bool,
+    success: bool,
+}
+
+#[derive(Debug)]
+struct TurnShellCwdBatch {
+    start_cwd: String,
+    call_order: Vec<String>,
+    outcomes: HashMap<String, ShellCwdCommitOutcome>,
+}
+
+fn read_shell_cwd_snapshot(
+    state_path: Option<&std::path::Path>,
+    workspace_cwd: &str,
+) -> String {
+    if let Some(saved) = state_path.and_then(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| text.trim_start_matches('\u{feff}').trim().to_owned())
+    }) {
+        if !saved.is_empty()
+            && std::path::Path::new(&saved).is_dir()
+            && crate::tools::is_shell_cwd_allowed(std::path::Path::new(&saved), workspace_cwd)
+        {
+            return saved;
+        }
+    }
+    workspace_cwd.to_owned()
+}
+
+impl TurnShellCwdBatch {
+    fn new(start_cwd: String, calls: &[PendingToolCall]) -> Self {
+        Self {
+            start_cwd,
+            call_order: calls.iter().map(|call| call.id.clone()).collect(),
+            outcomes: HashMap::new(),
+        }
+    }
+
+    fn record_from_value(&mut self, tool_use_id: &str, commit: &Value) {
+        let Some(state) = commit["state"].as_str().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let outcome = ShellCwdCommitOutcome {
+            state_path: std::path::PathBuf::from(state),
+            cwd: commit["cwd"].as_str().map(str::to_owned),
+            reset: commit["reset"].as_bool().unwrap_or(false),
+            changed: commit["changed"].as_bool().unwrap_or(false),
+            success: commit["success"].as_bool().unwrap_or(false),
+        };
+        self.outcomes.insert(tool_use_id.to_owned(), outcome);
+    }
+
+    fn resolve_commits(&self) -> Vec<ShellCwdCommitOutcome> {
+        let mut by_state: Vec<std::path::PathBuf> = Vec::new();
+        for id in &self.call_order {
+            if let Some(outcome) = self.outcomes.get(id) {
+                if !by_state.iter().any(|path| path == &outcome.state_path) {
+                    by_state.push(outcome.state_path.clone());
+                }
+            }
+        }
+        let mut resolved = Vec::new();
+        for state_path in by_state {
+            let ordered: Vec<&ShellCwdCommitOutcome> = self
+                .call_order
+                .iter()
+                .filter_map(|id| self.outcomes.get(id))
+                .filter(|outcome| outcome.state_path == state_path)
+                .collect();
+            let chosen = ordered
+                .iter()
+                .rev()
+                .find(|o| (o.changed || o.reset) && o.success)
+                .or_else(|| ordered.iter().rev().find(|o| o.changed || o.reset))
+                .or_else(|| {
+                    (!state_path.exists())
+                        .then(|| ordered.iter().rev().find(|o| o.cwd.is_some()))
+                        .flatten()
+                });
+            if let Some(outcome) = chosen {
+                resolved.push((*outcome).clone());
+            }
+        }
+        resolved
+    }
+
+    fn commit(self) {
+        for outcome in self.resolve_commits() {
+            if outcome.reset {
+                let _ = std::fs::remove_file(&outcome.state_path);
+            } else if let Some(dir) = outcome.cwd {
+                if let Some(parent) = outcome.state_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let name = outcome
+                    .state_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("shell-cwd");
+                let tmp = outcome
+                    .state_path
+                    .with_file_name(format!(".{name}.tmp.{}", uuid::Uuid::new_v4()));
+                if std::fs::write(&tmp, format!("{dir}\n")).is_ok() {
+                    if std::fs::rename(&tmp, &outcome.state_path).is_err() {
+                        let _ = std::fs::remove_file(&tmp);
+                        let _ = std::fs::write(&outcome.state_path, format!("{dir}\n"));
+                    }
+                } else {
+                    let _ = std::fs::write(&outcome.state_path, format!("{dir}\n"));
+                }
+            }
+        }
+    }
+}
+
+struct TurnShellCwdGuard {
+    slot: Arc<std::sync::Mutex<Option<TurnShellCwdBatch>>>,
+    active: bool,
+}
+
+impl TurnShellCwdGuard {
+    fn begin(
+        slot: &Arc<std::sync::Mutex<Option<TurnShellCwdBatch>>>,
+        start_cwd: String,
+        calls: &[PendingToolCall],
+    ) -> Option<Self> {
+        if count_foreground_bash_calls(calls) < 2 {
+            return None;
+        }
+        let mut guard = slot.lock().ok()?;
+        if guard.is_some() {
+            return None;
+        }
+        *guard = Some(TurnShellCwdBatch::new(start_cwd, calls));
+        Some(Self {
+            slot: Arc::clone(slot),
+            active: true,
+        })
+    }
+
+    fn commit(mut self) {
+        self.active = false;
+        let batch = self.slot.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(batch) = batch {
+            batch.commit();
+        }
+    }
+}
+
+impl Drop for TurnShellCwdGuard {
+    fn drop(&mut self) {
+        if self.active {
+            if let Ok(mut guard) = self.slot.lock() {
+                *guard = None;
+            }
+        }
+    }
+}
+
 struct BashHintClaim<'a> {
     cooldown: &'a std::sync::atomic::AtomicUsize,
     active: bool,
@@ -8374,13 +8617,176 @@ pub(crate) mod toolscript_approval;
 #[cfg(test)]
 mod shell_state_input_tests {
     use super::{
-        count_foreground_bash_calls, is_bash_coaching_note, shell_state_input,
-        try_claim_bash_hint, update_consecutive_single_bash_turns, update_redundant_cd_cooldown,
-        BashHintClaim, PendingToolCall, BASH_HINT_CLAIMED, REDUNDANT_CD_HINT_COOLDOWN_CALLS,
+        count_foreground_bash_calls, is_bash_coaching_note, read_shell_cwd_snapshot,
+        shell_state_input, try_claim_bash_hint, update_consecutive_single_bash_turns,
+        update_redundant_cd_cooldown, BashHintClaim, PendingToolCall, TurnShellCwdBatch,
+        TurnShellCwdGuard, BASH_HINT_CLAIMED, REDUNDANT_CD_HINT_COOLDOWN_CALLS,
     };
     use crate::permissions::PermissionMode;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    #[test]
+    fn shell_cwd_batch_snapshot_isolates_mid_turn_cd_and_commits_last_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        let sub_a = workspace.join("HuLa");
+        let sub_b = workspace.join("Other");
+        std::fs::create_dir_all(&sub_a).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let workspace_str = workspace.to_str().unwrap();
+        let sub_a_str = sub_a.to_str().unwrap();
+        let sub_b_str = sub_b.to_str().unwrap();
+        let state = workspace.join("state/shell-cwd/session-1");
+
+        // Snapshot falls back to workspace cwd before any state file exists.
+        assert_eq!(
+            read_shell_cwd_snapshot(Some(&state), workspace_str),
+            workspace_str
+        );
+
+        let mk_bash = |id: &str, cmd: &str| PendingToolCall {
+            id: id.to_owned(),
+            provider_id: id.to_owned(),
+            name: "Bash".to_owned(),
+            input: json!({ "command": cmd }),
+            concurrent: false,
+        };
+
+        // Single-Bash turn does not activate batch isolation (behaves identically to before).
+        let slot: Arc<Mutex<Option<TurnShellCwdBatch>>> = Arc::new(Mutex::new(None));
+        let single = vec![mk_bash("c1", "cd HuLa && pwd")];
+        assert!(TurnShellCwdGuard::begin(&slot, workspace_str.to_owned(), &single).is_none());
+
+        // Multi-Bash turn freezes batch_start_cwd and commits only after the turn finishes.
+        let calls = vec![
+            mk_bash("c1", "cd HuLa && cmd1"),
+            mk_bash("c2", "cd HuLa && cmd2"),
+        ];
+        let guard = TurnShellCwdGuard::begin(&slot, workspace_str.to_owned(), &calls).unwrap();
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().start_cwd,
+            workspace_str
+        );
+        // Nested batch guard cannot clobber the active turn-level guard.
+        assert!(TurnShellCwdGuard::begin(&slot, sub_a_str.to_owned(), &calls).is_none());
+
+        // Record out-of-order completions (c2 before c1): state file stays untouched mid-turn.
+        slot.lock().unwrap().as_mut().unwrap().record_from_value(
+            "c2",
+            &json!({
+                "state": state.to_string_lossy(),
+                "cwd": sub_b_str,
+                "reset": false,
+                "changed": true,
+                "success": true
+            }),
+        );
+        slot.lock().unwrap().as_mut().unwrap().record_from_value(
+            "c1",
+            &json!({
+                "state": state.to_string_lossy(),
+                "cwd": sub_a_str,
+                "reset": false,
+                "changed": true,
+                "success": true
+            }),
+        );
+        assert!(
+            !state.exists(),
+            "mid-turn cd must not write shell-cwd before commit"
+        );
+        guard.commit();
+        // c2 is last in call_order and succeeded in changing cwd.
+        assert_eq!(
+            std::fs::read_to_string(&state).unwrap().trim(),
+            sub_b_str
+        );
+        assert_eq!(
+            read_shell_cwd_snapshot(Some(&state), workspace_str),
+            sub_b_str
+        );
+
+        // Next turn: c1 changes cwd (succeeds), c2 stays in batch_start_cwd (changed=false).
+        // Unchanged c2 must not overwrite c1's cwd change.
+        let guard = TurnShellCwdGuard::begin(&slot, sub_b_str.to_owned(), &calls).unwrap();
+        slot.lock().unwrap().as_mut().unwrap().record_from_value(
+            "c1",
+            &json!({
+                "state": state.to_string_lossy(),
+                "cwd": sub_a_str,
+                "reset": false,
+                "changed": true,
+                "success": true
+            }),
+        );
+        slot.lock().unwrap().as_mut().unwrap().record_from_value(
+            "c2",
+            &json!({
+                "state": state.to_string_lossy(),
+                "cwd": sub_b_str,
+                "reset": false,
+                "changed": false,
+                "success": true
+            }),
+        );
+        guard.commit();
+        assert_eq!(
+            std::fs::read_to_string(&state).unwrap().trim(),
+            sub_a_str
+        );
+
+        // Prefer the last call that SUCCEEDED in changing cwd over a later failing call.
+        let guard = TurnShellCwdGuard::begin(&slot, sub_a_str.to_owned(), &calls).unwrap();
+        slot.lock().unwrap().as_mut().unwrap().record_from_value(
+            "c1",
+            &json!({
+                "state": state.to_string_lossy(),
+                "cwd": sub_b_str,
+                "reset": false,
+                "changed": true,
+                "success": true
+            }),
+        );
+        slot.lock().unwrap().as_mut().unwrap().record_from_value(
+            "c2",
+            &json!({
+                "state": state.to_string_lossy(),
+                "cwd": workspace_str,
+                "reset": false,
+                "changed": true,
+                "success": false
+            }),
+        );
+        guard.commit();
+        assert_eq!(
+            std::fs::read_to_string(&state).unwrap().trim(),
+            sub_b_str
+        );
+
+        // Dropping the guard without commit clears the slot without modifying disk.
+        {
+            let _aborted = TurnShellCwdGuard::begin(&slot, sub_b_str.to_owned(), &calls).unwrap();
+            slot.lock().unwrap().as_mut().unwrap().record_from_value(
+                "c1",
+                &json!({
+                    "state": state.to_string_lossy(),
+                    "cwd": sub_a_str,
+                    "reset": false,
+                    "changed": true,
+                    "success": true
+                }),
+            );
+        }
+        assert!(slot.lock().unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(&state).unwrap().trim(),
+            sub_b_str
+        );
+    }
 
     #[test]
     fn redundant_cd_cooldown_rate_limits_hints() {
