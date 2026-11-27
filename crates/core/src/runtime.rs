@@ -250,6 +250,7 @@ pub(crate) fn replay_history_with_ids(
 }
 
 struct ModelRequestStep {
+    request_id: String,
     thinking: Option<String>,
     text: String,
     calls: Vec<(String, Option<String>)>,
@@ -260,7 +261,7 @@ fn load_model_request_steps(
     message_id: &str,
 ) -> Result<Vec<ModelRequestStep>> {
     let mut stmt = match conn.prepare(
-        "SELECT response_blocks_json FROM model_requests \
+        "SELECT id, response_blocks_json FROM model_requests \
          WHERE message_id = ?1 \
          ORDER BY request_number ASC, started_at_ms ASC, rowid ASC",
     ) {
@@ -272,10 +273,15 @@ fn load_model_request_steps(
         }
         Err(err) => return Err(err.into()),
     };
-    let rows = stmt.query_map([message_id], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([message_id], |row| {
+        Ok((
+            row.get::<_, Option<String>>(0)?.unwrap_or_default(),
+            row.get::<_, String>(1)?,
+        ))
+    })?;
     let mut steps = Vec::new();
-    for raw in rows {
-        let raw = raw?;
+    for entry in rows {
+        let (request_id, raw) = entry?;
         let Ok(blocks) = serde_json::from_str::<Vec<Value>>(&raw) else {
             continue;
         };
@@ -322,6 +328,7 @@ fn load_model_request_steps(
             }
         }
         steps.push(ModelRequestStep {
+            request_id,
             thinking: (!thinking_parts.is_empty()).then(|| thinking_parts.join("\n\n")),
             text: text_parts.concat(),
             calls,
@@ -482,17 +489,58 @@ pub(crate) fn replay_rows(
             let mut remaining = calls;
             for step in steps {
                 let mut step_calls = Vec::new();
-                for (call_id, call_name) in &step.calls {
-                    let pos = (!call_id.is_empty())
-                        .then(|| remaining.iter().position(|c| c.id == *call_id))
-                        .flatten()
-                        .or_else(|| {
-                            call_name.as_deref().and_then(|name| {
-                                remaining.iter().position(|c| c.name == name)
+                // Priority 1: exact `request_id` link from `tool_calls.request_id`.
+                // Preserve `step.calls` (`provider_call_id` / `id`) order first, then
+                // any remaining linked calls in their `sort_order`.
+                if !step.request_id.is_empty()
+                    && remaining
+                        .iter()
+                        .any(|c| c.request_id.as_deref() == Some(step.request_id.as_str()))
+                {
+                    for (call_id, _) in &step.calls {
+                        if !call_id.is_empty() {
+                            if let Some(pos) = remaining.iter().position(|c| {
+                                c.request_id.as_deref() == Some(step.request_id.as_str())
+                                    && (c.provider_call_id.as_deref() == Some(call_id.as_str())
+                                        || c.id == *call_id)
+                            }) {
+                                step_calls.push(remaining.remove(pos));
+                            }
+                        }
+                    }
+                    let mut idx = 0;
+                    while idx < remaining.len() {
+                        if remaining[idx].request_id.as_deref() == Some(step.request_id.as_str()) {
+                            step_calls.push(remaining.remove(idx));
+                        } else {
+                            idx += 1;
+                        }
+                    }
+                } else {
+                    // Priority 2 (legacy fallback, only when `c.request_id` is None):
+                    // exact `c.id == call_id` or `c.provider_call_id == Some(call_id)`,
+                    // then earliest remaining `c.name == name`.
+                    for (call_id, call_name) in &step.calls {
+                        let pos = (!call_id.is_empty())
+                            .then(|| {
+                                remaining.iter().position(|c| {
+                                    c.request_id.is_none()
+                                        && (c.id == *call_id
+                                            || c.provider_call_id.as_deref()
+                                                == Some(call_id.as_str()))
+                                })
                             })
-                        });
-                    if let Some(pos) = pos {
-                        step_calls.push(remaining.remove(pos));
+                            .flatten()
+                            .or_else(|| {
+                                call_name.as_deref().and_then(|name| {
+                                    remaining
+                                        .iter()
+                                        .position(|c| c.request_id.is_none() && c.name == name)
+                                })
+                            });
+                        if let Some(pos) = pos {
+                            step_calls.push(remaining.remove(pos));
+                        }
                     }
                 }
                 if !step_calls.is_empty() {
@@ -1247,5 +1295,101 @@ mod model_history_step_replay_tests {
         assert_eq!(history[5]["tool_call_id"], inv3);
         assert_eq!(history[6]["reasoning_content"], "Step 3 report");
         assert_eq!(history[6]["content"], "Done hiding");
+    }
+
+    #[test]
+    fn openai_replays_exact_request_id_and_provider_call_id_even_with_skipped_same_tool_name() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store.append(&id, "user", "Run bash across steps").unwrap();
+        let assistant_id = store.append(&id, "assistant", "All done").unwrap();
+
+        let conn = open_session_db(&store, &id);
+        let inv_step2_first = format!("{assistant_id}:inv-step2-first");
+        let inv_step2_second = format!("{assistant_id}:inv-step2-second");
+        // Intentionally insert step 2's second call with an earlier sort_order
+        // and omit step 1's Bash call entirely: without `request_id` + `provider_call_id`,
+        // step 1 would steal step 2's Bash call by tool name.
+        message_repo::insert_tool_call(
+            &conn,
+            &inv_step2_second,
+            &assistant_id,
+            "Bash",
+            Some(r#"{"command":"echo second"}"#),
+            Some("second"),
+            false,
+            0,
+        )
+        .unwrap();
+        message_repo::insert_tool_call(
+            &conn,
+            &inv_step2_first,
+            &assistant_id,
+            "Bash",
+            Some(r#"{"command":"echo first"}"#),
+            Some("first"),
+            false,
+            1,
+        )
+        .unwrap();
+
+        let req1 = json!([
+            {"type": "thinking", "text": "Step 1 skipped bash"},
+            {"type": "tool_call", "id": "call_step1_bash", "name": "Bash", "arguments": "{}"}
+        ])
+        .to_string();
+        let req2 = json!([
+            {"type": "thinking", "text": "Step 2 two bashes"},
+            {"type": "tool_call", "id": "call_step2_first", "name": "Bash", "arguments": "{}"},
+            {"type": "tool_call", "id": "call_step2_second", "name": "Bash", "arguments": "{}"}
+        ])
+        .to_string();
+        let req3 = json!([
+            {"type": "thinking", "text": "Step 3 summary"},
+            {"type": "text", "text": "All done"}
+        ])
+        .to_string();
+        for (idx, blocks) in [(1, req1), (2, req2), (3, req3)] {
+            conn.execute(
+                "INSERT INTO model_requests (id, message_id, conversation_id, request_number, provider_id, model, api_format, status, started_at_ms, response_blocks_json)
+                 VALUES (?1, ?2, ?3, ?4, 'p', 'm', 'openai', 'completed', ?5, ?6)",
+                rusqlite::params![format!("req-{idx}"), assistant_id, id, idx, idx * 1000, blocks],
+            )
+            .unwrap();
+        }
+        message_repo::set_tool_call_request_link(
+            &conn,
+            &inv_step2_first,
+            Some("req-2"),
+            Some("call_step2_first"),
+        )
+        .unwrap();
+        message_repo::set_tool_call_request_link(
+            &conn,
+            &inv_step2_second,
+            Some("req-2"),
+            Some("call_step2_second"),
+        )
+        .unwrap();
+        drop(conn);
+
+        let history = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+        // user + step2(assistant + 2 tools) + final assistant (step 1 had no executed tool call)
+        assert_eq!(history.len(), 5);
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["reasoning_content"], "Step 2 two bashes");
+        assert_eq!(history[1]["tool_calls"].as_array().unwrap().len(), 2);
+        // Order follows step 2's provider_call_id order (`first` then `second`).
+        assert_eq!(history[1]["tool_calls"][0]["id"], inv_step2_first);
+        assert_eq!(history[1]["tool_calls"][1]["id"], inv_step2_second);
+        assert_eq!(history[2]["tool_call_id"], inv_step2_first);
+        assert_eq!(history[2]["content"], "first");
+        assert_eq!(history[3]["tool_call_id"], inv_step2_second);
+        assert_eq!(history[3]["content"], "second");
+        assert_eq!(history[4]["role"], "assistant");
+        assert_eq!(history[4]["reasoning_content"], "Step 3 summary");
+        assert_eq!(history[4]["content"], "All done");
     }
 }

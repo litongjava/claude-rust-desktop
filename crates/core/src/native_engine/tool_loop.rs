@@ -233,6 +233,13 @@ pub enum EngineEvent {
         parent_tool_use_id: String,
         sequence: u64,
     },
+    /// Links an executor tool occurrence (`tool_use_id`) to the originating
+    /// `model_requests.id` and provider-emitted `provider_call_id`.
+    ToolCallRequestLink {
+        tool_use_id: String,
+        request_id: String,
+        provider_call_id: String,
+    },
 }
 
 /// Tools the model loaded with ToolLoad, in the order they were first loaded.
@@ -376,6 +383,7 @@ pub struct ToolLoopExecutor {
     protected_input: Option<usize>,
     pending_inputs: Vec<String>,
     replay_tools: Vec<crate::db::message_repo::ReplayToolRow>,
+    replay_request_links: crate::services::tool_history::ToolRequestLinks,
     tool_order: i64,
     standalone_frontend: bool,
     /// Hook context and skill content recorded for earlier user messages.
@@ -1896,6 +1904,7 @@ impl ToolLoopExecutor {
             protected_input,
             pending_inputs: Vec::new(),
             replay_tools: Vec::new(),
+            replay_request_links: Default::default(),
             tool_order: 0,
             standalone_frontend: false,
             turn_context: Vec::new(),
@@ -6378,6 +6387,18 @@ impl ToolLoopExecutor {
                                         display_title: self.task_display_title(&name, &input).await,
                                     })
                                     .await;
+                                if let Some(request_id) =
+                                    request_trace.started()["id"].as_str().map(str::to_owned)
+                                {
+                                    let _ = self
+                                        .event_tx
+                                        .send(EngineEvent::ToolCallRequestLink {
+                                            tool_use_id: invocation.clone(),
+                                            request_id,
+                                            provider_call_id: provider_id.clone(),
+                                        })
+                                        .await;
+                                }
 
                                 let concurrent = self.is_concurrency_safe(&name, &input);
 
@@ -6472,6 +6493,7 @@ impl ToolLoopExecutor {
             if response_status == "completed" {
                 self.record_request_usage(&snapshot);
             }
+            let step_request_id = snapshot["id"].as_str().map(str::to_owned);
             let _ = self
                 .event_tx
                 .send(EngineEvent::RequestSnapshot(snapshot))
@@ -6566,7 +6588,13 @@ impl ToolLoopExecutor {
                                 }
                             }
                         }
-                        self.retain_replay_tool(tc, &actual_input, &output_str, is_error);
+                        self.retain_replay_tool(
+                            tc,
+                            &actual_input,
+                            &output_str,
+                            is_error,
+                            step_request_id.as_deref(),
+                        );
                         let mcp = self.mcp_outputs.remove(&tc.id);
                         let mcp =
                             self.finish_mcp_output(&tc.id, &tc.name, &output_str, is_error, mcp)?;
@@ -6905,6 +6933,7 @@ impl ToolLoopExecutor {
             let mut staged: Vec<(bool, String)> = Vec::new();
             // Set when this attempt is the single authorized replacement.
             let mut replaces_request_id: Option<String> = None;
+            let step_request_id: Option<String>;
             'attempt: loop {
                 // A pending replacement never opens for a consumer that has
                 // already gone away.
@@ -7387,6 +7416,7 @@ impl ToolLoopExecutor {
                 if response_status == "completed" {
                     self.record_request_usage(&snapshot);
                 }
+                step_request_id = snapshot["id"].as_str().map(str::to_owned);
                 let _ = self
                     .event_tx
                     .send(EngineEvent::RequestSnapshot(snapshot))
@@ -7472,6 +7502,16 @@ impl ToolLoopExecutor {
                             display_title: self.task_display_title(name, &input).await,
                         })
                         .await;
+                    if let Some(request_id) = step_request_id.clone() {
+                        let _ = self
+                            .event_tx
+                            .send(EngineEvent::ToolCallRequestLink {
+                                tool_use_id: invocation.clone(),
+                                request_id,
+                                provider_call_id: provider_id.clone(),
+                            })
+                            .await;
+                    }
 
                     let concurrent = self.is_concurrency_safe(name, &input);
 
@@ -7535,7 +7575,13 @@ impl ToolLoopExecutor {
                                 call.function.arguments = actual_input.to_string();
                             }
                         }
-                        self.retain_replay_tool(tc, &actual_input, &output_str, is_error);
+                        self.retain_replay_tool(
+                            tc,
+                            &actual_input,
+                            &output_str,
+                            is_error,
+                            step_request_id.as_deref(),
+                        );
                         let mcp = self.mcp_outputs.remove(&tc.id);
                         let mcp =
                             self.finish_mcp_output(&tc.id, &tc.name, &output_str, is_error, mcp)?;
