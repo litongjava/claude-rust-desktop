@@ -210,6 +210,101 @@ pub fn inline_skills_for_session(
     reminder
 }
 
+/// Workspace-local CodeGraph index state inferred purely from filesystem
+/// metadata (zero subprocesses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodeGraphIndexStatus {
+    /// `<dir>/.codegraph/codegraph.db` exists as a non-empty regular file.
+    Ready(PathBuf),
+    /// Current workspace is a git worktree without `.codegraph/codegraph.db`,
+    /// while the main git repository has a non-empty `.codegraph/codegraph.db`.
+    WorktreeUninitialized { main_repo: PathBuf },
+    /// Current workspace is inside a git repository (or worktree) without a
+    /// populated `.codegraph/codegraph.db`.
+    GitUninitialized(PathBuf),
+    /// Workspace is not inside a git repository and has no `.codegraph/codegraph.db`.
+    NotGitRepo,
+}
+
+fn has_non_empty_codegraph_db(dir: &Path) -> bool {
+    fs::metadata(dir.join(".codegraph").join("codegraph.db"))
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+}
+
+fn resolve_worktree_main_repo(worktree_root: &Path, git_file: &Path) -> Option<PathBuf> {
+    let content = fs::read_to_string(git_file).ok()?;
+    let raw_gitdir = content
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+        .trim();
+    if raw_gitdir.is_empty() {
+        return None;
+    }
+    let raw_path = Path::new(raw_gitdir);
+    let gitdir = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        worktree_root.join(raw_path)
+    };
+    let worktrees_dir = gitdir.parent()?;
+    if worktrees_dir.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
+        return None;
+    }
+    let common_git_dir = worktrees_dir.parent()?;
+    if common_git_dir.file_name().and_then(|n| n.to_str()) != Some(".git") {
+        return None;
+    }
+    let main_repo = common_git_dir.parent()?;
+    if raw_path.is_absolute() {
+        Some(main_repo.to_path_buf())
+    } else {
+        Some(fs::canonicalize(main_repo).unwrap_or_else(|_| main_repo.to_path_buf()))
+    }
+}
+
+/// Inspect `<workspace>` (and ancestors up to the enclosing git root) for a
+/// populated `.codegraph/codegraph.db` using filesystem metadata only.
+pub fn codegraph_workspace_status(workspace: &Path) -> CodeGraphIndexStatus {
+    for dir in workspace.ancestors() {
+        if has_non_empty_codegraph_db(dir) {
+            return CodeGraphIndexStatus::Ready(dir.to_path_buf());
+        }
+        let git_path = dir.join(".git");
+        let Ok(meta) = fs::metadata(&git_path) else {
+            continue;
+        };
+        if meta.is_file() {
+            if let Some(main_repo) = resolve_worktree_main_repo(dir, &git_path) {
+                if has_non_empty_codegraph_db(&main_repo) {
+                    return CodeGraphIndexStatus::WorktreeUninitialized { main_repo };
+                }
+            }
+            return CodeGraphIndexStatus::GitUninitialized(dir.to_path_buf());
+        }
+        if meta.is_dir() {
+            return CodeGraphIndexStatus::GitUninitialized(dir.to_path_buf());
+        }
+    }
+    CodeGraphIndexStatus::NotGitRepo
+}
+
+fn codegraph_status_note(workspace: &Path) -> &'static str {
+    match codegraph_workspace_status(workspace) {
+        CodeGraphIndexStatus::Ready(_) => {
+            "\n\nWorkspace CodeGraph index: READY (`.codegraph/codegraph.db` exists). Query directly with `codegraph explore|node|callers|callees|impact` — skip `codegraph status` / `codegraph init`."
+        }
+        CodeGraphIndexStatus::WorktreeUninitialized { .. } => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git worktree (`.codegraph/codegraph.db` is missing; git worktrees do not inherit the main repo's index). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
+        }
+        CodeGraphIndexStatus::GitUninitialized(_) => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git repository (`.codegraph/codegraph.db` is missing). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
+        }
+        CodeGraphIndexStatus::NotGitRepo => {
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED (not a git repository; skip `codegraph init` and use parallel `Read`/`Grep`/`Glob`)."
+        }
+    }
+}
+
 /// Full skill bodies for the first-turn context from every skill whose
 /// effective state is `SkillState::Always` (marked `always_inline`) and that is
 /// model-invocable. Empty when no skill is in `Always`, so users pay zero extra
@@ -218,13 +313,32 @@ pub fn inline_skills_for_session(
 pub fn inline_skill_blocks(
     skills: &BTreeMap<String, crate::skills::discovery::SkillCommand>,
 ) -> Vec<(String, String)> {
+    inline_skill_blocks_for_workspace(skills, None)
+}
+
+/// Like [`inline_skill_blocks`], additionally enriching the `codegraph` skill
+/// block with a one-line factual status of the workspace's `.codegraph` index
+/// when `workspace` is provided.
+pub fn inline_skill_blocks_for_workspace(
+    skills: &BTreeMap<String, crate::skills::discovery::SkillCommand>,
+    workspace: Option<&Path>,
+) -> Vec<(String, String)> {
     skills
         .values()
         .filter(|skill| skill.always_inline && skill.model_invocable())
         .filter_map(|skill| {
             let body = skill.content.replace("$ARGUMENTS", "");
             let body = body.trim();
-            (!body.is_empty()).then(|| (skill.name.clone(), body.to_owned()))
+            if body.is_empty() {
+                return None;
+            }
+            let mut body = body.to_owned();
+            if skill.name == "codegraph" {
+                if let Some(ws) = workspace {
+                    body.push_str(codegraph_status_note(ws));
+                }
+            }
+            Some((skill.name.clone(), body))
         })
         .collect()
 }
@@ -1446,6 +1560,139 @@ mod tests {
             ..Default::default()
         })
         .contains(&frozen));
+    }
+
+    #[test]
+    fn codegraph_workspace_status_detects_ready_worktree_and_uninitialized() {
+        // 1. Direct `.codegraph/codegraph.db` present -> Ready (also from a nested subdir).
+        let ready = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ready.path().join(".git")).unwrap();
+        std::fs::create_dir_all(ready.path().join(".codegraph")).unwrap();
+        std::fs::write(ready.path().join(".codegraph/codegraph.db"), b"sqlite-bytes").unwrap();
+        let nested = ready.path().join("crates/core");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            codegraph_workspace_status(ready.path()),
+            CodeGraphIndexStatus::Ready(ready.path().to_path_buf())
+        );
+        assert_eq!(
+            codegraph_workspace_status(&nested),
+            CodeGraphIndexStatus::Ready(ready.path().to_path_buf())
+        );
+
+        // Zero-byte `.codegraph/codegraph.db` inside a git repo is GitUninitialized.
+        let empty_db = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(empty_db.path().join(".git")).unwrap();
+        std::fs::create_dir_all(empty_db.path().join(".codegraph")).unwrap();
+        std::fs::write(empty_db.path().join(".codegraph/codegraph.db"), b"").unwrap();
+        assert_eq!(
+            codegraph_workspace_status(empty_db.path()),
+            CodeGraphIndexStatus::GitUninitialized(empty_db.path().to_path_buf())
+        );
+
+        // 2. Git worktree `.git` file pointing to main repo with `.codegraph/codegraph.db`,
+        //    while worktree only has `.codegraph/.gitignore` -> WorktreeUninitialized.
+        let container = tempfile::tempdir().unwrap();
+        let main_repo = container.path().join("main");
+        let worktree = container.path().join("wt-feature");
+        std::fs::create_dir_all(main_repo.join(".git/worktrees/wt-feature")).unwrap();
+        std::fs::create_dir_all(main_repo.join(".codegraph")).unwrap();
+        std::fs::write(main_repo.join(".codegraph/codegraph.db"), b"sqlite-bytes").unwrap();
+        std::fs::create_dir_all(worktree.join(".codegraph")).unwrap();
+        std::fs::write(worktree.join(".codegraph/.gitignore"), b"codegraph.db\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main_repo.join(".git/worktrees/wt-feature").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            codegraph_workspace_status(&worktree),
+            CodeGraphIndexStatus::WorktreeUninitialized {
+                main_repo: main_repo.clone(),
+            }
+        );
+
+        // 3. Non-git empty workspace -> NotGitRepo.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            codegraph_workspace_status(empty.path()),
+            CodeGraphIndexStatus::NotGitRepo
+        );
+    }
+
+    #[test]
+    fn inline_skill_blocks_for_workspace_appends_status_only_to_codegraph() {
+        let skill = |name: &str, content: &str| crate::skills::discovery::SkillCommand {
+            name: name.to_owned(),
+            description: format!("{name} description"),
+            path: std::path::PathBuf::from(format!("/skills/{name}/SKILL.md")),
+            content: content.to_owned(),
+            user_invocable: true,
+            disable_model_invocation: false,
+            listing_name_only: false,
+            always_inline: true,
+            context: None,
+            shell: None,
+            agent: None,
+        };
+        let skills = BTreeMap::from([
+            ("codegraph".to_owned(), skill("codegraph", "Use CodeGraph.")),
+            (
+                "style-guide".to_owned(),
+                skill("style-guide", "Follow the style guide."),
+            ),
+        ]);
+
+        // Ready workspace.
+        let ready = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ready.path().join(".codegraph")).unwrap();
+        std::fs::write(ready.path().join(".codegraph/codegraph.db"), b"db").unwrap();
+        let ready_blocks = inline_skill_blocks_for_workspace(&skills, Some(ready.path()));
+        assert_eq!(ready_blocks.len(), 2);
+        assert_eq!(ready_blocks[0].0, "codegraph");
+        assert!(ready_blocks[0].1.starts_with("Use CodeGraph.\n\nWorkspace CodeGraph index: READY"));
+        assert!(ready_blocks[0].1.contains("skip `codegraph status` / `codegraph init`"));
+        assert_eq!(ready_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
+
+        // Worktree without its own index while main repo has one.
+        let container = tempfile::tempdir().unwrap();
+        let main_repo = container.path().join("main");
+        let worktree = container.path().join("wt");
+        std::fs::create_dir_all(main_repo.join(".git/worktrees/wt")).unwrap();
+        std::fs::create_dir_all(main_repo.join(".codegraph")).unwrap();
+        std::fs::write(main_repo.join(".codegraph/codegraph.db"), b"db").unwrap();
+        std::fs::create_dir_all(worktree.join(".codegraph")).unwrap();
+        std::fs::write(worktree.join(".codegraph/.gitignore"), b"*\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", main_repo.join(".git/worktrees/wt").display()),
+        )
+        .unwrap();
+        let wt_blocks = inline_skill_blocks_for_workspace(&skills, Some(&worktree));
+        assert!(wt_blocks[0]
+            .1
+            .contains("NOT INITIALIZED in this git worktree"));
+        assert!(wt_blocks[0].1.contains("codegraph init -y"));
+        assert_eq!(wt_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
+
+        // Uninitialized regular git repository -> prompts `codegraph init -y`.
+        let git_only = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(git_only.path().join(".git")).unwrap();
+        let git_blocks = inline_skill_blocks_for_workspace(&skills, Some(git_only.path()));
+        assert!(git_blocks[0]
+            .1
+            .contains("NOT INITIALIZED in this git repository"));
+        assert!(git_blocks[0].1.contains("codegraph init -y"));
+        assert_eq!(git_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
+
+        // Non-git empty workspace -> skips `codegraph init`.
+        let empty = tempfile::tempdir().unwrap();
+        let empty_blocks = inline_skill_blocks_for_workspace(&skills, Some(empty.path()));
+        assert!(empty_blocks[0]
+            .1
+            .contains("not a git repository; skip `codegraph init`"));
+        assert!(!empty_blocks[0].1.contains("codegraph init -y"));
+        assert_eq!(empty_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
     }
 
     #[test]
