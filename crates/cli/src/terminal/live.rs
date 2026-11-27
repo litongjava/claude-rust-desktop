@@ -2407,7 +2407,7 @@ fn run(
                         let paths = deepseek_code_core::runtime::RuntimePaths::new(root.clone()).ok()?;
                         let mut context = crate::services::context(&paths).ok()?;
                         context.db = std::sync::Arc::new(owner.scoped_stores());
-                        Some(context)
+                        Some((context, owner))
                     });
                     state.shell_context = Some((root, session));
                 }
@@ -3288,15 +3288,13 @@ fn run(
         }
         if last_agents.elapsed() >= Duration::from_secs(1) {
             last_agents = Instant::now();
-            if let Some((_, session)) = &state.shell_context {
-                if let Some(context) = &agent_context {
-                    state.agent_panel = crate::background_commands::running_agents(&context.paths, &context.db, session);
-                    super::title::background(!state.agent_panel.is_empty());
-                    state.agent_panel.extend(state.foreground_agents.iter().filter_map(|(id, kind)| crate::background_commands::foreground_agent(context, id, kind)));
+            if let Some((context, parent)) = &agent_context {
+                let (background, agents) = crate::background_commands::panel_agents(context, parent, &state.foreground_agents);
+                super::title::background(background > 0);
+                state.agent_panel = agents;
 
-                    if let Some(id) = &state.agent_detail { agent_preview = crate::background_commands::agent_execution(context, id); }
-                    dirty = true;
-                }
+                if let Some(id) = &state.agent_detail { agent_preview = crate::background_commands::agent_execution(context, id); }
+                dirty = true;
             }
         }
         if last_tick.elapsed() >= Duration::from_millis(120) {
@@ -3558,7 +3556,7 @@ mod tests {
         let mut editor = super::super::input::editor::PromptEditor::default();
         let agent =
             crate::background_commands::foreground_agent(&context, &context.db.open_session("child").unwrap().address(), "general").unwrap();
-        editor.set_agent_rows(Box::new(move || vec![agent.clone()]));
+        editor.set_agent_rows(Box::new(move || (0, vec![agent.clone()])));
         editor.set_subagents(context.clone(), "parent".into());
         editor.set_agent_details(Box::new(move |id| {
             crate::background_commands::agent_execution(&context, id)
