@@ -292,10 +292,10 @@ fn codegraph_status_note(workspace: &Path) -> &'static str {
             "\n\nWorkspace CodeGraph index: READY (`.codegraph/codegraph.db` exists). Query directly with `codegraph explore|node|callers|callees|impact` — skip `codegraph status` / `codegraph init`."
         }
         CodeGraphIndexStatus::WorktreeUninitialized { .. } => {
-            "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git worktree (`.codegraph/codegraph.db` is missing; git worktrees do not inherit the main repo's index). Run `codegraph init` once if this task spans multiple files or symbol call paths, or use parallel `Read`/`Grep`/`Glob` for targeted edits."
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED in this git worktree (`.codegraph/codegraph.db` is missing; git worktrees do not inherit the main repo's index). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
         }
         CodeGraphIndexStatus::NotInitialized => {
-            "\n\nWorkspace CodeGraph index: NOT INITIALIZED (`.codegraph/codegraph.db` is missing). Run `codegraph init` once for multi-file symbol/call-path exploration, or use parallel `Read`/`Grep`/`Glob` for targeted edits."
+            "\n\nWorkspace CodeGraph index: NOT INITIALIZED (`.codegraph/codegraph.db` is missing). Run `codegraph init -y` first to build the local index, then query with `codegraph explore|node|callers|callees|impact`."
         }
     }
 }
@@ -1667,6 +1667,7 @@ mod tests {
         assert!(wt_blocks[0]
             .1
             .contains("NOT INITIALIZED in this git worktree"));
+        assert!(wt_blocks[0].1.contains("codegraph init -y"));
         assert_eq!(wt_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
 
         // Empty workspace.
@@ -1675,6 +1676,7 @@ mod tests {
         assert!(empty_blocks[0]
             .1
             .contains("Workspace CodeGraph index: NOT INITIALIZED (`.codegraph/codegraph.db` is missing)."));
+        assert!(empty_blocks[0].1.contains("codegraph init -y"));
         assert_eq!(empty_blocks[1], ("style-guide".to_owned(), "Follow the style guide.".to_owned()));
     }
 
