@@ -82,7 +82,8 @@ pub const SESSION_TIPS: &str = r#"Shell & tool-batching tips for this session:
 - When `.codegraph/codegraph.db` is READY, reach for the `codegraph` CLI first (`codegraph explore "<symbols or question>"`, `codegraph node <name>`, `codegraph callers|callees|impact <symbol>`) for symbol lookup, call chains, and change impact instead of serial `Grep`/`Bash` hops.
 - Keep `Read`/`Grep`/`Glob` for reading and searching source files (batch them in parallel in one turn); do not use `Bash` with `cat`/`sed`/`head`/`tail`/`grep`/`find`/`ls` as a substitute for reading code (use `Bash` only for bulk log aggregation or shell-native pipelines).
 - Foreground `Bash` persists `cwd` across calls: once you `cd` into a directory, do not repeat `cd <dir> &&` on every command; use `(cd <dir> && ...)` or `git -C <dir>` for one-off directory switches.
-- Foreground `Bash` kills its entire process tree (including auto-spawned helper daemons) when the call ends. Start any long-running service that must survive across calls (e.g. a frontend dev server like `vite`/`pnpm dev`, a backend server, or a local daemon) with `detach: true`, and never poll background jobs with `sleep`."#;
+- Foreground `Bash` kills its entire process tree (including auto-spawned helper daemons) when the call ends. Start any long-running service that must survive across calls (e.g. a frontend dev server like `vite`/`pnpm dev`, a backend server, or a local daemon) with `detach: true`, and never poll background jobs with `sleep`.
+- File placement: for project-related files, do NOT write them to the OS temp directory (`/tmp`, `$TEMP`, `AppData\Local\Temp`); write project-related temporary/scratch files under `./temp/`, project-related non-temporary files under `./permanent/`, and documentation under `./docs/` in the current workspace."#;
 
 pub fn session_tips_reminder() -> String {
     format!("<system-reminder>\n{SESSION_TIPS}\n</system-reminder>")
