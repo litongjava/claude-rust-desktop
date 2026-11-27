@@ -252,7 +252,7 @@ pub(crate) fn replay_history_with_ids(
 struct ModelRequestStep {
     thinking: Option<String>,
     text: String,
-    call_ids: Vec<String>,
+    calls: Vec<(String, Option<String>)>,
 }
 
 fn load_model_request_steps(
@@ -281,12 +281,13 @@ fn load_model_request_steps(
         };
         let mut thinking_parts = Vec::new();
         let mut text_parts = Vec::new();
-        let mut call_ids = Vec::new();
+        let mut calls = Vec::new();
         for block in &blocks {
             match block.get("type").and_then(Value::as_str) {
                 Some("thinking") => {
                     if let Some(text) = block
                         .get("thinking")
+                        .or_else(|| block.get("text"))
                         .and_then(Value::as_str)
                         .filter(|text| !text.trim().is_empty())
                     {
@@ -303,12 +304,18 @@ fn load_model_request_steps(
                     }
                 }
                 Some("tool_call" | "tool_use") => {
-                    if let Some(id) = block
+                    let id = block
                         .get("id")
                         .and_then(Value::as_str)
-                        .filter(|id| !id.is_empty())
-                    {
-                        call_ids.push(id.to_owned());
+                        .unwrap_or_default()
+                        .to_owned();
+                    let name = block
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned);
+                    if !id.is_empty() || name.is_some() {
+                        calls.push((id, name));
                     }
                 }
                 _ => {}
@@ -317,7 +324,7 @@ fn load_model_request_steps(
         steps.push(ModelRequestStep {
             thinking: (!thinking_parts.is_empty()).then(|| thinking_parts.join("\n\n")),
             text: text_parts.concat(),
-            call_ids,
+            calls,
         });
     }
     Ok(steps)
@@ -475,8 +482,16 @@ pub(crate) fn replay_rows(
             let mut remaining = calls;
             for step in steps {
                 let mut step_calls = Vec::new();
-                for call_id in &step.call_ids {
-                    if let Some(pos) = remaining.iter().position(|c| c.id == *call_id) {
+                for (call_id, call_name) in &step.calls {
+                    let pos = (!call_id.is_empty())
+                        .then(|| remaining.iter().position(|c| c.id == *call_id))
+                        .flatten()
+                        .or_else(|| {
+                            call_name.as_deref().and_then(|name| {
+                                remaining.iter().position(|c| c.name == name)
+                            })
+                        });
+                    if let Some(pos) = pos {
                         step_calls.push(remaining.remove(pos));
                     }
                 }
@@ -1167,5 +1182,70 @@ mod model_history_step_replay_tests {
         assert_eq!(history[4]["role"], "assistant");
         assert_eq!(history[4]["content"], "Legacy answer");
         assert!(history[4].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn openai_replays_per_step_with_text_thinking_and_durable_inv_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = RuntimePaths::new(root.path().join("data")).unwrap();
+        let store = SessionStore::new(paths.open_database().unwrap());
+        let id = store.create(root.path(), "model", "provider").unwrap();
+        store.append(&id, "user", "Hide two buttons").unwrap();
+        let assistant_id = store.append(&id, "assistant", "Done hiding").unwrap();
+
+        let conn = open_session_db(&store, &id);
+        conn.execute(
+            "UPDATE messages SET thinking = ?1 WHERE id = ?2",
+            rusqlite::params!["step1step2step3", assistant_id],
+        )
+        .unwrap();
+        let inv1 = format!("{assistant_id}:inv-aaaa-1");
+        let inv2 = format!("{assistant_id}:inv-aaaa-2");
+        let inv3 = format!("{assistant_id}:inv-aaaa-3");
+        message_repo::insert_tool_call(&conn, &inv1, &assistant_id, "Bash", Some("{}"), Some("out1"), false, 0).unwrap();
+        message_repo::insert_tool_call(&conn, &inv2, &assistant_id, "Grep", Some("{}"), Some("out2"), false, 1).unwrap();
+        message_repo::insert_tool_call(&conn, &inv3, &assistant_id, "Read", Some("{}"), Some("out3"), false, 2).unwrap();
+
+        // Production model_requests shape: thinking uses `"text"` and tool_call uses provider `"call_..."` id.
+        let req1 = json!([
+            {"type": "thinking", "text": "Step 1 explore"},
+            {"type": "tool_call", "id": "call_provider_1", "name": "Bash", "arguments": "{}"},
+            {"type": "tool_call", "id": "call_provider_2", "name": "Grep", "arguments": "{}"}
+        ])
+        .to_string();
+        let req2 = json!([
+            {"type": "thinking", "text": "Step 2 read"},
+            {"type": "tool_call", "id": "call_provider_3", "name": "Read", "arguments": "{}"}
+        ])
+        .to_string();
+        let req3 = json!([
+            {"type": "thinking", "text": "Step 3 report"},
+            {"type": "text", "text": "Done hiding"}
+        ])
+        .to_string();
+        for (idx, blocks) in [(1, req1), (2, req2), (3, req3)] {
+            conn.execute(
+                "INSERT INTO model_requests (id, message_id, conversation_id, request_number, provider_id, model, api_format, status, started_at_ms, response_blocks_json)
+                 VALUES (?1, ?2, ?3, ?4, 'p', 'm', 'openai', 'completed', ?5, ?6)",
+                rusqlite::params![format!("req-{idx}"), assistant_id, id, idx, idx * 1000, blocks],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let history = store.model_history(&id, &ApiFormat::OpenAI).unwrap();
+        assert_eq!(history.len(), 7, "user + step1(asst+2tools) + step2(asst+1tool) + step3(asst)");
+        assert_eq!(history[1]["reasoning_content"], "Step 1 explore");
+        assert_eq!(history[1]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(history[1]["tool_calls"][0]["id"], inv1);
+        assert_eq!(history[1]["tool_calls"][1]["id"], inv2);
+        assert_eq!(history[2]["tool_call_id"], inv1);
+        assert_eq!(history[3]["tool_call_id"], inv2);
+        assert_eq!(history[4]["reasoning_content"], "Step 2 read");
+        assert_eq!(history[4]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(history[4]["tool_calls"][0]["id"], inv3);
+        assert_eq!(history[5]["tool_call_id"], inv3);
+        assert_eq!(history[6]["reasoning_content"], "Step 3 report");
+        assert_eq!(history[6]["content"], "Done hiding");
     }
 }
