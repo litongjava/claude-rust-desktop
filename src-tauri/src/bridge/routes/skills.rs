@@ -537,6 +537,7 @@ mod tests {
             context: None,
             shell: None,
             agent: None,
+            always_inline: false,
         }
     }
 
