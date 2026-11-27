@@ -100,7 +100,7 @@ pub(crate) fn allowed_in_missing_workspace_readonly(command: &str, argument: &st
     let argument = argument.trim();
     match command {
         "/resume" | "/history" | "/export" | "/copy" | "/copy-session-id" | "/context"
-        | "/cost" | "/usage" | "/status" | "/stats" | "/sessions" | "/help" | "/vim"
+        | "/cost" | "/usage" | "/status" | "/sessions" | "/help" | "/vim"
         | "/scroll-speed" => true,
         "/exit" | "/quit" => argument.is_empty(),
         "/theme" | "/color" | "/output-style" => argument.is_empty(),
@@ -109,9 +109,8 @@ pub(crate) fn allowed_in_missing_workspace_readonly(command: &str, argument: &st
             match parts.next() {
                 None => true,
                 Some(
-                    "list" | "running" | "completed" | "failed" | "sessions",
+                    "list" | "running" | "completed" | "failed" | "sessions" | "records",
                 ) => parts.next().is_none(),
-                Some("records") => parts.next().is_none_or(|legacy| legacy == "legacy" && parts.next().is_none()),
                 Some("show") => true,
                 _ => false,
             }
@@ -1258,10 +1257,15 @@ impl Session {
             deepseek_code_core::skills::SkillsManager::with_path(paths.data_dir.join("skills")),
         )))
         // One in-process monitor per executing session. Utility subcommands
-        // never open a Session and therefore never sample.
+        // never open a Session and therefore never sample. A missing directory
+        // is not sampled on disk; a later writable resume updates the path.
         .with_resource_monitor(ResourceMonitor::start(
             ResourceMonitorConfig::load(&paths.data_dir),
-            workspace.clone(),
+            if missing_workspace.is_some() {
+                paths.data_dir.clone()
+            } else {
+                workspace.clone()
+            },
             paths.data_dir.clone(),
         ));
         // Registration is a separate step: it waits until startup options chose
@@ -1493,7 +1497,7 @@ impl Session {
         shard: &deepseek_code_core::db::session_store::SessionDb,
         state: deepseek_code_core::native_engine::session_binding::BindingSnapshot,
     ) -> Result<deepseek_code_core::native_engine::session_binding::ActiveBinding> {
-        let target = if self.id == shard.id() {
+        let target = if self.id == shard.id() && !self.is_missing_workspace() {
             (*self.binding).clone()
         } else {
             Default::default()
@@ -1718,6 +1722,9 @@ impl Session {
         self.providers.lock().await.binding = (*target).clone();
         self.binding = target;
         self.workspace = path.clone();
+        if let Some(monitor) = self.engine.resource_monitor() {
+            monitor.update_workspace(self.paths.data_dir.clone());
+        }
         self.missing_workspace = Some(MissingWorkspace {
             path,
             missing_path,
@@ -6268,7 +6275,6 @@ mod missing_workspace_tests {
             ("/context", ""),
             ("/cost", ""),
             ("/status", ""),
-            ("/stats", ""),
             ("/sessions", ""),
             ("/help", ""),
             ("/vim", ""),
@@ -6283,7 +6289,7 @@ mod missing_workspace_tests {
             ("/tasks", "running"),
             ("/tasks", "show task-1"),
             ("/tasks", "sessions"),
-            ("/tasks", "records legacy"),
+            ("/tasks", "records"),
         ] {
             assert!(
                 allowed_in_missing_workspace_readonly(command, argument),
@@ -6324,9 +6330,12 @@ mod missing_workspace_tests {
             ("/background", ""),
             ("/config", ""),
             ("/settings", ""),
+            ("/search-config", ""),
+            ("/stats", ""),
             ("/theme", "dark"),
             ("/color", "red"),
             ("/output-style", "learning"),
+            ("/tasks", "records legacy"),
             ("/tasks", "cancel task-1"),
             ("/tasks", "answer task-1 req yes"),
             ("/tasks", "stop-session id"),
