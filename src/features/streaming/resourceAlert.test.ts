@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createStreamCallbacks } from './createStreamCallbacks';
+import { nextResourceAlertToast } from './resourceAlert';
 
 vi.mock('../../api', () => ({ getConversation: vi.fn(), getContextSize: vi.fn(), getAttachmentUrl: vi.fn(), compactConversation: vi.fn() }));
 vi.mock('../../api/conversations', () => ({ persistMessages: vi.fn() }));
@@ -74,5 +75,28 @@ describe('resource alerts', () => {
     const { callbacks, onResourceAlert } = harness(false);
     callbacks[callback]('resource_alert', 'Low disk', { type: 'resource_alert', kind: 'disk', summary: 'Low disk' });
     expect(onResourceAlert).not.toHaveBeenCalled();
+  });
+});
+
+describe('resource alert toast', () => {
+  it('prefixes and trims the summary', () => {
+    expect(nextResourceAlertToast(null, '  Low memory: 1 GiB free  ')).toEqual({
+      id: 1,
+      text: 'System resource warning: Low memory: 1 GiB free',
+    });
+  });
+
+  it('advances the id when the same summary arrives again so the timer restarts', () => {
+    const first = nextResourceAlertToast(null, 'High CPU usage: 99.0% sustained');
+    const second = nextResourceAlertToast(first, 'High CPU usage: 99.0% sustained');
+    expect(second?.text).toBe(first?.text);
+    expect(second?.id).toBe((first?.id ?? 0) + 1);
+  });
+
+  it('keeps the current toast for a blank or missing summary', () => {
+    expect(nextResourceAlertToast(null, undefined)).toBeNull();
+    expect(nextResourceAlertToast(null, '   ')).toBeNull();
+    const current = { id: 4, text: 'System resource warning: Low disk' };
+    expect(nextResourceAlertToast(current, '')).toBe(current);
   });
 });

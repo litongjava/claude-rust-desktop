@@ -99,11 +99,31 @@ impl ResourceMonitorConfig {
         config.sanitized()
     }
 
-    /// Keeps the interval in a range that is responsive without busy-waiting.
+    /// Keeps the interval in a range that is responsive without busy-waiting and
+    /// replaces thresholds that would silently disable their comparison (`NaN`,
+    /// infinities and negatives). Values above 100 are preserved so tests can
+    /// force a deterministic breach.
     pub fn sanitized(mut self) -> Self {
+        let defaults = Self::default();
         self.interval_secs = self
             .interval_secs
             .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
+        if !self.cpu_percent_threshold.is_finite() || self.cpu_percent_threshold < 0.0 {
+            self.cpu_percent_threshold = defaults.cpu_percent_threshold;
+        }
+        if !self.memory_available_percent_threshold.is_finite()
+            || self.memory_available_percent_threshold < 0.0
+        {
+            self.memory_available_percent_threshold = defaults.memory_available_percent_threshold;
+        }
+        if !self.disk_available_percent_threshold.is_finite()
+            || self.disk_available_percent_threshold < 0.0
+        {
+            self.disk_available_percent_threshold = defaults.disk_available_percent_threshold;
+        }
+        self.cpu_consecutive = self.cpu_consecutive.max(1);
+        self.memory_consecutive = self.memory_consecutive.max(1);
+        self.disk_consecutive = self.disk_consecutive.max(1);
         self
     }
 
@@ -822,12 +842,18 @@ pub struct EvaluationOutcome {
     /// Keys that returned to their recovery band on this sample. A warning
     /// queued for one of them is stale even before its TTL expires.
     pub recovered: Vec<ResourceKey>,
+    /// Fresh readings for keys that are still breaching during the cooldown.
+    /// The monitor refreshes an undrained warning for them in place, so a long
+    /// tool call cannot let a valid warning expire while pressure persists.
+    pub breaching: Vec<ResourceAlert>,
 }
 
 /// What one monitored key did on this sample.
 enum UpdateOutcome {
     None,
     Alert,
+    /// Still breaching while latched and inside the cooldown.
+    Ongoing,
     Recovered,
 }
 
@@ -860,6 +886,9 @@ impl ResourceEvaluator {
                 UpdateOutcome::Alert => outcome
                     .alerts
                     .push(ResourceAlert::cpu(percent, &self.config)),
+                UpdateOutcome::Ongoing => outcome
+                    .breaching
+                    .push(ResourceAlert::cpu(percent, &self.config)),
                 UpdateOutcome::Recovered => outcome.recovered.push(ResourceKey::Cpu),
                 UpdateOutcome::None => {}
             }
@@ -872,6 +901,9 @@ impl ResourceEvaluator {
             match self.update(ResourceKey::Memory, breach, recovered, now, required) {
                 UpdateOutcome::Alert => outcome
                     .alerts
+                    .push(ResourceAlert::memory(memory, &self.config)),
+                UpdateOutcome::Ongoing => outcome
+                    .breaching
                     .push(ResourceAlert::memory(memory, &self.config)),
                 UpdateOutcome::Recovered => outcome.recovered.push(ResourceKey::Memory),
                 UpdateOutcome::None => {}
@@ -887,6 +919,9 @@ impl ResourceEvaluator {
                 UpdateOutcome::Alert => {
                     outcome.alerts.push(ResourceAlert::disk(disk, &self.config))
                 }
+                UpdateOutcome::Ongoing => outcome
+                    .breaching
+                    .push(ResourceAlert::disk(disk, &self.config)),
                 UpdateOutcome::Recovered => outcome
                     .recovered
                     .push(ResourceKey::Disk(disk.label.clone())),
@@ -936,12 +971,13 @@ impl ResourceEvaluator {
         }
 
         // Already latched: remind periodically while the pressure lasts, but
-        // never more often than the cooldown.
+        // never more often than the cooldown. Between reminders the warning is
+        // still live, which keeps an undrained alert from expiring.
         if due {
             state.last_alerted = Some(now);
             return UpdateOutcome::Alert;
         }
-        UpdateOutcome::None
+        UpdateOutcome::Ongoing
     }
 }
 
@@ -1059,12 +1095,7 @@ impl ResourceMonitor {
                     let outcome = lock(&inner.evaluator).evaluate_with_recovery(&sample, now);
                     {
                         let mut pending = lock(&inner.alerts);
-                        // A recovered or expired warning must be gone before a
-                        // new one for the same key replaces it.
-                        prune_alerts(&mut pending, &outcome.recovered, now, inner.stale_ttl);
-                        for alert in outcome.alerts {
-                            enqueue_alert(&mut pending, alert, now);
-                        }
+                        apply_outcome(&mut pending, outcome, now, inner.stale_ttl);
                     }
                     // Published after the queue update so observers of the
                     // latest sample see a fully processed tick.
@@ -1118,6 +1149,35 @@ impl ResourceMonitor {
         if let Some(task) = lock(&self.inner.task).take() {
             task.abort();
         }
+    }
+}
+
+/// Applies one evaluation to the pending queue. A key that is still breaching
+/// keeps its undrained warning alive and up to date, so a long tool call cannot
+/// watch a valid warning expire while pressure persists. Refreshing never
+/// inserts a warning: after delivery the cooldown still throttles reminders.
+fn apply_outcome(
+    queue: &mut VecDeque<PendingAlert>,
+    outcome: EvaluationOutcome,
+    now: Instant,
+    stale_ttl: Duration,
+) {
+    for alert in outcome.breaching {
+        if let Some(existing) = queue
+            .iter_mut()
+            .find(|queued| queued.alert.key == alert.key)
+        {
+            *existing = PendingAlert {
+                alert,
+                created_at: now,
+            };
+        }
+    }
+    // A recovered or expired warning must be gone before a new one for the same
+    // key replaces it.
+    prune_alerts(queue, &outcome.recovered, now, stale_ttl);
+    for alert in outcome.alerts {
+        enqueue_alert(queue, alert, now);
     }
 }
 
@@ -1368,6 +1428,46 @@ mod tests {
         let mut high = ResourceMonitorConfig::default();
         high.interval_secs = 600;
         assert_eq!(high.sanitized().interval_secs, 300);
+    }
+
+    #[test]
+    fn sanitized_replaces_invalid_thresholds_and_zero_consecutive_counts() {
+        let defaults = ResourceMonitorConfig::default();
+        let config = ResourceMonitorConfig {
+            cpu_percent_threshold: f64::NAN,
+            memory_available_percent_threshold: -5.0,
+            disk_available_percent_threshold: f64::INFINITY,
+            cpu_consecutive: 0,
+            memory_consecutive: 0,
+            disk_consecutive: 0,
+            ..ResourceMonitorConfig::default()
+        }
+        .sanitized();
+
+        assert_eq!(config.cpu_percent_threshold, defaults.cpu_percent_threshold);
+        assert_eq!(
+            config.memory_available_percent_threshold,
+            defaults.memory_available_percent_threshold
+        );
+        assert_eq!(
+            config.disk_available_percent_threshold,
+            defaults.disk_available_percent_threshold
+        );
+        assert_eq!(config.cpu_consecutive, 1);
+        assert_eq!(config.memory_consecutive, 1);
+        assert_eq!(config.disk_consecutive, 1);
+
+        // Deterministic CLI tests rely on a threshold above 100 surviving.
+        let above = ResourceMonitorConfig {
+            cpu_percent_threshold: 100.1,
+            memory_available_percent_threshold: 100.1,
+            disk_available_percent_threshold: 100.1,
+            ..defaults
+        }
+        .sanitized();
+        assert_eq!(above.cpu_percent_threshold, 100.1);
+        assert_eq!(above.memory_available_percent_threshold, 100.1);
+        assert_eq!(above.disk_available_percent_threshold, 100.1);
     }
 
     // ---- platform parsers ------------------------------------------------
@@ -2032,6 +2132,50 @@ mod tests {
         assert_eq!(drained.len(), 1, "an alert older than the TTL is discarded");
         assert_eq!(drained[0].key, ResourceKey::Memory);
         assert!(monitor.drain_alerts_at(now).is_empty());
+    }
+
+    #[test]
+    fn sustained_breach_refreshes_undrained_alert_past_stale_ttl() {
+        let mut config = ResourceMonitorConfig::default();
+        config.cpu_consecutive = 1;
+        config.cooldown_secs = 300;
+        let mut evaluator = ResourceEvaluator::new(config);
+        let mut queue = VecDeque::new();
+        let stale_ttl = Duration::from_secs(30);
+        let start = Instant::now();
+
+        let outcome = evaluator.evaluate_with_recovery(&cpu_sample(99.0), start);
+        assert_eq!(outcome.alerts.len(), 1);
+        apply_outcome(&mut queue, outcome, start, stale_ttl);
+        assert_eq!(queue.len(), 1);
+
+        // More than `stale_ttl` later the metric is still critically low, but
+        // the cooldown suppresses a new alert. The undrained warning must
+        // survive and carry the latest reading.
+        let later = start + stale_ttl + Duration::from_secs(10);
+        let outcome = evaluator.evaluate_with_recovery(&cpu_sample(97.5), later);
+        assert!(
+            outcome.alerts.is_empty(),
+            "a cooldown reminder must not fire yet"
+        );
+        assert_eq!(outcome.breaching.len(), 1);
+        apply_outcome(&mut queue, outcome, later, stale_ttl);
+        assert_eq!(queue.len(), 1, "the still-breaching warning is not evicted");
+        let delivered: Vec<ResourceAlert> = queue.drain(..).map(|pending| pending.alert).collect();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].summary(), "High CPU usage: 97.5% sustained");
+
+        // Delivering the warning does not re-arm it: the cooldown still applies,
+        // so a later still-breaching sample must not enqueue a second warning.
+        let afterwards = later + Duration::from_secs(1);
+        let outcome = evaluator.evaluate_with_recovery(&cpu_sample(98.0), afterwards);
+        assert!(outcome.alerts.is_empty());
+        assert_eq!(outcome.breaching.len(), 1);
+        apply_outcome(&mut queue, outcome, afterwards, stale_ttl);
+        assert!(
+            queue.is_empty(),
+            "a delivered alert must not be re-enqueued inside the cooldown"
+        );
     }
 
     #[test]
