@@ -4679,6 +4679,9 @@ pub struct TurnDisplay {
     change_details: std::collections::BTreeMap<String, Vec<change_view::Line>>,
     /// The session-wide numbers of this turn's shell commands.
     numbers: std::collections::HashMap<String, usize>,
+    /// Notices recorded so tests can assert rendering without a terminal.
+    #[cfg(test)]
+    notices: Vec<String>,
 }
 impl TurnDisplay {
     pub fn new(
@@ -4736,6 +4739,8 @@ impl TurnDisplay {
             changes: Default::default(),
             change_details: Default::default(),
             numbers: Default::default(),
+            #[cfg(test)]
+            notices: Vec::new(),
         })
     }
     pub fn restore_numbers(&mut self, session: &crate::session::Session) -> anyhow::Result<()> {
@@ -5098,12 +5103,18 @@ impl TurnDisplay {
         }
     }
     pub fn notice(&mut self, text: &str) {
+        #[cfg(test)]
+        self.notices.push(text.to_owned());
         if let Some(live) = &self.live {
             live.notice(text);
         } else {
             self.fallback.clear();
             eprintln!("{text}");
         }
+    }
+    #[cfg(test)]
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
     }
     pub async fn action(&mut self) -> Option<Action> {
         match &mut self.live {
