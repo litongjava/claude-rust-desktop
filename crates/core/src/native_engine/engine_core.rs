@@ -1242,7 +1242,8 @@ impl QueryEngine {
         // Skills in `SkillState::Always` have their full body injected into the
         // first user message, so the model has their complete instructions on
         // turn 1 without spending a turn calling `Skill`.
-        let inline_blocks = crate::prompt::inline_skill_blocks(&discovered_skills);
+        let inline_blocks =
+            crate::prompt::inline_skill_blocks_for_workspace(&discovered_skills, Some(&workspace));
         // The set of tools ToolLoad can offer and the model-invocable skills
         // are frozen into the first user message. A later discovery only adds a
         // change reminder to the latest message, never an edit to that prefix.

@@ -734,11 +734,15 @@ pub(crate) const REDUNDANT_CD_NOTE_PREFIX: &str = "Bash already runs in ";
 /// of using parallel `Read`/`Grep`/`Glob` tool calls.
 pub(crate) const SHELL_READ_SEARCH_NOTE_PREFIX: &str = "Use dedicated Read/Grep/Glob";
 
+/// Prefix of the one-line coaching note added to a foreground `Bash` result
+/// when a single turn splits work across multiple foreground `Bash` tool calls.
+pub(crate) const BASH_BATCH_NOTE_PREFIX: &str = "Avoid splitting multiple Bash calls in one turn";
+
 /// Returns true when `command` only uses shell read/search utilities (`cat`,
-/// `sed -n`, `head`, `tail`, `grep`, `rg`, `find`) — optionally separated by
-/// `echo`, `;`, `&&`, or a leading `cd` — with no file writes or real build/git
-/// commands. Commands like `cargo test | tail -40`, `git diff | grep`, or
-/// `sed -i` return `false`.
+/// `sed -n`, `head`, `tail`, `grep`, `rg`, `find`, `ls`, `wc`) — optionally
+/// separated by `echo`, `;`, `&&`, or a leading `cd` — with no file writes or
+/// real build/git commands. Commands like `cargo test | tail -40`,
+/// `git diff | grep`, or `sed -i` return `false`.
 pub(crate) fn is_pure_shell_read_or_search(command: &str) -> bool {
     // Any output redirection or in-place sed edit is not a pure read/search.
     if command.contains('>') {
@@ -765,7 +769,7 @@ pub(crate) fn is_pure_shell_read_or_search(command: &str) -> bool {
                 };
                 if idx == 0 {
                     match cmd {
-                        "cat" | "head" | "tail" | "grep" | "rg" | "find" => {
+                        "cat" | "head" | "tail" | "grep" | "rg" | "find" | "ls" | "wc" => {
                             saw_read_or_search = true;
                         }
                         "sed" => {
@@ -922,12 +926,20 @@ fn pure_shell_read_or_search_detection_cases() {
     assert!(is_pure_shell_read_or_search("grep -rn \"foo\" src/ | head -30"));
     assert!(is_pure_shell_read_or_search("cd /repo && grep -n \"bar\" a.rs"));
     assert!(is_pure_shell_read_or_search("cat src/lib.rs"));
+    assert!(is_pure_shell_read_or_search("ls crates/core/src"));
+    assert!(is_pure_shell_read_or_search("wc -l src/lib.rs"));
+    assert!(is_pure_shell_read_or_search(
+        "cd /repo && ls src && grep -n foo a.rs"
+    ));
 
     assert!(!is_pure_shell_read_or_search("cargo test 2>&1 | tail -40"));
+    assert!(!is_pure_shell_read_or_search("cargo test"));
     assert!(!is_pure_shell_read_or_search("git diff | grep foo"));
+    assert!(!is_pure_shell_read_or_search("git status && ls"));
     assert!(!is_pure_shell_read_or_search("sed -i '' 's/a/b/' a.rs"));
     assert!(!is_pure_shell_read_or_search("cat a.rs > b.rs"));
     assert!(!is_pure_shell_read_or_search("codegraph explore foo | head -20"));
+    assert!(!is_pure_shell_read_or_search("codegraph explore foo"));
     assert!(!is_pure_shell_read_or_search("git status --short"));
 }
 
@@ -1000,6 +1012,83 @@ async fn bash_adds_redundant_cd_note_only_when_requested_for_same_cwd() {
     assert!(
         sub_note.starts_with(REDUNDANT_CD_NOTE_PREFIX) && sub_note.contains(sub_str),
         "expected redundant-cd note for persisted sub cwd, got: {hinted_sub}"
+    );
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn bash_adds_redundant_cd_and_read_search_combined_note() {
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    std::fs::write(project.join("a.rs"), "fn foo() {}\n").unwrap();
+    let cwd = project.to_str().unwrap();
+    let state = project.join("cwd-state");
+
+    let combined = tool_bash_async(
+        serde_json::json!({
+            "command": format!("cd {cwd} && grep -n foo a.rs"),
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_redundant_cd": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    let note = combined["note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains(REDUNDANT_CD_NOTE_PREFIX) && note.contains(SHELL_READ_SEARCH_NOTE_PREFIX),
+        "expected combined redundant-cd + read/search note, got: {combined}"
+    );
+    assert_eq!(
+        note,
+        format!(
+            "{REDUNDANT_CD_NOTE_PREFIX}{cwd}; omit redundant leading 'cd'. {SHELL_READ_SEARCH_NOTE_PREFIX} tools in parallel instead of Bash cat/sed/grep."
+        )
+    );
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test]
+async fn bash_adds_redundant_cd_batch_hint_note() {
+    crate::config::OrchestrationConfig::init_global().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    let cwd = project.to_str().unwrap();
+    let state = project.join("cwd-state");
+
+    let batched = tool_bash_async(
+        serde_json::json!({
+            "command": "pwd -P",
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_batch_bash": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    let note = batched["note"].as_str().unwrap_or_default();
+    assert!(
+        note.starts_with(BASH_BATCH_NOTE_PREFIX),
+        "expected batch-bash note, got: {batched}"
+    );
+
+    let combined = tool_bash_async(
+        serde_json::json!({
+            "command": format!("cd {cwd} && pwd -P"),
+            "__cwd_state": state.to_string_lossy(),
+            "__hint_redundant_cd": true,
+            "__hint_batch_bash": true
+        }),
+        cwd,
+    )
+    .await
+    .unwrap();
+    let combined_note = combined["note"].as_str().unwrap_or_default();
+    assert!(
+        combined_note.contains(REDUNDANT_CD_NOTE_PREFIX)
+            && combined_note.contains(BASH_BATCH_NOTE_PREFIX),
+        "expected combined redundant-cd + batch-bash note, got: {combined}"
     );
 }
 
@@ -1876,22 +1965,32 @@ async fn tool_bash_async(input: serde_json::Value, cwd: &str) -> Result<serde_js
                 }
             }
         }
-        if input["__hint_redundant_cd"].as_bool().unwrap_or(false) {
-            if has_redundant_leading_cd(&raw_command, &safe_cwd) {
-                if let Some(object) = result.as_object_mut() {
-                    object.entry("note".to_owned()).or_insert_with(|| {
-                        serde_json::json!(format!(
-                            "{REDUNDANT_CD_NOTE_PREFIX}{safe_cwd}; omit redundant leading 'cd'."
-                        ))
-                    });
+        let hint_redundant_cd = input["__hint_redundant_cd"].as_bool().unwrap_or(false);
+        let hint_batch_bash = input["__hint_batch_bash"].as_bool().unwrap_or(false);
+        if hint_redundant_cd || hint_batch_bash {
+            let mut notes = Vec::new();
+            if hint_redundant_cd {
+                if has_redundant_leading_cd(&raw_command, &safe_cwd) {
+                    notes.push(format!(
+                        "{REDUNDANT_CD_NOTE_PREFIX}{safe_cwd}; omit redundant leading 'cd'."
+                    ));
                 }
-            } else if is_pure_shell_read_or_search(&raw_command) {
+                if is_pure_shell_read_or_search(&raw_command) {
+                    notes.push(format!(
+                        "{SHELL_READ_SEARCH_NOTE_PREFIX} tools in parallel instead of Bash cat/sed/grep."
+                    ));
+                }
+            }
+            if hint_batch_bash {
+                notes.push(format!(
+                    "{BASH_BATCH_NOTE_PREFIX}; chain related shell commands with && or ; in one Bash call, or use parallel Read/Grep/Glob."
+                ));
+            }
+            if !notes.is_empty() {
                 if let Some(object) = result.as_object_mut() {
-                    object.entry("note".to_owned()).or_insert_with(|| {
-                        serde_json::json!(format!(
-                            "{SHELL_READ_SEARCH_NOTE_PREFIX} tools in parallel instead of Bash cat/sed/grep."
-                        ))
-                    });
+                    object
+                        .entry("note".to_owned())
+                        .or_insert_with(|| serde_json::json!(notes.join(" ")));
                 }
             }
         }
