@@ -6529,6 +6529,7 @@ impl ToolLoopExecutor {
                 let mut redundant_cd_cwd: Option<String> = None;
                 let mut foreground_sleep_detected = false;
                 let mut inline_python_calls = 0usize;
+                let mut wrapped_powershell_calls = 0usize;
                 if pending_tool_calls
                     .iter()
                     .any(|t| t.name.as_str() == "ExitPlanMode")
@@ -6594,6 +6595,9 @@ impl ToolLoopExecutor {
                                 if is_standalone_inline_python_command(command) {
                                     inline_python_calls += 1;
                                 }
+                                if has_wrapped_powershell_command(&actual_input, command) {
+                                    wrapped_powershell_calls += 1;
+                                }
                             }
                         }
                         let _ = self
@@ -6630,6 +6634,7 @@ impl ToolLoopExecutor {
                     foreground_sleep_detected,
                     inline_python_calls,
                     python_available,
+                    wrapped_powershell_calls,
                 ) {
                     tool_results.push(ContentBlock::Text { text: reminder });
                 }
@@ -7500,6 +7505,7 @@ impl ToolLoopExecutor {
                 let mut redundant_cd_cwd: Option<String> = None;
                 let mut foreground_sleep_detected = false;
                 let mut inline_python_calls = 0usize;
+                let mut wrapped_powershell_calls = 0usize;
                 if pending_tool_calls
                     .iter()
                     .any(|t| t.name.as_str() == "ExitPlanMode")
@@ -7562,6 +7568,9 @@ impl ToolLoopExecutor {
                                 if is_standalone_inline_python_command(command) {
                                     inline_python_calls += 1;
                                 }
+                                if has_wrapped_powershell_command(&actual_input, command) {
+                                    wrapped_powershell_calls += 1;
+                                }
                             }
                         }
                         let _ = self
@@ -7618,6 +7627,7 @@ impl ToolLoopExecutor {
                     foreground_sleep_detected,
                     inline_python_calls,
                     python_available,
+                    wrapped_powershell_calls,
                 ) {
                     conversation_messages.push(OpenAIMessage {
                         role: "user".into(),
@@ -8701,12 +8711,17 @@ Do NOT poll with foreground `sleep` or `for`/`while` wait loops.\n\
 const INLINE_PYTHON_COACHING_TEXT: &str = "\
 Prefer the dedicated `Python` tool over `Bash` heredocs (`python - <<'EOF'`) or `python -c` for inline Python snippets and data inspection. If `Python` is on-demand, load it first with `ToolLoad({\"names\":[\"Python\"]})`.";
 
+const WRAPPED_POWERSHELL_COACHING_TEXT: &str = "\
+You are invoking `powershell`/`pwsh` inside Git Bash. Pass `shell: \"powershell\"` (or `\"pwsh\"`) directly on the `Bash` tool instead of wrapping `powershell -Command \"...\"`, so you can write native multi-line PowerShell without `\\$`/`\\\"` escaping.";
+
 #[derive(Debug, Default)]
 struct BashCoachingState {
     redundant_cd_cooldown: usize,
     foreground_sleep_cooldown: usize,
     inline_python_count: usize,
     inline_python_cooldown: usize,
+    wrapped_powershell_count: usize,
+    wrapped_powershell_cooldown: usize,
 }
 
 impl BashCoachingState {
@@ -8715,6 +8730,8 @@ impl BashCoachingState {
         self.foreground_sleep_cooldown = 0;
         self.inline_python_count = 0;
         self.inline_python_cooldown = 0;
+        self.wrapped_powershell_count = 0;
+        self.wrapped_powershell_cooldown = 0;
     }
 
     fn build_turn_reminder(
@@ -8723,6 +8740,7 @@ impl BashCoachingState {
         foreground_sleep_detected: bool,
         inline_python_calls: usize,
         python_tool_available: bool,
+        wrapped_powershell_calls: usize,
     ) -> Option<String> {
         let mut notices = Vec::new();
 
@@ -8757,6 +8775,18 @@ impl BashCoachingState {
             self.inline_python_cooldown = BASH_COACHING_COOLDOWN_TURNS;
         }
 
+        if wrapped_powershell_calls > 0 {
+            self.wrapped_powershell_count = self
+                .wrapped_powershell_count
+                .saturating_add(wrapped_powershell_calls);
+        }
+        if self.wrapped_powershell_cooldown > 0 {
+            self.wrapped_powershell_cooldown -= 1;
+        } else if wrapped_powershell_calls > 0 && self.wrapped_powershell_count >= 2 {
+            notices.push(WRAPPED_POWERSHELL_COACHING_TEXT.to_owned());
+            self.wrapped_powershell_cooldown = BASH_COACHING_COOLDOWN_TURNS;
+        }
+
         if notices.is_empty() {
             None
         } else {
@@ -8766,6 +8796,50 @@ impl BashCoachingState {
             ))
         }
     }
+}
+
+fn has_wrapped_powershell_command(input: &Value, command: &str) -> bool {
+    if let Some(shell) = input.get("shell").and_then(Value::as_str) {
+        let lower = shell.trim().to_ascii_lowercase();
+        if !lower.is_empty() && !matches!(lower.as_str(), "bash" | "sh") {
+            return false;
+        }
+    }
+    for segment in split_shell_segments(command) {
+        let mut iter = segment.iter().peekable();
+        while let Some(word) = iter.peek() {
+            if is_shell_env_assignment(word)
+                || matches!(
+                    word.as_str(),
+                    "then" | "do" | "else" | "elif" | "!" | "command" | "env"
+                )
+            {
+                iter.next();
+            } else {
+                break;
+            }
+        }
+        let Some(cmd) = iter.next() else {
+            continue;
+        };
+        let base = cmd
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(cmd.as_str())
+            .to_ascii_lowercase();
+        if !matches!(base.as_str(), "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe") {
+            continue;
+        }
+        if iter.any(|arg| {
+            matches!(
+                arg.to_ascii_lowercase().as_str(),
+                "-command" | "-c" | "-encodedcommand" | "-enc" | "-ec" | "/command" | "/c"
+            )
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn format_redundant_cd_coaching(cwd: &str) -> String {
@@ -9629,8 +9703,10 @@ mod shell_state_input_tests {
 mod bash_coaching_tests {
     use super::{
         extract_redundant_cd_cwd, format_redundant_cd_coaching, has_foreground_sleep_command,
-        is_foreground_bash_call, is_standalone_inline_python_command, BashCoachingState,
-        BASH_COACHING_COOLDOWN_TURNS, FOREGROUND_SLEEP_COACHING_TEXT, INLINE_PYTHON_COACHING_TEXT,
+        has_wrapped_powershell_command, is_foreground_bash_call,
+        is_standalone_inline_python_command, BashCoachingState, BASH_COACHING_COOLDOWN_TURNS,
+        FOREGROUND_SLEEP_COACHING_TEXT, INLINE_PYTHON_COACHING_TEXT,
+        WRAPPED_POWERSHELL_COACHING_TEXT,
     };
     use serde_json::json;
 
@@ -9669,7 +9745,7 @@ mod bash_coaching_tests {
 
         let mut state = BashCoachingState::default();
         let reminder = state
-            .build_turn_reminder(Some("/workspace/app"), false, 0, false)
+            .build_turn_reminder(Some("/workspace/app"), false, 0, false, 0)
             .expect("redundant cd reminder");
         assert_eq!(
             reminder,
@@ -9757,28 +9833,81 @@ mod bash_coaching_tests {
         // Unavailable Python tool never triggers (even across repeated calls)
         let mut unavailable_state = BashCoachingState::default();
         assert_eq!(
-            unavailable_state.build_turn_reminder(None, false, 1, false),
+            unavailable_state.build_turn_reminder(None, false, 1, false, 0),
             None
         );
         assert_eq!(
-            unavailable_state.build_turn_reminder(None, false, 1, false),
+            unavailable_state.build_turn_reminder(None, false, 1, false, 0),
             None
         );
 
         // Available Python tool: 1st occurrence does not trigger; 2nd triggers; then 4-turn cooldown
         let mut state = BashCoachingState::default();
-        assert_eq!(state.build_turn_reminder(None, false, 1, true), None);
+        assert_eq!(state.build_turn_reminder(None, false, 1, true, 0), None);
         let second = state
-            .build_turn_reminder(None, false, 1, true)
+            .build_turn_reminder(None, false, 1, true, 0)
             .expect("inline python reminder on 2nd occurrence");
         assert_eq!(
             second,
             format!("<system-reminder>\n{INLINE_PYTHON_COACHING_TEXT}\n</system-reminder>")
         );
         for _ in 0..BASH_COACHING_COOLDOWN_TURNS {
-            assert_eq!(state.build_turn_reminder(None, false, 1, true), None);
+            assert_eq!(state.build_turn_reminder(None, false, 1, true, 0), None);
         }
-        assert!(state.build_turn_reminder(None, false, 1, true).is_some());
+        assert!(state.build_turn_reminder(None, false, 1, true, 0).is_some());
+    }
+
+    #[test]
+    fn wrapped_powershell_coaching_triggers_on_second_call_without_false_positives() {
+        let bash_input = json!({"command": "placeholder"});
+        let ps_input = json!({"shell": "powershell", "command": "placeholder"});
+
+        // True positives: powershell/pwsh -Command wrapped inside default bash
+        assert!(has_wrapped_powershell_command(
+            &bash_input,
+            "powershell -NoProfile -Command \"Get-Process miwang\""
+        ));
+        assert!(has_wrapped_powershell_command(
+            &bash_input,
+            "mkdir -p .devlogs/shots && powershell.exe -NoProfile -Command \"Add-Type ...\""
+        ));
+        assert!(has_wrapped_powershell_command(
+            &bash_input,
+            "cd /repo && pwsh -c 'Write-Output 1'"
+        ));
+
+        // False positives: explicit shell: powershell, -File, quoted text, grep
+        assert!(!has_wrapped_powershell_command(
+            &ps_input,
+            "powershell -NoProfile -Command \"Get-Process\""
+        ));
+        assert!(!has_wrapped_powershell_command(
+            &bash_input,
+            "powershell -NoProfile -File scripts/build.ps1"
+        ));
+        assert!(!has_wrapped_powershell_command(
+            &bash_input,
+            "echo \"powershell -Command Get-Date\""
+        ));
+        assert!(!has_wrapped_powershell_command(
+            &bash_input,
+            "grep powershell README.md"
+        ));
+
+        // 1st occurrence does not trigger; 2nd triggers; then 4-turn cooldown
+        let mut state = BashCoachingState::default();
+        assert_eq!(state.build_turn_reminder(None, false, 0, false, 1), None);
+        let second = state
+            .build_turn_reminder(None, false, 0, false, 1)
+            .expect("wrapped powershell reminder on 2nd occurrence");
+        assert_eq!(
+            second,
+            format!("<system-reminder>\n{WRAPPED_POWERSHELL_COACHING_TEXT}\n</system-reminder>")
+        );
+        for _ in 0..BASH_COACHING_COOLDOWN_TURNS {
+            assert_eq!(state.build_turn_reminder(None, false, 0, false, 1), None);
+        }
+        assert!(state.build_turn_reminder(None, false, 0, false, 1).is_some());
     }
 
     #[test]
@@ -9788,7 +9917,7 @@ mod bash_coaching_tests {
 
         // Both triggers in the same turn merge into one <system-reminder>.
         let combined = state
-            .build_turn_reminder(Some("/repo"), true, 0, false)
+            .build_turn_reminder(Some("/repo"), true, 0, false, 0)
             .expect("combined reminder");
         let expected = format!(
             "<system-reminder>\n{}\n\n{}\n</system-reminder>",
@@ -9801,32 +9930,33 @@ mod bash_coaching_tests {
 
         // Next 4 turns are cooled down for both categories.
         for _ in 0..BASH_COACHING_COOLDOWN_TURNS {
-            assert_eq!(state.build_turn_reminder(Some("/repo"), true, 0, false), None);
+            assert_eq!(state.build_turn_reminder(Some("/repo"), true, 0, false, 0), None);
         }
 
         // Turn 5: only redundant_cd triggers -> arms only redundant_cd cooldown.
         let cd_only = state
-            .build_turn_reminder(Some("/repo"), false, 0, false)
+            .build_turn_reminder(Some("/repo"), false, 0, false, 0)
             .expect("cd reminder after cooldown");
         assert!(cd_only.contains("ALREADY in `/repo`"));
         assert!(!cd_only.contains("Do NOT poll with foreground `sleep`"));
 
         // Next turn: redundant_cd is suppressed, but foreground_sleep fires independently.
         let sleep_only = state
-            .build_turn_reminder(Some("/repo"), true, 0, false)
+            .build_turn_reminder(Some("/repo"), true, 0, false, 0)
             .expect("independent sleep reminder");
         assert!(!sleep_only.contains("ALREADY in `/repo`"));
         assert!(sleep_only.contains(FOREGROUND_SLEEP_COACHING_TEXT));
 
         // Reset (e.g. on compaction) clears all cooldowns immediately.
         state.reset();
-        let all_three = state
-            .build_turn_reminder(Some("/repo"), true, 2, true)
-            .expect("all three notices merged");
-        assert!(all_three.contains("ALREADY in `/repo`"));
-        assert!(all_three.contains(FOREGROUND_SLEEP_COACHING_TEXT));
-        assert!(all_three.contains(INLINE_PYTHON_COACHING_TEXT));
-        assert_eq!(all_three.matches("<system-reminder>").count(), 1);
+        let all_four = state
+            .build_turn_reminder(Some("/repo"), true, 2, true, 2)
+            .expect("all four notices merged");
+        assert!(all_four.contains("ALREADY in `/repo`"));
+        assert!(all_four.contains(FOREGROUND_SLEEP_COACHING_TEXT));
+        assert!(all_four.contains(INLINE_PYTHON_COACHING_TEXT));
+        assert!(all_four.contains(WRAPPED_POWERSHELL_COACHING_TEXT));
+        assert_eq!(all_four.matches("<system-reminder>").count(), 1);
     }
 }
 
