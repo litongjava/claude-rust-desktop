@@ -1224,10 +1224,19 @@ async fn run(cli: &mut Cli) -> Result<()> {
         if !single {
             if std::env::var_os(remote_host::HANDOFF_ENV).is_none() {
                 let banner = terminal::banner(&session.binding_state().model, &session.workspace);
-                eprintln!("{banner}");
+                let search_reminder = terminal::web_search_startup_reminder(
+                    &deepseek_code_core::config::ConfigManager::new(paths.data_dir.clone())
+                        .get_config()
+                        .deepseek_search,
+                );
+                let welcome = match search_reminder {
+                    Some(reminder) => format!("{banner}\n{reminder}"),
+                    None => banner,
+                };
+                eprintln!("{welcome}");
                 if resumed.is_none() {
                     let mut history = terminal::scrollback::Scrollback::take();
-                    history.set_welcome(format!("{banner}\n"));
+                    history.set_welcome(format!("{welcome}\n"));
                     history.save();
                 }
             }
